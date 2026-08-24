@@ -145,11 +145,11 @@ impl PreparedNode {
         } else {
             None
         };
-        // zecd permits at most one wallet with spending keys; watch-only (UFVK) wallets may be
-        // loaded without limit. Record each opened wallet's watch-only flag so the invariant can
-        // be enforced once every wallet has been spawned (the flag is only known after the actor
-        // reads the account from the wallet DB).
-        let mut loaded: Vec<(String, bool)> = Vec::new();
+        // zecd permits at most one wallet with spending keys per coin; watch-only (UFVK)
+        // wallets may be loaded without limit. Record each opened wallet's coin and watch-only
+        // flag so the invariant can be enforced once every wallet has been spawned (the flag
+        // is only known after the actor reads the account from the wallet DB).
+        let mut loaded: Vec<(String, crate::coin::Coin, bool)> = Vec::new();
         for (name, entry) in &config.wallets {
             let keys_path = entry.keys_path();
             if !WalletStore::exists(&keys_path) {
@@ -159,6 +159,33 @@ impl PreparedNode {
                     keys_path.display(),
                     name
                 );
+                continue;
+            }
+            // A Bitcoin wallet takes the BDK engine's spawn path; everything below this branch
+            // is the Zcash actor's bring-up. Same failure taxonomy: a binding mismatch is
+            // fatal for the whole node, any other failure skips the wallet.
+            #[cfg(feature = "bitcoin")]
+            if entry.coin == crate::coin::Coin::Bitcoin {
+                match spawn_bitcoin_wallet(&config, name, entry, &keys_path) {
+                    Ok(handle) => {
+                        let watch_only = !handle.has_seed;
+                        info!(
+                            "loaded wallet '{}' (bitcoin{})",
+                            name,
+                            if watch_only { ", watch-only" } else { "" }
+                        );
+                        loaded.push((name.clone(), entry.coin, watch_only));
+                        registry.insert(CoinWallet::Bitcoin(handle));
+                    }
+                    Err(e)
+                        if e.downcast_ref::<crate::btc::actor::BtcBindingMismatch>()
+                            .is_some() =>
+                    {
+                        stop_actors(&shutdown_tx, actor_tasks).await;
+                        return Err(e);
+                    }
+                    Err(e) => error!("failed to start wallet '{}': {e:#}", name),
+                }
                 continue;
             }
             let server = match backend::resolve_for_wallet(&config, entry) {
@@ -242,7 +269,7 @@ impl PreparedNode {
                         name,
                         if watch_only { " (watch-only)" } else { "" }
                     );
-                    loaded.push((name.clone(), watch_only));
+                    loaded.push((name.clone(), entry.coin, watch_only));
                     registry.insert(CoinWallet::Zcash(handle));
                     actor_tasks.push((name.clone(), task));
                 }
@@ -315,6 +342,43 @@ async fn stop_actors(
             }
         }
     }
+}
+
+/// Bring up one Bitcoin wallet: read its `keys.toml`, decrypt the seed where the custody
+/// model allows it (identity file + auto-unlock, exactly the Zcash actor's startup rule),
+/// and spawn the BDK actor. A passphrase-encrypted wallet starts without its seed - the
+/// wallet database already exists from init, so only the binding verification is skipped.
+#[cfg(feature = "bitcoin")]
+fn spawn_bitcoin_wallet(
+    config: &AppConfig,
+    name: &str,
+    entry: &config::WalletEntry,
+    keys_path: &std::path::Path,
+) -> anyhow::Result<crate::btc::actor::BtcWalletHandle> {
+    let store = WalletStore::read(keys_path)?;
+    if store.network.name() != config.network.name() {
+        anyhow::bail!(
+            "wallet '{}' was initialized for {} but this daemon runs {}",
+            name,
+            store.network.name(),
+            config.network.name()
+        );
+    }
+    let seed = if store.has_seed() && !store.is_encrypted() && config.keys.auto_unlock {
+        match &config.keys.age_identity {
+            Some(identity) => crate::wallet::keys::decrypt_seed_with_identity(&store, identity)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
+        name: name.to_string(),
+        engine_dir: entry.engine_dir(),
+        network: entry.bitcoin_network(),
+        seed,
+        wallet_holds_seed: store.has_seed(),
+    })
 }
 
 /// The per-call knobs of [`Node::send`], defaulting to what the Bitcoin-dialect sends do: the

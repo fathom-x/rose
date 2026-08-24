@@ -137,7 +137,7 @@ pub struct PoolsConfig {
     /// Receivers included in the UAs handed out by `getnewaddress` when no per-call override is
     /// given. Always a subset of `enabled`.
     pub default_receivers: ReceiverSet,
-    /// Whether the wallet may hand out bare transparent (`t1…`/`tm…`) receiving addresses - via
+    /// Whether the wallet may hand out bare transparent (`t1...`/`tm...`) receiving addresses - via
     /// `getnewaddress "" "transparent"`, and (when `transparent_default`) as the no-argument
     /// default. Off preserves zecd's shielded-only behaviour: `address_type = "transparent"` is
     /// rejected `-8`. Received transparent UTXOs are spendable only by auto-shielding them into a
@@ -348,6 +348,25 @@ impl WalletEntry {
     pub fn zcash_network(&self) -> ZNetwork {
         match self.chain {
             CoinNetwork::Zcash(network) => network,
+            // Every caller branches on `WalletEntry::coin` (or a registry tag derived from
+            // it) before unwrapping a chain; reaching this arm is that invariant broken, not
+            // an input error, so it fails loudly rather than inventing a network.
+            #[cfg(feature = "bitcoin")]
+            CoinNetwork::Bitcoin(_) => {
+                panic!("zcash_network() on a Bitcoin wallet entry (caller must branch on coin)")
+            }
+        }
+    }
+
+    /// This wallet's Bitcoin network. The same contract as [`WalletEntry::zcash_network`],
+    /// from the other side of the coin branch.
+    #[cfg(feature = "bitcoin")]
+    pub fn bitcoin_network(&self) -> crate::coin::BitcoinNetwork {
+        match self.chain {
+            CoinNetwork::Bitcoin(network) => network,
+            CoinNetwork::Zcash(_) => {
+                panic!("bitcoin_network() on a Zcash wallet entry (caller must branch on coin)")
+            }
         }
     }
 
@@ -884,6 +903,10 @@ struct LogFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WalletFile {
+    /// The coin this wallet serves (`"zcash"`, the default; `"bitcoin"` in a build carrying
+    /// the BDK engine). Validated in [`AppConfig::resolve`] and nowhere else, so the daemon,
+    /// `config check`, and the embedded facade refuse an unsupported value identically.
+    coin: Option<String>,
     dir: Option<PathBuf>,
     /// Path to this wallet's `keys.toml`, independent of `dir` (mount it as a Secret).
     keys_file: Option<PathBuf>,
@@ -1011,7 +1034,7 @@ struct SpendFile {
 struct PoolsFile {
     enabled: Option<Vec<String>>,
     default_receivers: Option<Vec<String>>,
-    /// Enable bare transparent (`t1…`/`tm…`) receiving addresses.
+    /// Enable bare transparent (`t1...`/`tm...`) receiving addresses.
     transparent: Option<bool>,
     /// Make a bare transparent address the no-argument `getnewaddress` default (implies
     /// `transparent`).
@@ -1497,7 +1520,59 @@ impl AppConfig {
                     None
                 }
             });
-            let coin = Coin::Zcash;
+            let coin = match &w.coin {
+                None => Coin::Zcash,
+                Some(token) => Coin::parse(token).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unsupported coin {token:?} for wallet {name:?} (this build supports: {})",
+                        Coin::supported_names()
+                    )
+                })?,
+            };
+            // Every other per-wallet key is the Zcash engine's (pool selection, the
+            // zebra/lightwalletd backend overrides). On a non-Zcash wallet a set key would be
+            // silently ignored, which reads as configuration and isn't - refuse it instead.
+            if coin != Coin::Zcash {
+                let zcash_only: &[(&str, bool)] = &[
+                    ("server", w.server.is_some()),
+                    ("tls", w.tls.is_some()),
+                    ("tls_roots", w.tls_roots.is_some()),
+                    (
+                        "tls_insecure_skip_verify",
+                        w.tls_insecure_skip_verify.is_some(),
+                    ),
+                    ("tls_ca_file", w.tls_ca_file.is_some()),
+                    ("tls_pinned_sha256", w.tls_pinned_sha256.is_some()),
+                    (
+                        "assume_transparent_in_compact_blocks",
+                        w.assume_transparent_in_compact_blocks.is_some(),
+                    ),
+                    ("pools", w.pools.is_some()),
+                    ("default_receivers", w.default_receivers.is_some()),
+                    ("transparent", w.transparent.is_some()),
+                    ("transparent_default", w.transparent_default.is_some()),
+                    ("transparent_gap_limit", w.transparent_gap_limit.is_some()),
+                    (
+                        "transparent_initial_scan",
+                        w.transparent_initial_scan.is_some(),
+                    ),
+                    (
+                        "transparent_allow_beyond_recovery_window",
+                        w.transparent_allow_beyond_recovery_window.is_some(),
+                    ),
+                    (
+                        "transparent_gap_warn_threshold",
+                        w.transparent_gap_warn_threshold.is_some(),
+                    ),
+                ];
+                if let Some((key, _)) = zcash_only.iter().find(|(_, set)| *set) {
+                    anyhow::bail!(
+                        "[wallets.{name}] {key} does not apply to a {} wallet (it configures \
+                         the Zcash engine)",
+                        coin.name()
+                    );
+                }
+            }
             let dir = w.dir.clone().unwrap_or_else(|| wallet_dir(&datadir, name));
             let backend_override = resolve_wallet_backend(name, w)?;
             let (
@@ -2603,7 +2678,7 @@ mod tests {
         assert_eq!(f.tls_insecure_skip_verify, None);
         assert_eq!(f.tls_ca_file, None);
         assert_eq!(f.tls_pinned_sha256, None);
-        // …and each of the three trust knobs has to be asked for explicitly.
+        // ...and each of the three trust knobs has to be asked for explicitly.
         let f: BackendFile = toml::from_str("tls_insecure_skip_verify = true").unwrap();
         assert_eq!(f.tls_insecure_skip_verify, Some(true));
         let f: BackendFile = toml::from_str(
@@ -2676,14 +2751,14 @@ mod tests {
         assert!(err.to_string().contains("tls_insecure_skip_verify"));
 
         // Nor can they ride a connection that will not be TLS at all, whether that is forced by
-        // `tls = "no"`…
+        // `tls = "no"`...
         assert!(validate_backend_tls(&BackendConfig {
             tls: Some(false),
             tls_pins: vec![pin],
             ..backend_cfg()
         })
         .is_err());
-        // …or by an http:// endpoint.
+        // ...or by an http:// endpoint.
         assert!(validate_backend_tls(&BackendConfig {
             server: "http://lwd.example.com:9067".into(),
             tls_ca_pem: Some(b"pem".to_vec()),
@@ -3079,6 +3154,95 @@ mod tests {
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.wallets["default"].coin, Coin::Zcash);
         assert_eq!(cfg.wallets["other"].coin, Coin::Zcash);
+    }
+
+    /// The `coin` key: an explicit `"zcash"` is the default spelled out, and an unsupported
+    /// token is one error raised in `resolve` (so the daemon, `config check`, and the
+    /// embedded facade refuse it identically), naming the wallet and this build's supported
+    /// set. Whether `"bitcoin"` is in that set is a property of the build.
+    #[test]
+    #[cfg(feature = "cli")]
+    fn the_coin_key_is_validated_in_resolve() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.w]\ncoin = \"zcash\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.wallets["w"].coin, Coin::Zcash);
+
+        std::fs::write(
+            &conf,
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.w]\ncoin = \"dogecoin\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let err = AppConfig::resolve(&cli).unwrap_err().to_string();
+        assert!(err.contains("unsupported coin \"dogecoin\""), "{err}");
+        assert!(err.contains("\"w\""), "{err}");
+        assert!(
+            err.contains(&format!("this build supports: {}", Coin::supported_names())),
+            "{err}"
+        );
+
+        std::fs::write(
+            &conf,
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        #[cfg(not(feature = "bitcoin"))]
+        {
+            let err = AppConfig::resolve(&cli).unwrap_err().to_string();
+            assert!(err.contains("unsupported coin \"bitcoin\""), "{err}");
+        }
+        #[cfg(feature = "bitcoin")]
+        {
+            let cfg = AppConfig::resolve(&cli).unwrap();
+            let entry = &cfg.wallets["btc"];
+            assert_eq!(entry.coin, Coin::Bitcoin);
+            assert_eq!(
+                entry.chain,
+                CoinNetwork::Bitcoin(crate::coin::BitcoinNetwork::Test)
+            );
+            assert_eq!(entry.bitcoin_network(), crate::coin::BitcoinNetwork::Test);
+            // The engine directory follows the coin's frozen path components.
+            assert!(entry.engine_dir().ends_with("btc/bdk"));
+        }
+    }
+
+    /// A Zcash-engine key on a non-Zcash wallet is refused, not silently ignored: a set key
+    /// that configures nothing would read as configuration.
+    #[test]
+    #[cfg(all(feature = "cli", feature = "bitcoin"))]
+    fn zcash_engine_keys_are_refused_on_a_bitcoin_wallet() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        for (key, line) in [
+            ("transparent", "transparent = true"),
+            ("pools", "pools = [\"orchard\"]"),
+            ("server", "server = \"zebra\""),
+        ] {
+            std::fs::write(
+                &conf,
+                format!(
+                    "network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n{line}\n"
+                ),
+            )
+            .unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let err = AppConfig::resolve(&cli).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("[wallets.btc] {key}")),
+                "{key}: {err}"
+            );
+            assert!(err.contains("Zcash engine"), "{key}: {err}");
+        }
     }
 
     #[test]

@@ -206,47 +206,55 @@ fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
     }
 }
 
-/// Enforce zecd's single-spending-wallet rule: at most one loaded wallet may hold spending
-/// keys, while any number of watch-only (UFVK) wallets may be loaded alongside it. `loaded`
-/// pairs each successfully-opened wallet name with its watch-only flag (`true` = watch-only),
-/// in a stable order so the error names the offending wallets deterministically. Returns an
-/// error naming the two spending wallets when more than one is present.
+/// Enforce zecd's single-spending-wallet rule: at most one loaded wallet **per coin** may
+/// hold spending keys, while any number of watch-only (UFVK) wallets may be loaded alongside
+/// it. Per coin because the rule exists for custody attribution ("which key can this
+/// compromised credential spend?"), and one seed serving two chains through two engines is
+/// one custody decision, not two - while two independent seeds for the same chain in one
+/// process is exactly what the rule refuses. `loaded` carries each successfully-opened
+/// wallet's name, coin, and watch-only flag (`true` = watch-only), in a stable order so the
+/// error names the offending wallets deterministically.
 /// `allow_multiple` opts out of the rule ([`crate::config::KeysConfig::allow_multiple_spending_wallets`]):
 /// the additional spenders are logged to the audit target rather than refused, so the loosened
 /// custody posture is visible in the record instead of being silent. Only an embedded node can
 /// reach that branch - the daemon refuses the option before it ever gets here
 /// ([`crate::config::reject_multiple_spenders_in_daemon`]).
 pub(crate) fn ensure_single_spending_wallet(
-    loaded: &[(String, bool)],
+    loaded: &[(String, crate::coin::Coin, bool)],
     allow_multiple: bool,
 ) -> anyhow::Result<()> {
-    let mut spenders = loaded
-        .iter()
-        .filter(|(_, watch_only)| !watch_only)
-        .map(|(name, _)| name.as_str());
-    if let (Some(first), Some(second)) = (spenders.next(), spenders.next()) {
-        if allow_multiple {
-            let all: Vec<&str> = loaded
-                .iter()
-                .filter(|(_, watch_only)| !watch_only)
-                .map(|(name, _)| name.as_str())
-                .collect();
-            tracing::warn!(
-                target: "zecd::audit",
-                spenders = all.len(),
-                wallets = %all.join(", "),
-                "multiple spending wallets loaded under [keys] allow_multiple_spending_wallets; \
-                 each holds independent spending keys in one process and one data directory"
+    for coin in crate::coin::Coin::SUPPORTED {
+        let mut spenders = loaded
+            .iter()
+            .filter(|(_, c, watch_only)| c == coin && !watch_only)
+            .map(|(name, _, _)| name.as_str());
+        if let (Some(first), Some(second)) = (spenders.next(), spenders.next()) {
+            if allow_multiple {
+                let all: Vec<&str> = loaded
+                    .iter()
+                    .filter(|(_, c, watch_only)| c == coin && !watch_only)
+                    .map(|(name, _, _)| name.as_str())
+                    .collect();
+                tracing::warn!(
+                    target: "zecd::audit",
+                    spenders = all.len(),
+                    coin = coin.name(),
+                    wallets = %all.join(", "),
+                    "multiple spending wallets loaded under [keys] allow_multiple_spending_wallets; \
+                     each holds independent spending keys in one process and one data directory"
+                );
+                continue;
+            }
+            anyhow::bail!(
+                "multiple {} spending wallets configured ('{first}' and '{second}'); zecd \
+                 allows at most one wallet with spending keys per coin (any number of \
+                 watch-only UFVK wallets may be loaded alongside it). Convert one to \
+                 watch-only (`zecd export-ufvk` + `zecd init --ufvk`) or remove it from the \
+                 configuration. An application embedding zecd as a library can instead set \
+                 [keys] allow_multiple_spending_wallets.",
+                coin.name()
             );
-            return Ok(());
         }
-        anyhow::bail!(
-            "multiple spending wallets configured ('{first}' and '{second}'); zecd allows at \
-             most one wallet with spending keys (any number of watch-only UFVK wallets may be \
-             loaded alongside it). Convert one to watch-only (`zecd export-ufvk` + \
-             `zecd init --ufvk`) or remove it from the configuration. An application embedding \
-             zecd as a library can instead set [keys] allow_multiple_spending_wallets."
-        );
     }
     Ok(())
 }
@@ -257,11 +265,32 @@ mod tests {
     #[cfg(feature = "server")]
     use super::rpcpassword_on_cli;
     /// Fixture helper: name/watch-only pairs in the shape the guard consumes.
-    fn wallets(entries: &[(&str, bool)]) -> Vec<(String, bool)> {
+    fn wallets(entries: &[(&str, bool)]) -> Vec<(String, crate::coin::Coin, bool)> {
         entries
             .iter()
-            .map(|(name, watch_only)| (name.to_string(), *watch_only))
+            .map(|(name, watch_only)| (name.to_string(), crate::coin::Coin::Zcash, *watch_only))
             .collect()
+    }
+
+    /// The rule is per coin: one Zcash spender and one Bitcoin spender in the same process is
+    /// one custody decision per chain, not a violation - while two spenders of the same coin
+    /// still are, whichever coin it is.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn one_spender_per_coin_is_allowed() {
+        use crate::coin::Coin;
+        let loaded = vec![
+            ("zec".to_string(), Coin::Zcash, false),
+            ("btc".to_string(), Coin::Bitcoin, false),
+        ];
+        assert!(ensure_single_spending_wallet(&loaded, false).is_ok());
+        let two_btc = vec![
+            ("btc-a".to_string(), Coin::Bitcoin, false),
+            ("btc-b".to_string(), Coin::Bitcoin, false),
+        ];
+        let err = ensure_single_spending_wallet(&two_btc, false)
+            .expect_err("two bitcoin spenders must be rejected");
+        assert!(err.to_string().contains("bitcoin"), "{err}");
     }
 
     #[test]

@@ -39,4 +39,8 @@ accepted = [
     "Unlicense",
     "Zlib",
     "CDLA-Permissive-2.0",
+    # Mirrors deny.toml: MIT +no-false-attribs, from the rust-bitcoin stack behind the
+    # off-by-default `bitcoin` feature. Not in the shipped (default-feature) bundle today,
+    # but the two allowlists describe one policy.
+    "MITNFA",
 ]

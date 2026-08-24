@@ -164,6 +164,8 @@ pub mod address;
 pub mod amount;
 pub mod backend;
 pub mod backoff;
+#[cfg(feature = "bitcoin")]
+pub mod btc;
 pub mod chain;
 pub mod chain_probe;
 pub mod coin;

@@ -666,6 +666,14 @@ pub fn resolve_for_wallet(
     // dials is decided here and nothing above this function reads the global config again.
     let mut server = match entry.coin {
         crate::coin::Coin::Zcash => resolve(&backend.server, entry.zcash_network())?,
+        // The `[backend]` token grammar names Zcash upstreams (zebrad, lightwalletd). The BDK
+        // engine has no chain source yet; when one lands it resolves its own endpoint kind
+        // here rather than reusing the Zcash grammar.
+        #[cfg(feature = "bitcoin")]
+        crate::coin::Coin::Bitcoin => anyhow::bail!(
+            "Bitcoin wallets do not take a [backend] upstream yet (the BDK engine has no \
+             chain source in this build)"
+        ),
     };
     apply_zebra_auth(&mut server, &config.zebra.auth());
     apply_cleartext_policy(
@@ -864,7 +872,7 @@ mod tests {
 
     #[test]
     fn tls_locality_heuristic_and_overrides() {
-        // Loopback and private-network hosts dial plaintext by default…
+        // Loopback and private-network hosts dial plaintext by default...
         for host in [
             "127.0.0.1:9067",
             "localhost:9067",
@@ -874,7 +882,7 @@ mod tests {
             let s = resolve(host, ZNetwork::Main).unwrap();
             assert!(!s.use_tls(), "{host} should default to plaintext");
         }
-        // …public hosts dial TLS.
+        // ...public hosts dial TLS.
         for host in ["zec.rocks:443", "203.0.113.5:9067"] {
             let s = resolve(host, ZNetwork::Main).unwrap();
             assert!(s.use_tls(), "{host} should default to TLS");
@@ -1022,7 +1030,7 @@ mod tests {
             ca_pem: Some(b"-----BEGIN CERTIFICATE-----".to_vec()),
             pins: vec![pin],
         };
-        // A bare host:port takes the configured TLS mode…
+        // A bare host:port takes the configured TLS mode...
         let mut s = resolve("lwd.example.com:9067", ZNetwork::Main).unwrap();
         apply_tls(&mut s, opts.clone());
         assert!(s.use_tls());
@@ -1030,7 +1038,7 @@ mod tests {
         assert_eq!(s.tls.pins, vec![pin]);
         assert!(s.tls.ca_pem.is_some());
         assert!(s.tls.requires_tls());
-        // …but an explicit scheme still wins over it, as for every other TLS setting.
+        // ...but an explicit scheme still wins over it, as for every other TLS setting.
         let mut s = resolve("http://127.0.0.1:9067", crate::network::regtest()).unwrap();
         apply_tls(&mut s, opts);
         assert!(!s.use_tls(), "http:// wins over tls = \"yes\"");

@@ -196,7 +196,7 @@ pub enum ReceiverRequest {
     Default,
     /// An explicit shielded receiver set (already validated as a subset of the enabled pools).
     Shielded(ReceiverSet),
-    /// A bare transparent (`t1…`/`tm…`) address. Only valid when the wallet enables transparent
+    /// A bare transparent (`t1...`/`tm...`) address. Only valid when the wallet enables transparent
     /// receiving (checked at the RPC layer and re-checked by the actor).
     Transparent,
 }
@@ -209,7 +209,7 @@ pub enum ReceiverRequest {
 /// handed).
 #[derive(Debug, Clone)]
 pub struct DerivedAddress {
-    /// The encoded address (a Unified Address, or a bare `t1…`/`tm…` for a transparent request).
+    /// The encoded address (a Unified Address, or a bare `t1...`/`tm...` for a transparent request).
     pub address: String,
     /// The index the address was derived at (diversifier index, or transparent child index).
     pub index: u128,
@@ -761,6 +761,9 @@ impl WalletHandle {
 pub enum CoinWallet {
     /// A Zcash wallet, served by the librustzcash-backed actor.
     Zcash(WalletHandle),
+    /// A Bitcoin wallet, served by the BDK-backed actor (`crate::btc`).
+    #[cfg(feature = "bitcoin")]
+    Bitcoin(crate::btc::actor::BtcWalletHandle),
 }
 
 impl CoinWallet {
@@ -768,6 +771,8 @@ impl CoinWallet {
     pub fn coin(&self) -> Coin {
         match self {
             CoinWallet::Zcash(_) => Coin::Zcash,
+            #[cfg(feature = "bitcoin")]
+            CoinWallet::Bitcoin(_) => Coin::Bitcoin,
         }
     }
 
@@ -775,6 +780,8 @@ impl CoinWallet {
     pub fn name(&self) -> &str {
         match self {
             CoinWallet::Zcash(handle) => &handle.name,
+            #[cfg(feature = "bitcoin")]
+            CoinWallet::Bitcoin(handle) => &handle.name,
         }
     }
 }
@@ -811,6 +818,31 @@ impl WalletRegistry {
     pub fn get(&self, name: Option<&str>) -> Result<&WalletHandle, RpcError> {
         match self.get_coin(name)? {
             CoinWallet::Zcash(handle) => Ok(handle),
+            // Unreachable through dispatch: every method whose handler resolves a Zcash handle
+            // is gated to Zcash wallets in `rpc::METHOD_COINS`, which answers -32601 first.
+            // Kept as an error rather than a panic so a gate omission is a wrong-but-bounded
+            // answer on one request, not a crashed daemon.
+            #[cfg(feature = "bitcoin")]
+            wallet @ CoinWallet::Bitcoin(_) => Err(RpcError::misc(format!(
+                "method not available for wallet '{}' (a Bitcoin wallet)",
+                wallet.name()
+            ))),
+        }
+    }
+
+    /// Look up a Bitcoin wallet by name - [`WalletRegistry::get`]'s counterpart on the other
+    /// side of the coin gate, for the handlers that serve Bitcoin wallets.
+    #[cfg(feature = "bitcoin")]
+    pub fn get_bitcoin(
+        &self,
+        name: Option<&str>,
+    ) -> Result<&crate::btc::actor::BtcWalletHandle, RpcError> {
+        match self.get_coin(name)? {
+            CoinWallet::Bitcoin(handle) => Ok(handle),
+            wallet @ CoinWallet::Zcash(_) => Err(RpcError::misc(format!(
+                "method not available for wallet '{}' (a Zcash wallet)",
+                wallet.name()
+            ))),
         }
     }
 

@@ -310,6 +310,13 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     crate::migrate::migrate(config)?;
 
     let entry = resolve_wallet_entry(config, &wallet);
+    // A Bitcoin wallet takes the BDK engine's init path (offline: the engine has no chain
+    // source, so there is no upstream to anchor a birthday on). Branch before any read that
+    // assumes a Zcash entry. The datadir lock and migration above cover both engines.
+    #[cfg(feature = "bitcoin")]
+    if entry.coin == crate::coin::Coin::Bitcoin {
+        return init_bitcoin_wallet(config, entry, wallet, key, encryption, birthday_opt).await;
+    }
     let keys_path = entry.keys_path();
     let enabled_pools = entry.pools.clone();
     // Create the account under the wallet's external transparent gap limit (only when transparent
@@ -569,6 +576,147 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     })
 }
 
+/// The Bitcoin half of [`init_wallet`]: same refusals (already-initialized, one spending
+/// wallet per coin), same custody models, no upstream. The engine has no chain source yet,
+/// so the recorded birthday is `--birthday` or 0 (scan from genesis when sync lands) rather
+/// than a near-tip default, and the wallet database is created here - from the seed, holding
+/// only public descriptors - so an encrypted wallet can start without its passphrase.
+#[cfg(feature = "bitcoin")]
+async fn init_bitcoin_wallet(
+    config: &AppConfig,
+    entry: crate::config::WalletEntry,
+    wallet: String,
+    key: InitKey,
+    encryption: EncryptionInput,
+    birthday_opt: Option<u32>,
+) -> anyhow::Result<InitOutcome> {
+    let keys_path = entry.keys_path();
+    let engine_dir = entry.engine_dir();
+    let btc_network = entry.bitcoin_network();
+    let wallet_dir = entry.dir;
+    // `keys.toml` speaks the environment vocabulary (`main`/`test`/`regtest`), shared by both
+    // coins' networks; the daemon checks it against its own environment at spawn.
+    let network = config.network;
+
+    if WalletStore::exists(&keys_path) {
+        return Err(anyhow!(
+            "wallet '{}' is already initialized ({} exists)",
+            wallet,
+            keys_path.display()
+        ));
+    }
+
+    let restore_input = match key {
+        InitKey::WatchOnly(_) => {
+            return Err(anyhow!(
+                "cannot create wallet '{}' with --ufvk: a Unified Full Viewing Key is a Zcash \
+                 key, and watch-only Bitcoin wallets (descriptor import) are not supported yet",
+                wallet
+            ))
+        }
+        InitKey::Restore(input) => Some(input),
+        InitKey::Generate => None,
+    };
+    let restore = restore_input.is_some();
+
+    // One spending wallet per coin (the same invariant the daemon enforces at startup),
+    // surfaced at init time. The library opt-in skips it, as on the Zcash path.
+    if !config.keys.allow_multiple_spending_wallets {
+        if let Some(existing) = existing_bitcoin_spending_wallet(config, &wallet) {
+            return Err(anyhow!(
+                "cannot create spending wallet '{}': wallet '{}' already holds spending keys \
+                 for bitcoin, and zecd allows at most one spending wallet per coin. Remove or \
+                 reconfigure the existing wallet.",
+                wallet,
+                existing
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(&wallet_dir)?;
+
+    let identity_path = config
+        .keys
+        .age_identity
+        .clone()
+        .unwrap_or_else(|| config.datadir.join("identity.txt"));
+    enum AtRest {
+        Passphrase(Passphrase),
+        Identity(Vec<Box<dyn age::Recipient + Send>>),
+    }
+    let at_rest = match encryption {
+        EncryptionInput::Passphrase(passphrase) => AtRest::Passphrase(passphrase),
+        EncryptionInput::DeferredPassphrase(read) => AtRest::Passphrase(read()?),
+        EncryptionInput::AgeIdentity => AtRest::Identity(ensure_identity(&identity_path).await?),
+    };
+
+    let mnemonic = match restore_input {
+        Some(input) => input.resolve()?,
+        None => Mnemonic::generate(Count::Words24),
+    };
+    let seed = {
+        let mut s = mnemonic.to_seed("");
+        let secret = SecretVec::new(s.to_vec());
+        s.zeroize();
+        secret
+    };
+
+    let birthday = BlockHeight::from(birthday_opt.unwrap_or(0));
+
+    // keys.toml first, then the wallet database: a failure between the two is self-healing
+    // (the daemon's spawn recreates a missing database from the seed), where the reverse
+    // order would leave a database the already-initialized refusal then trips over.
+    match &at_rest {
+        AtRest::Passphrase(passphrase) => WalletStore::init_with_passphrase_unpinned(
+            &keys_path,
+            passphrase.clone(),
+            &mnemonic,
+            birthday,
+            network,
+        )?,
+        AtRest::Identity(recipients) => WalletStore::init_with_mnemonic_unpinned(
+            &keys_path,
+            recipients.iter().map(|r| r.as_ref() as _),
+            &mnemonic,
+            birthday,
+            network,
+        )?,
+    }
+    crate::btc::store::create_wallet_db(&engine_dir, btc_network, &seed)?;
+
+    Ok(InitOutcome {
+        wallet,
+        wallet_dir,
+        keys_path,
+        network,
+        birthday: u32::from(birthday),
+        watch_only: false,
+        encrypted: matches!(at_rest, AtRest::Passphrase(_)),
+        identity_path: matches!(at_rest, AtRest::Identity(_)).then_some(identity_path),
+        generated_mnemonic: (!restore).then_some(mnemonic),
+    })
+}
+
+/// The Bitcoin counterpart of [`existing_spending_wallet`]: another *configured* Bitcoin
+/// wallet already holding a seed. Read from `keys.toml` rather than a wallet database - the
+/// BDK database holds only public descriptors, so the seed's presence in the store is the
+/// spending signal.
+#[cfg(feature = "bitcoin")]
+fn existing_bitcoin_spending_wallet(config: &AppConfig, exclude: &str) -> Option<String> {
+    config
+        .wallets
+        .iter()
+        .filter(|(name, entry)| {
+            name.as_str() != exclude && entry.coin == crate::coin::Coin::Bitcoin
+        })
+        .find(|(_, entry)| {
+            let keys_path = entry.keys_path();
+            WalletStore::exists(&keys_path)
+                && WalletStore::read(&keys_path).is_ok_and(|store| store.has_seed())
+        })
+        .map(|(name, _)| name.clone())
+}
+
 /// `zecd export-ufvk`: print the wallet's Unified Full Viewing Key to stdout, for setting up
 /// a watch-only zecd elsewhere (`init --ufvk`). The UFVK is read from the wallet DB (where it
 /// is stored for scanning anyway), so this works for locked and passphrase-encrypted wallets
@@ -590,6 +738,14 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
 /// for scanning anyway) and never touches spending material.
 pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<String> {
     let entry = resolve_wallet_entry(config, wallet);
+    #[cfg(feature = "bitcoin")]
+    if entry.coin == crate::coin::Coin::Bitcoin {
+        return Err(anyhow!(
+            "wallet '{}' is a Bitcoin wallet; a Unified Full Viewing Key is a Zcash key and \
+             descriptor export is not supported yet",
+            wallet
+        ));
+    }
     let keys_path = entry.keys_path();
     let network = entry.zcash_network();
     // Read-only and lock-free (it must run beside a live daemon), so it cannot migrate the
@@ -642,6 +798,15 @@ pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
     crate::migrate::migrate(config)?;
 
     let entry = resolve_wallet_entry(config, &args.wallet);
+    #[cfg(feature = "bitcoin")]
+    if entry.coin == crate::coin::Coin::Bitcoin {
+        anyhow::bail!(
+            "wallet '{}' is a Bitcoin wallet; `zecd rescan` is not supported for the BDK \
+             engine yet (delete {} to rebuild from seed on next start)",
+            args.wallet,
+            crate::btc::store::wallet_db_path(&entry.engine_dir()).display()
+        );
+    }
     let removed = rescan_wallet(
         entry.zcash_network(),
         &args.wallet,
@@ -926,6 +1091,125 @@ async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipie
 mod tests {
     use super::*;
     use zcash_client_backend::data_api::AccountBirthday;
+
+    /// The whole offline Bitcoin init: no upstream is dialed, `keys.toml` and the wallet
+    /// database land on disk, the database holds exactly what the seed derives (checked by
+    /// re-loading it against seed-derived descriptors), re-init is refused, and the
+    /// one-spender-per-coin guard fires for a second configured Bitcoin wallet.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn init_creates_a_bitcoin_wallet_offline() {
+        use crate::btc::keys::tests::BIP84_MNEMONIC;
+        use clap::Parser as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n\
+                 [wallets.btc]\ncoin = \"bitcoin\"\n\
+                 [wallets.btc2]\ncoin = \"bitcoin\"\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+        let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let config = AppConfig::resolve(&cli).unwrap();
+
+        let phrase = <Mnemonic<English>>::from_phrase(BIP84_MNEMONIC).unwrap();
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Restore(MnemonicInput::Phrase(phrase)),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.watch_only);
+        assert!(!outcome.encrypted);
+        assert_eq!(outcome.birthday, 0);
+        assert!(
+            outcome.generated_mnemonic.is_none(),
+            "restore, not generate"
+        );
+        assert!(WalletStore::exists(&outcome.keys_path));
+        let entry = &config.wallets["btc"];
+        assert!(crate::btc::store::wallet_db_path(&entry.engine_dir()).exists());
+
+        // The database binds to the seed: spawning with the same seed succeeds (descriptor
+        // verification against what keys.toml decrypts to), which is the daemon's load path.
+        let store = WalletStore::read(&outcome.keys_path).unwrap();
+        assert!(store.has_seed());
+        assert!(!store.is_encrypted());
+        let identity = outcome.identity_path.as_ref().expect("identity custody");
+        let seed = crate::wallet::keys::decrypt_seed_with_identity(&store, identity)
+            .unwrap()
+            .expect("seed decrypts");
+        let handle = crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
+            name: "btc".to_string(),
+            engine_dir: entry.engine_dir(),
+            network: entry.bitcoin_network(),
+            seed: Some(seed),
+            wallet_holds_seed: true,
+        })
+        .unwrap();
+        let address = handle.new_address().await.unwrap();
+        assert!(address.starts_with("tb1"), "testnet bech32, got {address}");
+
+        // Re-init refused.
+        let again = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .err()
+        .expect("re-init must be refused");
+        assert!(again.to_string().contains("already initialized"), "{again}");
+
+        // A second Bitcoin spending wallet trips the per-coin guard.
+        let second = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc2".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .err()
+        .expect("second bitcoin spender must be refused");
+        assert!(
+            second
+                .to_string()
+                .contains("at most one spending wallet per coin"),
+            "{second}"
+        );
+
+        // And --ufvk names a Zcash key, so it cannot create a Bitcoin wallet.
+        let ufvk = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc2".to_string(),
+                key: InitKey::WatchOnly("uview1invalid".to_string()),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .err()
+        .expect("--ufvk on a bitcoin wallet must be refused");
+        assert!(ufvk.to_string().contains("--ufvk"), "{ufvk}");
+    }
 
     #[test]
     fn restore_birthday_default_is_pool_aware() {

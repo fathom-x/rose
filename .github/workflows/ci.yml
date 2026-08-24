@@ -104,9 +104,17 @@ jobs:
           cargo clippy --all-targets --no-default-features -- -D warnings
           cargo clippy --all-targets --no-default-features --features server -- -D warnings
           cargo clippy --all-targets --no-default-features --features cli -- -D warnings
+          cargo clippy --all-targets --no-default-features --features bitcoin -- -D warnings
+          cargo clippy --all-targets --features bitcoin -- -D warnings
 
       - name: Test library-only (no default features)
         run: cargo test --no-default-features
+
+      # The BDK engine: default features plus the bitcoin wallet engine - the combination the
+      # engine-boundary rule exists for (an engine `use` that leaks into a default build, or a
+      # shared-layer item that only compiles with the engine present, fails here).
+      - name: Test with the bitcoin engine
+        run: cargo test --features bitcoin
 
   # Dependency policy: RustSec advisories (vulnerabilities AND unmaintained crates),
   # license allowlist, wildcard-version ban, and registry/git source pinning. Exceptions

@@ -28,6 +28,14 @@ pub fn parse_recipient(coin: Coin, s: &str) -> Result<ZcashAddress, RpcError> {
                 coin.display_name()
             ))
         }),
+        // The return type is the Zcash codec's, so a Bitcoin recipient cannot ride through
+        // here; the send surface stays Zcash-only in `rpc::METHOD_COINS` until the BDK
+        // engine's spend path lands, at which point this function grows a coin-tagged
+        // recipient type rather than a second arm.
+        #[cfg(feature = "bitcoin")]
+        Coin::Bitcoin => Err(RpcError::misc(
+            "sending is not yet implemented for Bitcoin wallets".to_string(),
+        )),
     }
 }
 

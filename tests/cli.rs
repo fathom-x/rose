@@ -1911,3 +1911,60 @@ fn chain_info_accepts_global_flags_on_either_side() {
         );
     }
 }
+
+/// The `coin` key against this binary. Without the `bitcoin` feature, `coin = "bitcoin"` is
+/// refused at resolve with the doctrine error ("this build supports: zcash") - reported by
+/// `config check` exactly as the daemon would report it. With the feature, the same config
+/// passes and the effective settings name the coin for that wallet only.
+#[test]
+fn config_check_reports_the_coin_key_per_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n\
+             [wallets.btc]\ncoin = \"bitcoin\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+
+    let out = config_check(&conf, &[]);
+    #[cfg(not(feature = "bitcoin"))]
+    {
+        assert!(!out.status.success(), "must refuse without the feature");
+        let stderr = stderr_of(&out);
+        assert!(stderr.contains("unsupported coin \"bitcoin\""), "{stderr}");
+        assert!(stderr.contains("this build supports: zcash"), "{stderr}");
+    }
+    #[cfg(feature = "bitcoin")]
+    {
+        assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+        let stdout = stdout_of(&out);
+        let btc_section = stdout
+            .split("[wallets.btc]")
+            .nth(1)
+            .map(|rest| rest.split("[wallets.").next().unwrap())
+            .expect("bitcoin wallet section rendered");
+        assert!(btc_section.contains("coin = \"bitcoin\""), "{stdout}");
+    }
+
+    // An unknown coin token is the same refusal on every build.
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n\
+             [wallets.d]\ncoin = \"dogecoin\"\n",
+            dir.path()
+        ),
+    )
+    .unwrap();
+    let out = config_check(&conf, &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("unsupported coin \"dogecoin\""),
+        "{}",
+        stderr_of(&out)
+    );
+}

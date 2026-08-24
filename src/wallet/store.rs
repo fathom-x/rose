@@ -84,6 +84,29 @@ impl WalletStore {
         write_keys_atomic(keys_path, &encoding, true)
     }
 
+    /// [`WalletStore::init_with_mnemonic`] without a UFVK pin, for a wallet whose engine
+    /// keeps no key pin in this file - the Bitcoin engine verifies its database's descriptors
+    /// against the seed at every spawn instead (`crate::btc::actor::spawn`), so the binding
+    /// check lives where the derived keys do. The seed itself is coin-agnostic (`keys.toml`
+    /// deliberately does not name a coin: one seed serves every coin at once).
+    #[cfg(feature = "bitcoin")]
+    pub fn init_with_mnemonic_unpinned<'a>(
+        keys_path: &Path,
+        recipients: impl Iterator<Item = &'a dyn age::Recipient>,
+        mnemonic: &Mnemonic,
+        birthday: BlockHeight,
+        network: ZNetwork,
+    ) -> anyhow::Result<()> {
+        let encoding = StoreEncoding {
+            mnemonic: Some(encrypt_mnemonic(recipients, mnemonic)?),
+            network: Some(network.name().to_string()),
+            birthday: Some(u32::from(birthday)),
+            encryption: None,
+            ufvk: None,
+        };
+        write_keys_atomic(keys_path, &encoding, true)
+    }
+
     /// Create a new `keys.toml` with the mnemonic passphrase-encrypted (age scrypt) - the
     /// Bitcoin-Core-style encrypted wallet, requiring `walletpassphrase` before spending.
     /// `ufvk` is the account's pinned viewing key (see [`WalletStore::pinned_ufvk`]).
@@ -104,6 +127,30 @@ impl WalletStore {
             birthday: Some(u32::from(birthday)),
             encryption: Some(ENC_PASSPHRASE.to_string()),
             ufvk: Some(ufvk.to_string()),
+        };
+        write_keys_atomic(keys_path, &encoding, true)
+    }
+
+    /// [`WalletStore::init_with_passphrase`] without a UFVK pin - see
+    /// [`WalletStore::init_with_mnemonic_unpinned`] for why the Bitcoin engine keeps no pin
+    /// here.
+    #[cfg(feature = "bitcoin")]
+    pub fn init_with_passphrase_unpinned(
+        keys_path: &Path,
+        passphrase: Passphrase,
+        mnemonic: &Mnemonic,
+        birthday: BlockHeight,
+        network: ZNetwork,
+    ) -> anyhow::Result<()> {
+        let encoding = StoreEncoding {
+            mnemonic: Some(encrypt_phrase_with_passphrase(
+                passphrase,
+                mnemonic.phrase(),
+            )?),
+            network: Some(network.name().to_string()),
+            birthday: Some(u32::from(birthday)),
+            encryption: Some(ENC_PASSPHRASE.to_string()),
+            ufvk: None,
         };
         write_keys_atomic(keys_path, &encoding, true)
     }

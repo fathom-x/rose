@@ -32,6 +32,10 @@ allow = [
     "Zlib",
     # webpki-roots: Mozilla CA root certificate bundle.
     "CDLA-Permissive-2.0",
+    # hex_lit (via the rust-bitcoin stack behind the off-by-default `bitcoin` feature):
+    # MIT +no-false-attribs, a permissive MIT variant whose one extra clause forbids
+    # misrepresenting the software's origin.
+    "MITNFA",
 ]
 confidence-threshold = 0.93
 

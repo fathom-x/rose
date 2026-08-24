@@ -125,6 +125,15 @@ libc = "0.2.186"
 # libc (already in-tree); windows-sys is pulled in transitively on Windows.
 fmutex = "0.3"
 
+# Bitcoin - the BDK wallet engine behind the `bitcoin` feature. One crate: `bdk_wallet`
+# re-exports `bitcoin`, `miniscript` and `bdk_chain`, so the whole engine surface arrives
+# through this dependency and its types stay confined to `src/btc/` (the engine-boundary rule
+# below). Deliberately WITHOUT bdk's `rusqlite` persistence feature: `bdk_chain` pins
+# `rusqlite ^0.31`, whose `libsqlite3-sys` conflicts with zecd's `rusqlite 0.37` (`links =
+# "sqlite3"` - only one version may exist in a build graph), so `src/btc/store.rs` implements
+# `WalletPersister` over zecd's own rusqlite instead.
+bdk_wallet = { version = "3.1", optional = true }
+
 # Optional drop-in allocator, enabled by both musl release images (`Dockerfile` and
 # `Dockerfile.arm64`). musl's default `malloc-ng` contends under Orchard proving's multi-threaded
 # (rayon) allocation churn - ~80x more futex syscalls than mimalloc - costing ~10% per shielded
@@ -152,6 +161,13 @@ cli = ["dep:clap", "dep:tracing-subscriber"]
 # config structs, the RPC handler signatures, and the registry enum is what makes the existing
 # `server`/`cli` gates cheap, and it is why `librustzcash` types are confined to `wallet/`,
 # `sync/` and `chain/` rather than threaded through `config.rs` and `rpc/`.
+# The BDK-backed Bitcoin wallet engine (`src/btc/`), off by default: a default build is
+# byte-identical to a pre-BDK one and `coin = "bitcoin"` in a config is refused at resolve
+# ("this build supports: zcash"). The gate stays cheap only while the engine-boundary rule
+# holds: no `bdk_wallet` type in a shared signature, config struct, or cross-coin enum -
+# the engine joins the shared shell at the two sanctioned seams (`wallet::CoinWallet` and
+# the RPC handlers), everything else lives in `src/btc/`.
+bitcoin = ["dep:bdk_wallet"]
 # Use mimalloc as the global allocator. Off by default; the musl release images opt in.
 mimalloc = ["dep:mimalloc"]
 # Hardened mimalloc (MI_SECURE): guard pages, encrypted/canary free-lists, randomized

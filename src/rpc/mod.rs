@@ -1,6 +1,8 @@
 //! JSON-RPC method dispatch.
 
 pub mod blockchain;
+#[cfg(feature = "bitcoin")]
+pub mod btc_methods;
 pub mod control;
 pub mod network;
 pub mod rawtx;
@@ -175,14 +177,24 @@ enum MethodCoins {
 
 /// The coins that serve each dispatched method.
 ///
-/// The nine `z_*` methods are Zcash-only (shielded sends, the shielding/merge sweeps, the
-/// async-operation trio, and zcashd's account address derivation); the other 42 are the
-/// Bitcoin-Core dialect zecd implements for any coin. Today every loaded wallet is Zcash, so
-/// the gate this table drives can never fire - it lands as machinery with live tests, so the
-/// PR that adds an engine changes data rather than dispatch.
+/// Three tiers. `All` marks the wallet-independent shell (control methods and the registry
+/// list), which no engine is involved in serving. The nine `z_*` methods are Zcash-only by
+/// nature (shielded sends, the shielding/merge sweeps, the async-operation trio, zcashd's
+/// account address derivation). Everything else is the shared Bitcoin-Core dialect *in
+/// shape*, but each method is listed for a coin only once that coin's engine actually serves
+/// it - a method the engine cannot serve yet must read as method-not-found, not reach a
+/// Zcash-typed handler. The BDK engine's surface grows by moving entries from `ZCASH_ONLY`
+/// to `ZCASH_AND_BITCOIN` alongside the handler branch that serves them.
 ///
 /// Kept in lockstep with [`ALL_METHODS`] by the `method_coins_table_matches_all_methods` test.
 const ZCASH_ONLY: &[Coin] = &[Coin::Zcash];
+/// The methods the BDK engine serves so far (in a build without the `bitcoin` feature this
+/// set is identical to [`ZCASH_ONLY`], so the table needs no cfg of its own).
+const ZCASH_AND_BITCOIN: &[Coin] = &[
+    Coin::Zcash,
+    #[cfg(feature = "bitcoin")]
+    Coin::Bitcoin,
+];
 const METHOD_COINS: &[(&str, MethodCoins)] = &[
     // Control
     ("stop", MethodCoins::All),
@@ -190,51 +202,54 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("help", MethodCoins::All),
     ("getrpcinfo", MethodCoins::All),
     // Network
-    ("getnetworkinfo", MethodCoins::All),
-    ("getconnectioncount", MethodCoins::All),
-    ("getpeerinfo", MethodCoins::All),
+    ("getnetworkinfo", MethodCoins::Only(ZCASH_ONLY)),
+    ("getconnectioncount", MethodCoins::Only(ZCASH_ONLY)),
+    ("getpeerinfo", MethodCoins::Only(ZCASH_ONLY)),
     ("ping", MethodCoins::All),
     // Blockchain
-    ("getblockchaininfo", MethodCoins::All),
-    ("getblockcount", MethodCoins::All),
-    ("getbestblockhash", MethodCoins::All),
-    ("getblockhash", MethodCoins::All),
-    ("getblockheader", MethodCoins::All),
-    ("waitfornewblock", MethodCoins::All),
-    ("waitforblock", MethodCoins::All),
-    ("waitforblockheight", MethodCoins::All),
-    ("waitforsync", MethodCoins::All),
+    ("getblockchaininfo", MethodCoins::Only(ZCASH_ONLY)),
+    ("getblockcount", MethodCoins::Only(ZCASH_ONLY)),
+    ("getbestblockhash", MethodCoins::Only(ZCASH_ONLY)),
+    ("getblockhash", MethodCoins::Only(ZCASH_ONLY)),
+    ("getblockheader", MethodCoins::Only(ZCASH_ONLY)),
+    ("waitfornewblock", MethodCoins::Only(ZCASH_ONLY)),
+    ("waitforblock", MethodCoins::Only(ZCASH_ONLY)),
+    ("waitforblockheight", MethodCoins::Only(ZCASH_ONLY)),
+    ("waitforsync", MethodCoins::Only(ZCASH_ONLY)),
     // Utility
-    ("validateaddress", MethodCoins::All),
-    ("estimatesmartfee", MethodCoins::All),
-    ("estimatefee", MethodCoins::All),
-    ("getmempoolinfo", MethodCoins::All),
-    ("signmessage", MethodCoins::All),
-    ("verifymessage", MethodCoins::All),
-    ("settxfee", MethodCoins::All),
+    ("validateaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
+    ("estimatesmartfee", MethodCoins::Only(ZCASH_ONLY)),
+    ("estimatefee", MethodCoins::Only(ZCASH_ONLY)),
+    ("getmempoolinfo", MethodCoins::Only(ZCASH_ONLY)),
+    ("signmessage", MethodCoins::Only(ZCASH_ONLY)),
+    ("verifymessage", MethodCoins::Only(ZCASH_ONLY)),
+    ("settxfee", MethodCoins::Only(ZCASH_ONLY)),
     // Raw transactions
-    ("sendrawtransaction", MethodCoins::All),
-    ("getrawtransaction", MethodCoins::All),
+    ("sendrawtransaction", MethodCoins::Only(ZCASH_ONLY)),
+    ("getrawtransaction", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - reads
-    ("getbalance", MethodCoins::All),
-    ("getbalances", MethodCoins::All),
-    ("getunconfirmedbalance", MethodCoins::All),
-    ("getwalletinfo", MethodCoins::All),
+    ("getbalance", MethodCoins::Only(ZCASH_AND_BITCOIN)),
+    ("getbalances", MethodCoins::Only(ZCASH_AND_BITCOIN)),
+    (
+        "getunconfirmedbalance",
+        MethodCoins::Only(ZCASH_AND_BITCOIN),
+    ),
+    ("getwalletinfo", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("listwallets", MethodCoins::All),
-    ("listtransactions", MethodCoins::All),
-    ("listsinceblock", MethodCoins::All),
-    ("gettransaction", MethodCoins::All),
-    ("listunspent", MethodCoins::All),
-    ("getreceivedbyaddress", MethodCoins::All),
-    ("listreceivedbyaddress", MethodCoins::All),
-    ("getaddressinfo", MethodCoins::All),
+    ("listtransactions", MethodCoins::Only(ZCASH_ONLY)),
+    ("listsinceblock", MethodCoins::Only(ZCASH_ONLY)),
+    ("gettransaction", MethodCoins::Only(ZCASH_ONLY)),
+    ("listunspent", MethodCoins::Only(ZCASH_AND_BITCOIN)),
+    ("getreceivedbyaddress", MethodCoins::Only(ZCASH_ONLY)),
+    ("listreceivedbyaddress", MethodCoins::Only(ZCASH_ONLY)),
+    ("getaddressinfo", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("z_listtransactions", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - writes
-    ("getnewaddress", MethodCoins::All),
-    ("sendtoaddress", MethodCoins::All),
-    ("sendmany", MethodCoins::All),
-    ("walletpassphrase", MethodCoins::All),
-    ("walletlock", MethodCoins::All),
+    ("getnewaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
+    ("sendtoaddress", MethodCoins::Only(ZCASH_ONLY)),
+    ("sendmany", MethodCoins::Only(ZCASH_ONLY)),
+    ("walletpassphrase", MethodCoins::Only(ZCASH_ONLY)),
+    ("walletlock", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - async operations
     ("z_sendmany", MethodCoins::Only(ZCASH_ONLY)),
     ("z_shieldcoinbase", MethodCoins::Only(ZCASH_ONLY)),
@@ -246,6 +261,19 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     // Wallet - address derivation (zcashd-style)
     ("z_getaddressforaccount", MethodCoins::Only(ZCASH_ONLY)),
 ];
+
+/// The methods `METHOD_COINS` lists as served for Bitcoin wallets - the gate's half of the
+/// lockstep contract with `btc_methods::BITCOIN_METHODS` (see the test there).
+#[cfg(all(test, feature = "bitcoin"))]
+pub(crate) fn methods_served_for_bitcoin() -> std::collections::BTreeSet<&'static str> {
+    METHOD_COINS
+        .iter()
+        .filter(
+            |(_, coins)| matches!(coins, MethodCoins::Only(set) if set.contains(&Coin::Bitcoin)),
+        )
+        .map(|(m, _)| *m)
+        .collect()
+}
 
 /// The coins serving `method`, or `None` when the method is unknown.
 fn method_coins(method: &str) -> Option<MethodCoins> {
@@ -305,8 +333,7 @@ pub(crate) async fn dispatch(
     // like a safelisted-out one. Deliberately non-erroring on an unresolvable wallet: dispatch
     // only knows the wallet *name* (handlers resolve the handle themselves), so failing here
     // would reorder every coin-restricted handler's own errors - an unknown wallet must keep
-    // answering -18, and a bad parameter must keep answering its own code. Today every loaded
-    // wallet is Zcash, so this can never fire.
+    // answering -18, and a bad parameter must keep answering its own code.
     if let Some(MethodCoins::Only(coins)) = method_coins(&req.method) {
         if let Ok(wallet) = state.registry.get_coin(wallet) {
             if !coins.contains(&wallet.coin()) {
@@ -323,6 +350,15 @@ async fn dispatch_zecd(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
+    // A Bitcoin wallet's methods are served by the engine's own sub-table; `None` means a
+    // wallet-independent method (the shared arms below serve it), since the coin gate above
+    // has already 404'd everything the engine does not serve.
+    #[cfg(feature = "bitcoin")]
+    if let Ok(crate::wallet::CoinWallet::Bitcoin(handle)) = state.registry.get_coin(wallet) {
+        if let Some(result) = btc_methods::dispatch(handle, req).await {
+            return result;
+        }
+    }
     match req.method.as_str() {
         // Control
         "stop" => control::stop(state),
@@ -463,12 +499,21 @@ mod tests {
         );
     }
 
-    /// The data itself: the `z_*` surface is Zcash-only and everything else is the shared
-    /// Bitcoin-Core dialect. Keyed off the name, so a new `z_*` method that forgets its
-    /// restriction fails here rather than passing unnoticed.
+    /// The data itself. The `z_*` surface must stay gated to Zcash (a new `z_*` method that
+    /// forgets its restriction fails here), `All` is reserved for the wallet-independent
+    /// shell, and every wallet-touching method names Zcash among its coins (the dialect is
+    /// implemented there first; a Bitcoin-only method does not exist).
     #[test]
-    fn z_methods_are_zcash_only_and_every_other_method_is_universal() {
+    fn method_coin_tiers_hold() {
         use crate::coin::Coin;
+        const WALLET_INDEPENDENT: &[&str] = &[
+            "stop",
+            "uptime",
+            "help",
+            "getrpcinfo",
+            "ping",
+            "listwallets",
+        ];
         for (method, coins) in super::METHOD_COINS {
             if method.starts_with("z_") {
                 assert_eq!(
@@ -476,19 +521,24 @@ mod tests {
                     super::MethodCoins::Only(&[Coin::Zcash]),
                     "{method} is a Zcash extension and must be gated to Zcash"
                 );
-            } else {
-                assert_eq!(
-                    *coins,
-                    super::MethodCoins::All,
-                    "{method} is part of the shared dialect and must not be coin-gated"
-                );
+            }
+            match coins {
+                super::MethodCoins::All => assert!(
+                    WALLET_INDEPENDENT.contains(method),
+                    "{method} resolves a wallet, so it must name the coins that serve it"
+                ),
+                super::MethodCoins::Only(coins) => {
+                    assert!(
+                        WALLET_INDEPENDENT.iter().all(|m| m != method),
+                        "{method} is wallet-independent and should be MethodCoins::All"
+                    );
+                    assert!(
+                        coins.contains(&Coin::Zcash),
+                        "{method}: every wallet-touching method is served for Zcash"
+                    );
+                }
             }
         }
-        let zcash_only = super::METHOD_COINS
-            .iter()
-            .filter(|(_, c)| *c != super::MethodCoins::All)
-            .count();
-        assert_eq!(zcash_only, 9, "the Zcash-only surface is nine methods");
     }
 
     #[test]

@@ -216,9 +216,21 @@ pub fn render(config: &AppConfig) -> String {
     // its own rather than depending on the reader to apply the `[pools]` defaults above.
     for (name, w) in &config.wallets {
         table(&mut s, &format!("wallets.{name}"));
+        // `coin` renders only when it is not the default, so a Zcash-only config's output is
+        // byte-stable across the key's existence - and a non-Zcash wallet's entry names the
+        // engine serving it.
+        if w.coin != crate::coin::Coin::Zcash {
+            kv(&mut s, "coin", str_val(w.coin.name()));
+        }
         kv(&mut s, "dir", path_val(&w.dir));
         if let Some(keys_file) = &w.keys_file {
             kv(&mut s, "keys_file", path_val(keys_file));
+        }
+        // The remaining per-wallet keys configure the Zcash engine and are refused by
+        // `resolve` on any other wallet, so rendering them there would emit a config
+        // `config check` rejects - the idempotence contract forbids that.
+        if w.coin != crate::coin::Coin::Zcash {
+            continue;
         }
         // Endpoint overrides are rendered only when this wallet actually sets them: an absent
         // key means "falls back to [backend]", which is what the omission says.
@@ -466,6 +478,47 @@ mod tests {
             "{first}"
         );
         assert!(first.contains("readiness = \"connected\""), "{first}");
+    }
+
+    /// A Bitcoin wallet renders its `coin` (the one non-default key selecting it), none of the
+    /// Zcash-engine keys (`resolve` refuses them there, and the idempotence contract forbids
+    /// emitting a config `config check` rejects), and still round-trips byte-identically.
+    #[test]
+    #[cfg(feature = "bitcoin")]
+    fn a_bitcoin_wallet_renders_without_zcash_engine_keys_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = render(&resolve_from(
+            &format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.btc]\ncoin = \"bitcoin\"\n",
+                dir.path()
+            ),
+            dir.path(),
+        ));
+        let btc_section = first
+            .split("[wallets.btc]")
+            .nth(1)
+            .map(|rest| rest.split("[wallets.").next().unwrap())
+            .expect("bitcoin wallet section rendered");
+        assert!(btc_section.contains("coin = \"bitcoin\""), "{first}");
+        for absent in ["pools", "transparent", "default_receivers", "server"] {
+            assert!(
+                !btc_section.contains(absent),
+                "{absent:?} must not render for a bitcoin wallet:\n{first}"
+            );
+        }
+        // The implicit default wallet is untouched: no `coin` line (it is the default), the
+        // Zcash keys present as ever.
+        let default_section = first
+            .split("[wallets.default]")
+            .nth(1)
+            .map(|rest| rest.split("[wallets.").next().unwrap())
+            .expect("default wallet section rendered");
+        assert!(!default_section.contains("coin ="), "{first}");
+        assert!(default_section.contains("transparent = false"), "{first}");
+
+        let round_trip = tempfile::tempdir().unwrap();
+        let second = render(&resolve_from(&first, round_trip.path()));
+        assert_eq!(first, second);
     }
 
     /// Every value the file left unset appears, filled in by this build - the whole point of the

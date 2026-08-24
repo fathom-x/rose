@@ -18,16 +18,27 @@ use crate::network::ZNetwork;
 pub enum Coin {
     /// Zcash.
     Zcash,
+    /// Bitcoin, served by the BDK-backed engine (`crate::btc`). The variant exists only in a
+    /// build carrying the `bitcoin` feature, so a default build's `SUPPORTED` set - and every
+    /// error message derived from it - names zcash alone.
+    #[cfg(feature = "bitcoin")]
+    Bitcoin,
 }
 
 impl Coin {
     /// Every coin zecd serves, in the order error messages list them.
-    pub const SUPPORTED: &'static [Coin] = &[Coin::Zcash];
+    pub const SUPPORTED: &'static [Coin] = &[
+        Coin::Zcash,
+        #[cfg(feature = "bitcoin")]
+        Coin::Bitcoin,
+    ];
 
     /// The lower-case token form: `"zcash"`.
     pub fn name(self) -> &'static str {
         match self {
             Coin::Zcash => "zcash",
+            #[cfg(feature = "bitcoin")]
+            Coin::Bitcoin => "bitcoin",
         }
     }
 
@@ -35,6 +46,8 @@ impl Coin {
     pub fn display_name(self) -> &'static str {
         match self {
             Coin::Zcash => "Zcash",
+            #[cfg(feature = "bitcoin")]
+            Coin::Bitcoin => "Bitcoin",
         }
     }
 
@@ -52,6 +65,8 @@ impl Coin {
     pub fn data_dir(self) -> &'static str {
         match self {
             Coin::Zcash => "zec",
+            #[cfg(feature = "bitcoin")]
+            Coin::Bitcoin => "btc",
         }
     }
 
@@ -71,6 +86,8 @@ impl Coin {
     pub fn engine_dir(self) -> &'static str {
         match self {
             Coin::Zcash => "lrz",
+            #[cfg(feature = "bitcoin")]
+            Coin::Bitcoin => "bdk",
         }
     }
 
@@ -92,6 +109,8 @@ impl Coin {
     pub fn chain(self, env: ZNetwork) -> CoinNetwork {
         match self {
             Coin::Zcash => CoinNetwork::Zcash(env),
+            #[cfg(feature = "bitcoin")]
+            Coin::Bitcoin => CoinNetwork::Bitcoin(BitcoinNetwork::from_environment(env)),
         }
     }
 }
@@ -106,6 +125,9 @@ impl Coin {
 pub enum CoinNetwork {
     /// A Zcash chain (mainnet, testnet, or a local regtest chain).
     Zcash(ZNetwork),
+    /// A Bitcoin chain (mainnet, testnet, or a local regtest chain).
+    #[cfg(feature = "bitcoin")]
+    Bitcoin(BitcoinNetwork),
 }
 
 impl CoinNetwork {
@@ -113,6 +135,49 @@ impl CoinNetwork {
     pub fn coin(self) -> Coin {
         match self {
             CoinNetwork::Zcash(_) => Coin::Zcash,
+            #[cfg(feature = "bitcoin")]
+            CoinNetwork::Bitcoin(_) => Coin::Bitcoin,
+        }
+    }
+}
+
+/// The Bitcoin chain a wallet serves, derived from the daemon's network environment like
+/// every [`CoinNetwork`].
+///
+/// A zecd-owned enum, not `bdk_wallet::bitcoin::Network`: [`CoinNetwork`] is a shared-layer
+/// type, and the engine-boundary rule keeps engine types out of cross-coin enums. The BDK
+/// engine maps this onto its own network type at its edge (`crate::btc`), the same way
+/// [`ZNetwork`] stays the Zcash engine's internal `Parameters` value.
+#[cfg(feature = "bitcoin")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitcoinNetwork {
+    /// Production Bitcoin.
+    Main,
+    /// The public test network.
+    Test,
+    /// A local regtest chain.
+    Regtest,
+}
+
+#[cfg(feature = "bitcoin")]
+impl BitcoinNetwork {
+    /// The Bitcoin chain within the daemon's network environment: a testnet daemon's Bitcoin
+    /// wallets are testnet wallets, exactly as its Zcash wallets are.
+    pub fn from_environment(env: ZNetwork) -> BitcoinNetwork {
+        match env {
+            ZNetwork::Main => BitcoinNetwork::Main,
+            ZNetwork::Test => BitcoinNetwork::Test,
+            ZNetwork::Regtest(_) => BitcoinNetwork::Regtest,
+        }
+    }
+
+    /// The short network name, matching [`ZNetwork::name`]'s vocabulary: `"main"`, `"test"`,
+    /// or `"regtest"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            BitcoinNetwork::Main => "main",
+            BitcoinNetwork::Test => "test",
+            BitcoinNetwork::Regtest => "regtest",
         }
     }
 }
@@ -122,11 +187,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zcash_is_the_only_supported_coin() {
+    fn zcash_is_always_supported() {
         assert_eq!(Coin::parse("zcash"), Some(Coin::Zcash));
         assert_eq!(Coin::parse("zzz"), None);
         assert_eq!(Coin::parse("ZCASH"), None, "tokens are case-sensitive");
+        #[cfg(not(feature = "bitcoin"))]
         assert_eq!(Coin::supported_names(), "zcash");
+        #[cfg(feature = "bitcoin")]
+        assert_eq!(Coin::supported_names(), "zcash, bitcoin");
+    }
+
+    /// A default build must keep refusing the bitcoin token: the `coin` key's error message
+    /// ("this build supports: ...") is derived from `SUPPORTED`, and the feature is the only
+    /// thing that widens it.
+    #[cfg(not(feature = "bitcoin"))]
+    #[test]
+    fn bitcoin_is_not_supported_without_the_feature() {
+        assert_eq!(Coin::parse("bitcoin"), None);
+    }
+
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn bitcoin_chain_derivation_follows_the_environment() {
+        assert_eq!(Coin::parse("bitcoin"), Some(Coin::Bitcoin));
+        for (env, expected) in [
+            (ZNetwork::Main, BitcoinNetwork::Main),
+            (ZNetwork::Test, BitcoinNetwork::Test),
+            (crate::network::regtest(), BitcoinNetwork::Regtest),
+        ] {
+            let chain = Coin::Bitcoin.chain(env);
+            assert_eq!(chain, CoinNetwork::Bitcoin(expected));
+            assert_eq!(chain.coin(), Coin::Bitcoin);
+        }
+        // The network vocabulary matches ZNetwork::name, so keys.toml and logs read the same
+        // for either coin.
+        assert_eq!(BitcoinNetwork::Main.name(), "main");
+        assert_eq!(BitcoinNetwork::Test.name(), "test");
+        assert_eq!(BitcoinNetwork::Regtest.name(), "regtest");
     }
 
     #[test]
@@ -145,6 +242,11 @@ mod tests {
     fn directory_names_are_frozen_and_distinct() {
         assert_eq!(Coin::Zcash.data_dir(), "zec");
         assert_eq!(Coin::Zcash.engine_dir(), "lrz");
+        #[cfg(feature = "bitcoin")]
+        {
+            assert_eq!(Coin::Bitcoin.data_dir(), "btc");
+            assert_eq!(Coin::Bitcoin.engine_dir(), "bdk");
+        }
         let mut seen = std::collections::BTreeSet::new();
         for coin in Coin::SUPPORTED {
             for dir in [coin.data_dir(), coin.engine_dir()] {

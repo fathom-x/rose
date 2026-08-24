@@ -275,6 +275,14 @@ pub fn derive(config: &AppConfig, opts: DeriveOptions<'_>) -> anyhow::Result<Der
     // and nothing else, and `keys.toml` sits at the wallet root, where no layout migration
     // moves it.
     let entry = crate::init::resolve_wallet_entry(config, wallet);
+    #[cfg(feature = "bitcoin")]
+    if entry.coin == crate::coin::Coin::Bitcoin {
+        bail!(
+            "wallet '{}' is a Bitcoin wallet; `zecd derive-address` derives Zcash addresses \
+             (offline Bitcoin address derivation is not supported yet)",
+            wallet
+        );
+    }
     // Derivation follows the wallet's own chain, so an index here is the index the daemon
     // serving that wallet exposes.
     let network = entry.zcash_network();

@@ -208,8 +208,8 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("ping", MethodCoins::All),
     // Blockchain
     ("getblockchaininfo", MethodCoins::Only(ZCASH_ONLY)),
-    ("getblockcount", MethodCoins::Only(ZCASH_ONLY)),
-    ("getbestblockhash", MethodCoins::Only(ZCASH_ONLY)),
+    ("getblockcount", MethodCoins::Only(ZCASH_AND_BITCOIN)),
+    ("getbestblockhash", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("getblockhash", MethodCoins::Only(ZCASH_ONLY)),
     ("getblockheader", MethodCoins::Only(ZCASH_ONLY)),
     ("waitfornewblock", MethodCoins::Only(ZCASH_ONLY)),
@@ -225,7 +225,7 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("verifymessage", MethodCoins::Only(ZCASH_ONLY)),
     ("settxfee", MethodCoins::Only(ZCASH_ONLY)),
     // Raw transactions
-    ("sendrawtransaction", MethodCoins::Only(ZCASH_ONLY)),
+    ("sendrawtransaction", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("getrawtransaction", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - reads
     ("getbalance", MethodCoins::Only(ZCASH_AND_BITCOIN)),
@@ -236,9 +236,9 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ),
     ("getwalletinfo", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("listwallets", MethodCoins::All),
-    ("listtransactions", MethodCoins::Only(ZCASH_ONLY)),
+    ("listtransactions", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("listsinceblock", MethodCoins::Only(ZCASH_ONLY)),
-    ("gettransaction", MethodCoins::Only(ZCASH_ONLY)),
+    ("gettransaction", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("listunspent", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("getreceivedbyaddress", MethodCoins::Only(ZCASH_ONLY)),
     ("listreceivedbyaddress", MethodCoins::Only(ZCASH_ONLY)),
@@ -246,8 +246,8 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("z_listtransactions", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - writes
     ("getnewaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
-    ("sendtoaddress", MethodCoins::Only(ZCASH_ONLY)),
-    ("sendmany", MethodCoins::Only(ZCASH_ONLY)),
+    ("sendtoaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
+    ("sendmany", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("walletpassphrase", MethodCoins::Only(ZCASH_ONLY)),
     ("walletlock", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - async operations

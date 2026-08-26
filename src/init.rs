@@ -1149,12 +1149,18 @@ mod tests {
         let seed = crate::wallet::keys::decrypt_seed_with_identity(&store, identity)
             .unwrap()
             .expect("seed decrypts");
-        let handle = crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
+        let (handle, _task) = crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
             name: "btc".to_string(),
             engine_dir: entry.engine_dir(),
             network: entry.bitcoin_network(),
             seed: Some(seed),
             wallet_holds_seed: true,
+            endpoint: None,
+            birthday: 0,
+            sync_interval: std::time::Duration::from_secs(20),
+            reconnect_base: std::time::Duration::from_secs(1),
+            reconnect_max: std::time::Duration::from_secs(60),
+            shutdown: tokio::sync::watch::channel(false).1,
         })
         .unwrap();
         let address = handle.new_address().await.unwrap();

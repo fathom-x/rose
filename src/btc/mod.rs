@@ -8,12 +8,15 @@
 //! through the one `bdk_wallet` dependency (which re-exports `bitcoin`, `miniscript` and
 //! `bdk_chain`).
 //!
-//! Phase 1 scope: key derivation from the shared BIP-39 seed (BIP 84 descriptors), on-disk
-//! persistence over zecd's own rusqlite, a single-writer actor mirroring the Zcash one, and
-//! the wallet-shaped read slice of the RPC surface. Chain access (a bitcoind or Electrum
-//! backend feeding sync) is the next phase; until it lands a Bitcoin wallet reports itself
-//! unsynced and its balances reflect only what the local database holds.
+//! Phase 1 delivered key derivation from the shared BIP-39 seed (BIP 84 descriptors),
+//! on-disk persistence over zecd's own rusqlite, a single-writer actor mirroring the Zcash
+//! one, and the wallet-shaped read slice of the RPC surface. Phase 2 (this tree) adds the
+//! chain source: a local bitcoind over JSON-RPC (`chain`), the actor's sync loop and mempool
+//! pass, and the spend path (seed-derived signers per send, never persisted) - so a bitcoin
+//! wallet now receives, tracks confirmations, and sends. A BIP-157 light mode is the planned
+//! second backend (see `chain`'s module doc).
 
 pub mod actor;
+pub mod chain;
 pub mod keys;
 pub mod store;

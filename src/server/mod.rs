@@ -321,6 +321,8 @@ mod tests {
                 assume_transparent_in_compact_blocks: false,
             },
             zebra: Default::default(),
+            #[cfg(feature = "bitcoin")]
+            bitcoind: Default::default(),
             rpc: rpc.clone(),
             keys: KeysConfig {
                 age_identity: None,

@@ -1,0 +1,53 @@
+# Development-only Bitcoin Core regtest stack, for exercising zecd's BDK engine
+# (the off-by-default `bitcoin` cargo feature).
+#
+# This is NOT part of the self-hosted deployment example (docker-compose.yml) and is not
+# used by the regtest harness (regtest_btc.rs spawns its own bitcoind from BITCOIND_BIN).
+# It is the manual-testing upstream for a `--features bitcoin` zecd: point a bitcoin
+# wallet's default `server = "bitcoind"` (regtest resolves to 127.0.0.1:18443) at it with
+# `[bitcoind] rpc_user = "btc"` / `rpc_password = "btc"`. The node serves:
+#   - JSON-RPC on 18443 (the bitcoind full-mode backend, and your bitcoin-cli)
+#   - compact block filters over P2P on 18444 (-blockfilterindex + -peerblockfilters,
+#     what the planned kyoto/bip157-backed light mode will peer with)
+#   - -txindex, so getrawtransaction answers for any mined tx
+#
+# The image is pinned to Bitcoin Core 30.2 - the version bip157 0.6.3 (the P2P engine
+# under bdk_kyoto 0.17.0, which pairs with the bdk_wallet 3.x this tree pins) runs its
+# own integration tests against. Keep the pin in step with the bdk lines when bumping.
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.btc-regtest.yml up -d
+#   alias bcli='docker compose -f deploy/docker-compose.btc-regtest.yml exec bitcoind \
+#       bitcoin-cli -regtest -rpcuser=btc -rpcpassword=btc'
+#   bcli createwallet miner
+#   bcli -generate 101          # mine past coinbase maturity; coins become spendable
+#   bcli getblockchaininfo
+#
+# Credentials are fixed dev values: regtest coins are valueless and the RPC port is
+# published on loopback only. Do not reuse this file's shape for mainnet.
+
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:30.2
+    restart: unless-stopped
+    command:
+      - -regtest
+      - -printtoconsole
+      - -server=1
+      - -rpcbind=0.0.0.0:18443
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=btc
+      - -rpcpassword=btc
+      - -txindex=1
+      - -blockfilterindex=1
+      - -peerblockfilters=1
+      - -fallbackfee=0.0001
+      - -listen=1
+    ports:
+      - "127.0.0.1:18443:18443" # JSON-RPC
+      - "127.0.0.1:18444:18444" # P2P, for a future BIP-157 light client on the host
+    volumes:
+      - bitcoind-regtest-data:/home/bitcoin/.bitcoin
+
+volumes:
+  bitcoind-regtest-data:

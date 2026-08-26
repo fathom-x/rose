@@ -9,14 +9,17 @@
 //! shapes as the Zcash handlers: bare 8-decimal JSON amounts, Bitcoin Core field names, the
 //! same error codes.
 //!
-//! Phase-1 scope: address issuance and the wallet-shaped reads. The engine has no chain
-//! source yet, so balances and UTXOs reflect only the local database (zero on a fresh
-//! wallet) and nothing reports confirmations above 0.
+//! Scope: address issuance, the wallet-shaped reads, the wallet's local chain view
+//! (`getblockcount`/`getbestblockhash` answer from the wallet's own synced checkpoint, the
+//! same authority the Zcash handlers use), history (`listtransactions`/`gettransaction`),
+//! and sends (`sendtoaddress`/`sendmany`/`sendrawtransaction`) - built, signed with
+//! seed-derived signers, and broadcast through the wallet's bitcoind upstream.
 
 use serde_json::{json, Value};
 
-use crate::amount::zats_to_value;
-use crate::btc::actor::BtcWalletHandle;
+use super::wallet_methods::param_engaged;
+use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
+use crate::btc::actor::{BtcConnState, BtcTxDetail, BtcTxRecord, BtcWalletHandle};
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
@@ -34,6 +37,13 @@ pub(crate) const BITCOIN_METHODS: &[&str] = &[
     "listunspent",
     "getaddressinfo",
     "validateaddress",
+    "getblockcount",
+    "getbestblockhash",
+    "listtransactions",
+    "gettransaction",
+    "sendtoaddress",
+    "sendmany",
+    "sendrawtransaction",
 ];
 
 /// Route one request for a Bitcoin wallet. `None` = not a method this engine serves
@@ -49,9 +59,16 @@ pub(crate) async fn dispatch(
         "getbalances" => getbalances(handle).await,
         "getunconfirmedbalance" => getunconfirmedbalance(handle).await,
         "getwalletinfo" => getwalletinfo(handle).await,
-        "listunspent" => listunspent(handle).await,
+        "listunspent" => listunspent(handle, req).await,
         "getaddressinfo" => getaddressinfo(handle, req).await,
         "validateaddress" => validateaddress(handle, req).await,
+        "getblockcount" => Ok(json!(handle.status().synced_height)),
+        "getbestblockhash" => Ok(json!(handle.status().synced_hash)),
+        "listtransactions" => listtransactions(handle, req).await,
+        "gettransaction" => gettransaction(handle, req).await,
+        "sendtoaddress" => sendtoaddress(handle, req).await,
+        "sendmany" => sendmany(handle, req).await,
+        "sendrawtransaction" => sendrawtransaction(handle, req).await,
         _ => return None,
     })
 }
@@ -97,12 +114,22 @@ async fn getbalance(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value,
             .as_u64()
             .ok_or_else(|| RpcError::invalid_parameter("minconf must be a non-negative integer"))?,
     };
-    let b = handle.balance().await?;
-    // Core's "total available": trusted funds, plus untrusted pending only at minconf 0.
-    let mut sats = b.confirmed + b.trusted_pending;
-    if minconf == 0 {
-        sats += b.untrusted_pending;
-    }
+    // Core's getbalance is TRUSTED funds only: confirmed outputs plus the wallet's own
+    // unconfirmed change - never an unconfirmed receive from a foreign sender, even at
+    // minconf 0 (that value lives in getunconfirmedbalance / getbalances.untrusted_pending).
+    let sats: u64 = if minconf == 0 {
+        let b = handle.balance().await?;
+        b.confirmed + b.trusted_pending
+    } else {
+        // minconf >= 1 is a plain depth filter; unconfirmed change is below any such depth.
+        handle
+            .list_unspent()
+            .await?
+            .iter()
+            .filter(|u| u.confirmations >= minconf)
+            .map(|u| u.amount_sat)
+            .sum()
+    };
     Ok(zats_to_value(sats))
 }
 
@@ -124,6 +151,7 @@ async fn getunconfirmedbalance(handle: &BtcWalletHandle) -> Result<Value, RpcErr
 
 async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
     let b = handle.balance().await?;
+    let status = handle.status();
     Ok(json!({
         "walletname": handle.name,
         "walletversion": 169900,
@@ -136,8 +164,19 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         "paytxfee": zats_to_value(0),
         "private_keys_enabled": handle.has_seed,
         "avoid_reuse": false,
-        // No chain source yet, so there is no scan to report progress on.
-        "scanning": false,
+        // Core's shape: `false`, or an object while a scan is running. The catch-up against
+        // the upstream is the closest thing this wallet has to a rescan.
+        "scanning": if status.conn_state == BtcConnState::Syncing {
+            json!({ "duration": 0, "progress": 0.0 })
+        } else {
+            json!(false)
+        },
+        // Core master's `lastprocessedblock`: the wallet's own synced checkpoint, which is
+        // also what `getblockcount`/`getbestblockhash` answer for this wallet.
+        "lastprocessedblock": {
+            "hash": status.synced_hash,
+            "height": status.synced_height,
+        },
         // zecd extension: which engine serves this wallet. The Zcash handler reports its own
         // extensions (pools, transparent) here; `coin` is the field a mixed-coin deployment
         // tells wallets apart by.
@@ -145,20 +184,67 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
     }))
 }
 
-async fn listunspent(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
+/// `listunspent [minconf] [maxconf] [addresses] [include_unsafe]` - Bitcoin Core's argument
+/// shape, mirroring the Zcash handler's semantics: `minconf` defaults to **1**, so an
+/// unconfirmed receive is hidden until asked for with `listunspent 0` (exactly Core), and
+/// `safe` is confirmed-or-own-change.
+async fn listunspent(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    let depth = |v: Option<&Value>, name: &str, default: u64| -> Result<u64, RpcError> {
+        match v {
+            None | Some(Value::Null) => Ok(default),
+            Some(v) => v.as_u64().ok_or_else(|| {
+                RpcError::invalid_parameter(format!("{name} must be a non-negative integer"))
+            }),
+        }
+    };
+    let minconf = depth(req.param(0), "minconf", 1)?;
+    let maxconf = depth(req.param(1), "maxconf", 9_999_999)?;
+    let filter: Option<std::collections::BTreeSet<String>> = match req.param(2) {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(addrs)) => {
+            let mut set = std::collections::BTreeSet::new();
+            for a in addrs {
+                let Some(a) = a.as_str() else {
+                    return Err(RpcError::type_error("addresses must be strings"));
+                };
+                // The actor's parse enforces validity and the wallet's network (Core
+                // rejects an invalid filter address rather than silently matching nothing).
+                handle.address_info(a.to_string()).await?;
+                if !set.insert(a.to_string()) {
+                    return Err(RpcError::invalid_parameter(format!(
+                        "Invalid parameter, duplicated address: {a}"
+                    )));
+                }
+            }
+            Some(set)
+        }
+        Some(_) => return Err(RpcError::type_error("addresses must be an array")),
+    };
+    let include_unsafe = match req.param(3) {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(RpcError::type_error("include_unsafe must be a boolean")),
+    };
     let utxos = handle.list_unspent().await?;
     let entries: Vec<Value> = utxos
         .into_iter()
+        .filter(|u| {
+            u.confirmations >= minconf
+                && u.confirmations <= maxconf
+                && (include_unsafe || u.trusted)
+                && filter
+                    .as_ref()
+                    .is_none_or(|f| u.address.as_ref().is_some_and(|a| f.contains(a)))
+        })
         .map(|u| {
             let mut obj = json!({
                 "txid": u.txid,
                 "vout": u.vout,
                 "amount": zats_to_value(u.amount_sat),
-                // The engine tracks no chain tip yet, so nothing can report depth.
-                "confirmations": 0,
+                "confirmations": u.confirmations,
                 "spendable": handle.has_seed,
                 "solvable": true,
-                "safe": false,
+                "safe": u.trusted,
             });
             if let Some(address) = u.address {
                 obj["address"] = Value::String(address);
@@ -167,6 +253,191 @@ async fn listunspent(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         })
         .collect();
     Ok(Value::Array(entries))
+}
+
+/// Core's `bip125-replaceable` vocabulary: `"yes"` only while the transaction is both
+/// unconfirmed and explicitly signaling BIP 125.
+fn bip125_replaceable(e: &BtcTxRecord) -> &'static str {
+    if e.confirmations == 0 && e.explicit_rbf {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// One `gettransaction details` element: the per-output slice (Core's per-output fan-out,
+/// the same accounting as the Zcash side's `tx_entries`; the label field is the usual
+/// stateless `""`). Transaction-level fields live on the enclosing object.
+fn detail_json(e: &BtcTxRecord, d: &BtcTxDetail) -> Value {
+    let mut obj = json!({
+        "category": d.category,
+        "amount": signed_zats_to_value(d.amount_sat),
+        "label": "",
+        "vout": d.vout,
+    });
+    if let Some(address) = &d.address {
+        obj["address"] = json!(address);
+    }
+    if d.category == "send" {
+        if let Some(fee) = e.fee_sat {
+            // Core reports the fee on send entries, negative.
+            obj["fee"] = signed_zats_to_value(-i64::try_from(fee).unwrap_or(i64::MAX));
+        }
+    }
+    obj
+}
+
+/// One `listtransactions` element: a [`detail_json`] slice joined with its transaction's
+/// own fields, exactly Core's flattened shape.
+fn tx_entry_json(e: &BtcTxRecord, d: &BtcTxDetail) -> Value {
+    let mut obj = detail_json(e, d);
+    obj["confirmations"] = json!(e.confirmations);
+    obj["txid"] = json!(e.txid);
+    obj["time"] = json!(e.time);
+    obj["timereceived"] = json!(e.time);
+    obj["bip125-replaceable"] = json!(bip125_replaceable(e));
+    if let (Some(hash), Some(height)) = (&e.blockhash, e.height) {
+        obj["blockhash"] = json!(hash);
+        obj["blockheight"] = json!(height);
+    }
+    obj
+}
+
+async fn listtransactions(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    // The label argument is meaningless in a stateless wallet: only "*" (or omitted) is
+    // accepted, exactly as the Zcash handler treats it.
+    if let Some(label) = opt_str(req, 0) {
+        if !label.is_empty() && label != "*" {
+            return Err(RpcError::invalid_parameter(
+                "labels are not supported (zecd is stateless); pass \"*\" or omit the label",
+            ));
+        }
+    }
+    let count = match req.param(1) {
+        None | Some(Value::Null) => 10,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| RpcError::invalid_parameter("count must be a non-negative integer"))?
+            as usize,
+    };
+    let skip = match req.param(2) {
+        None | Some(Value::Null) => 0,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| RpcError::invalid_parameter("skip must be a non-negative integer"))?
+            as usize,
+    };
+    let records = handle.list_transactions().await?;
+    // Flatten to per-output entries first (a change-only transaction contributes none);
+    // Core's pagination then applies to the entries: skip from the newest end, return up
+    // to `count`, oldest first.
+    let entries: Vec<Value> = records
+        .iter()
+        .flat_map(|e| e.details.iter().map(move |d| tx_entry_json(e, d)))
+        .collect();
+    let upper = entries.len().saturating_sub(skip);
+    let lower = upper.saturating_sub(count);
+    Ok(Value::Array(entries[lower..upper].to_vec()))
+}
+
+async fn gettransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    let Some(txid) = opt_str(req, 0) else {
+        return Err(RpcError::invalid_parameter("txid is required"));
+    };
+    let entry = handle
+        .get_transaction(txid.clone())
+        .await?
+        .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
+    // Core's top-level `amount` is the net wallet impact excluding the fee - the sum of the
+    // details (a self-payment's send+receive pair nets to zero, change never appears).
+    let amount_sat: i64 = entry.details.iter().map(|d| d.amount_sat).sum();
+    let details: Vec<Value> = entry
+        .details
+        .iter()
+        .map(|d| detail_json(&entry, d))
+        .collect();
+    let mut obj = json!({
+        "amount": signed_zats_to_value(amount_sat),
+        "confirmations": entry.confirmations,
+        "txid": entry.txid,
+        "time": entry.time,
+        "timereceived": entry.time,
+        "bip125-replaceable": bip125_replaceable(&entry),
+        "details": details,
+        "hex": entry.hex,
+    });
+    if let Some(fee) = entry.fee_sat {
+        obj["fee"] = signed_zats_to_value(-i64::try_from(fee).unwrap_or(i64::MAX));
+    }
+    if let (Some(hash), Some(height)) = (&entry.blockhash, entry.height) {
+        obj["blockhash"] = json!(hash);
+        obj["blockheight"] = json!(height);
+    }
+    Ok(obj)
+}
+
+async fn sendtoaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    let addr = req.require_str(0, "sendtoaddress requires an address")?;
+    let amount = match req.param(1) {
+        None | Some(Value::Null) => {
+            return Err(RpcError::missing_param("sendtoaddress requires an amount"))
+        }
+        Some(v) => value_to_zats(v)?,
+    };
+    // Params 2/3 (comment, comment_to) are metadata and safe to ignore (zecd is stateless),
+    // but subtractfeefromamount changes who pays the fee: silently ignoring it would debit
+    // the sender more than the caller intended. Reject it, same rule as the Zcash handler.
+    if req.param(4).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "subtractfeefromamount is not supported for bitcoin wallets yet",
+        ));
+    }
+    // Param 9 (fee_rate) is an explicit fee instruction; the wallet estimates via the node.
+    // Silently charging a different rate than the caller named would be worse than refusing.
+    if req.param(9).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "fee_rate is not supported (the wallet uses the node's smart-fee estimate)",
+        ));
+    }
+    let txid = handle.send(vec![(addr.to_string(), amount)]).await?;
+    Ok(Value::String(txid))
+}
+
+async fn sendmany(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    // Bitcoin Core's first parameter is the legacy dummy account, which must be "".
+    if let Some(dummy) = opt_str(req, 0) {
+        if !dummy.is_empty() {
+            return Err(RpcError::invalid_parameter(
+                "dummy first argument must be \"\" (accounts are not supported)",
+            ));
+        }
+    }
+    let Some(Value::Object(map)) = req.param(1) else {
+        return Err(RpcError::invalid_parameter(
+            "sendmany requires an {\"address\": amount} object",
+        ));
+    };
+    if map.is_empty() {
+        return Err(RpcError::invalid_parameter("sendmany requires recipients"));
+    }
+    let mut recipients = Vec::with_capacity(map.len());
+    for (addr, amount) in map {
+        recipients.push((addr.clone(), value_to_zats(amount)?));
+    }
+    // Param 4 (subtractfeefrom) changes who pays the fee; refuse rather than mischarge.
+    if req.param(4).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "subtractfeefrom is not supported for bitcoin wallets yet",
+        ));
+    }
+    let txid = handle.send(recipients).await?;
+    Ok(Value::String(txid))
+}
+
+async fn sendrawtransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    let hex = req.require_str(0, "sendrawtransaction requires a hex string")?;
+    let txid = handle.broadcast(hex.to_string()).await?;
+    Ok(Value::String(txid))
 }
 
 async fn getaddressinfo(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
@@ -254,12 +525,18 @@ mod tests {
         let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let config = crate::config::AppConfig::resolve(&cli).unwrap();
         let entry = &config.wallets["btc"];
-        let handle = crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
+        let (handle, _task) = crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
             name: "btc".to_string(),
             engine_dir: entry.engine_dir(),
             network: entry.bitcoin_network(),
             seed: Some(bip84_seed()),
             wallet_holds_seed: true,
+            endpoint: None,
+            birthday: 0,
+            sync_interval: std::time::Duration::from_secs(20),
+            reconnect_base: std::time::Duration::from_secs(1),
+            reconnect_max: std::time::Duration::from_secs(60),
+            shutdown: tokio::sync::watch::channel(false).1,
         })
         .unwrap();
         let mut registry = WalletRegistry::new("btc".to_string());
@@ -294,8 +571,42 @@ mod tests {
         assert_eq!(info["coin"], json!("bitcoin"));
         assert_eq!(info["private_keys_enabled"], json!(true));
         assert_eq!(info["scanning"], json!(false));
+        // The wallet's own chain view: a fresh wallet sits at its genesis checkpoint, and
+        // getblockcount/getbestblockhash answer from the same authority.
+        assert_eq!(info["lastprocessedblock"]["height"], json!(0));
+        assert_eq!(call("getblockcount", vec![]).await.unwrap(), json!(0));
+        let best = call("getbestblockhash", vec![]).await.unwrap();
+        assert_eq!(
+            best, info["lastprocessedblock"]["hash"],
+            "hash authorities agree"
+        );
 
         assert_eq!(call("listunspent", vec![]).await.unwrap(), json!([]));
+        assert_eq!(call("listtransactions", vec![]).await.unwrap(), json!([]));
+
+        // History misses and offline sends fail with their Core codes rather than panicking:
+        // an unknown txid is -5, a send with no upstream connection is -4, and a raw
+        // broadcast without an upstream is -4 too.
+        let err = call("gettransaction", vec![json!("00".repeat(32))])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
+        let err = call(
+            "sendtoaddress",
+            vec![json!(address.clone()), json!(0.001_f64)],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
+        let err = call("sendrawtransaction", vec![json!("0000")])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
+        // sendmany parameter shape: a non-object recipient set is -8 before any wallet work.
+        let err = call("sendmany", vec![json!(""), json!("nope")])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
 
         let addr_info = call("getaddressinfo", vec![json!(address.clone())])
             .await
@@ -318,12 +629,12 @@ mod tests {
         assert_eq!(call("listwallets", vec![]).await.unwrap(), json!(["btc"]));
 
         // Everything the engine does not serve reads as method-not-found: a Zcash-dialect
-        // write, a chain read (no chain source yet), and a z_* extension alike.
+        // node read, the passphrase surface, and a z_* extension alike.
         for gated in [
-            "sendtoaddress",
-            "getblockcount",
+            "getblockchaininfo",
+            "signmessage",
             "z_sendmany",
-            "listtransactions",
+            "walletpassphrase",
         ] {
             let err = call(gated, vec![]).await.unwrap_err();
             assert_eq!(

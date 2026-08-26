@@ -121,6 +121,9 @@ pub struct AppConfig {
     pub wallets: BTreeMap<String, WalletEntry>,
     pub backend: BackendConfig,
     pub zebra: ZebraConfig,
+    /// `[bitcoind]` credentials for bitcoin wallets' upstream (the BDK engine's full mode).
+    #[cfg(feature = "bitcoin")]
+    pub bitcoind: BitcoindConfig,
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
     pub sync: SyncConfig,
@@ -552,6 +555,26 @@ impl BackendConfig {
     }
 }
 
+/// `[bitcoind]` - credentials for a bitcoin wallet's `bitcoind`/`bitcoind://host:port`
+/// endpoint, mirroring `[zebra]`: a cookie file wins over user/password. Unlike zebrad,
+/// bitcoind's RPC always requires auth, so "nothing set" only works against a node the
+/// operator has explicitly opened (the dial then fails with the node's own refusal).
+/// The value type lives here (shared layer); the engine converts it at its edge
+/// (`crate::btc::chain`).
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Clone, Default)]
+pub struct BitcoindConfig {
+    /// The default upstream token for bitcoin wallets that don't set their own
+    /// `[wallets.<name>] server` (same grammar: `bitcoind` or `bitcoind://host:port`).
+    /// Unset means `bitcoind` - a local node on the network-standard port. This is the
+    /// bitcoin analog of `[backend] server`, so both coins share the same shape: a global
+    /// default with per-wallet overrides.
+    pub server: Option<String>,
+    pub rpc_user: Option<String>,
+    pub rpc_password: Option<String>,
+    pub rpc_cookie: Option<PathBuf>,
+}
+
 /// `[zebra]` - credentials for the `zebra://host:port` endpoint (direct-to-zebrad mode).
 /// A cookie file wins over user/password, and nothing set means no auth (zebrad with
 /// `enable_cookie_auth = false`).
@@ -886,6 +909,10 @@ struct ConfigFile {
     wallets: BTreeMap<String, WalletFile>,
     backend: Option<BackendFile>,
     zebra: Option<ZebraFile>,
+    /// `[bitcoind]` exists only in a build carrying the BDK engine; a default build refuses
+    /// the section as an unknown field, consistent with `coin = "bitcoin"` being refused.
+    #[cfg(feature = "bitcoin")]
+    bitcoind: Option<BitcoindFile>,
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
     sync: Option<SyncFile>,
@@ -983,6 +1010,17 @@ struct BackendFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ZebraFile {
+    rpc_user: Option<String>,
+    rpc_password: Option<String>,
+    rpc_cookie: Option<PathBuf>,
+}
+
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BitcoindFile {
+    /// Default upstream token for bitcoin wallets (`bitcoind` when unset).
+    server: Option<String>,
     rpc_user: Option<String>,
     rpc_password: Option<String>,
     rpc_cookie: Option<PathBuf>,
@@ -1579,8 +1617,10 @@ impl AppConfig {
             // zebra/lightwalletd backend overrides). On a non-Zcash wallet a set key would be
             // silently ignored, which reads as configuration and isn't - refuse it instead.
             if coin != Coin::Zcash {
+                // `server` is legal on any coin - each engine resolves the token with its own
+                // grammar (`backend::resolve_for_wallet` for Zcash, `btc::chain` for Bitcoin),
+                // so a Zcash token on a bitcoin wallet is refused there, naming the grammar.
                 let zcash_only: &[(&str, bool)] = &[
-                    ("server", w.server.is_some()),
                     ("tls", w.tls.is_some()),
                     ("tls_roots", w.tls_roots.is_some()),
                     (
@@ -1758,6 +1798,17 @@ impl AppConfig {
             rpc_user: zebra_file.rpc_user,
             rpc_password: zebra_file.rpc_password,
             rpc_cookie: zebra_file.rpc_cookie,
+        };
+
+        #[cfg(feature = "bitcoin")]
+        let bitcoind = {
+            let bitcoind_file = file.bitcoind.unwrap_or_default();
+            BitcoindConfig {
+                server: bitcoind_file.server,
+                rpc_user: bitcoind_file.rpc_user,
+                rpc_password: bitcoind_file.rpc_password,
+                rpc_cookie: bitcoind_file.rpc_cookie,
+            }
         };
 
         let rpc_file = file.rpc.unwrap_or(RpcFile {
@@ -1949,6 +2000,8 @@ impl AppConfig {
             wallets,
             backend,
             zebra,
+            #[cfg(feature = "bitcoin")]
+            bitcoind,
             rpc,
             keys,
             sync,
@@ -3354,7 +3407,7 @@ mod tests {
         for (key, line) in [
             ("transparent", "transparent = true"),
             ("pools", "pools = [\"orchard\"]"),
-            ("server", "server = \"zebra\""),
+            ("tls", "tls = \"yes\""),
         ] {
             std::fs::write(
                 &conf,

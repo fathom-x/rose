@@ -139,7 +139,7 @@ pub(crate) fn parse_receiver_tokens(
 ///   `/wallet/<name>` path instead.
 /// - **One receiver kind per call:** the valid `receiver_type`s are this wallet's enabled
 ///   shielded pools (`sapling`/`orchard`) or - on a wallet with `[pools] transparent = true` -
-///   `p2pkh` **alone**, which derives the *bare* `t1…`/`tm…` address at the requested index
+///   `p2pkh` **alone**, which derives the *bare* `t1...`/`tm...` address at the requested index
 ///   (ZIP-316 forbids a transparent-only UA, and zecd never mixes a transparent receiver into a
 ///   UA it hands out). Mixing `p2pkh` with a shielded pool is `-8`, as are `p2sh` (zecd derives
 ///   no script addresses), a pool the wallet has not enabled, and any unknown token.
@@ -1657,8 +1657,9 @@ pub(crate) fn listunspent(
 
 /// Whether a positional param was supplied with a value that "turns it on" (anything but
 /// null/false/empty array). Used to reject unsupported options that would change money
-/// semantics if silently ignored.
-fn param_engaged(v: &Value) -> bool {
+/// semantics if silently ignored. Shared with the Bitcoin handlers (`super::btc_methods`),
+/// which apply the same rule to the same positional options.
+pub(crate) fn param_engaged(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,

@@ -131,7 +131,10 @@ env:
   # The harness --test targets for the standard (zecd) suite. Both node legs (zebra and zakura)
   # run this full list; only the zecd-lwd leg overrides it with its own subset (see the matrix
   # `include` below). Extended/stress tests skip in seconds unless their gate is set.
-  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_migration --test regtest_funded --test regtest_ironwood --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes"
+  # regtest_btc (the BDK engine's bitcoind e2e) self-skips here: these legs build zecd
+  # without the `bitcoin` feature and provision no bitcoind. It runs for real in the
+  # dedicated `btc-e2e` job below, which supplies both.
+  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_migration --test regtest_funded --test regtest_ironwood --test regtest_proving_cache --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_sendmany_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_stress_notes --test regtest_btc"
 
 concurrency:
   group: regtest-${{ github.event_name }}-${{ github.ref }}
@@ -504,3 +507,69 @@ jobs:
           free -g || true
           echo "== captured logs (${{ matrix.node }}) =="
           ls -la "$RUNNER_TEMP/regtest-logs" 2>/dev/null || echo "(no logs were written)"
+
+  # The BDK engine's live e2e (regtest-harness/tests/regtest_btc.rs): a `--features bitcoin`
+  # zecd against a real regtest Bitcoin Core - receive at 0-conf, confirm, wallet-built send
+  # accepted by the node's mempool, sendmany, change attribution, checkpoint persistence
+  # across a restart. Its own small job rather than a leg of the `regtest` matrix: it needs
+  # neither zebra, nor the funder, nor the chain snapshot, and the matrix legs' zecd is the
+  # default-feature build (where the same test self-skips by design). A debug zecd is
+  # deliberate - the test does no Orchard proving, and the debug build halves the job's
+  # compile time.
+  btc-e2e:
+    runs-on: ubuntu-latest
+    env:
+      # Bitcoin Core release the e2e runs against - the version the bdk_bitcoind_rpc/bip157
+      # line is tested against upstream (see deploy/docker-compose.btc-regtest.yml, which
+      # pins the same version for manual testing; keep the two together when bumping).
+      # The download is verified against the COMMITTED checksum manifest
+      # (deploy/bitcoin-core/SHA256SUMS), whose own provenance - 15 independent guix.sigs
+      # builder attestations plus an OpenTimestamps anchor in the Bitcoin chain - is
+      # documented (with the bump procedure) in deploy/bitcoin-core/README.md.
+      BITCOIN_CORE_VERSION: "30.2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            regtest-harness
+
+      - name: Cache Bitcoin Core
+        id: cache-bitcoind
+        uses: actions/cache@v4
+        with:
+          path: ~/bitcoin-core
+          key: bitcoin-core-${{ env.BITCOIN_CORE_VERSION }}-x86_64-linux-gnu
+
+      - name: Download Bitcoin Core
+        if: steps.cache-bitcoind.outputs.cache-hit != 'true'
+        run: |
+          tarball="bitcoin-${BITCOIN_CORE_VERSION}-x86_64-linux-gnu.tar.gz"
+          cd "$(mktemp -d)"
+          curl -sfLO "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_CORE_VERSION}/${tarball}"
+          # Checked against the manifest committed in this repo, not one fetched beside the
+          # tarball (--ignore-missing: the manifest covers every 30.2 artifact, we hold one).
+          sha256sum --check --ignore-missing "${GITHUB_WORKSPACE}/deploy/bitcoin-core/SHA256SUMS"
+          mkdir -p ~/bitcoin-core
+          tar -xzf "$tarball" -C ~/bitcoin-core --strip-components=1
+
+      - name: Build zecd with the bitcoin engine
+        run: cargo build --locked --features bitcoin --bin zecd
+
+      - name: Run the bitcoind e2e
+        working-directory: regtest-harness
+        env:
+          ZECD_BIN: ${{ github.workspace }}/target/debug/zecd
+        run: |
+          # Set in the script rather than the env block: `~` in a YAML env value would reach
+          # the harness unexpanded.
+          export BITCOIND_BIN="$HOME/bitcoin-core/bin/bitcoind"
+          "$BITCOIND_BIN" --version | head -1
+          cargo test --locked --test regtest_btc -- --nocapture

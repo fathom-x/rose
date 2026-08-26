@@ -166,8 +166,25 @@ impl PreparedNode {
             // fatal for the whole node, any other failure skips the wallet.
             #[cfg(feature = "bitcoin")]
             if entry.coin == crate::coin::Coin::Bitcoin {
-                match spawn_bitcoin_wallet(&config, name, entry, &keys_path) {
-                    Ok(handle) => {
+                // An unresolvable endpoint is a configuration error, fatal like the Zcash
+                // branch's resolve failure below (the daemon would otherwise start a wallet
+                // that can never sync).
+                let endpoint = match crate::btc::chain::resolve_for_wallet(&config, entry) {
+                    Ok(endpoint) => endpoint,
+                    Err(e) => {
+                        stop_actors(&shutdown_tx, actor_tasks).await;
+                        return Err(e);
+                    }
+                };
+                match spawn_bitcoin_wallet(
+                    &config,
+                    name,
+                    entry,
+                    &keys_path,
+                    endpoint,
+                    shutdown_tx.subscribe(),
+                ) {
+                    Ok((handle, task)) => {
                         let watch_only = !handle.has_seed;
                         info!(
                             "loaded wallet '{}' (bitcoin{})",
@@ -176,6 +193,7 @@ impl PreparedNode {
                         );
                         loaded.push((name.clone(), entry.coin, watch_only));
                         registry.insert(CoinWallet::Bitcoin(handle));
+                        actor_tasks.push((name.clone(), task));
                     }
                     Err(e)
                         if e.downcast_ref::<crate::btc::actor::BtcBindingMismatch>()
@@ -354,7 +372,12 @@ fn spawn_bitcoin_wallet(
     name: &str,
     entry: &config::WalletEntry,
     keys_path: &std::path::Path,
-) -> anyhow::Result<crate::btc::actor::BtcWalletHandle> {
+    endpoint: crate::btc::chain::BitcoindEndpoint,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<(
+    crate::btc::actor::BtcWalletHandle,
+    tokio::task::JoinHandle<()>,
+)> {
     let store = WalletStore::read(keys_path)?;
     if store.network.name() != config.network.name() {
         anyhow::bail!(
@@ -378,6 +401,12 @@ fn spawn_bitcoin_wallet(
         network: entry.bitcoin_network(),
         seed,
         wallet_holds_seed: store.has_seed(),
+        endpoint: Some(endpoint),
+        birthday: u32::from(store.birthday),
+        sync_interval: Duration::from_secs(config.sync.interval_secs),
+        reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
+        reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
+        shutdown,
     })
 }
 
@@ -616,6 +645,8 @@ pub(crate) mod testutil {
                 assume_transparent_in_compact_blocks: false,
             },
             zebra: Default::default(),
+            #[cfg(feature = "bitcoin")]
+            bitcoind: Default::default(),
             rpc,
             keys: KeysConfig {
                 age_identity: None,

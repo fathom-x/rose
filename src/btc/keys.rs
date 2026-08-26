@@ -78,6 +78,28 @@ impl AccountKeys {
     }
 }
 
+/// A throwaway in-memory wallet over the **private** BIP 84 descriptors, for signing PSBTs
+/// built by the persisted (public-descriptor) wallet - the spend half of the custody model:
+/// derived from the seed per send, never persisted, dropped when the send completes. Its
+/// key material is byte-identical to what [`AccountKeys`] describes (same master, same
+/// paths), so the PSBT's BIP 32 origin metadata routes every input to it.
+pub fn signing_wallet(
+    seed: &SecretVec<u8>,
+    net: BitcoinNetwork,
+) -> anyhow::Result<bdk_wallet::Wallet> {
+    use bdk_wallet::template::Bip84;
+    let network = network(net);
+    let master =
+        Xpriv::new_master(network, seed.expose_secret()).context("derive BIP 32 master key")?;
+    bdk_wallet::Wallet::create(
+        Bip84(master, KeychainKind::External),
+        Bip84(master, KeychainKind::Internal),
+    )
+    .network(network)
+    .create_wallet_no_persist()
+    .map_err(|e| anyhow::anyhow!("build signing wallet: {e}"))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

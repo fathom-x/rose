@@ -171,7 +171,35 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
         ));
     }
 
+    // The global `[bitcoind] server` default, when set, must parse even if no bitcoin wallet
+    // currently uses it (the per-wallet resolve below only validates the effective token of
+    // wallets that exist) - the same posture as the global `[backend] server` check above.
+    #[cfg(feature = "bitcoin")]
+    if let Some(token) = &config.bitcoind.server {
+        let btc_network =
+            crate::coin::BitcoinNetwork::from_environment(config.network, config.btc_testnet);
+        if let Err(e) = crate::btc::chain::resolve(token, btc_network) {
+            findings.push(Finding::error(format!("[bitcoind] server: {e:#}")));
+        }
+    }
+
     for (name, wallet) in &config.wallets {
+        // A bitcoin wallet's endpoint has its own grammar and preflight (`crate::btc::chain`),
+        // and none of the Zcash warnings below apply to it.
+        #[cfg(feature = "bitcoin")]
+        if wallet.coin == crate::coin::Coin::Bitcoin {
+            match crate::btc::chain::resolve_for_wallet(config, wallet) {
+                Ok(endpoint) => {
+                    if let Err(e) = endpoint.preflight() {
+                        findings.push(Finding::error(format!("[wallets.{name}] server: {e:#}")));
+                    }
+                }
+                Err(e) => {
+                    findings.push(Finding::error(format!("[wallets.{name}] server: {e:#}")));
+                }
+            }
+            continue;
+        }
         // A wallet that overrides the endpoint dials its own, so it gets its own resolve and
         // preflight - and the per-wallet warnings below key off *its* backend kind, not the
         // global one. A wallet with no overrides is the global endpoint already checked above.

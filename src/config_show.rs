@@ -127,6 +127,41 @@ pub fn render(config: &AppConfig) -> String {
         config.zebra.rpc_user.is_some() || config.zebra.rpc_password.is_some(),
     );
 
+    // `[bitcoind]` mirrors `[backend]` + `[zebra]` for bitcoin wallets: the global default
+    // upstream (rendered like `[backend] server` - always, with the resolved endpoint as a
+    // note) plus credentials, secrets redacted the same way. The section exists only in a
+    // build carrying the BDK engine, which is also the only build whose parser accepts it -
+    // the idempotence contract holds per build.
+    #[cfg(feature = "bitcoin")]
+    {
+        table(&mut s, "bitcoind");
+        let btc_network =
+            crate::coin::BitcoinNetwork::from_environment(config.network, config.btc_testnet);
+        let token = config.bitcoind.server.as_deref().unwrap_or("bitcoind");
+        match crate::btc::chain::resolve(token, btc_network) {
+            Ok((host, port)) => kv_note(
+                &mut s,
+                "server",
+                str_val(token),
+                &format!("bitcoind {host}:{port}"),
+            ),
+            Err(e) => kv_note(
+                &mut s,
+                "server",
+                str_val(token),
+                &format!("UNRESOLVED: {e}"),
+            ),
+        }
+        if let Some(cookie) = &config.bitcoind.rpc_cookie {
+            kv(&mut s, "rpc_cookie", path_val(cookie));
+        }
+        redacted_pair(
+            &mut s,
+            &["rpc_user", "rpc_password"],
+            config.bitcoind.rpc_user.is_some() || config.bitcoind.rpc_password.is_some(),
+        );
+    }
+
     table(&mut s, "rpc");
     kv(&mut s, "bind", str_val(&config.rpc.bind.to_string()));
     kv(&mut s, "port", config.rpc.port);
@@ -234,6 +269,25 @@ pub fn render(config: &AppConfig) -> String {
         kv(&mut s, "dir", path_val(&w.dir));
         if let Some(keys_file) = &w.keys_file {
             kv(&mut s, "keys_file", path_val(keys_file));
+        }
+        // `server` is legal on every coin (each engine has its own token grammar), rendered
+        // only when this wallet actually sets it: an absent key means "the coin's default
+        // upstream" (the global `[backend]` for Zcash, a local bitcoind for Bitcoin).
+        #[cfg(feature = "bitcoin")]
+        if w.coin == crate::coin::Coin::Bitcoin {
+            if let Some(server) = &w.backend.server {
+                match crate::btc::chain::resolve_for_wallet(config, w) {
+                    Ok(resolved) => {
+                        kv_note(&mut s, "server", str_val(server), &resolved.describe())
+                    }
+                    Err(e) => kv_note(
+                        &mut s,
+                        "server",
+                        str_val(server),
+                        &format!("UNRESOLVED: {e}"),
+                    ),
+                }
+            }
         }
         // The remaining per-wallet keys configure the Zcash engine and are refused by
         // `resolve` on any other wallet, so rendering them there would emit a config

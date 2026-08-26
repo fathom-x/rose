@@ -110,6 +110,12 @@ fn read_secret_file(path: &std::path::Path) -> anyhow::Result<String> {
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub network: ZNetwork,
+    /// Which public Bitcoin test network this (testnet) daemon's Bitcoin wallets use - the
+    /// top-level `btc_testnet` key, already applied to every Bitcoin [`WalletEntry::chain`].
+    /// Carried here so `config show` can render the effective value even when no Bitcoin
+    /// wallet is configured yet.
+    #[cfg(feature = "bitcoin")]
+    pub btc_testnet: crate::coin::BitcoinTestnet,
     pub datadir: PathBuf,
     pub default_wallet: String,
     pub wallets: BTreeMap<String, WalletEntry>,
@@ -868,6 +874,12 @@ impl SpendConfig {
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     network: Option<String>,
+    /// Which public Bitcoin test network a testnet daemon's Bitcoin wallets use:
+    /// `"testnet3"` (the default) or `"testnet4"`. Parsed in every build so the error a
+    /// default build gives is "this build has no bitcoin engine", not an unknown-key
+    /// message; validated in [`AppConfig::resolve`] and nowhere else, like `coin`. Refused
+    /// outside `network = "test"`, where it would be silently inert.
+    btc_testnet: Option<String>,
     datadir: Option<PathBuf>,
     default_wallet: Option<String>,
     #[serde(default)]
@@ -1491,6 +1503,40 @@ impl AppConfig {
             ZNetwork::Test
         };
 
+        // `btc_testnet`: which public Bitcoin test network a testnet daemon's Bitcoin wallets
+        // use. Validated here in every build (like `coin`): a build without the bitcoin
+        // engine refuses a set key rather than silently ignoring it, and so does any daemon
+        // whose environment is not the test one - main and regtest each name exactly one
+        // Bitcoin chain, so the key would be inert there.
+        #[cfg(not(feature = "bitcoin"))]
+        if let Some(token) = &file.btc_testnet {
+            anyhow::bail!(
+                "btc_testnet = {token:?} requires a zecd build with the `bitcoin` feature \
+                 (this build supports: {})",
+                Coin::supported_names()
+            );
+        }
+        #[cfg(feature = "bitcoin")]
+        let btc_testnet = match &file.btc_testnet {
+            None => crate::coin::BitcoinTestnet::default(),
+            Some(token) => {
+                let testnet = crate::coin::BitcoinTestnet::parse(token).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unsupported btc_testnet {token:?} (expected one of: {})",
+                        crate::coin::BitcoinTestnet::supported_names()
+                    )
+                })?;
+                if !matches!(network, ZNetwork::Test) {
+                    anyhow::bail!(
+                        "btc_testnet = {token:?} applies only to a testnet daemon \
+                         (network = \"test\"); this daemon's network is {:?}",
+                        network.name()
+                    );
+                }
+                testnet
+            }
+        };
+
         let default_wallet = file
             .default_wallet
             .clone()
@@ -1596,13 +1642,17 @@ impl AppConfig {
                 w.transparent_gap_warn_threshold,
                 &pools,
             )?;
+            #[cfg(feature = "bitcoin")]
+            let chain = coin.chain_with(network, btc_testnet);
+            #[cfg(not(feature = "bitcoin"))]
+            let chain = coin.chain(network);
             wallets.insert(
                 name.clone(),
                 WalletEntry {
                     dir,
                     keys_file,
                     coin,
-                    chain: coin.chain(network),
+                    chain,
                     backend: backend_override,
                     pools: enabled,
                     default_receivers,
@@ -1892,6 +1942,8 @@ impl AppConfig {
 
         Ok(AppConfig {
             network,
+            #[cfg(feature = "bitcoin")]
+            btc_testnet,
             datadir,
             default_wallet,
             wallets,
@@ -3207,11 +3259,87 @@ mod tests {
             assert_eq!(entry.coin, Coin::Bitcoin);
             assert_eq!(
                 entry.chain,
-                CoinNetwork::Bitcoin(crate::coin::BitcoinNetwork::Test)
+                CoinNetwork::Bitcoin(crate::coin::BitcoinNetwork::Testnet3)
             );
-            assert_eq!(entry.bitcoin_network(), crate::coin::BitcoinNetwork::Test);
+            assert_eq!(
+                entry.bitcoin_network(),
+                crate::coin::BitcoinNetwork::Testnet3
+            );
             // The engine directory follows the coin's frozen path components.
             assert!(entry.engine_dir().ends_with("btc/bdk"));
+        }
+    }
+
+    /// The `btc_testnet` key: it selects which public Bitcoin testnet a testnet daemon's
+    /// Bitcoin wallets ride (default testnet3), an unsupported token is refused naming the
+    /// accepted set, and outside the test environment - where it would be silently inert -
+    /// it is refused too. A build without the bitcoin engine refuses any set value.
+    #[test]
+    #[cfg(feature = "cli")]
+    fn the_btc_testnet_key_is_validated_in_resolve() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        let resolve = |text: &str| {
+            std::fs::write(&conf, text).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            AppConfig::resolve(&cli)
+        };
+
+        #[cfg(not(feature = "bitcoin"))]
+        {
+            let err = resolve("network = \"test\"\ndatadir = \"/d\"\nbtc_testnet = \"testnet4\"\n")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("requires a zecd build"), "{err}");
+        }
+        #[cfg(feature = "bitcoin")]
+        {
+            use crate::coin::{BitcoinNetwork, BitcoinTestnet};
+            // Default: testnet3, the engine's previous behaviour.
+            let cfg = resolve(
+                "network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n",
+            )
+            .unwrap();
+            assert_eq!(cfg.btc_testnet, BitcoinTestnet::Testnet3);
+            assert_eq!(
+                cfg.wallets["btc"].bitcoin_network(),
+                BitcoinNetwork::Testnet3
+            );
+
+            // testnet4 selects the other public testnet for every Bitcoin wallet.
+            let cfg = resolve(
+                "network = \"test\"\ndatadir = \"/d\"\nbtc_testnet = \"testnet4\"\n\
+                 [wallets.btc]\ncoin = \"bitcoin\"\n",
+            )
+            .unwrap();
+            assert_eq!(cfg.btc_testnet, BitcoinTestnet::Testnet4);
+            assert_eq!(
+                cfg.wallets["btc"].bitcoin_network(),
+                BitcoinNetwork::Testnet4
+            );
+            // ...and never touches a Zcash wallet's chain.
+            assert_eq!(
+                cfg.wallets["default"].chain,
+                CoinNetwork::Zcash(ZNetwork::Test)
+            );
+
+            // An unsupported token names the accepted set.
+            let err = resolve("network = \"test\"\ndatadir = \"/d\"\nbtc_testnet = \"signet\"\n")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("testnet3, testnet4"), "{err}");
+
+            // Outside the test environment the key is inert, so it is refused instead.
+            for network in ["main", "regtest"] {
+                let err = resolve(&format!(
+                    "network = \"{network}\"\ndatadir = \"/d\"\nbtc_testnet = \"testnet4\"\n"
+                ))
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("applies only to a testnet daemon"), "{err}");
+                assert!(err.contains(network), "{err}");
+            }
         }
     }
 

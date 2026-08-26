@@ -105,12 +105,36 @@ impl Coin {
             .join(", ")
     }
 
-    /// This coin's chain within the daemon's network environment.
+    /// This coin's chain within the daemon's network environment, with the default Bitcoin
+    /// testnet ([`BitcoinTestnet::Testnet3`]) when the environment is the test one. Config
+    /// resolution uses [`Coin::chain_with`] so the `btc_testnet` key can pick the other
+    /// public Bitcoin test network; everything else (tests, the implicit Zcash default
+    /// wallet) takes the default through here.
     pub fn chain(self, env: ZNetwork) -> CoinNetwork {
+        #[cfg(feature = "bitcoin")]
+        {
+            self.chain_with(env, BitcoinTestnet::default())
+        }
+        #[cfg(not(feature = "bitcoin"))]
+        {
+            match self {
+                Coin::Zcash => CoinNetwork::Zcash(env),
+            }
+        }
+    }
+
+    /// [`Coin::chain`] with an explicit Bitcoin testnet selection: which of the two public
+    /// Bitcoin test networks a testnet daemon's Bitcoin wallets ride (the `btc_testnet`
+    /// config key). A Zcash wallet's chain ignores it - the Zcash environment has one public
+    /// testnet - and outside the test environment it is inert by construction
+    /// ([`BitcoinNetwork::from_environment`] only consults it for [`ZNetwork::Test`]).
+    #[cfg(feature = "bitcoin")]
+    pub fn chain_with(self, env: ZNetwork, btc_testnet: BitcoinTestnet) -> CoinNetwork {
         match self {
             Coin::Zcash => CoinNetwork::Zcash(env),
-            #[cfg(feature = "bitcoin")]
-            Coin::Bitcoin => CoinNetwork::Bitcoin(BitcoinNetwork::from_environment(env)),
+            Coin::Bitcoin => {
+                CoinNetwork::Bitcoin(BitcoinNetwork::from_environment(env, btc_testnet))
+            }
         }
     }
 }
@@ -125,7 +149,7 @@ impl Coin {
 pub enum CoinNetwork {
     /// A Zcash chain (mainnet, testnet, or a local regtest chain).
     Zcash(ZNetwork),
-    /// A Bitcoin chain (mainnet, testnet, or a local regtest chain).
+    /// A Bitcoin chain (mainnet, one of the two public testnets, or a local regtest chain).
     #[cfg(feature = "bitcoin")]
     Bitcoin(BitcoinNetwork),
 }
@@ -153,8 +177,12 @@ impl CoinNetwork {
 pub enum BitcoinNetwork {
     /// Production Bitcoin.
     Main,
-    /// The public test network.
-    Test,
+    /// The original public test network (Bitcoin Core's `-testnet`).
+    Testnet3,
+    /// The BIP-94 public test network (Bitcoin Core's `-testnet4`). Same key derivation and
+    /// address encoding as testnet3 (coin type `1'`, `tb1` HRP) - a different chain
+    /// (genesis, network magic), which the wallet database records at creation.
+    Testnet4,
     /// A local regtest chain.
     Regtest,
 }
@@ -162,23 +190,73 @@ pub enum BitcoinNetwork {
 #[cfg(feature = "bitcoin")]
 impl BitcoinNetwork {
     /// The Bitcoin chain within the daemon's network environment: a testnet daemon's Bitcoin
-    /// wallets are testnet wallets, exactly as its Zcash wallets are.
-    pub fn from_environment(env: ZNetwork) -> BitcoinNetwork {
+    /// wallets are testnet wallets, exactly as its Zcash wallets are - with `btc_testnet`
+    /// picking *which* public Bitcoin testnet, since Bitcoin has two live ones where Zcash
+    /// has one.
+    pub fn from_environment(env: ZNetwork, testnet: BitcoinTestnet) -> BitcoinNetwork {
         match env {
             ZNetwork::Main => BitcoinNetwork::Main,
-            ZNetwork::Test => BitcoinNetwork::Test,
+            ZNetwork::Test => match testnet {
+                BitcoinTestnet::Testnet3 => BitcoinNetwork::Testnet3,
+                BitcoinTestnet::Testnet4 => BitcoinNetwork::Testnet4,
+            },
             ZNetwork::Regtest(_) => BitcoinNetwork::Regtest,
         }
     }
 
-    /// The short network name, matching [`ZNetwork::name`]'s vocabulary: `"main"`, `"test"`,
-    /// or `"regtest"`.
+    /// The short network name: `"main"` and `"regtest"` match [`ZNetwork::name`]'s
+    /// vocabulary; the test environment names its concrete chain (`"testnet3"` /
+    /// `"testnet4"`), since the environment word `"test"` no longer identifies one.
     pub fn name(self) -> &'static str {
         match self {
             BitcoinNetwork::Main => "main",
-            BitcoinNetwork::Test => "test",
+            BitcoinNetwork::Testnet3 => "testnet3",
+            BitcoinNetwork::Testnet4 => "testnet4",
             BitcoinNetwork::Regtest => "regtest",
         }
+    }
+}
+
+/// Which public Bitcoin test network a testnet daemon's Bitcoin wallets use - the value of
+/// the top-level `btc_testnet` config key.
+///
+/// A daemon-global refinement of the network *environment*, not a per-wallet chain choice:
+/// `--testnet` still says "this daemon is a testnet daemon", and this key says what that
+/// means for Bitcoin, where two public test networks are live. The default is testnet3,
+/// matching Bitcoin Core's own `-testnet` and preserving the engine's previous behaviour.
+#[cfg(feature = "bitcoin")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BitcoinTestnet {
+    /// The original public test network (`"testnet3"`).
+    #[default]
+    Testnet3,
+    /// The BIP-94 public test network (`"testnet4"`).
+    Testnet4,
+}
+
+#[cfg(feature = "bitcoin")]
+impl BitcoinTestnet {
+    /// Parse the config token. `None` for anything else; the caller owns the error message
+    /// (which should name [`BitcoinTestnet::supported_names`]).
+    pub fn parse(s: &str) -> Option<BitcoinTestnet> {
+        match s.trim() {
+            "testnet3" => Some(BitcoinTestnet::Testnet3),
+            "testnet4" => Some(BitcoinTestnet::Testnet4),
+            _ => None,
+        }
+    }
+
+    /// The token form, round-tripping through [`BitcoinTestnet::parse`].
+    pub fn name(self) -> &'static str {
+        match self {
+            BitcoinTestnet::Testnet3 => "testnet3",
+            BitcoinTestnet::Testnet4 => "testnet4",
+        }
+    }
+
+    /// The accepted tokens, for error messages.
+    pub fn supported_names() -> &'static str {
+        "testnet3, testnet4"
     }
 }
 
@@ -212,18 +290,60 @@ mod tests {
         assert_eq!(Coin::parse("bitcoin"), Some(Coin::Bitcoin));
         for (env, expected) in [
             (ZNetwork::Main, BitcoinNetwork::Main),
-            (ZNetwork::Test, BitcoinNetwork::Test),
+            (ZNetwork::Test, BitcoinNetwork::Testnet3),
             (crate::network::regtest(), BitcoinNetwork::Regtest),
         ] {
             let chain = Coin::Bitcoin.chain(env);
             assert_eq!(chain, CoinNetwork::Bitcoin(expected));
             assert_eq!(chain.coin(), Coin::Bitcoin);
         }
-        // The network vocabulary matches ZNetwork::name, so keys.toml and logs read the same
-        // for either coin.
+        // `btc_testnet` refines only the test environment: testnet4 selects the other public
+        // testnet there, and is inert (by construction) on main and regtest.
+        for testnet in [BitcoinTestnet::Testnet3, BitcoinTestnet::Testnet4] {
+            let expected = match testnet {
+                BitcoinTestnet::Testnet3 => BitcoinNetwork::Testnet3,
+                BitcoinTestnet::Testnet4 => BitcoinNetwork::Testnet4,
+            };
+            assert_eq!(
+                Coin::Bitcoin.chain_with(ZNetwork::Test, testnet),
+                CoinNetwork::Bitcoin(expected)
+            );
+            assert_eq!(
+                Coin::Bitcoin.chain_with(ZNetwork::Main, testnet),
+                CoinNetwork::Bitcoin(BitcoinNetwork::Main)
+            );
+            assert_eq!(
+                Coin::Bitcoin.chain_with(crate::network::regtest(), testnet),
+                CoinNetwork::Bitcoin(BitcoinNetwork::Regtest)
+            );
+            // A Zcash chain never consults the Bitcoin testnet selection.
+            assert_eq!(
+                Coin::Zcash.chain_with(ZNetwork::Test, testnet),
+                CoinNetwork::Zcash(ZNetwork::Test)
+            );
+        }
+        // main/regtest keep ZNetwork::name's vocabulary; the test environment names its
+        // concrete chain, since "test" no longer identifies one.
         assert_eq!(BitcoinNetwork::Main.name(), "main");
-        assert_eq!(BitcoinNetwork::Test.name(), "test");
+        assert_eq!(BitcoinNetwork::Testnet3.name(), "testnet3");
+        assert_eq!(BitcoinNetwork::Testnet4.name(), "testnet4");
         assert_eq!(BitcoinNetwork::Regtest.name(), "regtest");
+    }
+
+    /// The `btc_testnet` token grammar: the two public testnets round-trip, the default is
+    /// testnet3 (Bitcoin Core's own `-testnet`, and the engine's previous behaviour), and
+    /// anything else - the environment word "test" included - is a parse failure for the
+    /// config layer to report.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn btc_testnet_tokens_round_trip_and_default_to_testnet3() {
+        assert_eq!(BitcoinTestnet::default(), BitcoinTestnet::Testnet3);
+        for testnet in [BitcoinTestnet::Testnet3, BitcoinTestnet::Testnet4] {
+            assert_eq!(BitcoinTestnet::parse(testnet.name()), Some(testnet));
+        }
+        for bad in ["test", "testnet", "signet", "TESTNET4", ""] {
+            assert_eq!(BitcoinTestnet::parse(bad), None, "{bad:?} must not parse");
+        }
     }
 
     #[test]

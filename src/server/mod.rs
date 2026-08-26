@@ -300,6 +300,8 @@ mod tests {
     fn test_state_with_rpc(rpc: RpcConfig) -> HttpState {
         let config = AppConfig {
             network: crate::network::ZNetwork::Test,
+            #[cfg(feature = "bitcoin")]
+            btc_testnet: Default::default(),
             datadir: std::path::PathBuf::from("/tmp"),
             default_wallet: "default".into(),
             wallets: BTreeMap::new(),
@@ -571,7 +573,7 @@ mod tests {
         let mut state = test_state();
         state.app.registry = Arc::new(reg);
 
-        // The default route reports the default wallet's height…
+        // The default route reports the default wallet's height...
         let r = router(state.clone())
             .oneshot(req(
                 r#"{"method":"getblockcount","id":1}"#,
@@ -581,7 +583,7 @@ mod tests {
             .unwrap();
         assert_eq!(body_json(r).await["result"].as_u64(), Some(2000));
 
-        // …while /wallet/w2 reports w2's own (still-scanning) height, not the default's.
+        // ...while /wallet/w2 reports w2's own (still-scanning) height, not the default's.
         let r = router(state)
             .oneshot(req_to(
                 "/wallet/w2",

@@ -595,6 +595,8 @@ pub(crate) mod testutil {
         };
         AppConfig {
             network: crate::network::ZNetwork::Test,
+            #[cfg(feature = "bitcoin")]
+            btc_testnet: Default::default(),
             datadir: std::path::PathBuf::from("/tmp"),
             default_wallet: "default".into(),
             wallets: BTreeMap::new(),

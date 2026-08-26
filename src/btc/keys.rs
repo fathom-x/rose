@@ -27,7 +27,8 @@ use crate::coin::BitcoinNetwork;
 pub fn network(net: BitcoinNetwork) -> Network {
     match net {
         BitcoinNetwork::Main => Network::Bitcoin,
-        BitcoinNetwork::Test => Network::Testnet,
+        BitcoinNetwork::Testnet3 => Network::Testnet,
+        BitcoinNetwork::Testnet4 => Network::Testnet4,
         BitcoinNetwork::Regtest => Network::Regtest,
     }
 }
@@ -54,7 +55,7 @@ impl AccountKeys {
         let fingerprint = master.fingerprint(&secp);
         let coin_type = match net {
             BitcoinNetwork::Main => 0,
-            BitcoinNetwork::Test | BitcoinNetwork::Regtest => 1,
+            BitcoinNetwork::Testnet3 | BitcoinNetwork::Testnet4 | BitcoinNetwork::Regtest => 1,
         };
         let path = DerivationPath::from(vec![
             ChildNumber::from_hardened_idx(84).expect("84 is in range"),
@@ -128,12 +129,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn testnet_and_regtest_use_coin_type_one() {
-        let test = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Test).unwrap();
+    fn testnets_and_regtest_use_coin_type_one() {
+        let testnet3 = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Testnet3).unwrap();
+        let testnet4 = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Testnet4).unwrap();
         let regtest = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
-        // Same path (m/84'/1'/0'), same key material; only the daemon-side network differs.
-        assert_eq!(test.account_xpub, regtest.account_xpub);
-        assert_eq!(test.network, Network::Testnet);
+        // Same path (m/84'/1'/0'), same key material - testnet3 and testnet4 differ only as
+        // chains, never as key derivations; only the daemon-side network differs.
+        assert_eq!(testnet3.account_xpub, regtest.account_xpub);
+        assert_eq!(testnet3.account_xpub, testnet4.account_xpub);
+        assert_eq!(testnet3.network, Network::Testnet);
+        assert_eq!(testnet4.network, Network::Testnet4);
         assert_eq!(regtest.network, Network::Regtest);
     }
 }

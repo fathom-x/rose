@@ -186,17 +186,30 @@ pub fn spawn(config: BtcActorConfig) -> anyhow::Result<BtcWalletHandle> {
             );
     }
     let wallet = match PersistedWallet::load(&mut persister, load).map_err(|e| {
-        // A stored descriptor that disagrees with the seed-derived one is the Bitcoin analog
-        // of `wallet::binding::BindingMismatch`: evidence the wallet database was replaced,
-        // not an ordinary open failure. Type it so the spawn loop can treat it as fatal for
-        // the whole node, exactly as the Zcash binding check is.
-        if let bdk_wallet::LoadWithPersistError::InvalidChangeSet(
-            bdk_wallet::LoadError::Mismatch(mismatch),
-        ) = &e
-        {
-            anyhow::Error::new(BtcBindingMismatch(format!("{mismatch:?}")))
-        } else {
-            anyhow::Error::new(e)
+        match &e {
+            // The database was created for a different Bitcoin network than this daemon
+            // resolves for the wallet - a configuration change (the `btc_testnet` key, or
+            // the daemon's network environment), not tampering. Name the knob and the fix
+            // instead of reporting a binding mismatch.
+            bdk_wallet::LoadWithPersistError::InvalidChangeSet(
+                bdk_wallet::LoadError::Mismatch(bdk_wallet::LoadMismatch::Network {
+                    loaded,
+                    expected,
+                }),
+            ) => anyhow::anyhow!(
+                "bitcoin wallet database was created for {loaded} but this daemon is \
+                 configured for {expected}: restore the previous network settings (the \
+                 top-level btc_testnet key selects between testnet3 and testnet4), or point \
+                 this wallet at a fresh directory for the new network"
+            ),
+            // A stored descriptor that disagrees with the seed-derived one is the Bitcoin
+            // analog of `wallet::binding::BindingMismatch`: evidence the wallet database was
+            // replaced, not an ordinary open failure. Type it so the spawn loop can treat it
+            // as fatal for the whole node, exactly as the Zcash binding check is.
+            bdk_wallet::LoadWithPersistError::InvalidChangeSet(
+                bdk_wallet::LoadError::Mismatch(mismatch),
+            ) => anyhow::Error::new(BtcBindingMismatch(format!("{mismatch:?}"))),
+            _ => anyhow::Error::new(e),
         }
     })? {
         Some(wallet) => wallet,
@@ -371,6 +384,34 @@ mod tests {
             err.downcast_ref::<BtcBindingMismatch>().is_some(),
             "expected BtcBindingMismatch, got: {err:#}"
         );
+    }
+
+    /// A wallet database created for one Bitcoin testnet refuses to load under the other -
+    /// testnet3 and testnet4 derive identical keys, so the recorded network is what tells
+    /// the chains apart - and the error is an actionable configuration message naming the
+    /// `btc_testnet` knob, NOT the binding mismatch (nothing was tampered with).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_the_testnet_over_an_existing_database_is_an_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let testnet3 = BtcActorConfig {
+            network: BitcoinNetwork::Testnet3,
+            ..config(dir.path(), Some(bip84_seed()))
+        };
+        {
+            let handle = spawn(testnet3).unwrap();
+            let address = handle.new_address().await.unwrap();
+            assert!(address.starts_with("tb1"), "{address}");
+        }
+        let testnet4 = BtcActorConfig {
+            network: BitcoinNetwork::Testnet4,
+            ..config(dir.path(), Some(bip84_seed()))
+        };
+        let err = spawn(testnet4).unwrap_err();
+        assert!(
+            err.downcast_ref::<BtcBindingMismatch>().is_none(),
+            "a network flip is configuration, not tampering: {err:#}"
+        );
+        assert!(err.to_string().contains("btc_testnet"), "{err:#}");
     }
 
     /// A missing database with no seed is an error naming init, not a silently empty wallet.

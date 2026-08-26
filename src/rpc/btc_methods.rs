@@ -186,7 +186,7 @@ async fn getaddressinfo(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Va
     if let Some((change, index)) = info.derivation {
         let coin_type = match handle.network {
             BitcoinNetwork::Main => 0,
-            BitcoinNetwork::Test | BitcoinNetwork::Regtest => 1,
+            BitcoinNetwork::Testnet3 | BitcoinNetwork::Testnet4 | BitcoinNetwork::Regtest => 1,
         };
         obj["hdkeypath"] = Value::String(format!(
             "m/84'/{coin_type}'/0'/{}/{index}",

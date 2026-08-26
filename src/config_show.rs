@@ -51,6 +51,15 @@ pub fn render(config: &AppConfig) -> String {
     // Top-level scalars first: in TOML every key after a `[table]` header belongs to that table.
     s.push('\n');
     kv(&mut s, "network", str_val(config.network.name()));
+    // `btc_testnet` renders only where `resolve` accepts it - a testnet daemon, in a build
+    // carrying the bitcoin engine - since emitting it anywhere else would produce a config
+    // `config check` rejects, which the idempotence contract forbids. There it renders
+    // unconditionally (default included): which public Bitcoin testnet the daemon's Bitcoin
+    // wallets ride is exactly the kind of default a cross-version diff should surface.
+    #[cfg(feature = "bitcoin")]
+    if matches!(config.network, crate::network::ZNetwork::Test) {
+        kv(&mut s, "btc_testnet", str_val(config.btc_testnet.name()));
+    }
     kv(&mut s, "datadir", path_val(&config.datadir));
     kv(&mut s, "default_wallet", str_val(&config.default_wallet));
 
@@ -494,6 +503,9 @@ mod tests {
             ),
             dir.path(),
         ));
+        // The effective Bitcoin testnet renders as a top-level key on a testnet daemon,
+        // default included, so the choice of chain is never implicit in the output.
+        assert!(first.contains("btc_testnet = \"testnet3\""), "{first}");
         let btc_section = first
             .split("[wallets.btc]")
             .nth(1)
@@ -519,6 +531,22 @@ mod tests {
         let round_trip = tempfile::tempdir().unwrap();
         let second = render(&resolve_from(&first, round_trip.path()));
         assert_eq!(first, second);
+
+        // A non-default btc_testnet round-trips too: the rendered key is one `resolve`
+        // accepts and reproduces.
+        let testnet4 = render(&resolve_from(
+            &format!(
+                "network = \"test\"\ndatadir = {:?}\nbtc_testnet = \"testnet4\"\n\
+                 [wallets.btc]\ncoin = \"bitcoin\"\n",
+                dir.path()
+            ),
+            dir.path(),
+        ));
+        assert!(
+            testnet4.contains("btc_testnet = \"testnet4\""),
+            "{testnet4}"
+        );
+        assert_eq!(testnet4, render(&resolve_from(&testnet4, dir.path())));
     }
 
     /// Every value the file left unset appears, filled in by this build - the whole point of the

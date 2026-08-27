@@ -1,0 +1,65 @@
+# Development-only Bitcoin Core **testnet3** node, for testing zecd's BDK engine (the
+# off-by-default `bitcoin` cargo feature) with real - valueless - testnet3 coins.
+#
+# The public-testnet sibling of docker-compose.btc-regtest.yml (same image pin, same
+# credential shape; see docker-compose.btc-testnet4.yml for the newer BIP-94 testnet,
+# which is much smaller to sync - testnet3's chain state runs tens of GB where testnet4
+# is a few). Not part of the self-hosted deployment example (docker-compose.yml) and not
+# used by the regtest harness. Unlike regtest there is nothing to mine: the node syncs
+# the public testnet3 chain and you fund the wallet from a testnet3 faucet.
+#
+# The node serves:
+#   - JSON-RPC on 18332 (bitcoind's testnet3 default - exactly where a testnet3 zecd's
+#     bare `server = "bitcoind"` token resolves to)
+#   - compact block filters over P2P on 18333 (-blockfilterindex + -peerblockfilters,
+#     what the planned kyoto/bip157-backed light mode will peer with)
+#   - -txindex, so getrawtransaction answers for any confirmed tx
+#
+# The image is pinned to Bitcoin Core 30.2, in lockstep with the regtest stack and the CI
+# `btc-e2e` job (provenance: deploy/bitcoin-core/README.md). Keep the pins together when
+# bumping.
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.btc-testnet3.yml up -d
+#   alias bcli3='docker compose -f deploy/docker-compose.btc-testnet3.yml exec bitcoind \
+#       bitcoin-cli -testnet -rpcuser=btc -rpcpassword=btc'
+#   bcli3 getblockchaininfo     # wait for initialblockdownload: false
+#
+# and point a `--features bitcoin` zecd at it:
+#   network = "test"
+#   btc_testnet = "testnet3"    # the default - the line just makes the choice explicit
+#   [wallets.btc]
+#   coin = "bitcoin"            # server defaults to "bitcoind" = 127.0.0.1:18332
+#   [bitcoind]
+#   rpc_user = "btc"
+#   rpc_password = "btc"
+#
+# zecd keeps its own keys (keys.toml) and does all wallet tracking itself - the node
+# needs no bitcoind wallet. Credentials are fixed dev values: testnet coins are valueless
+# and the RPC port is published on loopback only. Do not reuse this file's shape for
+# mainnet.
+
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:30.2
+    restart: unless-stopped
+    command:
+      - -testnet
+      - -printtoconsole
+      - -server=1
+      - -rpcbind=0.0.0.0:18332
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=btc
+      - -rpcpassword=btc
+      - -txindex=1
+      - -blockfilterindex=1
+      - -peerblockfilters=1
+      - -listen=1
+    ports:
+      - "127.0.0.1:18332:18332" # JSON-RPC
+      - "127.0.0.1:18333:18333" # P2P, for a future BIP-157 light client on the host
+    volumes:
+      - bitcoind-testnet3-data:/home/bitcoin/.bitcoin
+
+volumes:
+  bitcoind-testnet3-data:

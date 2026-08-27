@@ -2,7 +2,8 @@
 
 The pinned Bitcoin Core release that the BDK engine's tooling runs against - the CI
 `btc-e2e` job (`.github/workflows/regtest.yml`) and the manual regtest stack
-(`../docker-compose.btc-regtest.yml`). Two files, both copied verbatim from
+(`../docker-compose.btc-regtest.yml`, plus its public-testnet siblings
+`../docker-compose.btc-testnet{3,4}.yml`). Two files, both copied verbatim from
 `https://bitcoincore.org/bin/bitcoin-core-30.2/` and independently verified before commit:
 
 - `SHA256SUMS` - the release's checksum manifest, covering every 30.2 artifact (the CI
@@ -30,4 +31,4 @@ Bumping the pinned version = replacing both files and re-running the same two ch
 download the new `SHA256SUMS` + `SHA256SUMS.ots`, cross-check against `guix.sigs/<ver>/`
 (`grep <tarball> */all.SHA256SUMS | sort | uniq -c` - expect a broad builder consensus),
 `ots upgrade SHA256SUMS.ots`, verify, commit. Update the version in the CI job and the
-compose file in the same change.
+compose files in the same change.

@@ -182,9 +182,14 @@ pub async fn probe(config: &AppConfig, server_override: Option<&str>) -> anyhow:
         chain_name: info.chain_name.clone(),
         tip_height,
         tip_hash,
+        // `chain-info` dials the Zcash upstream and has no wallet context, so the margin is
+        // the global override or the Zcash default.
         suggested_birthday: crate::init::fresh_wallet_birthday(
             tip_height,
-            config.keys.fresh_wallet_birthday_margin,
+            config
+                .keys
+                .fresh_wallet_birthday_margin
+                .unwrap_or(crate::init::FRESH_WALLET_BIRTHDAY_MARGIN),
         ),
         tip_branch_id: info.tip_branch_id,
         unsupported_upgrades: crate::chain::unsupported_upgrades(&info),

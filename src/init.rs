@@ -28,26 +28,276 @@ use crate::wallet::keys;
 use crate::wallet::open;
 use crate::wallet::store::{Passphrase, WalletStore};
 
-/// How far below the chain tip a *freshly generated* wallet's birthday is placed.
+/// How far below the chain tip a *freshly generated* **Zcash** wallet's birthday is placed.
 ///
 /// A new wallet has no history, so the tip itself would do - the margin absorbs a short reorg
 /// between reading the tip and recording the birthday, which would otherwise strand the wallet
-/// anchored to a block that no longer exists. Six blocks is generous against observed reorg
-/// depths (Bitcoin's deepest reorg in 2026 was 2 blocks; Zcash's are similarly shallow), and
-/// costs six blocks of scan on either chain. This is the default for
-/// `[keys] fresh_wallet_birthday_margin`, the config override for operators with their own
-/// reorg model.
-pub const FRESH_WALLET_BIRTHDAY_MARGIN: u32 = 6;
+/// anchored to a block that no longer exists. 100 blocks is ~2 hours at Zcash's 75-second
+/// spacing, far beyond observed reorg depths, and costs nothing meaningful to scan. The
+/// margin defaults per coin ([`default_fresh_wallet_birthday_margin`]) precisely because a
+/// block count spans ~10x more wall-clock time on Bitcoin; the config overrides
+/// (`[keys]`/`[wallets.<name>] fresh_wallet_birthday_margin`) exist for operators with their
+/// own reorg model.
+pub const FRESH_WALLET_BIRTHDAY_MARGIN: u32 = 100;
+
+/// The [`FRESH_WALLET_BIRTHDAY_MARGIN`] analog for a **Bitcoin** wallet: ~1 hour at 10-minute
+/// spacing, still generous against observed depths (Bitcoin's deepest reorg in 2026 was
+/// 2 blocks).
+#[cfg(feature = "bitcoin")]
+pub const BTC_FRESH_WALLET_BIRTHDAY_MARGIN: u32 = 6;
+
+/// The built-in birthday margin for a coin, when neither the wallet's
+/// `fresh_wallet_birthday_margin` nor the global `[keys]` one is set.
+pub fn default_fresh_wallet_birthday_margin(coin: crate::coin::Coin) -> u32 {
+    match coin {
+        crate::coin::Coin::Zcash => FRESH_WALLET_BIRTHDAY_MARGIN,
+        #[cfg(feature = "bitcoin")]
+        crate::coin::Coin::Bitcoin => BTC_FRESH_WALLET_BIRTHDAY_MARGIN,
+    }
+}
 
 /// The birthday `init` records for a freshly generated wallet at a given chain tip, `margin`
-/// blocks below it (`margin` comes from `[keys] fresh_wallet_birthday_margin`, default
-/// [`FRESH_WALLET_BIRTHDAY_MARGIN`]).
+/// blocks below it (`margin` is the wallet's resolved `fresh_wallet_birthday_margin`).
 ///
 /// Exposed so a caller that needs the height *before* creating the wallet - pinning a birthday
 /// alongside a seed it generated itself, say - gets the number `init` would actually use rather
 /// than re-deriving the policy. [`crate::chain_probe`] reports it for exactly that reason.
 pub fn fresh_wallet_birthday(chain_tip: u32, margin: u32) -> u32 {
     chain_tip.saturating_sub(margin)
+}
+
+/// A wallet birthday as the operator states it: an exact block height, or a calendar date
+/// (UTC) that `init` resolves to a height with a comfortable safety margin.
+///
+/// Dates exist because a height is the wrong unit to ask a human for: nobody remembers the
+/// height their wallet was created at, everyone can say "sometime in July" - and a height is
+/// per-network where a date means the right thing on every chain. Approximate is fine by
+/// construction: a birthday resolved *early* merely scans more, while funds can never
+/// predate the wallet, so every resolution path here errs low (see
+/// [`BIRTHDAY_DATE_MARGIN_SECS`]). The resolved height is what gets persisted; nothing
+/// downstream sees a date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Birthday {
+    Height(u32),
+    /// Unix seconds at the date's UTC midnight.
+    Date(u64),
+}
+
+impl From<u32> for Birthday {
+    fn from(height: u32) -> Self {
+        Birthday::Height(height)
+    }
+}
+
+impl Birthday {
+    /// Parse a CLI birthday: all-digits is a height, `YYYY-MM-DD` a UTC date. The `String`
+    /// error type is what clap's `value_parser` wants.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        if s.chars().all(|c| c.is_ascii_digit()) {
+            return s
+                .parse::<u32>()
+                .map(Birthday::Height)
+                .map_err(|_| format!("'{s}' is not a valid block height"));
+        }
+        let mut parts = s.splitn(3, '-');
+        let (y, m, d) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(y), Some(m), Some(d)) => (y, m, d),
+            _ => {
+                return Err(format!(
+                    "'{s}' is neither a block height nor a YYYY-MM-DD date"
+                ))
+            }
+        };
+        let bad = || format!("'{s}' is not a valid YYYY-MM-DD date");
+        let year: i64 = y.parse().map_err(|_| bad())?;
+        let month: u32 = m.parse().map_err(|_| bad())?;
+        let day: u32 = d.parse().map_err(|_| bad())?;
+        if !(2009..=9999).contains(&year) || !(1..=12).contains(&month) {
+            return Err(bad());
+        }
+        if day == 0 || day > days_in_month(year, month) {
+            return Err(bad());
+        }
+        let days = days_from_civil(year, i64::from(month), i64::from(day));
+        let midnight = u64::try_from(days).map_err(|_| bad())? * 86_400;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX);
+        if midnight > now {
+            return Err(format!("birthday date '{s}' is in the future"));
+        }
+        Ok(Birthday::Date(midnight))
+    }
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        _ => 28,
+    }
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's `days_from_civil` algorithm),
+/// so date parsing needs no calendar dependency.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The comfortable margin a date-given birthday is backed off by before it becomes a
+/// height: one full day. The date's UTC midnight already precedes the wallet's actual
+/// creation moment by up to a day, header timestamps skew by at most ~2 hours, and a day
+/// of extra scan is cheap on every chain - so the resolved height provably cannot postdate
+/// the wallet's first possible transaction.
+const BIRTHDAY_DATE_MARGIN_SECS: u64 = 24 * 60 * 60;
+
+/// The pure state of the date->height search over block times, driven by
+/// [`height_for_time`] and [`zcash_height_for_date`] so the algorithm exists once (an
+/// `async` probe cannot ride the sync driver's closure).
+///
+/// Probes are *interpolated*, not bisected: the bracket's two endpoints imply the chain's
+/// own average block time over that span, and the target's offset into the bracket divided
+/// by that spacing lands within a few blocks on a steadily-mined chain - single-digit
+/// probes where bisection alone takes ~log2(tip) (~22 on Bitcoin mainnet, more on
+/// testnet3). The average is derived per bracket from the observed times, so it self-tunes
+/// to any network and to hashrate drift within one, with no hardcoded spacing constants.
+/// Every other probe falls back to plain bisection, bounding pathological timestamp
+/// distributions at ~2 log2(tip) instead of O(tip).
+///
+/// Invariant between observations: `time(lo) <= target < time(hi)`, so [`answer`] is `lo`
+/// once the bracket closes. Block header times jitter by ~2 hours rather than being
+/// strictly monotonic; callers pass a target already backed off by
+/// [`BIRTHDAY_DATE_MARGIN_SECS`], which dwarfs it. A target before the chain's first block
+/// resolves to height 1 (scan everything; never height 0 - genesis is unrequestable on the
+/// Zcash side).
+///
+/// [`answer`]: HeightSearch::answer
+struct HeightSearch {
+    lo: u32,
+    hi: u32,
+    t_lo: Option<u64>,
+    t_hi: Option<u64>,
+    target: u64,
+    bisect: bool,
+    done: bool,
+}
+
+impl HeightSearch {
+    fn new(tip: u32, target: u64) -> Self {
+        Self {
+            lo: 1,
+            hi: tip.max(1),
+            t_lo: None,
+            t_hi: None,
+            target,
+            bisect: false,
+            done: false,
+        }
+    }
+
+    /// The next height to fetch a block time for, or `None` once [`Self::answer`] is
+    /// ready: the bracket's two endpoints first, then interpolated probes.
+    fn next_probe(&self) -> Option<u32> {
+        if self.done {
+            return None;
+        }
+        let (t_lo, t_hi) = match (self.t_lo, self.t_hi) {
+            (None, _) => return Some(self.lo),
+            (_, None) => return Some(self.hi),
+            (Some(t_lo), Some(t_hi)) => (t_lo, t_hi),
+        };
+        if self.hi - self.lo <= 1 {
+            return None;
+        }
+        let span = self.hi - self.lo;
+        // `t_hi > t_lo` holds by the bracket invariant; the guard is belt-and-braces
+        // against a division by zero ever costing correctness.
+        let guess = if self.bisect || t_hi <= t_lo {
+            self.lo + span / 2
+        } else {
+            // (t_hi - t_lo) / span is the bracket's average seconds-per-block; the
+            // target's offset from t_lo divided by it is the interpolated distance.
+            let num = u128::from(self.target - t_lo) * u128::from(span);
+            let den = u128::from(t_hi - t_lo);
+            self.lo + u32::try_from(num / den).unwrap_or(span)
+        };
+        // Strictly inside the bracket, so every probe shrinks it.
+        Some(guess.clamp(self.lo + 1, self.hi - 1))
+    }
+
+    /// Feed back the block time at the height [`Self::next_probe`] named.
+    fn observe(&mut self, height: u32, time: u64) {
+        if self.t_lo.is_none() {
+            self.t_lo = Some(time);
+            // A target before the chain's first block: height 1 is the answer (scan
+            // everything). A one-block chain is likewise already answered.
+            if time > self.target || self.hi == self.lo {
+                self.done = true;
+            }
+            return;
+        }
+        if self.t_hi.is_none() {
+            self.t_hi = Some(time);
+            // The whole chain sits at or before the target: the tip is the answer.
+            if time <= self.target {
+                self.lo = self.hi;
+                self.done = true;
+            }
+            return;
+        }
+        self.bisect = !self.bisect;
+        if time <= self.target {
+            self.lo = height;
+            self.t_lo = Some(time);
+        } else {
+            self.hi = height;
+            self.t_hi = Some(time);
+        }
+    }
+
+    /// The highest height whose observed time is at or below the target.
+    fn answer(&self) -> u32 {
+        self.lo
+    }
+}
+
+/// [`HeightSearch`] driven by a blocking probe (the bitcoind path); one upstream call per
+/// probe.
+fn height_for_time(
+    mut time_at: impl FnMut(u32) -> anyhow::Result<u64>,
+    tip: u32,
+    target: u64,
+) -> anyhow::Result<u32> {
+    let mut search = HeightSearch::new(tip, target);
+    while let Some(height) = search.next_probe() {
+        let time = time_at(height)?;
+        search.observe(height, time);
+    }
+    Ok(search.answer())
+}
+
+/// [`HeightSearch`] driven against the Zcash upstream: the block time at each probed
+/// height comes from the tree state, one unary call both backends serve.
+async fn zcash_height_for_date(
+    client: &mut crate::chain::AnySource,
+    chain_tip: u32,
+    date: u64,
+) -> anyhow::Result<u32> {
+    let target = date.saturating_sub(BIRTHDAY_DATE_MARGIN_SECS);
+    let mut search = HeightSearch::new(chain_tip, target);
+    while let Some(height) = search.next_probe() {
+        let state = client.tree_state(BlockHeight::from(height)).await?;
+        search.observe(height, u64::from(state.time));
+    }
+    Ok(search.answer())
 }
 
 /// The default account birthday when `--birthday` is omitted for a restore/import: the
@@ -158,7 +408,10 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
                 .pools
                 .transparent_allow_beyond_recovery_window,
             transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
-            fresh_wallet_birthday_margin: config.keys.fresh_wallet_birthday_margin,
+            fresh_wallet_birthday_margin: config
+                .keys
+                .fresh_wallet_birthday_margin
+                .unwrap_or(FRESH_WALLET_BIRTHDAY_MARGIN),
         })
 }
 
@@ -208,9 +461,11 @@ pub struct InitOptions {
     pub wallet: String,
     pub key: InitKey,
     pub encryption: EncryptionInput,
-    /// Birthday height; defaults to near-tip for a fresh wallet and to the earliest enabled
-    /// pool's activation for a restore/import (safe but slow - see the CLI's warning).
-    pub birthday: Option<u32>,
+    /// Birthday, as a height or a UTC date ([`Birthday`]); defaults to near-tip for a fresh
+    /// wallet and to the earliest enabled pool's activation for a restore/import (safe but
+    /// slow - see the CLI's warning). A date is resolved to a height here and never
+    /// persisted as a date; refused on regtest, whose block timestamps mean nothing.
+    pub birthday: Option<Birthday>,
 }
 
 /// What [`init_wallet`] created - everything the CLI prints, as data.
@@ -273,6 +528,11 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
         outcome.wallet,
         outcome.wallet_dir.display()
     );
+    // A date input resolved to a height the operator never typed; show them the number
+    // that was actually recorded.
+    if matches!(args.birthday, Some(Birthday::Date(_))) {
+        eprintln!("birthday height: {}", outcome.birthday);
+    }
     if outcome.watch_only {
         eprintln!(
             "Watch-only wallet (imported UFVK): balances, history, and addresses are \
@@ -470,8 +730,23 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     // pool's activation (Orchard/NU5 for the Orchard-only default) - never missing a note, at
     // the cost of a long initial sync we warn about.
     let key_may_have_history = restore || ufvk.is_some();
-    let birthday_height = BlockHeight::from(birthday_opt.unwrap_or_else(|| {
-        if key_may_have_history {
+    let birthday_height = BlockHeight::from(match birthday_opt {
+        Some(Birthday::Height(height)) => height,
+        Some(Birthday::Date(date)) => {
+            if network.is_regtest() {
+                bail!(
+                    "--birthday takes a date only on public networks: regtest block \
+                     timestamps are not meaningful. Pass --birthday <height> instead."
+                );
+            }
+            let height = zcash_height_for_date(&mut client, chain_tip, date).await?;
+            tracing::info!(
+                "resolved the --birthday date to height {height} (~1 day before the \
+                 date's midnight UTC, so the wallet cannot miss funds)"
+            );
+            height
+        }
+        None if key_may_have_history => {
             let (height, label) = restore_birthday_default(network, &enabled_pools);
             warn!(
                 "no --birthday given; scanning from {label} activation (height {height}) - a \
@@ -479,10 +754,9 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
                  wallet's first transaction to speed up the initial sync."
             );
             height
-        } else {
-            fresh_wallet_birthday(chain_tip, birthday_margin)
         }
-    }));
+        None => fresh_wallet_birthday(chain_tip, birthday_margin),
+    });
     // Anchors on the tree state of the block before the birthday (which leaks the birthday to
     // the server). Shared with `chain_probe::account_birthday`, which is how an embedder pins a
     // birthday before the wallet exists - one code path, so the two cannot diverge.
@@ -586,6 +860,82 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     })
 }
 
+/// Resolve a date birthday for a Bitcoin wallet, erring low in both shapes:
+///  * a bitcoind upstream answers exactly - binary-search the node's headers for the last
+///    block at or before the date minus the one-day margin ([`height_for_time`]); an
+///    unreachable node is a clean refusal naming `--birthday <height>` as the offline
+///    escape hatch, like the fresh-wallet dial.
+///  * kyoto stays offline, as everywhere in `init`: a date at or after the shipped scan
+///    floor's own date maps to the floor height, which serves *exactly* as well as the
+///    true height (the first scan starts at the floor for any birthday at or above it -
+///    see `btc::kyoto`); an earlier date has no offline reference and falls back to the
+///    BIP 84 history floor, slow but never wrong.
+///
+/// Regtest is refused like the Zcash side: its block timestamps mean nothing.
+#[cfg(feature = "bitcoin")]
+async fn bitcoin_height_for_date(
+    config: &AppConfig,
+    entry: &crate::config::WalletEntry,
+    btc_network: crate::coin::BitcoinNetwork,
+    date: u64,
+) -> anyhow::Result<u32> {
+    if btc_network == crate::coin::BitcoinNetwork::Regtest {
+        bail!(
+            "--birthday takes a date only on public networks: regtest block timestamps \
+             are not meaningful. Pass --birthday <height> instead."
+        );
+    }
+    let endpoint = crate::btc::chain::resolve_for_wallet(config, entry)?;
+    let described = endpoint.describe();
+    match endpoint {
+        crate::btc::chain::BtcEndpoint::Bitcoind(endpoint) => {
+            let target = date.saturating_sub(BIRTHDAY_DATE_MARGIN_SECS);
+            let height = tokio::task::spawn_blocking(move || -> anyhow::Result<u32> {
+                let rpc = endpoint.connect_blocking()?;
+                let tip = u32::try_from(rpc.tip_at_connect).unwrap_or(u32::MAX);
+                height_for_time(|h| rpc.block_time_blocking(h), tip, target)
+            })
+            .await
+            .context("bitcoind dial task")?
+            .with_context(|| {
+                format!(
+                    "dialing {described} to resolve the --birthday date failed. Start the \
+                     node (or point `server`/[bitcoind] at it), or pass --birthday <height> \
+                     to initialize offline"
+                )
+            })?;
+            tracing::info!(
+                "resolved the --birthday date to height {height} (~1 day before the date's \
+                 midnight UTC, so the wallet cannot miss funds)"
+            );
+            Ok(height)
+        }
+        crate::btc::chain::BtcEndpoint::Kyoto(_) => {
+            match crate::btc::kyoto::birthday_height_for_date(btc_network, date) {
+                Some(height) => {
+                    tracing::info!(
+                        "resolved the --birthday date to height {height}, this build's \
+                         shipped scan floor - the height a kyoto first scan starts at for \
+                         any birthday above it, so no precision is lost and the resolution \
+                         stays offline"
+                    );
+                    Ok(height)
+                }
+                None => {
+                    let height = bip84_history_floor(btc_network);
+                    warn!(
+                        "the --birthday date predates this build's shipped scan floor, and \
+                         kyoto resolves dates offline against that floor alone; recording \
+                         the BIP 84 history floor (height {height}) instead - a full \
+                         history scan. Pass --birthday <height> for a faster first sync."
+                    );
+                    Ok(height)
+                }
+            }
+        }
+    }
+}
+
 /// The Bitcoin half of [`init_wallet`]: same refusals (already-initialized, one spending
 /// wallet per coin), same custody models, no upstream. The engine has no chain source yet,
 /// so the recorded birthday is `--birthday` or 0 (scan from genesis when sync lands) rather
@@ -598,7 +948,7 @@ async fn init_bitcoin_wallet(
     wallet: String,
     key: InitKey,
     encryption: EncryptionInput,
-    birthday_opt: Option<u32>,
+    birthday_opt: Option<Birthday>,
 ) -> anyhow::Result<InitOutcome> {
     let keys_path = entry.keys_path();
     let engine_dir = entry.engine_dir();
@@ -648,8 +998,11 @@ async fn init_bitcoin_wallet(
 
     // Resolve the birthday before anything is written, so a failed dial is a clean refusal
     // (the same before-any-write doctrine as the Zcash path, which likewise dials its
-    // upstream once at init). Three cases:
-    //  * --birthday given: honored verbatim; the init stays fully offline.
+    // upstream once at init). Four cases:
+    //  * --birthday height: honored verbatim; the init stays fully offline.
+    //  * --birthday date: resolved to a height erring low (`bitcoin_height_for_date`) -
+    //    exactly via a bitcoind upstream's headers, offline via the shipped scan floor on
+    //    kyoto.
     //  * restore: the seed may hold history from any point in its past, so scan everything
     //    it could possibly own - from SegWit activation, the first block a BIP 84 (bech32)
     //    output can exist in. Warned, like the Zcash restore default.
@@ -657,7 +1010,10 @@ async fn init_bitcoin_wallet(
     //    (`fresh_wallet_birthday`, shared with the Zcash path). The one case that needs the
     //    upstream - and the dial also verifies the node serves the wallet's chain.
     let birthday = match birthday_opt {
-        Some(height) => BlockHeight::from(height),
+        Some(Birthday::Height(height)) => BlockHeight::from(height),
+        Some(Birthday::Date(date)) => {
+            BlockHeight::from(bitcoin_height_for_date(config, &entry, btc_network, date).await?)
+        }
         None if restore => {
             let height = bip84_history_floor(btc_network);
             warn!(
@@ -670,20 +1026,41 @@ async fn init_bitcoin_wallet(
         None => {
             let endpoint = crate::btc::chain::resolve_for_wallet(config, &entry)?;
             let described = endpoint.describe();
-            // The client is blocking (`bitcoincore-rpc`); `spawn_blocking` rather than the
-            // actor's `block_in_place` so a current-thread embedder can call `init_wallet`.
-            let rpc = tokio::task::spawn_blocking(move || endpoint.connect_blocking())
-                .await
-                .context("bitcoind dial task")?
-                .with_context(|| {
-                    format!(
-                        "dialing {described} to anchor the new wallet's birthday failed. \
-                         Start the node (or point `server`/[bitcoind] at it), or pass \
-                         --birthday <height> to initialize offline"
-                    )
-                })?;
-            let tip = u32::try_from(rpc.tip_at_connect).unwrap_or(u32::MAX);
-            BlockHeight::from(fresh_wallet_birthday(tip, birthday_margin))
+            match endpoint {
+                crate::btc::chain::BtcEndpoint::Bitcoind(endpoint) => {
+                    // The client is blocking (`bitcoincore-rpc`); `spawn_blocking` rather than
+                    // the actor's `block_in_place` so a current-thread embedder can call
+                    // `init_wallet`.
+                    let rpc = tokio::task::spawn_blocking(move || endpoint.connect_blocking())
+                        .await
+                        .context("bitcoind dial task")?
+                        .with_context(|| {
+                            format!(
+                                "dialing {described} to anchor the new wallet's birthday \
+                                 failed. Start the node (or point `server`/[bitcoind] at it), \
+                                 or pass --birthday <height> to initialize offline"
+                            )
+                        })?;
+                    let tip = u32::try_from(rpc.tip_at_connect).unwrap_or(u32::MAX);
+                    BlockHeight::from(fresh_wallet_birthday(tip, birthday_margin))
+                }
+                // Kyoto has a `chain_tip()`, but reaching it means starting a P2P node,
+                // discovering peers and syncing headers - seconds to minutes on a cold data
+                // directory, inside a command that is otherwise instant and fully offline.
+                // Rather than hide that behind `init`, refuse and name the flag, the same
+                // shape as the unreachable-bitcoind refusal above.
+                crate::btc::chain::BtcEndpoint::Kyoto(_) => {
+                    anyhow::bail!(
+                        "a kyoto wallet cannot anchor its own birthday at init: reading the \
+                         chain tip over BIP-157 means starting a P2P node and syncing block \
+                         headers first, which `init` will not do behind your back. Pass \
+                         --birthday <YYYY-MM-DD> (today's date is the right answer for a \
+                         new wallet; resolved offline) or --birthday <height>, or \
+                         initialize against a bitcoind `server` and switch this wallet to \
+                         kyoto afterwards."
+                    );
+                }
+            }
         }
     };
 
@@ -1319,13 +1696,157 @@ mod tests {
                 wallet: "btc".to_string(),
                 key: InitKey::Generate,
                 encryption: EncryptionInput::AgeIdentity,
-                birthday: Some(12_345),
+                birthday: Some(Birthday::Height(12_345)),
             },
         )
         .await
         .unwrap();
         assert_eq!(outcome.birthday, 12_345);
         assert!(outcome.generated_mnemonic.is_some());
+    }
+
+    #[test]
+    fn birthday_parses_heights_and_dates() {
+        assert_eq!(Birthday::parse("12345"), Ok(Birthday::Height(12_345)));
+        assert_eq!(Birthday::parse("0"), Ok(Birthday::Height(0)));
+        // 2026-07-28T00:00:00Z - the mainnet scan floor's own date, cross-checked with
+        // `date -ud 2026-07-28 +%s`.
+        assert_eq!(
+            Birthday::parse("2026-07-28"),
+            Ok(Birthday::Date(1_785_196_800))
+        );
+        // A leap day parses (and 2023's non-leap February rejects it below).
+        assert_eq!(
+            Birthday::parse("2024-02-29"),
+            Ok(Birthday::Date(1_709_164_800))
+        );
+        for bad in [
+            "2026-02-30",
+            "2023-02-29",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-7",
+            "yesterday",
+            "99999999999",
+            "2008-12-31",
+            "9999-01-01",
+            "",
+        ] {
+            assert!(Birthday::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn height_for_time_finds_the_last_block_at_or_before_target() {
+        // A synthetic chain: block h mined at 600h.
+        let time_at = |h: u32| Ok(u64::from(h) * 600);
+        assert_eq!(height_for_time(time_at, 1_000, 600 * 500).unwrap(), 500);
+        // Between blocks: rounds down.
+        assert_eq!(
+            height_for_time(time_at, 1_000, 600 * 500 + 599).unwrap(),
+            500
+        );
+        // A target before the chain resolves to height 1, never 0 (genesis is
+        // unrequestable on the Zcash side); one after the tip resolves to the tip.
+        assert_eq!(height_for_time(time_at, 1_000, 0).unwrap(), 1);
+        assert_eq!(height_for_time(time_at, 1_000, u64::MAX).unwrap(), 1_000);
+        // Header-time jitter (~2h, here on every 7th block) cannot push the result past
+        // the true boundary, and the full-day margin callers back the target off by
+        // dwarfs the undershoot it can cause.
+        let jitter = |h: u32| {
+            let base = u64::from(h) * 600;
+            Ok(if h.is_multiple_of(7) {
+                base + 7_200
+            } else {
+                base
+            })
+        };
+        let resolved = height_for_time(jitter, 1_000, 600 * 656).unwrap();
+        assert!((600..=656).contains(&resolved), "{resolved}");
+    }
+
+    #[test]
+    fn height_probes_stay_few_on_a_steadily_mined_chain() {
+        use std::cell::Cell;
+        let probes = Cell::new(0u32);
+        let time_at = |h: u32| {
+            probes.set(probes.get() + 1);
+            Ok(u64::from(h) * 600)
+        };
+        assert_eq!(
+            height_for_time(time_at, 1_000_000, 600 * 777_777 + 42).unwrap(),
+            777_777
+        );
+        // The point of interpolating: the endpoints imply the chain's average block time,
+        // so the search lands in single-digit probes where bisection alone takes ~20.
+        assert!(probes.get() <= 8, "{} probes", probes.get());
+    }
+
+    #[test]
+    fn height_probe_count_stays_logarithmic_on_pathological_timestamps() {
+        use std::cell::Cell;
+        // Quadratic times (early blocks nearly simultaneous, late ones sparse) drag every
+        // interpolated guess toward one end; the alternated bisection keeps the probe
+        // count ~2 log2(tip) rather than O(tip).
+        let probes = Cell::new(0u32);
+        let time_at = |h: u32| {
+            probes.set(probes.get() + 1);
+            Ok(u64::from(h) * u64::from(h))
+        };
+        let target = 250_000u64 * 250_000;
+        assert_eq!(
+            height_for_time(time_at, 1_000_000, target).unwrap(),
+            250_000
+        );
+        assert!(probes.get() <= 50, "{} probes", probes.get());
+    }
+
+    /// A kyoto wallet with a *date* birthday initializes fully offline: the date resolves
+    /// against the shipped scan floor (or the BIP 84 history floor when it predates it),
+    /// starting no P2P node and dialing nothing.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_kyoto_init_with_a_date_birthday_is_offline() {
+        use crate::coin::BitcoinNetwork;
+        // Well after the testnet3 floor's own date (2026-08-16), so the floor height serves.
+        let recent = 1_787_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), "kyoto", "");
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Date(recent)),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Some(outcome.birthday),
+            crate::btc::kyoto::birthday_height_for_date(BitcoinNetwork::Testnet3, recent)
+        );
+
+        // A date from 2020 predates the floor: no offline reference, so the BIP 84
+        // history floor is recorded - slow, never wrong.
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), "kyoto", "");
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Date(1_600_000_000)),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.birthday,
+            bip84_history_floor(BitcoinNetwork::Testnet3)
+        );
     }
 
     /// A generated wallet with no `--birthday` needs the node: the failed dial is an
@@ -1455,7 +1976,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(outcome.birthday, 50_000 - FRESH_WALLET_BIRTHDAY_MARGIN);
+        // The wallet's coin default: BTC_FRESH_WALLET_BIRTHDAY_MARGIN, not the Zcash 100.
+        assert_eq!(
+            config.wallets["btc"].fresh_wallet_birthday_margin,
+            BTC_FRESH_WALLET_BIRTHDAY_MARGIN
+        );
+        assert_eq!(outcome.birthday, 50_000 - BTC_FRESH_WALLET_BIRTHDAY_MARGIN);
         assert!(outcome.generated_mnemonic.is_some());
     }
 
@@ -1499,7 +2025,7 @@ mod tests {
             &format!("bitcoind://{addr}"),
             "fresh_wallet_birthday_margin = 2\n[keys]\nfresh_wallet_birthday_margin = 4\n",
         );
-        assert_eq!(config.keys.fresh_wallet_birthday_margin, 4);
+        assert_eq!(config.keys.fresh_wallet_birthday_margin, Some(4));
         let outcome = init_wallet(
             &config,
             InitOptions {

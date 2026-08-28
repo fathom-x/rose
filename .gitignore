@@ -14,6 +14,11 @@ keys.toml
 .cookie
 identity.txt
 zecd.toml
+# Compose reads deploy/.env automatically, and the mainnet stack sources its bitcoind
+# rpcauth line from there - so an operator following that file's instructions creates a
+# credential-bearing file here. Ignored in the tracked .gitignore (not just a local
+# .git/info/exclude) so it is ignored in every clone, not only the one it was written in.
+deploy/.env
 # ...but the docker-stack template is intentional (a checked-in example, no real secrets).
 !/deploy/zecd.toml
 __pycache__/

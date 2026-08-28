@@ -242,13 +242,14 @@ auto_unlock = true
 # seed and aren't covered - recreate them with `zecd init --ufvk`.)
 bootstrap_from_keys = true
 # How many blocks below the chain tip `zecd init` anchors a freshly generated wallet's
-# birthday. This is the GLOBAL default (both engines); any [wallets.<name>] section can
-# override it per wallet - the same block count spans ~10x more wall-clock time on Bitcoin
-# than on Zcash, which is what a per-wallet value is for. The margin only absorbs a reorg
-# between reading the tip and recording the birthday; the default is already generous
-# against observed reorg depths, so leave this alone unless you have your own reorg model.
-# Restores and an explicit `--birthday` are unaffected.
-# fresh_wallet_birthday_margin = 6
+# birthday. Unset (the default), each wallet uses its coin's built-in margin - 100 for
+# Zcash, 6 for Bitcoin, roughly the same wall-clock cover at each chain's block spacing.
+# Setting this applies ONE global number to every wallet; any [wallets.<name>] section can
+# override it per wallet. The margin only absorbs a reorg between reading the tip and
+# recording the birthday, and the defaults are already generous against observed reorg
+# depths, so leave this alone unless you have your own reorg model. Restores and an
+# explicit `--birthday` are unaffected.
+# fresh_wallet_birthday_margin = 100
 #
 # Permit more than one loaded wallet to hold spending keys. LIBRARY CONSUMERS ONLY: the zecd
 # daemon REFUSES TO START with this set, and `zecd config check` reports it as an error.

@@ -178,7 +178,7 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
     if let Some(token) = &config.bitcoind.server {
         let btc_network =
             crate::coin::BitcoinNetwork::from_environment(config.network, config.btc_testnet);
-        if let Err(e) = crate::btc::chain::resolve(token, btc_network) {
+        if let Err(e) = crate::btc::chain::describe_token(token, btc_network) {
             findings.push(Finding::error(format!("[bitcoind] server: {e:#}")));
         }
     }

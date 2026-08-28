@@ -563,7 +563,7 @@ jobs:
       - name: Build zecd with the bitcoin engine
         run: cargo build --locked --features bitcoin --bin zecd
 
-      - name: Run the bitcoind e2e
+      - name: Run the bitcoind and kyoto e2es
         working-directory: regtest-harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/debug/zecd
@@ -572,4 +572,8 @@ jobs:
           # the harness unexpanded.
           export BITCOIND_BIN="$HOME/bitcoin-core/bin/bitcoind"
           "$BITCOIND_BIN" --version | head -1
-          cargo test --locked --test regtest_btc -- --nocapture
+          # Both chain-source dialects against the same pinned Core: the bitcoind JSON-RPC
+          # backend, then the kyoto BIP-157 light client (which needs the node's
+          # -blockfilterindex/-peerblockfilters, flags the test passes itself). cargo runs
+          # the two binaries sequentially; each brings up its own isolated stack.
+          cargo test --locked --test regtest_btc --test regtest_btc_kyoto -- --nocapture

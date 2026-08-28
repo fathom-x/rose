@@ -138,13 +138,8 @@ pub fn render(config: &AppConfig) -> String {
         let btc_network =
             crate::coin::BitcoinNetwork::from_environment(config.network, config.btc_testnet);
         let token = config.bitcoind.server.as_deref().unwrap_or("bitcoind");
-        match crate::btc::chain::resolve(token, btc_network) {
-            Ok((host, port)) => kv_note(
-                &mut s,
-                "server",
-                str_val(token),
-                &format!("bitcoind {host}:{port}"),
-            ),
+        match crate::btc::chain::describe_token(token, btc_network) {
+            Ok(described) => kv_note(&mut s, "server", str_val(token), &described),
             Err(e) => kv_note(
                 &mut s,
                 "server",
@@ -201,11 +196,11 @@ pub fn render(config: &AppConfig) -> String {
         "bootstrap_from_keys",
         config.keys.bootstrap_from_keys,
     );
-    kv(
-        &mut s,
-        "fresh_wallet_birthday_margin",
-        config.keys.fresh_wallet_birthday_margin,
-    );
+    // Rendered only when set: unset means "each wallet's coin default", which is not one
+    // number (100 Zcash / 6 Bitcoin) - the per-wallet lines below carry the resolved values.
+    if let Some(margin) = config.keys.fresh_wallet_birthday_margin {
+        kv(&mut s, "fresh_wallet_birthday_margin", margin);
+    }
 
     table(&mut s, "sync");
     kv(&mut s, "interval_secs", config.sync.interval_secs);
@@ -275,10 +270,15 @@ pub fn render(config: &AppConfig) -> String {
         if let Some(keys_file) = &w.keys_file {
             kv(&mut s, "keys_file", path_val(keys_file));
         }
-        // Legal on every coin, rendered only when it differs from the global
-        // `[keys] fresh_wallet_birthday_margin` (the entry stores the resolved value, so
-        // "differs from the global" is exactly "this wallet set it").
-        if w.fresh_wallet_birthday_margin != config.keys.fresh_wallet_birthday_margin {
+        // Legal on every coin, rendered only when it differs from what this wallet would
+        // resolve to anyway (the global `[keys]` value, else the coin default) - the entry
+        // stores the resolved value, so "differs from the fallback" is exactly "this wallet
+        // set it".
+        let default_margin = config
+            .keys
+            .fresh_wallet_birthday_margin
+            .unwrap_or_else(|| crate::init::default_fresh_wallet_birthday_margin(w.coin));
+        if w.fresh_wallet_birthday_margin != default_margin {
             kv(
                 &mut s,
                 "fresh_wallet_birthday_margin",

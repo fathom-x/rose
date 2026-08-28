@@ -372,7 +372,7 @@ fn spawn_bitcoin_wallet(
     name: &str,
     entry: &config::WalletEntry,
     keys_path: &std::path::Path,
-    endpoint: crate::btc::chain::BitcoindEndpoint,
+    endpoint: crate::btc::chain::BtcEndpoint,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<(
     crate::btc::actor::BtcWalletHandle,
@@ -653,7 +653,7 @@ pub(crate) mod testutil {
                 auto_unlock: true,
                 bootstrap_from_keys: true,
                 allow_multiple_spending_wallets: false,
-                fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
+                fresh_wallet_birthday_margin: None,
             },
             sync: SyncConfig {
                 interval_secs: 20,

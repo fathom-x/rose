@@ -1,19 +1,30 @@
 //! The BDK engine's chain access: resolving a Bitcoin wallet's upstream endpoint and dialing
 //! bitcoind's JSON-RPC.
 //!
-//! The one backend today is a **local bitcoind** ("full mode", the analog of the Zcash
-//! engine's `zebra://`): plaintext HTTP JSON-RPC, local-only by the same cleartext-credential
-//! policy the zebra backend enforces, with the block/mempool emission handled by
-//! `bdk_bitcoind_rpc`'s checkpoint-anchored [`Emitter`](bdk_bitcoind_rpc::Emitter) (driven by
-//! the actor). A BIP-157 light mode (kyoto/bip157 - the lightwalletd analog, with better
-//! privacy) is the planned second backend; when it lands, this module grows the enum seam the
-//! Zcash side's `chain::AnySource` models, and the token grammar a second scheme.
+//! Two backends live behind [`BtcEndpoint`], the enum seam the Zcash side's
+//! `chain::AnySource` models:
+//!
+//!  * **A local bitcoind** ("full mode", the analog of `zebra://`): plaintext HTTP JSON-RPC,
+//!    local-only by the same cleartext-credential policy the zebra backend enforces, with
+//!    block/mempool emission handled by `bdk_bitcoind_rpc`'s checkpoint-anchored
+//!    [`Emitter`](bdk_bitcoind_rpc::Emitter) (driven by the actor).
+//!  * **Kyoto**, a BIP-157/158 compact-block-filter light client ([`crate::btc::kyoto`]) - the
+//!    privacy analog of the Zcash light mode, peering over P2P with no server and no
+//!    credentials at all. It carries no mempool and no fee estimator; that module's doc has
+//!    the full divergence list.
 //!
 //! Token grammar (`[wallets.<name>] server` on a bitcoin wallet):
 //!  * `bitcoind` - the default: a local bitcoind at `127.0.0.1` on the network's standard RPC
 //!    port (8332 main / 18332 test / 18443 regtest).
 //!  * `bitcoind://host:port` - an explicit bitcoind JSON-RPC endpoint (plaintext HTTP,
 //!    local-only by policy - the same gate as `zebra://`).
+//!  * `kyoto` - the light client, finding peers through the network's DNS seeds. The
+//!    credential-free counterpart of `zecrocks`, and like it, meaningless on regtest (no
+//!    seeds), where it is refused naming the explicit form.
+//!  * `kyoto://host:port` - the light client pinned to one trusted peer, which must be an IP
+//!    address (a P2P address, not a DNS name) serving compact filters. Naming peers switches
+//!    the node to whitelist-only, so discovery does not silently top up an operator's chosen
+//!    set.
 //!
 //! The Zcash tokens (`zebra`, `zecrocks`, `https://...`) are refused here by construction: a
 //! bitcoin wallet cannot dial a Zcash upstream, and the error says which grammar applies.
@@ -153,6 +164,111 @@ impl BitcoindEndpoint {
     }
 }
 
+/// A resolved bitcoin upstream, in either dialect. The engine's counterpart of the Zcash
+/// side's [`crate::chain::AnySource`]: the two backends share nothing but this seam, because
+/// they differ in shape as much as in protocol - a blocking pull against an authenticated
+/// local RPC versus an async push from a credential-free P2P node.
+#[derive(Clone, Debug)]
+pub enum BtcEndpoint {
+    Bitcoind(BitcoindEndpoint),
+    Kyoto(crate::btc::kyoto::KyotoEndpoint),
+}
+
+impl BtcEndpoint {
+    pub fn describe(&self) -> String {
+        match self {
+            BtcEndpoint::Bitcoind(e) => e.describe(),
+            BtcEndpoint::Kyoto(e) => e.describe(),
+        }
+    }
+
+    /// The configuration-only checks a connect would fail on, shared with `zecd config check`
+    /// so both dialects report their unreachable-by-construction cases offline.
+    pub fn preflight(&self) -> anyhow::Result<()> {
+        match self {
+            BtcEndpoint::Bitcoind(e) => e.preflight(),
+            BtcEndpoint::Kyoto(e) => e.preflight(),
+        }
+    }
+}
+
+/// Whether a server token names the kyoto backend. Kept separate from [`resolve`] so the
+/// caller decides which endpoint to build without parsing the token twice.
+fn is_kyoto_token(token: &str) -> bool {
+    token == "kyoto" || token.starts_with("kyoto://")
+}
+
+/// Parse a kyoto token into its trusted-peer list (empty for the bare `kyoto`).
+///
+/// A peer must be an IP address: this is a P2P address that goes into the node's peer book,
+/// not a URL host, and kyoto's own address type is `AddrV2`. The port is optional, defaulting
+/// to the network's standard P2P port inside kyoto. An IPv6 literal with a port must be
+/// bracketed (`kyoto://[2001:db8::1]:8333`): an unbracketed multi-colon string is taken
+/// whole as the address, since `2001:db8::1:8333` is itself a valid IPv6 address and
+/// guessing a port out of it would silently whitelist a different peer.
+pub fn resolve_kyoto_peers(token: &str) -> anyhow::Result<Vec<(std::net::IpAddr, Option<u16>)>> {
+    if token == "kyoto" {
+        return Ok(Vec::new());
+    }
+    let rest = token
+        .strip_prefix("kyoto://")
+        .ok_or_else(|| anyhow!("invalid kyoto endpoint '{token}'"))?
+        .trim_end_matches('/');
+    if rest.is_empty() {
+        bail!("invalid endpoint '{token}': empty peer address");
+    }
+    // Split off the optional `:port`. Count the colons first: an unbracketed IPv6 literal
+    // is all address, and only a bracketed one can carry a port.
+    let (host, port) = if let Some(bracketed) = rest.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((h, "")) => (h, None),
+            Some((h, p)) => match p.strip_prefix(':') {
+                Some(p) => (h, Some(p)),
+                None => bail!("invalid endpoint '{token}': expected ':port' after ']'"),
+            },
+            None => bail!("invalid endpoint '{token}': unclosed '['"),
+        }
+    } else if rest.matches(':').count() > 1 {
+        (rest, None)
+    } else {
+        match rest.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        }
+    };
+    let ip: std::net::IpAddr = host.parse().map_err(|_| {
+        anyhow!(
+            "invalid kyoto peer '{host}' in '{token}': a kyoto peer is a P2P address, so it \
+             must be an IP address rather than a DNS name (resolve it yourself, or use the \
+             bare 'kyoto' token to discover peers through the network's DNS seeds)"
+        )
+    })?;
+    let port = match port {
+        Some(p) => Some(
+            p.parse::<u16>()
+                .map_err(|_| anyhow!("invalid port in '{token}'"))?,
+        ),
+        None => None,
+    };
+    Ok(vec![(ip, port)])
+}
+
+/// Validate a server token in either dialect and describe what it resolves to, for
+/// `config check` and `config show` - which see tokens (including the global
+/// `[bitcoind] server` default) with no wallet to build an endpoint against.
+pub fn describe_token(token: &str, network: BitcoinNetwork) -> anyhow::Result<String> {
+    if is_kyoto_token(token) {
+        let peers = resolve_kyoto_peers(token)?;
+        return Ok(match peers.first() {
+            None => "kyoto (p2p, dns-seeded peers)".to_string(),
+            Some((ip, Some(port))) => format!("kyoto (p2p, trusted peer {ip}:{port})"),
+            Some((ip, None)) => format!("kyoto (p2p, trusted peer {ip})"),
+        });
+    }
+    let (host, port) = resolve(token, network)?;
+    Ok(format!("bitcoind {host}:{port}"))
+}
+
 /// Resolve one bitcoin wallet's upstream endpoint from its entry: the wallet's own `server`
 /// token, else the global `[bitcoind] server` default, else the built-in `bitcoind` (a
 /// local node on the network-standard port) - the same global-default-with-per-wallet-
@@ -163,7 +279,7 @@ impl BitcoindEndpoint {
 pub fn resolve_for_wallet(
     config: &crate::config::AppConfig,
     entry: &crate::config::WalletEntry,
-) -> anyhow::Result<BitcoindEndpoint> {
+) -> anyhow::Result<BtcEndpoint> {
     debug_assert_eq!(entry.coin, crate::coin::Coin::Bitcoin);
     let network = entry.bitcoin_network();
     let token = entry
@@ -172,8 +288,17 @@ pub fn resolve_for_wallet(
         .as_deref()
         .or(config.bitcoind.server.as_deref())
         .unwrap_or("bitcoind");
+    // The light client carries no credentials and no cleartext gate, so it shares none of the
+    // bitcoind branch's endpoint state - only the wallet's own directory, for its header store.
+    if is_kyoto_token(token) {
+        let peers = resolve_kyoto_peers(token)?;
+        let data_dir = crate::config::btc_kyoto_dir(&entry.dir);
+        return Ok(BtcEndpoint::Kyoto(crate::btc::kyoto::KyotoEndpoint::new(
+            network, peers, data_dir,
+        )));
+    }
     let (host, port) = resolve(token, network)?;
-    Ok(BitcoindEndpoint {
+    Ok(BtcEndpoint::Bitcoind(BitcoindEndpoint {
         host,
         port,
         network,
@@ -186,7 +311,7 @@ pub fn resolve_for_wallet(
             rfc1918_is_local: config.backend.rfc1918_is_local,
             allow_remote_cleartext: config.backend.allow_remote_cleartext,
         },
-    })
+    }))
 }
 
 /// Parse the bitcoin server token into `(host, port)`. See the module doc for the grammar.
@@ -205,8 +330,10 @@ pub fn resolve(token: &str, network: BitcoinNetwork) -> anyhow::Result<(String, 
         // mistake, so say explicitly that those name Zcash upstreams.
         bail!(
             "invalid server '{token}' for a bitcoin wallet: expected 'bitcoind' (a local \
-             bitcoind on the standard port) or 'bitcoind://host:port' (the zebra/lightwalletd \
-             tokens name Zcash upstreams)"
+             bitcoind on the standard port), 'bitcoind://host:port', 'kyoto' (the BIP-157 \
+             light client, peers from the network's DNS seeds) or 'kyoto://ip:port' (the \
+             light client pinned to a trusted peer) - the zebra/lightwalletd tokens name \
+             Zcash upstreams"
         );
     };
     let rest = rest.trim_end_matches('/');
@@ -246,6 +373,20 @@ impl BitcoindRpc {
             .map_err(|e| anyhow!("{e}"))
     }
 
+    /// The header time at `height`, for `init`'s date-birthday binary search - two cheap
+    /// calls (`getblockhash` + `getblockheader`), never a block fetch.
+    pub fn block_time_blocking(&self, height: u32) -> anyhow::Result<u64> {
+        let hash = self
+            .client
+            .get_block_hash(u64::from(height))
+            .map_err(|e| anyhow!("getblockhash {height}: {e}"))?;
+        let header = self
+            .client
+            .get_block_header_info(&hash)
+            .map_err(|e| anyhow!("getblockheader {hash}: {e}"))?;
+        Ok(u64::try_from(header.time).unwrap_or(u64::MAX))
+    }
+
     /// The node's smart-fee estimate for confirmation within `target` blocks, as a
     /// `FeeRate`, or `None` when the node has no estimate (fresh regtest chains, thin
     /// mempools). The estimate comes back in BTC/kvB; the ceiling division keeps the
@@ -281,6 +422,79 @@ mod tests {
     }
 
     #[test]
+    fn kyoto_tokens_resolve_to_a_trusted_peer_list() {
+        // The bare token means DNS-seed discovery: no peers pinned.
+        assert!(resolve_kyoto_peers("kyoto").unwrap().is_empty());
+
+        let peers = resolve_kyoto_peers("kyoto://192.0.2.7:8333").unwrap();
+        assert_eq!(peers, vec![("192.0.2.7".parse().unwrap(), Some(8333))]);
+
+        // The port is optional - kyoto substitutes the network's standard P2P port.
+        let peers = resolve_kyoto_peers("kyoto://192.0.2.7").unwrap();
+        assert_eq!(peers, vec![("192.0.2.7".parse().unwrap(), None)]);
+
+        // A trailing slash is tolerated, like the bitcoind grammar.
+        assert_eq!(
+            resolve_kyoto_peers("kyoto://192.0.2.7:8333/").unwrap(),
+            vec![("192.0.2.7".parse().unwrap(), Some(8333))]
+        );
+    }
+
+    #[test]
+    fn an_ipv6_peer_survives_the_port_split() {
+        // The naive rsplit_once(':') would shred an IPv6 literal; bracketed form carries a
+        // port, bare form does not.
+        let peers = resolve_kyoto_peers("kyoto://[2001:db8::1]:8333").unwrap();
+        assert_eq!(peers, vec![("2001:db8::1".parse().unwrap(), Some(8333))]);
+        let peers = resolve_kyoto_peers("kyoto://2001:db8::1").unwrap();
+        assert_eq!(peers, vec![("2001:db8::1".parse().unwrap(), None)]);
+        // Brackets without a port are legal - the port is documented optional, and this
+        // form used to be refused with a misleading "invalid port" error.
+        let peers = resolve_kyoto_peers("kyoto://[2001:db8::1]").unwrap();
+        assert_eq!(peers, vec![("2001:db8::1".parse().unwrap(), None)]);
+        // An unbracketed multi-colon string is all address, never address-plus-port:
+        // "2001:db8::1:8333" IS a valid IPv6 address, so guessing a port out of it would
+        // silently whitelist a different peer. A port needs brackets.
+        let peers = resolve_kyoto_peers("kyoto://2001:db8::1:8333").unwrap();
+        assert_eq!(peers, vec![("2001:db8::1:8333".parse().unwrap(), None)]);
+        // Bracket syntax errors are named, not shredded.
+        for bad in ["kyoto://[2001:db8::1", "kyoto://[2001:db8::1]8333"] {
+            assert!(resolve_kyoto_peers(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_dns_name_peer_is_refused_naming_why() {
+        // A P2P peer goes into an address book as an `AddrV2`, so a hostname cannot be one;
+        // the error has to say that rather than looking like a typo.
+        let err = resolve_kyoto_peers("kyoto://node.example.com:8333")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IP address"), "{err}");
+        assert!(err.contains("DNS seeds"), "{err}");
+        for bad in ["kyoto://", "kyoto://192.0.2.7:notaport"] {
+            assert!(resolve_kyoto_peers(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn describe_token_covers_both_dialects() {
+        assert_eq!(
+            describe_token("bitcoind", BitcoinNetwork::Main).unwrap(),
+            "bitcoind 127.0.0.1:8332"
+        );
+        assert!(describe_token("kyoto", BitcoinNetwork::Main)
+            .unwrap()
+            .contains("dns-seeded"));
+        assert!(
+            describe_token("kyoto://192.0.2.7:8333", BitcoinNetwork::Main)
+                .unwrap()
+                .contains("192.0.2.7:8333")
+        );
+        assert!(describe_token("nonsense", BitcoinNetwork::Main).is_err());
+    }
+
+    #[test]
     fn explicit_endpoints_parse_and_bad_tokens_name_the_grammar() {
         let (host, port) = resolve("bitcoind://10.0.0.5:18443", BitcoinNetwork::Regtest).unwrap();
         assert_eq!(host, "10.0.0.5");
@@ -294,6 +508,8 @@ mod tests {
             let err = resolve(bad, BitcoinNetwork::Main).unwrap_err().to_string();
             assert!(err.contains("bitcoind"), "{bad}: {err}");
             assert!(err.contains("Zcash upstreams"), "{bad}: {err}");
+            // Both backends must be discoverable from the refusal, not just the default one.
+            assert!(err.contains("kyoto"), "{bad}: {err}");
         }
         for bad in ["bitcoind://", "bitcoind://:8332", "bitcoind://h:notaport"] {
             assert!(resolve(bad, BitcoinNetwork::Main).is_err(), "{bad}");

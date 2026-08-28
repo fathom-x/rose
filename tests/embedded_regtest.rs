@@ -495,7 +495,7 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
             wallet: "default".into(),
             key: zecd::init::InitKey::Restore(zecd::init::MnemonicInput::Phrase(phrase())),
             encryption: zecd::init::EncryptionInput::AgeIdentity,
-            birthday: Some(1),
+            birthday: Some(zecd::init::Birthday::Height(1)),
         },
     )
     .await

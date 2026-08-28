@@ -66,6 +66,18 @@ pub fn engine_dir(wallet_dir: &Path, coin: Coin) -> PathBuf {
     coin_dir(wallet_dir, coin).join(coin.engine_dir())
 }
 
+/// Where the Bitcoin engine's kyoto light client keeps its own store: `<wallet dir>/btc/kyoto`.
+///
+/// A fourth path helper rather than a literal join at the call site, for the reason the three
+/// above give. It sits beside the BDK database ([`engine_dir`]) rather than inside it because
+/// it belongs to the *chain source*, not the wallet: block headers, filter headers and a peer
+/// book, all public chain data that any node could refetch. Deleting it costs a re-sync of
+/// headers and nothing else - no wallet state lives here.
+#[cfg(feature = "bitcoin")]
+pub fn btc_kyoto_dir(wallet_dir: &Path) -> PathBuf {
+    coin_dir(wallet_dir, Coin::Bitcoin).join("kyoto")
+}
+
 /// Binary configuration defaults (config file, datadir, ports).
 pub struct BinaryDefaults {
     /// Config file name looked up inside the datadir (`zecd.toml`).
@@ -348,9 +360,10 @@ pub struct WalletEntry {
     pub transparent_gap_warn_threshold: u32,
     /// How far below the chain tip `init` anchors this wallet's birthday when freshly
     /// generated (resolved per wallet: the wallet's own key, else the global
-    /// `[keys] fresh_wallet_birthday_margin`). Legal on every coin - the policy is
-    /// engine-agnostic even though the same block count spans different wall-clock time per
-    /// chain, which is exactly why a per-wallet override exists.
+    /// `[keys] fresh_wallet_birthday_margin`, else the coin's built-in margin -
+    /// [`crate::init::default_fresh_wallet_birthday_margin`]). Legal on every coin, like
+    /// `server`; the per-coin default exists because the same block count spans ~10x more
+    /// wall-clock time on Bitcoin than on Zcash.
     pub fresh_wallet_birthday_margin: u32,
 }
 
@@ -649,13 +662,14 @@ pub struct KeysConfig {
     /// data directory be a disposable cache while the seed lives in a mounted Secret. Set false
     /// to instead fail fast on an empty datadir.
     pub bootstrap_from_keys: bool,
-    /// How far below the chain tip `init` anchors a *freshly generated* wallet's birthday
-    /// (both engines share the policy). The margin only absorbs a reorg between reading the
-    /// tip and recording the birthday; the default
-    /// ([`crate::init::FRESH_WALLET_BIRTHDAY_MARGIN`]) is already generous against observed
-    /// reorg depths, so this knob exists for operators with their own reorg model, not for
-    /// tuning. Restores and an explicit `--birthday` are unaffected.
-    pub fresh_wallet_birthday_margin: u32,
+    /// The global `[keys] fresh_wallet_birthday_margin`: how far below the chain tip `init`
+    /// anchors a *freshly generated* wallet's birthday, for every wallet that doesn't set its
+    /// own. `None` (the default) means each wallet uses its coin's built-in margin
+    /// ([`crate::init::default_fresh_wallet_birthday_margin`]) - the same block count spans
+    /// ~10x more wall-clock time on Bitcoin than on Zcash, so "unset" deliberately does not
+    /// mean one shared number. The knob exists for operators with their own reorg model, not
+    /// for tuning. Restores and an explicit `--birthday` are unaffected.
+    pub fresh_wallet_birthday_margin: Option<u32>,
     /// Permit more than one loaded wallet to hold spending keys - **honored only by an embedded
     /// node, and refused outright by the `zecd` daemon** (see
     /// [`reject_multiple_spenders_in_daemon`]).
@@ -1337,9 +1351,13 @@ pub struct InitArgs {
     #[arg(long, value_name = "UFVK", conflicts_with_all = ["restore", "encrypt"])]
     pub ufvk: Option<String>,
 
-    /// Optional birthday height; defaults to the current chain tip for new wallets.
-    #[arg(long)]
-    pub birthday: Option<u32>,
+    /// Optional birthday: a block height, or a UTC date as YYYY-MM-DD - the date is
+    /// resolved to a height with a ~1-day safety margin, so it need not be exact (an early
+    /// birthday only scans more; funds can never predate the wallet). Defaults to near the
+    /// current chain tip for new wallets. Dates are refused on regtest, whose block
+    /// timestamps mean nothing.
+    #[arg(long, value_name = "HEIGHT|YYYY-MM-DD", value_parser = crate::init::Birthday::parse)]
+    pub birthday: Option<crate::init::Birthday>,
 }
 
 #[cfg(feature = "cli")]
@@ -1611,12 +1629,12 @@ impl AppConfig {
         let pools = resolve_global_pools(file.pools.as_ref())?;
 
         // The global `[keys] fresh_wallet_birthday_margin`, hoisted ahead of the wallet loop
-        // (each wallet's own key overrides it; `[keys]` itself resolves further down).
+        // (each wallet's own key overrides it, and a wallet with neither falls back to its
+        // coin's built-in margin; `[keys]` itself resolves further down).
         let global_birthday_margin = file
             .keys
             .as_ref()
-            .and_then(|k| k.fresh_wallet_birthday_margin)
-            .unwrap_or(crate::init::FRESH_WALLET_BIRTHDAY_MARGIN);
+            .and_then(|k| k.fresh_wallet_birthday_margin);
 
         // Wallets: from file, plus an implicit default if none declared. Each wallet's pools and
         // default receivers are resolved against the global `[pools]` defaults, with the same
@@ -1730,7 +1748,8 @@ impl AppConfig {
                     transparent_gap_warn_threshold,
                     fresh_wallet_birthday_margin: w
                         .fresh_wallet_birthday_margin
-                        .unwrap_or(global_birthday_margin),
+                        .or(global_birthday_margin)
+                        .unwrap_or_else(|| crate::init::default_fresh_wallet_birthday_margin(coin)),
                 },
             );
         }
@@ -1751,7 +1770,8 @@ impl AppConfig {
                 transparent_allow_beyond_recovery_window: pools
                     .transparent_allow_beyond_recovery_window,
                 transparent_gap_warn_threshold: pools.transparent_gap_warn_threshold,
-                fresh_wallet_birthday_margin: global_birthday_margin,
+                fresh_wallet_birthday_margin: global_birthday_margin
+                    .unwrap_or(crate::init::FRESH_WALLET_BIRTHDAY_MARGIN),
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {

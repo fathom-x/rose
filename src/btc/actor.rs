@@ -32,8 +32,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, info_span, warn, Instrument as _};
 
 use crate::backoff::Backoff;
-use crate::btc::chain::{BitcoindEndpoint, BitcoindRpc};
+use crate::btc::chain::{BitcoindRpc, BtcEndpoint};
 use crate::btc::keys::{self, AccountKeys};
+use crate::btc::kyoto::KyotoConn;
 use crate::btc::store::Persister;
 use crate::coin::BitcoinNetwork;
 use crate::error::{codes, RpcError};
@@ -300,7 +301,7 @@ pub struct BtcActorConfig {
     pub wallet_holds_seed: bool,
     /// The wallet's bitcoind upstream. `None` runs the actor with no sync loop (offline
     /// command service - what the pre-chain-source engine always did, kept for tests).
-    pub endpoint: Option<BitcoindEndpoint>,
+    pub endpoint: Option<BtcEndpoint>,
     /// The height the block scan starts from on an empty chain state (recorded by init).
     pub birthday: u32,
     /// How often to poll the upstream once caught up (`[sync] interval_secs`).
@@ -408,6 +409,7 @@ pub fn spawn(
         endpoint,
         birthday,
         conn: None,
+        at_tip: false,
         backoff: Backoff::new(reconnect_base, reconnect_max),
         next_attempt: Instant::now(),
         reconnect_warned: false,
@@ -429,14 +431,23 @@ pub fn spawn(
     ))
 }
 
-/// A live upstream connection: the RPC handle plus the block/mempool emitter anchored on the
-/// wallet's checkpoint at connect time. Dropped (and rebuilt on reconnect) after any
-/// transport error.
-struct Conn {
-    rpc: BitcoindRpc,
-    emitter: Emitter<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
-    /// Whether the last pass reached the node's tip (drives Ready vs Syncing).
-    at_tip: bool,
+/// A live upstream connection, in whichever dialect the endpoint resolved to. Dropped (and
+/// rebuilt on reconnect) after any transport error.
+///
+/// The two variants are shaped by their protocols and share no state: bitcoind is a blocking
+/// pull whose position lives in the emitter, kyoto an async push whose updates arrive over a
+/// channel its own task feeds. What *is* shared - whether the last pass reached tip - lives on
+/// the actor as [`BtcActor::at_tip`], since both dialects report it and neither owns it.
+// One instance per actor, never in a collection - the same reasoning `chain::AnySource`
+// records for the Zcash side, where boxing the larger variant would buy indirection and no
+// memory.
+#[allow(clippy::large_enum_variant)]
+enum Conn {
+    Bitcoind {
+        rpc: BitcoindRpc,
+        emitter: Emitter<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
+    },
+    Kyoto(KyotoConn),
 }
 
 struct BtcActor {
@@ -444,9 +455,11 @@ struct BtcActor {
     persister: Persister,
     seed: Option<SecretVec<u8>>,
     network: BitcoinNetwork,
-    endpoint: Option<BitcoindEndpoint>,
+    endpoint: Option<BtcEndpoint>,
     birthday: u32,
     conn: Option<Conn>,
+    /// Whether the last sync pass reached the upstream's tip (drives Ready vs Syncing).
+    at_tip: bool,
     backoff: Backoff,
     next_attempt: Instant,
     /// WARN once per outage, then DEBUG (the logging convention for reconnect streams).
@@ -496,7 +509,7 @@ impl BtcActor {
             let mut closed = false;
             loop {
                 match self.cmd_rx.try_recv() {
-                    Ok(cmd) => self.handle(cmd),
+                    Ok(cmd) => self.handle(cmd).await,
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         closed = true;
@@ -530,7 +543,7 @@ impl BtcActor {
             tokio::select! {
                 _ = self.shutdown.changed() => {}
                 maybe_cmd = self.cmd_rx.recv() => match maybe_cmd {
-                    Some(cmd) => self.handle(cmd),
+                    Some(cmd) => self.handle(cmd).await,
                     None => break,
                 },
                 _ = tokio::time::sleep(wait) => {}
@@ -556,41 +569,65 @@ impl BtcActor {
         let Some(conn) = self.conn.as_mut() else {
             return false;
         };
-        // The emitter's RPC calls are blocking; relocate the worker's other tasks for the
-        // duration, exactly as the Zcash scan does.
-        let result = tokio::task::block_in_place(|| {
-            let mut applied = 0usize;
-            while applied < SYNC_BLOCKS_PER_PASS {
-                match conn.emitter.next_block() {
-                    Ok(Some(event)) => {
-                        let height = event.block_height();
-                        self.wallet
-                            .apply_block_connected_to(&event.block, height, event.connected_to())
-                            .map_err(|e| anyhow::anyhow!("apply block {height}: {e}"))?;
-                        applied += 1;
+        let mut reached_tip = false;
+        let result = match conn {
+            // Bitcoind: a bounded blocking pull. The emitter's RPC calls block, so relocate
+            // the worker's other tasks for the duration, exactly as the Zcash scan does.
+            Conn::Bitcoind { emitter, .. } => tokio::task::block_in_place(|| {
+                let mut applied = 0usize;
+                while applied < SYNC_BLOCKS_PER_PASS {
+                    match emitter.next_block() {
+                        Ok(Some(event)) => {
+                            let height = event.block_height();
+                            self.wallet
+                                .apply_block_connected_to(
+                                    &event.block,
+                                    height,
+                                    event.connected_to(),
+                                )
+                                .map_err(|e| anyhow::anyhow!("apply block {height}: {e}"))?;
+                            applied += 1;
+                        }
+                        Ok(None) => {
+                            reached_tip = true;
+                            // Caught up: one mempool pass gives 0-conf visibility and eviction
+                            // handling (evictions are only reported once the emitter is at tip).
+                            let event = emitter
+                                .mempool()
+                                .map_err(|e| anyhow::anyhow!("mempool: {e}"))?;
+                            self.wallet.apply_unconfirmed_txs(event.update);
+                            self.wallet.apply_evicted_txs(event.evicted);
+                            return Ok(applied);
+                        }
+                        Err(e) => return Err(anyhow::anyhow!("next_block: {e}")),
                     }
-                    Ok(None) => {
-                        conn.at_tip = true;
-                        // Caught up: one mempool pass gives 0-conf visibility and eviction
-                        // handling (evictions are only reported once the emitter is at tip).
-                        let event = conn
-                            .emitter
-                            .mempool()
-                            .map_err(|e| anyhow::anyhow!("mempool: {e}"))?;
-                        self.wallet.apply_unconfirmed_txs(event.update);
-                        self.wallet.apply_evicted_txs(event.evicted);
-                        return Ok(applied);
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("next_block: {e}")),
                 }
-            }
-            Ok(applied)
-        });
+                Ok(applied)
+            }),
+            // Kyoto: a non-blocking poll of the bridge channel. An `Update` is a whole
+            // sync-to-tip rather than one block, so its arrival *is* the tip signal - and
+            // there is no mempool pass to follow it, the divergence `kyoto`'s module doc
+            // records. `applied` counts updates, only to decide whether the pass did work.
+            Conn::Kyoto(kyoto) => match kyoto.try_next_update() {
+                Ok(Some(update)) => {
+                    reached_tip = true;
+                    self.wallet
+                        .apply_update(update)
+                        .map_err(|e| anyhow::anyhow!("apply kyoto update: {e}"))
+                        .map(|()| 1usize)
+                }
+                // No update yet: the client is still finding peers or downloading filters.
+                Ok(None) => Ok(0),
+                Err(e) => Err(e),
+            },
+        };
         match result {
             Ok(applied) => {
                 self.persist("sync pass");
-                let at_tip = self.conn.as_ref().is_some_and(|c| c.at_tip);
-                let state = if at_tip {
+                if reached_tip {
+                    self.at_tip = true;
+                }
+                let state = if self.at_tip {
                     BtcConnState::Ready
                 } else {
                     BtcConnState::Syncing
@@ -622,34 +659,48 @@ impl BtcActor {
         let Some(endpoint) = self.endpoint.clone() else {
             return false;
         };
-        let dial = tokio::task::block_in_place(|| endpoint.connect_blocking());
-        match dial {
-            Ok(rpc) => {
+        let dial = match &endpoint {
+            BtcEndpoint::Bitcoind(e) => {
+                tokio::task::block_in_place(|| e.connect_blocking()).map(|rpc| {
+                    info!(
+                        upstream = %endpoint.describe(),
+                        node_tip = rpc.tip_at_connect,
+                        wallet_height = self.wallet.latest_checkpoint().height(),
+                        "connected to the upstream"
+                    );
+                    // Hand the emitter the wallet's unconfirmed transactions so mempool
+                    // evictions of them are reported (a wallet with none is the empty set).
+                    let expected: Vec<Arc<Transaction>> = self
+                        .wallet
+                        .transactions()
+                        .filter(|wtx| !wtx.chain_position.is_confirmed())
+                        .map(|wtx| wtx.tx_node.tx.clone())
+                        .collect();
+                    let emitter = Emitter::new(
+                        rpc.client(),
+                        self.wallet.latest_checkpoint(),
+                        self.birthday,
+                        expected,
+                    );
+                    Conn::Bitcoind { rpc, emitter }
+                })
+            }
+            // Kyoto "connects" by starting its node task; peer discovery and header sync
+            // run in the background, so this returns before the client has a tip. There is
+            // nothing to hand it about unconfirmed transactions - it has no mempool.
+            BtcEndpoint::Kyoto(e) => e.connect(&self.wallet, self.birthday).map(|kyoto| {
                 info!(
                     upstream = %endpoint.describe(),
-                    node_tip = rpc.tip_at_connect,
                     wallet_height = self.wallet.latest_checkpoint().height(),
-                    "connected to the upstream"
+                    "started the light client (peer discovery runs in the background)"
                 );
-                // Hand the emitter the wallet's unconfirmed transactions so mempool
-                // evictions of them are reported (a wallet with none is the empty set).
-                let expected: Vec<Arc<Transaction>> = self
-                    .wallet
-                    .transactions()
-                    .filter(|wtx| !wtx.chain_position.is_confirmed())
-                    .map(|wtx| wtx.tx_node.tx.clone())
-                    .collect();
-                let emitter = Emitter::new(
-                    rpc.client(),
-                    self.wallet.latest_checkpoint(),
-                    self.birthday,
-                    expected,
-                );
-                self.conn = Some(Conn {
-                    rpc,
-                    emitter,
-                    at_tip: false,
-                });
+                Conn::Kyoto(kyoto)
+            }),
+        };
+        match dial {
+            Ok(conn) => {
+                self.conn = Some(conn);
+                self.at_tip = false;
                 self.backoff.reset();
                 self.reconnect_warned = false;
                 self.status_tx
@@ -659,9 +710,9 @@ impl BtcActor {
             Err(e) => {
                 let delay = self.backoff.next_delay();
                 if self.reconnect_warned {
-                    debug!("connect to bitcoind failed (retrying in {delay:?}): {e:#}");
+                    debug!("connect to the upstream failed (retrying in {delay:?}): {e:#}");
                 } else {
-                    warn!("connect to bitcoind failed (retrying in {delay:?}): {e:#}");
+                    warn!("connect to the upstream failed (retrying in {delay:?}): {e:#}");
                     self.reconnect_warned = true;
                 }
                 self.next_attempt = Instant::now() + delay;
@@ -674,6 +725,7 @@ impl BtcActor {
 
     fn drop_conn(&mut self) {
         self.conn = None;
+        self.at_tip = false;
         self.next_attempt = Instant::now() + self.backoff.next_delay();
         self.status_tx
             .send_replace(status_of(&self.wallet, BtcConnState::Down));
@@ -698,7 +750,7 @@ impl BtcActor {
         }
     }
 
-    fn handle(&mut self, cmd: BtcCommand) {
+    async fn handle(&mut self, cmd: BtcCommand) {
         match cmd {
             BtcCommand::NewAddress { reply } => {
                 let address = self.wallet.reveal_next_address(KeychainKind::External);
@@ -778,11 +830,11 @@ impl BtcActor {
                 let _ = reply.send(result);
             }
             BtcCommand::Send { recipients, reply } => {
-                let result = self.do_send(recipients);
+                let result = self.do_send(recipients).await;
                 let _ = reply.send(result);
             }
             BtcCommand::Broadcast { hex, reply } => {
-                let result = self.do_broadcast(hex);
+                let result = self.do_broadcast(hex).await;
                 let _ = reply.send(result);
             }
             BtcCommand::ListTransactions { reply } => {
@@ -882,29 +934,83 @@ impl BtcActor {
         entries.into_iter().map(|(_, e)| e).collect()
     }
 
-    fn do_send(&mut self, recipients: Vec<(String, u64)>) -> Result<String, RpcError> {
-        let Some(seed) = &self.seed else {
+    /// The upstream's fee rate for a send, in whichever dialect is connected.
+    ///
+    /// Bitcoind answers with `estimatesmartfee`. Kyoto has no such call and answers with a
+    /// far coarser signal - see [`KyotoConn::estimate_fee_rate`] - so the mainnet fallback
+    /// rule below is doing more work on that backend than on this one.
+    async fn upstream_fee_rate(&mut self) -> anyhow::Result<Option<bdk_wallet::bitcoin::FeeRate>> {
+        let requester = match self.conn.as_ref() {
+            // Blocking and synchronous: answer here, before any await exists.
+            Some(Conn::Bitcoind { rpc, .. }) => {
+                return tokio::task::block_in_place(|| {
+                    rpc.estimate_fee_rate_blocking(FEE_TARGET_BLOCKS)
+                });
+            }
+            Some(Conn::Kyoto(kyoto)) => kyoto.requester(),
+            None => return Err(anyhow::anyhow!("no upstream connection")),
+        };
+        // Kyoto has no fee estimator of its own worth the name, so ask mempool.space for a
+        // real forward estimate first and keep the on-chain signals as the fallback. A
+        // failure here is not a failed send - it degrades to what the light client can see
+        // by itself. `crate::btc::fees` documents what the lookup does and does not reveal.
+        let network = self.network;
+        match crate::btc::fees::recommended_fee_rate(network).await {
+            Ok(Some(rate)) => return Ok(Some(rate)),
+            // No oracle for this network (regtest); the on-chain signals are all there is.
+            Ok(None) => {}
+            Err(e) => warn!(
+                "mempool.space fee lookup failed ({e:#}); falling back to kyoto's own \
+                 relay floor and recent-block fee median"
+            ),
+        }
+        crate::btc::kyoto::estimate_fee_rate(requester).await
+    }
+
+    /// Broadcast in whichever dialect is connected: bitcoind's `sendrawtransaction`, or a
+    /// kyoto submission to the P2P peers.
+    async fn upstream_broadcast(&mut self, tx: &Transaction) -> anyhow::Result<Txid> {
+        let requester = match self.conn.as_ref() {
+            Some(Conn::Bitcoind { rpc, .. }) => {
+                return tokio::task::block_in_place(|| rpc.broadcast_blocking(tx));
+            }
+            Some(Conn::Kyoto(kyoto)) => kyoto.requester(),
+            None => return Err(anyhow::anyhow!("no upstream connection")),
+        };
+        crate::btc::kyoto::broadcast(requester, tx).await
+    }
+
+    async fn do_send(&mut self, recipients: Vec<(String, u64)>) -> Result<String, RpcError> {
+        // Checked here but borrowed only at the signing step below: the fee and broadcast
+        // calls take `&mut self`, so holding a `&self.seed` across them would not borrow-check.
+        if self.seed.is_none() {
             return Err(RpcError::new(
                 codes::RPC_WALLET_ERROR,
                 "Error: Private keys are disabled for this wallet, or the wallet is locked \
                  (bitcoin wallets have no walletpassphrase yet - use an identity-file wallet \
                  with auto_unlock for unattended sending)",
             ));
-        };
-        let Some(conn) = self.conn.as_ref() else {
+        }
+        if self.conn.is_none() {
             return Err(RpcError::new(
                 codes::RPC_WALLET_ERROR,
-                "no connection to the bitcoind upstream (fee estimation and broadcast need \
-                 it); retry once the node is reachable",
+                "no connection to the upstream (fee estimation and broadcast need it); retry \
+                 once it is reachable",
             ));
-        };
-        // Fee rate: the node's smart estimate, or - matching bitcoind's fallbackfee posture -
+        }
+        // Fee rate: the upstream's estimate, or - matching bitcoind's fallbackfee posture -
         // a 1 sat/vB floor on test networks only (mainnet refuses rather than guessing).
-        let fee_rate =
-            tokio::task::block_in_place(|| conn.rpc.estimate_fee_rate_blocking(FEE_TARGET_BLOCKS))
-                .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?;
+        // Whatever the source - estimatesmartfee, mempool.space, or the kyoto peers' relay
+        // floor and block medians - the rate passes the sanity ceiling HERE, at the one
+        // chokepoint every send goes through, so no source (present or future) can dictate
+        // an absurd fee: it becomes a refusal naming the number instead of a payment.
+        let fee_rate = self
+            .upstream_fee_rate()
+            .await
+            .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?;
         let fee_rate = match fee_rate {
-            Some(rate) => rate,
+            Some(rate) => crate::btc::fees::enforce_sanity_ceiling(rate)
+                .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?,
             None if self.network == BitcoinNetwork::Main => {
                 return Err(RpcError::new(
                     codes::RPC_WALLET_ERROR,
@@ -938,6 +1044,10 @@ impl BtcActor {
 
         // Signers are derived from the seed per send and dropped with this scope - the
         // custody model's spend half (the persisted wallet holds public descriptors only).
+        let seed = self
+            .seed
+            .as_ref()
+            .expect("seed presence checked at the top of do_send");
         let signing = keys::signing_wallet(seed, self.network)
             .map_err(|e| RpcError::misc(format!("derive signing descriptors: {e:#}")))?;
         let finalized = signing
@@ -951,7 +1061,9 @@ impl BtcActor {
         let tx = psbt
             .extract_tx()
             .map_err(|e| RpcError::misc(format!("extract transaction: {e:?}")))?;
-        let txid = tokio::task::block_in_place(|| conn.rpc.broadcast_blocking(&tx))
+        let txid = self
+            .upstream_broadcast(&tx)
+            .await
             .map_err(|e| RpcError::new(codes::RPC_VERIFY_REJECTED, format!("{e:#}")))?;
         // Record our own send immediately (0-conf), which also locks its inputs against
         // reuse by the next send's coin selection.
@@ -967,13 +1079,13 @@ impl BtcActor {
         Ok(txid.to_string())
     }
 
-    fn do_broadcast(&mut self, hex: String) -> Result<String, RpcError> {
-        let Some(conn) = self.conn.as_ref() else {
+    async fn do_broadcast(&mut self, hex: String) -> Result<String, RpcError> {
+        if self.conn.is_none() {
             return Err(RpcError::new(
                 codes::RPC_WALLET_ERROR,
-                "no connection to the bitcoind upstream; retry once the node is reachable",
+                "no connection to the upstream; retry once it is reachable",
             ));
-        };
+        }
         let tx: Transaction = bdk_wallet::bitcoin::consensus::encode::deserialize_hex(&hex)
             .map_err(|e| {
                 RpcError::new(
@@ -981,7 +1093,9 @@ impl BtcActor {
                     format!("TX decode failed: {e}"),
                 )
             })?;
-        let txid = tokio::task::block_in_place(|| conn.rpc.broadcast_blocking(&tx))
+        let txid = self
+            .upstream_broadcast(&tx)
+            .await
             .map_err(|e| RpcError::new(codes::RPC_VERIFY_REJECTED, format!("{e:#}")))?;
         // If the transaction touches this wallet, record it at 0-conf (the apply filters
         // relevance itself, so a foreign transaction is a no-op).
@@ -1147,7 +1261,9 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
-        assert!(err.message.contains("bitcoind"), "{}", err.message);
+        // Dialect-neutral since the engine grew a second backend: the wallet may be offline
+        // from a bitcoind or from a kyoto light client, and the message names neither.
+        assert!(err.message.contains("upstream"), "{}", err.message);
         let err = handle.broadcast("00".repeat(20)).await.unwrap_err();
         assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
 

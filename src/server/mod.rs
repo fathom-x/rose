@@ -329,6 +329,7 @@ mod tests {
                 auto_unlock: true,
                 bootstrap_from_keys: true,
                 allow_multiple_spending_wallets: false,
+                fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
             },
             sync: SyncConfig {
                 interval_secs: 20,

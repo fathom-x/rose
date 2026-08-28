@@ -182,7 +182,10 @@ pub async fn probe(config: &AppConfig, server_override: Option<&str>) -> anyhow:
         chain_name: info.chain_name.clone(),
         tip_height,
         tip_hash,
-        suggested_birthday: crate::init::fresh_wallet_birthday(tip_height),
+        suggested_birthday: crate::init::fresh_wallet_birthday(
+            tip_height,
+            config.keys.fresh_wallet_birthday_margin,
+        ),
         tip_branch_id: info.tip_branch_id,
         unsupported_upgrades: crate::chain::unsupported_upgrades(&info),
         elapsed,
@@ -356,11 +359,12 @@ mod tests {
     /// wrap - a fresh regtest chain is exactly that case.
     #[test]
     fn suggested_birthday_matches_init_and_clamps_on_a_short_chain() {
+        let margin = crate::init::FRESH_WALLET_BIRTHDAY_MARGIN;
         assert_eq!(
-            crate::init::fresh_wallet_birthday(1_000),
-            1_000 - crate::init::FRESH_WALLET_BIRTHDAY_MARGIN
+            crate::init::fresh_wallet_birthday(1_000, margin),
+            1_000 - margin
         );
-        assert_eq!(crate::init::fresh_wallet_birthday(0), 0);
-        assert_eq!(crate::init::fresh_wallet_birthday(5), 0);
+        assert_eq!(crate::init::fresh_wallet_birthday(0, margin), 0);
+        assert_eq!(crate::init::fresh_wallet_birthday(5, margin), 0);
     }
 }

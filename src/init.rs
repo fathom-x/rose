@@ -32,16 +32,22 @@ use crate::wallet::store::{Passphrase, WalletStore};
 ///
 /// A new wallet has no history, so the tip itself would do - the margin absorbs a short reorg
 /// between reading the tip and recording the birthday, which would otherwise strand the wallet
-/// anchored to a block that no longer exists.
-pub const FRESH_WALLET_BIRTHDAY_MARGIN: u32 = 100;
+/// anchored to a block that no longer exists. Six blocks is generous against observed reorg
+/// depths (Bitcoin's deepest reorg in 2026 was 2 blocks; Zcash's are similarly shallow), and
+/// costs six blocks of scan on either chain. This is the default for
+/// `[keys] fresh_wallet_birthday_margin`, the config override for operators with their own
+/// reorg model.
+pub const FRESH_WALLET_BIRTHDAY_MARGIN: u32 = 6;
 
-/// The birthday `init` records for a freshly generated wallet at a given chain tip.
+/// The birthday `init` records for a freshly generated wallet at a given chain tip, `margin`
+/// blocks below it (`margin` comes from `[keys] fresh_wallet_birthday_margin`, default
+/// [`FRESH_WALLET_BIRTHDAY_MARGIN`]).
 ///
 /// Exposed so a caller that needs the height *before* creating the wallet - pinning a birthday
 /// alongside a seed it generated itself, say - gets the number `init` would actually use rather
 /// than re-deriving the policy. [`crate::chain_probe`] reports it for exactly that reason.
-pub fn fresh_wallet_birthday(chain_tip: u32) -> u32 {
-    chain_tip.saturating_sub(FRESH_WALLET_BIRTHDAY_MARGIN)
+pub fn fresh_wallet_birthday(chain_tip: u32, margin: u32) -> u32 {
+    chain_tip.saturating_sub(margin)
 }
 
 /// The default account birthday when `--birthday` is omitted for a restore/import: the
@@ -152,6 +158,7 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
                 .pools
                 .transparent_allow_beyond_recovery_window,
             transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
+            fresh_wallet_birthday_margin: config.keys.fresh_wallet_birthday_margin,
         })
 }
 
@@ -310,15 +317,18 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     crate::migrate::migrate(config)?;
 
     let entry = resolve_wallet_entry(config, &wallet);
-    // A Bitcoin wallet takes the BDK engine's init path (offline: the engine has no chain
-    // source, so there is no upstream to anchor a birthday on). Branch before any read that
-    // assumes a Zcash entry. The datadir lock and migration above cover both engines.
+    // A Bitcoin wallet takes the BDK engine's init path. Branch before any read that assumes
+    // a Zcash entry; the datadir lock and migration above cover both engines. Like the Zcash
+    // path, it dials its upstream (bitcoind) once - but only to anchor a freshly generated
+    // wallet's birthday just below the tip; a restore (SegWit-activation floor) or an
+    // explicit --birthday initializes fully offline.
     #[cfg(feature = "bitcoin")]
     if entry.coin == crate::coin::Coin::Bitcoin {
         return init_bitcoin_wallet(config, entry, wallet, key, encryption, birthday_opt).await;
     }
     let keys_path = entry.keys_path();
     let enabled_pools = entry.pools.clone();
+    let birthday_margin = entry.fresh_wallet_birthday_margin;
     // Create the account under the wallet's external transparent gap limit (only when transparent
     // is enabled), so init pre-generates the same receiving-address window the daemon scans.
     let init_gap_limit = entry
@@ -470,7 +480,7 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
             );
             height
         } else {
-            fresh_wallet_birthday(chain_tip)
+            fresh_wallet_birthday(chain_tip, birthday_margin)
         }
     }));
     // Anchors on the tree state of the block before the birthday (which leaks the birthday to
@@ -593,7 +603,10 @@ async fn init_bitcoin_wallet(
     let keys_path = entry.keys_path();
     let engine_dir = entry.engine_dir();
     let btc_network = entry.bitcoin_network();
-    let wallet_dir = entry.dir;
+    let birthday_margin = entry.fresh_wallet_birthday_margin;
+    // `entry` stays whole: the generated-wallet path below resolves the wallet's bitcoind
+    // endpoint from it to anchor the birthday.
+    let wallet_dir = entry.dir.clone();
     // `keys.toml` speaks the environment vocabulary (`main`/`test`/`regtest`), shared by both
     // coins' networks; the daemon checks it against its own environment at spawn.
     let network = config.network;
@@ -633,6 +646,47 @@ async fn init_bitcoin_wallet(
         }
     }
 
+    // Resolve the birthday before anything is written, so a failed dial is a clean refusal
+    // (the same before-any-write doctrine as the Zcash path, which likewise dials its
+    // upstream once at init). Three cases:
+    //  * --birthday given: honored verbatim; the init stays fully offline.
+    //  * restore: the seed may hold history from any point in its past, so scan everything
+    //    it could possibly own - from SegWit activation, the first block a BIP 84 (bech32)
+    //    output can exist in. Warned, like the Zcash restore default.
+    //  * freshly generated: no history is possible, so anchor just below the node's tip
+    //    (`fresh_wallet_birthday`, shared with the Zcash path). The one case that needs the
+    //    upstream - and the dial also verifies the node serves the wallet's chain.
+    let birthday = match birthday_opt {
+        Some(height) => BlockHeight::from(height),
+        None if restore => {
+            let height = bip84_history_floor(btc_network);
+            warn!(
+                "no --birthday given; scanning from SegWit activation (height {height}) - a \
+                 full history rescan that is slow on mainnet. Pass --birthday <height> at or \
+                 before the wallet's first transaction to speed up the initial sync."
+            );
+            BlockHeight::from(height)
+        }
+        None => {
+            let endpoint = crate::btc::chain::resolve_for_wallet(config, &entry)?;
+            let described = endpoint.describe();
+            // The client is blocking (`bitcoincore-rpc`); `spawn_blocking` rather than the
+            // actor's `block_in_place` so a current-thread embedder can call `init_wallet`.
+            let rpc = tokio::task::spawn_blocking(move || endpoint.connect_blocking())
+                .await
+                .context("bitcoind dial task")?
+                .with_context(|| {
+                    format!(
+                        "dialing {described} to anchor the new wallet's birthday failed. \
+                         Start the node (or point `server`/[bitcoind] at it), or pass \
+                         --birthday <height> to initialize offline"
+                    )
+                })?;
+            let tip = u32::try_from(rpc.tip_at_connect).unwrap_or(u32::MAX);
+            BlockHeight::from(fresh_wallet_birthday(tip, birthday_margin))
+        }
+    };
+
     std::fs::create_dir_all(&wallet_dir)?;
 
     let identity_path = config
@@ -660,8 +714,6 @@ async fn init_bitcoin_wallet(
         s.zeroize();
         secret
     };
-
-    let birthday = BlockHeight::from(birthday_opt.unwrap_or(0));
 
     // keys.toml first, then the wallet database: a failure between the two is self-healing
     // (the daemon's spawn recreates a missing database from the seed), where the reverse
@@ -695,6 +747,21 @@ async fn init_bitcoin_wallet(
         identity_path: matches!(at_rest, AtRest::Identity(_)).then_some(identity_path),
         generated_mnemonic: (!restore).then_some(mnemonic),
     })
+}
+
+/// The first block a restored Bitcoin wallet's history can exist in: SegWit activation. The
+/// engine is bech32-only (BIP 84 is its sole derivation), and a P2WPKH output cannot appear
+/// in a block before SegWit activated, so a restore that scans from here provably misses
+/// nothing - the Bitcoin analog of [`restore_birthday_default`]'s earliest-enabled-pool
+/// floor. Testnet4 and regtest deploy SegWit from the start.
+#[cfg(feature = "bitcoin")]
+fn bip84_history_floor(network: crate::coin::BitcoinNetwork) -> u32 {
+    use crate::coin::BitcoinNetwork;
+    match network {
+        BitcoinNetwork::Main => 481_824,
+        BitcoinNetwork::Testnet3 => 834_624,
+        BitcoinNetwork::Testnet4 | BitcoinNetwork::Regtest => 0,
+    }
 }
 
 /// The Bitcoin counterpart of [`existing_spending_wallet`]: another *configured* Bitcoin
@@ -1131,7 +1198,9 @@ mod tests {
         .unwrap();
         assert!(!outcome.watch_only);
         assert!(!outcome.encrypted);
-        assert_eq!(outcome.birthday, 0);
+        // The restore default: the SegWit-activation floor for testnet3 (`network = "test"`)
+        // - the first block a BIP 84 output can exist in, so nothing is missed.
+        assert_eq!(outcome.birthday, 834_624);
         assert!(
             outcome.generated_mnemonic.is_none(),
             "restore, not generate"
@@ -1215,6 +1284,234 @@ mod tests {
         .err()
         .expect("--ufvk on a bitcoin wallet must be refused");
         assert!(ufvk.to_string().contains("--ufvk"), "{ufvk}");
+    }
+
+    /// Bitcoin-wallet config whose `[bitcoind]` points at `server`; wallet `btc` on testnet.
+    /// `extra` is appended verbatim (e.g. a `[keys]` section).
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    fn bitcoin_test_config(dir: &std::path::Path, server: &str, extra: &str) -> AppConfig {
+        use clap::Parser as _;
+        let conf = dir.join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n\
+                 [bitcoind]\nserver = \"{server}\"\n\
+                 [wallets.btc]\ncoin = \"bitcoin\"\n{extra}",
+                dir
+            ),
+        )
+        .unwrap();
+        let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        AppConfig::resolve(&cli).unwrap()
+    }
+
+    /// A generated wallet with an explicit `--birthday` initializes fully offline: the server
+    /// below is unreachable on purpose, so a dial would fail the test.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_init_generate_with_explicit_birthday_is_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), "bitcoind://127.0.0.1:1", "");
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(12_345),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.birthday, 12_345);
+        assert!(outcome.generated_mnemonic.is_some());
+    }
+
+    /// A generated wallet with no `--birthday` needs the node: the failed dial is an
+    /// actionable refusal naming the offline escape hatch, and fires before anything is
+    /// written.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_init_generate_without_birthday_needs_the_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), "bitcoind://127.0.0.1:1", "");
+        let err = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .err()
+        .expect("the dial must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--birthday"),
+            "must name the escape hatch: {msg}"
+        );
+        let entry = &config.wallets["btc"];
+        assert!(
+            !WalletStore::exists(&entry.keys_path()),
+            "refusal must precede writes"
+        );
+        assert!(!entry.dir.exists(), "refusal must precede writes");
+    }
+
+    /// Minimal fake bitcoind: an HTTP/1.1 JSON-RPC loop answering every request with the
+    /// same `getblockchaininfo` result (testnet chain at a fixed tip), echoing the request
+    /// id (the client checks it). Detached; it dies with the test process.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    fn fake_bitcoind(tip: u64) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..pos]);
+                    let len = headers
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= pos + 4 + len {
+                        break;
+                    }
+                }
+                let body = String::from_utf8_lossy(&buf);
+                let id: String = body
+                    .split("\"id\":")
+                    .nth(1)
+                    .map(|rest| rest.chars().take_while(|c| c.is_ascii_digit()).collect())
+                    .filter(|s: &String| !s.is_empty())
+                    .unwrap_or_else(|| "0".to_string());
+                // `get_blockchain_info` first probes the node version via `getnetworkinfo`
+                // (and branches on it for softfork-shape compatibility), so both methods
+                // must answer.
+                let result = if body.contains("getnetworkinfo") {
+                    "{\"version\":300200,\"subversion\":\"/Satoshi:30.2.0/\",\
+                     \"protocolversion\":70016,\"localservices\":\"0000000000000409\",\
+                     \"localrelay\":true,\"timeoffset\":0,\"connections\":0,\
+                     \"networkactive\":true,\"networks\":[],\"relayfee\":0.00001,\
+                     \"incrementalfee\":0.00001,\"localaddresses\":[],\"warnings\":\"\"}"
+                        .to_string()
+                } else {
+                    format!(
+                        "{{\"chain\":\"test\",\"blocks\":{tip},\"headers\":{tip},\
+                         \"bestblockhash\":\"{:064}\",\"difficulty\":1.0,\"mediantime\":0,\
+                         \"verificationprogress\":1.0,\"initialblockdownload\":false,\
+                         \"chainwork\":\"00\",\"size_on_disk\":0,\"pruned\":false,\
+                         \"warnings\":\"\"}}",
+                        0
+                    )
+                };
+                let resp_body = format!("{{\"result\":{result},\"error\":null,\"id\":{id}}}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        addr
+    }
+
+    /// The generated-wallet default: `init` dials the node once and anchors the birthday
+    /// just below its tip, exactly as the Zcash path does against zebra.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_init_generate_anchors_birthday_on_the_node_tip() {
+        let addr = fake_bitcoind(50_000);
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), &format!("bitcoind://{addr}"), "");
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.birthday, 50_000 - FRESH_WALLET_BIRTHDAY_MARGIN);
+        assert!(outcome.generated_mnemonic.is_some());
+    }
+
+    /// `[keys] fresh_wallet_birthday_margin` overrides the anchor's default margin.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_init_birthday_margin_is_configurable() {
+        let addr = fake_bitcoind(50_000);
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(
+            dir.path(),
+            &format!("bitcoind://{addr}"),
+            "[keys]\nfresh_wallet_birthday_margin = 0\n",
+        );
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.birthday, 50_000,
+            "margin 0 anchors on the tip itself"
+        );
+    }
+
+    /// The per-wallet `fresh_wallet_birthday_margin` beats the global `[keys]` one (the
+    /// `extra` continues the `[wallets.btc]` table, then opens `[keys]`).
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_init_birthday_margin_per_wallet_beats_global() {
+        let addr = fake_bitcoind(50_000);
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(
+            dir.path(),
+            &format!("bitcoind://{addr}"),
+            "fresh_wallet_birthday_margin = 2\n[keys]\nfresh_wallet_birthday_margin = 4\n",
+        );
+        assert_eq!(config.keys.fresh_wallet_birthday_margin, 4);
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.birthday, 50_000 - 2);
     }
 
     #[test]
@@ -1438,6 +1735,7 @@ mod tests {
                 transparent_initial_scan: 0,
                 transparent_allow_beyond_recovery_window: true,
                 transparent_gap_warn_threshold: 5,
+                fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
             },
         );
         wallets.insert(
@@ -1456,6 +1754,7 @@ mod tests {
                 transparent_initial_scan: 0,
                 transparent_allow_beyond_recovery_window: true,
                 transparent_gap_warn_threshold: 5,
+                fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
             },
         );
 
@@ -1504,6 +1803,7 @@ mod tests {
                     transparent_initial_scan: 0,
                     transparent_allow_beyond_recovery_window: true,
                     transparent_gap_warn_threshold: 5,
+                    fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
                 },
             );
         }

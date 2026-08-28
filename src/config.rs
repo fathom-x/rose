@@ -346,6 +346,12 @@ pub struct WalletEntry {
     /// This wallet's remaining-slot warning threshold
     /// (see [`PoolsConfig::transparent_gap_warn_threshold`]).
     pub transparent_gap_warn_threshold: u32,
+    /// How far below the chain tip `init` anchors this wallet's birthday when freshly
+    /// generated (resolved per wallet: the wallet's own key, else the global
+    /// `[keys] fresh_wallet_birthday_margin`). Legal on every coin - the policy is
+    /// engine-agnostic even though the same block count spans different wall-clock time per
+    /// chain, which is exactly why a per-wallet override exists.
+    pub fresh_wallet_birthday_margin: u32,
 }
 
 impl WalletEntry {
@@ -643,6 +649,13 @@ pub struct KeysConfig {
     /// data directory be a disposable cache while the seed lives in a mounted Secret. Set false
     /// to instead fail fast on an empty datadir.
     pub bootstrap_from_keys: bool,
+    /// How far below the chain tip `init` anchors a *freshly generated* wallet's birthday
+    /// (both engines share the policy). The margin only absorbs a reorg between reading the
+    /// tip and recording the birthday; the default
+    /// ([`crate::init::FRESH_WALLET_BIRTHDAY_MARGIN`]) is already generous against observed
+    /// reorg depths, so this knob exists for operators with their own reorg model, not for
+    /// tuning. Restores and an explicit `--birthday` are unaffected.
+    pub fresh_wallet_birthday_margin: u32,
     /// Permit more than one loaded wallet to hold spending keys - **honored only by an embedded
     /// node, and refused outright by the `zecd` daemon** (see
     /// [`reject_multiple_spenders_in_daemon`]).
@@ -979,6 +992,9 @@ struct WalletFile {
     transparent_allow_beyond_recovery_window: Option<bool>,
     /// Override the global `[pools] transparent_gap_warn_threshold` for this wallet.
     transparent_gap_warn_threshold: Option<u32>,
+    /// Override the global `[keys] fresh_wallet_birthday_margin` for this wallet. Legal on
+    /// every coin, like `server`.
+    fresh_wallet_birthday_margin: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1057,6 +1073,8 @@ struct KeysFile {
     /// Rebuild `data.sqlite` from `keys.toml` on an empty datadir (default true).
     bootstrap_from_keys: Option<bool>,
     allow_multiple_spending_wallets: Option<bool>,
+    /// Blocks below the tip a freshly generated wallet's birthday is anchored.
+    fresh_wallet_birthday_margin: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1592,6 +1610,14 @@ impl AppConfig {
         // Global pool defaults (`[pools]`), validated before any per-wallet override.
         let pools = resolve_global_pools(file.pools.as_ref())?;
 
+        // The global `[keys] fresh_wallet_birthday_margin`, hoisted ahead of the wallet loop
+        // (each wallet's own key overrides it; `[keys]` itself resolves further down).
+        let global_birthday_margin = file
+            .keys
+            .as_ref()
+            .and_then(|k| k.fresh_wallet_birthday_margin)
+            .unwrap_or(crate::init::FRESH_WALLET_BIRTHDAY_MARGIN);
+
         // Wallets: from file, plus an implicit default if none declared. Each wallet's pools and
         // default receivers are resolved against the global `[pools]` defaults, with the same
         // subset validation applied per wallet.
@@ -1702,6 +1728,9 @@ impl AppConfig {
                     transparent_initial_scan,
                     transparent_allow_beyond_recovery_window,
                     transparent_gap_warn_threshold,
+                    fresh_wallet_birthday_margin: w
+                        .fresh_wallet_birthday_margin
+                        .unwrap_or(global_birthday_margin),
                 },
             );
         }
@@ -1722,6 +1751,7 @@ impl AppConfig {
                 transparent_allow_beyond_recovery_window: pools
                     .transparent_allow_beyond_recovery_window,
                 transparent_gap_warn_threshold: pools.transparent_gap_warn_threshold,
+                fresh_wallet_birthday_margin: global_birthday_margin,
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {
@@ -1888,6 +1918,7 @@ impl AppConfig {
             keys_file: None,
             bootstrap_from_keys: None,
             allow_multiple_spending_wallets: None,
+            fresh_wallet_birthday_margin: None,
         });
         let keys = KeysConfig {
             // Default to <datadir>/identity.txt, matching where `zecd init` writes the
@@ -1902,6 +1933,7 @@ impl AppConfig {
             allow_multiple_spending_wallets: keys_file
                 .allow_multiple_spending_wallets
                 .unwrap_or(false),
+            fresh_wallet_birthday_margin: global_birthday_margin,
         };
 
         let sync_file = file.sync.unwrap_or(SyncFile {

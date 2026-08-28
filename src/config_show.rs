@@ -201,6 +201,11 @@ pub fn render(config: &AppConfig) -> String {
         "bootstrap_from_keys",
         config.keys.bootstrap_from_keys,
     );
+    kv(
+        &mut s,
+        "fresh_wallet_birthday_margin",
+        config.keys.fresh_wallet_birthday_margin,
+    );
 
     table(&mut s, "sync");
     kv(&mut s, "interval_secs", config.sync.interval_secs);
@@ -269,6 +274,16 @@ pub fn render(config: &AppConfig) -> String {
         kv(&mut s, "dir", path_val(&w.dir));
         if let Some(keys_file) = &w.keys_file {
             kv(&mut s, "keys_file", path_val(keys_file));
+        }
+        // Legal on every coin, rendered only when it differs from the global
+        // `[keys] fresh_wallet_birthday_margin` (the entry stores the resolved value, so
+        // "differs from the global" is exactly "this wallet set it").
+        if w.fresh_wallet_birthday_margin != config.keys.fresh_wallet_birthday_margin {
+            kv(
+                &mut s,
+                "fresh_wallet_birthday_margin",
+                w.fresh_wallet_birthday_margin,
+            );
         }
         // `server` is legal on every coin (each engine has its own token grammar), rendered
         // only when this wallet actually sets it: an absent key means "the coin's default

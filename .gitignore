@@ -3,8 +3,12 @@
 **/*.rs.bk
 Cargo.lock.orig
 
-# Local runtime data / wallets (never commit secrets)
+# Local runtime data / wallets (never commit secrets). /data-btc* covers the datadirs the
+# Bitcoin dev-stack samples (deploy/zecd.btc-testnet*.toml) document, which sit in the repo
+# root because zecd runs on the host there - the entries below catch a datadir's contents but
+# not its `.lock`, so without this the directory itself shows up untracked.
 /data
+/data-btc*
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal

@@ -942,10 +942,14 @@ async fn bitcoin_height_for_date(
 }
 
 /// The Bitcoin half of [`init_wallet`]: same refusals (already-initialized, one spending
-/// wallet per coin), same custody models, no upstream. The engine has no chain source yet,
-/// so the recorded birthday is `--birthday` or 0 (scan from genesis when sync lands) rather
-/// than a near-tip default, and the wallet database is created here - from the seed, holding
-/// only public descriptors - so an encrypted wallet can start without its passphrase.
+/// wallet per coin), same custody models, and the wallet database is created here - from the
+/// seed, holding only public descriptors - so an encrypted wallet can start without its
+/// passphrase. The birthday is resolved exactly as the block comment below describes: an
+/// explicit height is offline, a date needs the upstream on bitcoind (offline on kyoto), a
+/// restore falls back to the BIP 84 history floor, and a freshly generated wallet dials the
+/// node to anchor just below its tip. So it is offline for an explicit height and for a
+/// restore, and needs the node for a bitcoind date search and for a fresh wallet's tip
+/// anchor - it is not the no-upstream command it was before the chain source landed.
 #[cfg(feature = "bitcoin")]
 async fn init_bitcoin_wallet(
     config: &AppConfig,

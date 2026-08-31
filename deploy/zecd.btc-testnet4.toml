@@ -1,0 +1,108 @@
+# zecd configuration for the Bitcoin **testnet4** dev stack
+# (deploy/docker-compose.btc-testnet4.yml), for exercising the BDK engine against real -
+# valueless - testnet4 coins. See deploy/zecd.btc-testnet3.toml for the testnet3 twin; the
+# two differ only in `btc_testnet`, the ports, and the datadir, so both can run side by side.
+#
+# Needs a zecd built with the `bitcoin` feature. A default build carries no BDK engine and
+# refuses this file three times over: `[bitcoind]` is gated out of the config schema (so it
+# trips deny_unknown_fields at parse time, which is the error you actually see), and
+# `coin = "bitcoin"` and `btc_testnet` are both refused in resolve behind it. So running
+# `zecd config check --conf <this file>` is the probe for whether a binary has the engine.
+#
+# Unlike deploy/zecd.toml this file is NOT mounted into a container: the compose stack runs
+# only bitcoind, publishing its RPC on loopback, and zecd runs on the host. Relative paths
+# below therefore resolve against zecd's working directory - the repository root, if you run
+# the commands as written:
+#
+#   docker compose -f deploy/docker-compose.btc-testnet4.yml up -d
+#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4.toml \
+#       init --birthday 2026-08-01
+#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4.toml
+#
+# `init` resolves the wallet's birthday four ways, and only two of them are offline. An
+# explicit `--birthday <height>` is taken verbatim; a `--birthday <YYYY-MM-DD>` date is
+# resolved by a header search over the bitcoind upstream (offline against the shipped scan
+# floor on kyoto); `--restore` with no birthday falls back to the BIP 84 SegWit-activation
+# floor, a full history rescan; and a freshly generated wallet with no birthday **dials the
+# node** to anchor just below its tip, which is why the compose stack goes up first. That
+# last case is the one to know about: a kyoto wallet refuses it outright (reaching the tip
+# would mean starting a P2P node and syncing headers), so pass `--birthday <today's date>`
+# for a new kyoto wallet. Nothing here records 0 or scans from genesis.
+#
+# Then fund the wallet from a testnet4 faucet (e.g. mempool.space/testnet4). The coins are
+# valueless, which is why the bitcoind credentials below are fixed dev values published in
+# the repo (zecd's own [rpc] password is a CHANGE-ME placeholder - see the note on it). Do
+# not reuse this file's shape for mainnet.
+
+network = "test"
+# Which public Bitcoin test network this daemon's Bitcoin wallets run on: "testnet3" (the
+# default) or "testnet4" (BIP 94). It is a daemon-global refinement of `network`, not a
+# per-wallet chain choice, and is refused outside `network = "test"` where it would be inert.
+# The two testnets are key-identical (coin type 1', tb1, the same descriptors), so keys.toml
+# stays valid across both - but the chain is recorded in the BDK database at creation, so
+# flipping this over an existing wallet DB is refused at startup. Use a separate datadir.
+btc_testnet = "testnet4"
+datadir = "./data-btc-testnet4"
+default_wallet = "btc"
+
+[wallets.btc]
+coin = "bitcoin"
+# Endpoint precedence is this wallet's own `server`, then `[bitcoind] server`, then the
+# built-in `bitcoind` token - which resolves to 127.0.0.1 on the network-standard port,
+# 48332 for testnet4 (48333 is P2P). That is exactly what the compose stack publishes, so
+# the line below is what the default already does; it is here to name the port.
+# server = "bitcoind://127.0.0.1:48332"
+#
+# LIGHT MODE alternative - kyoto, a BIP-157/158 compact-block-filter client peering over
+# P2P with no server and no credentials (so the cleartext gate below does not apply to it).
+# It is the privacy analog of the Zcash light mode, not the feature analog: filters are
+# block-derived, so there is no mempool - no 0-conf receive visibility, no eviction
+# handling, and no estimatesmartfee. `kyoto` DNS-seeds its peers; `kyoto://<ip>:<port>`
+# pins one trusted peer (an IP, never a DNS name) and switches the node to whitelist-only,
+# which is how you point it at this stack's own node (it runs -peerblockfilters):
+# server = "kyoto://127.0.0.1:48333"
+
+[bitcoind]
+# Matches -rpcuser/-rpcpassword in the compose file. A cookie file (`rpc_cookie`) wins over
+# user/password when both are set. These credentials ride plaintext HTTP, so zecd's
+# cleartext-credential gate applies: loopback and the private ranges are allowed, a
+# globally-routable host is refused at connect.
+rpc_user = "btc"
+rpc_password = "btc"
+
+[rpc]
+# zecd's own Bitcoin-Core-dialect JSON-RPC, for the client under test. Loopback-only: unlike
+# deploy/zecd.toml there is no container boundary to cross, so nothing needs 0.0.0.0.
+bind = "127.0.0.1"
+port = 48232
+user = "btc"
+# The one value in this file to change: the [bitcoind] credentials above are fixed dev values
+# matching the compose stack, but this is zecd's OWN RPC password and has no counterpart to
+# match. `CHANGE-ME` is only rejected outright on mainnet, so a testnet daemon starts with it
+# as the literal password - set it, and authenticate with what you set.
+password = "CHANGE-ME"
+
+[keys]
+# age identity written by `zecd init`; used to decrypt the seed for unattended sending. A
+# bitcoin send derives its signers from that seed per send (no spending material is stored
+# in the BDK database), and there is no `walletpassphrase` for a bitcoin wallet - so a
+# passphrase-encrypted one cannot send at all, and this is the only unattended custody model.
+age_identity = "./data-btc-testnet4/identity.txt"
+auto_unlock = true
+
+[sync]
+# How often the actor polls when caught up. The default is 20s; a dev stack wants the 0-conf
+# mempool pass to surface a faucet payment promptly.
+interval_secs = 5
+
+[health]
+# NB the health server reports on Zcash wallets only - /status lists them and /readyz gates on
+# them - so on this bitcoin-only config /status shows an empty wallet map and /readyz is
+# trivially ready. Poll `getwalletinfo.lastprocessedblock` (or getblockcount, which answers
+# from the wallet's own applied height, never the node's tip) for sync state instead. The
+# port is set here only so a testnet3 daemon can run alongside this one.
+port = 49233
+
+[log]
+level = "info"
+format = "text"

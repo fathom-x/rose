@@ -12,7 +12,7 @@
 #   - JSON-RPC on 18332 (bitcoind's testnet3 default - exactly where a testnet3 zecd's
 #     bare `server = "bitcoind"` token resolves to)
 #   - compact block filters over P2P on 18333 (-blockfilterindex + -peerblockfilters,
-#     what the planned kyoto/bip157-backed light mode will peer with)
+#     what zecd's kyoto/BIP-157 light mode peers with: server = "kyoto://127.0.0.1:18333")
 #   - -txindex, so getrawtransaction answers for any confirmed tx
 #
 # The image is pinned to Bitcoin Core 30.2, in lockstep with the regtest stack and the CI
@@ -25,7 +25,8 @@
 #       bitcoin-cli -testnet -rpcuser=btc -rpcpassword=btc'
 #   bcli3 getblockchaininfo     # wait for initialblockdownload: false
 #
-# and point a `--features bitcoin` zecd at it:
+# and point a `--features bitcoin` zecd at it. deploy/zecd.btc-testnet3.toml is that
+# config written out and commented (host-side, not mounted here); in outline:
 #   network = "test"
 #   btc_testnet = "testnet3"    # the default - the line just makes the choice explicit
 #   [wallets.btc]

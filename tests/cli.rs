@@ -1277,12 +1277,46 @@ fn repo_file(rel: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
+/// The samples every build must accept: they configure the Zcash engine, which is always
+/// compiled in.
+const SAMPLE_CONFIGS: [&str; 2] = ["zecd.example.toml", "deploy/zecd.toml"];
+
+/// The Bitcoin dev-stack samples (the zecd side of `deploy/docker-compose.btc-testnet*.yml`).
+/// They select the BDK engine, so they are shipped-and-valid only for a build carrying the
+/// `bitcoin` feature; a default build refuses them, which
+/// `the_bitcoin_sample_configs_need_the_engine_they_select` asserts from the other side. The
+/// two lists are joined rather than checked separately so the samples pick up every rule the
+/// general ones are held to, including the `config show` round trip.
+#[cfg(feature = "bitcoin")]
+fn bitcoin_sample_configs() -> &'static [&'static str] {
+    &BITCOIN_SAMPLE_CONFIGS
+}
+
+#[cfg(not(feature = "bitcoin"))]
+fn bitcoin_sample_configs() -> &'static [&'static str] {
+    &[]
+}
+
+const BITCOIN_SAMPLE_CONFIGS: [&str; 2] = [
+    "deploy/zecd.btc-testnet3.toml",
+    "deploy/zecd.btc-testnet4.toml",
+];
+
+/// Every sample config, for whichever engines this build carries.
+fn shipped_sample_configs() -> Vec<&'static str> {
+    SAMPLE_CONFIGS
+        .iter()
+        .chain(bitcoin_sample_configs())
+        .copied()
+        .collect()
+}
+
 /// Every sample config this repo ships must be one *this* build accepts.
 #[test]
 fn the_sample_configs_this_repo_ships_are_valid_for_this_build() {
     // deploy/zecd.mainnet.toml is deliberately absent - it carries the CHANGE-ME placeholder
     // and is covered by the test below.
-    for rel in ["zecd.example.toml", "deploy/zecd.toml"] {
+    for rel in shipped_sample_configs() {
         let out = config_check(&repo_file(rel), &[]);
         assert!(
             out.status.success(),
@@ -1334,13 +1368,39 @@ fn the_mainnet_sample_config_is_refused_only_for_its_placeholder_password() {
     );
 }
 
+/// The other side of `bitcoin_sample_configs`. The Bitcoin dev-stack samples select an engine
+/// a default build does not carry, so that build must refuse them - and each file's header
+/// tells the operator that running `config check` on it is the probe for whether a given
+/// binary has the engine, so this is the assertion behind that instruction. The refusal comes
+/// from the `[bitcoind]` section, which is `cfg`-gated out of the config schema and so trips
+/// `deny_unknown_fields` at parse time - before `coin`/`btc_testnet` reach the doctrine check
+/// in `resolve`. Assert the message names the section: "unknown field" alone would also pass
+/// for a sample that had rotted onto a genuinely retired key.
+#[cfg(not(feature = "bitcoin"))]
+#[test]
+fn the_bitcoin_sample_configs_need_the_engine_they_select() {
+    for rel in BITCOIN_SAMPLE_CONFIGS {
+        let out = config_check(&repo_file(rel), &[]);
+        assert!(
+            !out.status.success(),
+            "{rel} selects the BDK engine; a build without it must refuse the file:\n{}",
+            stdout_of(&out)
+        );
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("unknown field `bitcoind`"),
+            "{rel} was refused for some reason other than the missing engine: {stderr}"
+        );
+    }
+}
+
 /// The renderer's schema contract, run over the shipped samples: what `config show` prints for
 /// a real deployment config is still a config this build accepts. The fixtures that pin this
 /// elsewhere are small; these files are the widest configs in the tree.
 #[test]
 fn config_show_renders_the_shipped_samples_into_configs_zecd_accepts() {
     let dir = tempfile::tempdir().unwrap();
-    for rel in ["zecd.example.toml", "deploy/zecd.toml"] {
+    for rel in shipped_sample_configs() {
         let shown = config_show(&repo_file(rel));
         assert!(
             shown.status.success(),

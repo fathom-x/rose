@@ -25,14 +25,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bdk_bitcoind_rpc::Emitter;
-use bdk_wallet::bitcoin::{Address, Amount, Transaction, Txid};
+use bdk_wallet::bitcoin::{Address, Amount, FeeRate, OutPoint, Psbt, Transaction, Txid};
 use bdk_wallet::{KeychainKind, PersistedWallet, SignOptions, Wallet};
 use secrecy::SecretVec;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, info_span, warn, Instrument as _};
 
 use crate::backoff::Backoff;
-use crate::btc::chain::{BitcoindRpc, BtcEndpoint};
+use crate::btc::chain::{BitcoindRpc, BroadcastError, BtcEndpoint};
 use crate::btc::keys::{self, AccountKeys};
 use crate::btc::kyoto::KyotoConn;
 use crate::btc::store::Persister;
@@ -49,6 +49,13 @@ const SYNC_BLOCKS_PER_PASS: usize = 512;
 
 /// The confirmation target handed to `estimatesmartfee` for wallet-built sends.
 const FEE_TARGET_BLOCKS: u16 = 6;
+
+/// The most a subtract-fee build's fee may overshoot the converged guess and still be
+/// accepted: the conservative dust bound (546 sat, P2PKH's - above the ~294 sat bound of
+/// the P2WPKH change this wallet actually produces). BDK only drops a change output whose
+/// value is at or below its script's dust limit, so a changeless overshoot is always under
+/// this; anything larger means the loop has genuinely not converged.
+const DUST_SLACK_SAT: u64 = 546;
 
 /// The wallet's balance in satoshis, bucketed the way BDK reports it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -175,6 +182,7 @@ enum BtcCommand {
     Send {
         /// `(address, amount in satoshis)` per recipient.
         recipients: Vec<(String, u64)>,
+        options: BtcSendOptions,
         reply: oneshot::Sender<Result<String, RpcError>>,
     },
     Broadcast {
@@ -188,6 +196,24 @@ enum BtcCommand {
         txid: String,
         reply: oneshot::Sender<Result<Option<BtcTxRecord>, RpcError>>,
     },
+}
+
+/// Caller-supplied send options - the optional `sendtoaddress`/`sendmany` parameters the
+/// engine honors. Wire-friendly primitives only (the RPC layer builds this, and engine types
+/// must not cross that seam); `Default` is a plain estimated-fee send.
+#[derive(Clone, Debug, Default)]
+pub struct BtcSendOptions {
+    /// An explicit fee rate in sat/kvB - the caller's sat/vB scaled by 1000, Core's own
+    /// `fee_rate` precision (see `crate::amount::value_to_sat_per_kvb`). `None` estimates
+    /// via the upstream. An explicit rate still passes the sanity ceiling at the `do_send`
+    /// chokepoint: a fat-fingered 100000 sat/vB burns funds exactly like a dishonest signal.
+    pub fee_rate_sat_per_kvb: Option<u64>,
+    /// Indices into `recipients` whose amounts pay the fee (`subtractfeefromamount` /
+    /// `subtractfeefrom`): the fee is divided equally among them, the first paying
+    /// recipient **in recipient order** also covering the remainder - Core's split, which
+    /// keys on output order, not the order the `subtractfeefrom` array listed them.
+    /// Empty = the sender's change pays, as ever.
+    pub subtract_fee_from: Vec<usize>,
 }
 
 /// A handle to a running Bitcoin wallet actor - the registry's
@@ -239,9 +265,17 @@ impl BtcWalletHandle {
     }
 
     /// Build, sign, broadcast, and record a send paying `recipients`. Returns the txid.
-    pub async fn send(&self, recipients: Vec<(String, u64)>) -> Result<String, RpcError> {
-        self.dispatch(|reply| BtcCommand::Send { recipients, reply })
-            .await
+    pub async fn send(
+        &self,
+        recipients: Vec<(String, u64)>,
+        options: BtcSendOptions,
+    ) -> Result<String, RpcError> {
+        self.dispatch(|reply| BtcCommand::Send {
+            recipients,
+            options,
+            reply,
+        })
+        .await
     }
 
     /// Broadcast a caller-built raw transaction (`sendrawtransaction`). Returns the txid.
@@ -829,8 +863,12 @@ impl BtcActor {
                 };
                 let _ = reply.send(result);
             }
-            BtcCommand::Send { recipients, reply } => {
-                let result = self.do_send(recipients).await;
+            BtcCommand::Send {
+                recipients,
+                options,
+                reply,
+            } => {
+                let result = self.do_send(recipients, options).await;
                 let _ = reply.send(result);
             }
             BtcCommand::Broadcast { hex, reply } => {
@@ -968,19 +1006,58 @@ impl BtcActor {
     }
 
     /// Broadcast in whichever dialect is connected: bitcoind's `sendrawtransaction`, or a
-    /// kyoto submission to the P2P peers.
-    async fn upstream_broadcast(&mut self, tx: &Transaction) -> anyhow::Result<Txid> {
+    /// kyoto submission to the P2P peers. Failures come back as [`BroadcastError`]:
+    /// bitcoind classifies rejection vs transport itself, and every kyoto failure is
+    /// transport-shaped - a rejection there surfaces asynchronously in the log stream, so
+    /// this call failing only ever means "no verdict" (see [`crate::btc::kyoto::broadcast`]).
+    async fn upstream_broadcast(&mut self, tx: &Transaction) -> Result<Txid, BroadcastError> {
         let requester = match self.conn.as_ref() {
             Some(Conn::Bitcoind { rpc, .. }) => {
                 return tokio::task::block_in_place(|| rpc.broadcast_blocking(tx));
             }
             Some(Conn::Kyoto(kyoto)) => kyoto.requester(),
-            None => return Err(anyhow::anyhow!("no upstream connection")),
+            None => {
+                return Err(BroadcastError::Transport(anyhow::anyhow!(
+                    "no upstream connection"
+                )))
+            }
         };
-        crate::btc::kyoto::broadcast(requester, tx).await
+        crate::btc::kyoto::broadcast(requester, tx)
+            .await
+            .map_err(BroadcastError::Transport)
     }
 
-    async fn do_send(&mut self, recipients: Vec<(String, u64)>) -> Result<String, RpcError> {
+    /// Map a broadcast failure onto the RPC vocabulary. A rejection passes the node's own
+    /// verify-family code and message through (the node answered; retrying the same bytes
+    /// cannot succeed). A transport failure is `-4` - retry semantics, the opposite
+    /// instruction - and drops a bitcoind connection so the next operation redials with
+    /// backoff (the `Conn` convention); a kyoto connection is deliberately kept, since the
+    /// light client itself holds the still-queued transaction and tearing it down would
+    /// discard the pending relay.
+    fn broadcast_failure(&mut self, e: BroadcastError) -> RpcError {
+        match e {
+            BroadcastError::Rejected { code, message } => RpcError::new(code, message),
+            BroadcastError::Transport(err) => {
+                if matches!(self.conn, Some(Conn::Bitcoind { .. })) {
+                    self.drop_conn();
+                }
+                RpcError::new(
+                    codes::RPC_WALLET_ERROR,
+                    format!(
+                        "broadcast failed before the upstream gave a verdict: {err:#}. The \
+                         transaction was not recorded (its inputs stay unlocked); retry \
+                         once the upstream is reachable"
+                    ),
+                )
+            }
+        }
+    }
+
+    async fn do_send(
+        &mut self,
+        recipients: Vec<(String, u64)>,
+        options: BtcSendOptions,
+    ) -> Result<String, RpcError> {
         // Checked here but borrowed only at the signing step below: the fee and broadcast
         // calls take `&mut self`, so holding a `&self.seed` across them would not borrow-check.
         if self.seed.is_none() {
@@ -998,16 +1075,27 @@ impl BtcActor {
                  once it is reachable",
             ));
         }
-        // Fee rate: the upstream's estimate, or - matching bitcoind's fallbackfee posture -
-        // a 1 sat/vB floor on test networks only (mainnet refuses rather than guessing).
-        // Whatever the source - estimatesmartfee, mempool.space, or the kyoto peers' relay
-        // floor and block medians - the rate passes the sanity ceiling HERE, at the one
-        // chokepoint every send goes through, so no source (present or future) can dictate
-        // an absurd fee: it becomes a refusal naming the number instead of a payment.
-        let fee_rate = self
-            .upstream_fee_rate()
-            .await
-            .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?;
+        // Fee rate: the caller's explicit `fee_rate` when given (no estimation dial at all -
+        // on the kyoto backend this is the one way to price a send without trusting
+        // mempool.space or the peers' coarse signals), else the upstream's estimate, or -
+        // matching bitcoind's fallbackfee posture - a 1 sat/vB floor on test networks only
+        // (mainnet refuses rather than guessing). Whatever the source - the caller,
+        // estimatesmartfee, mempool.space, or the kyoto peers' relay floor and block
+        // medians - the rate passes the sanity ceiling HERE, at the one chokepoint every
+        // send goes through, so no source (present or future) can dictate an absurd fee: it
+        // becomes a refusal naming the number instead of a payment.
+        let fee_rate = match options.fee_rate_sat_per_kvb {
+            // sat/kvB -> sat/kwu is a /4 (1 vB = 4 WU), ceiling-divided so the built
+            // transaction never pays under the rate the caller named - by weight, which is
+            // how BDK prices every fee (against a rounded-up vsize the realized rate can
+            // read fractionally under; the conservative satisfaction-weight estimate is
+            // what covers relay floors in practice, same as the estimated-rate path).
+            Some(kvb) => Some(FeeRate::from_sat_per_kwu(kvb.div_ceil(4))),
+            None => self
+                .upstream_fee_rate()
+                .await
+                .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?,
+        };
         let fee_rate = match fee_rate {
             Some(rate) => crate::btc::fees::enforce_sanity_ceiling(rate)
                 .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?,
@@ -1015,10 +1103,10 @@ impl BtcActor {
                 return Err(RpcError::new(
                     codes::RPC_WALLET_ERROR,
                     "Fee estimation failed and no fallback applies on mainnet; retry once \
-                     the node has fee data",
+                     the node has fee data (or pass an explicit fee_rate)",
                 ))
             }
-            None => bdk_wallet::bitcoin::FeeRate::from_sat_per_vb_u32(1),
+            None => FeeRate::from_sat_per_vb_u32(1),
         };
         let network = self.wallet.network();
         let mut parsed = Vec::with_capacity(recipients.len());
@@ -1035,12 +1123,16 @@ impl BtcActor {
         }
 
         let started = Instant::now();
-        let mut builder = self.wallet.build_tx();
-        for (address, amount) in &parsed {
-            builder.add_recipient(address.script_pubkey(), *amount);
-        }
-        builder.fee_rate(fee_rate);
-        let mut psbt = builder.finish().map_err(map_create_tx_error)?;
+        let mut psbt = if options.subtract_fee_from.is_empty() {
+            let mut builder = self.wallet.build_tx();
+            for (address, amount) in &parsed {
+                builder.add_recipient(address.script_pubkey(), *amount);
+            }
+            builder.fee_rate(fee_rate);
+            builder.finish().map_err(map_create_tx_error)?
+        } else {
+            self.build_subtract_fee_psbt(&parsed, &options.subtract_fee_from, fee_rate)?
+        };
 
         // Signers are derived from the seed per send and dropped with this scope - the
         // custody model's spend half (the persisted wallet holds public descriptors only).
@@ -1061,10 +1153,10 @@ impl BtcActor {
         let tx = psbt
             .extract_tx()
             .map_err(|e| RpcError::misc(format!("extract transaction: {e:?}")))?;
-        let txid = self
-            .upstream_broadcast(&tx)
-            .await
-            .map_err(|e| RpcError::new(codes::RPC_VERIFY_REJECTED, format!("{e:#}")))?;
+        let txid = match self.upstream_broadcast(&tx).await {
+            Ok(txid) => txid,
+            Err(e) => return Err(self.broadcast_failure(e)),
+        };
         // Record our own send immediately (0-conf), which also locks its inputs against
         // reuse by the next send's coin selection.
         self.wallet
@@ -1077,6 +1169,94 @@ impl BtcActor {
             "sent transaction"
         );
         Ok(txid.to_string())
+    }
+
+    /// Build the PSBT for a subtract-fee send: the listed recipients pay the fee out of
+    /// their own amounts, so coin selection must target the stated amounts alone - the
+    /// defining property of a subtract-fee send, and what makes "send the whole balance"
+    /// work at all (selecting for amounts *plus* fee would refuse it as insufficient).
+    ///
+    /// BDK's `TxBuilder` has no subtract-fee mode, so this converges on one: a zero-fee
+    /// build picks the inputs, then rate-priced rebuilds over those pinned inputs walk the
+    /// fee to a fixed point via [`subtract_fee_from_amounts`]. With the inputs pinned, the
+    /// fee for a given output structure is deterministic, so the loop settles as soon as
+    /// the change output's presence does - two or three builds; the iteration cap is a
+    /// backstop, not a path. Note each change-producing build reveals an internal keychain
+    /// index into BDK's staged changeset (persisted on the next `persist`, broadcast or
+    /// not), so a subtract-fee send can consume two or three internal indices with only
+    /// the last funded - gap-limit-scale noise, but not nothing: don't add builds here
+    /// casually.
+    ///
+    /// One shape has no fixed point: when the pinned inputs exceed the amounts by less
+    /// than a change output's dust bound, BDK folds that surplus into the fee (as Core
+    /// does with sub-dust change), so the observed fee sits that fixed surplus above the
+    /// guess on every changeless iteration. The acceptance below therefore takes a
+    /// changeless build whose fee overshoots the guess by at most [`DUST_SLACK_SAT`]:
+    /// the recipients still pay only the guess, and the surplus could never have come
+    /// back as change anyway.
+    fn build_subtract_fee_psbt(
+        &mut self,
+        parsed: &[(Address, Amount)],
+        subtract: &[usize],
+        fee_rate: FeeRate,
+    ) -> Result<Psbt, RpcError> {
+        let inputs: Vec<OutPoint> = {
+            let mut builder = self.wallet.build_tx();
+            for (address, amount) in parsed {
+                builder.add_recipient(address.script_pubkey(), *amount);
+            }
+            builder.fee_absolute(Amount::ZERO);
+            let psbt = builder.finish().map_err(map_create_tx_error)?;
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .map(|i| i.previous_output)
+                .collect()
+        };
+        let mut fee_sat = 0u64;
+        for _ in 0..8 {
+            let reduced = subtract_fee_from_amounts(parsed, subtract, fee_sat)?;
+            let mut builder = self.wallet.build_tx();
+            builder
+                .add_utxos(&inputs)
+                .map_err(|e| RpcError::misc(format!("re-select inputs: {e:?}")))?;
+            builder.manually_selected_only();
+            for (address, amount) in &reduced {
+                builder.add_recipient(address.script_pubkey(), *amount);
+            }
+            builder.fee_rate(fee_rate);
+            match builder.finish() {
+                Ok(psbt) => {
+                    let actual = psbt
+                        .fee()
+                        .map_err(|e| RpcError::misc(format!("compute the psbt fee: {e}")))?
+                        .to_sat();
+                    // Exact convergence, or the changeless sub-dust window (see the doc
+                    // comment): a build with no change output whose fee exceeds the guess
+                    // by at most a dust bound is the folded-surplus fixed point.
+                    let changeless = psbt.unsigned_tx.output.len() == reduced.len();
+                    if actual == fee_sat
+                        || (changeless && actual > fee_sat && actual - fee_sat <= DUST_SLACK_SAT)
+                    {
+                        return Ok(psbt);
+                    }
+                    fee_sat = actual;
+                }
+                // The pinned inputs cover the amounts but not amounts + fee - the guess is
+                // still low (a whole-balance send's first pass always lands here): the
+                // shortfall IS the missing fee, so fold it in and go around.
+                Err(bdk_wallet::error::CreateTxError::CoinSelection(
+                    bdk_wallet::coin_selection::InsufficientFunds { needed, available },
+                )) => {
+                    fee_sat += needed.to_sat().saturating_sub(available.to_sat());
+                }
+                Err(e) => return Err(map_create_tx_error(e)),
+            }
+        }
+        Err(RpcError::new(
+            codes::RPC_WALLET_ERROR,
+            "fee subtraction did not converge; retry, or send without subtractfeefromamount",
+        ))
     }
 
     async fn do_broadcast(&mut self, hex: String) -> Result<String, RpcError> {
@@ -1093,10 +1273,10 @@ impl BtcActor {
                     format!("TX decode failed: {e}"),
                 )
             })?;
-        let txid = self
-            .upstream_broadcast(&tx)
-            .await
-            .map_err(|e| RpcError::new(codes::RPC_VERIFY_REJECTED, format!("{e:#}")))?;
+        let txid = match self.upstream_broadcast(&tx).await {
+            Ok(txid) => txid,
+            Err(e) => return Err(self.broadcast_failure(e)),
+        };
         // If the transaction touches this wallet, record it at 0-conf (the apply filters
         // relevance itself, so a foreign transaction is a no-op).
         self.wallet
@@ -1104,6 +1284,44 @@ impl BtcActor {
         self.persist("broadcast");
         Ok(txid.to_string())
     }
+}
+
+/// Divide `fee_sat` across the `subtract` recipients and return the reduced amounts -
+/// Core's split: `fee / n` each, with the first paying recipient **in recipient order**
+/// also covering the remainder (Core keys on output order, not on the order the
+/// `subtractfeefrom` array named them). A recipient whose amount cannot cover its share
+/// is a refusal naming the problem, matching Core's "too small to pay the fee" behavior
+/// rather than sending dust or underflowing.
+fn subtract_fee_from_amounts(
+    parsed: &[(Address, Amount)],
+    subtract: &[usize],
+    fee_sat: u64,
+) -> Result<Vec<(Address, Amount)>, RpcError> {
+    let n = subtract.len() as u64;
+    let share = fee_sat / n;
+    let remainder = fee_sat % n;
+    let first_paying = subtract.iter().min().copied();
+    let mut out = parsed.to_vec();
+    for idx in subtract {
+        let cut = share
+            + if Some(*idx) == first_paying {
+                remainder
+            } else {
+                0
+            };
+        let entry = out
+            .get_mut(*idx)
+            .ok_or_else(|| RpcError::invalid_parameter("subtractfeefrom index out of range"))?;
+        let have = entry.1.to_sat();
+        if have <= cut {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "The transaction amount is too small to pay the fee",
+            ));
+        }
+        entry.1 = Amount::from_sat(have - cut);
+    }
+    Ok(out)
 }
 
 /// Map BDK's transaction-build failure onto the Bitcoin Core error vocabulary: insufficient
@@ -1238,6 +1456,48 @@ mod tests {
         assert!(err.to_string().contains("btc_testnet"), "{err:#}");
     }
 
+    /// Core's subtract-fee division: `fee / n` per listed recipient, the first paying
+    /// recipient in **recipient order** covering the remainder (whatever order the
+    /// `subtractfeefrom` array named them - Core keys on output order), unlisted
+    /// recipients untouched, and an amount that cannot cover its share refusing rather
+    /// than underflowing.
+    #[test]
+    fn subtract_fee_from_amounts_splits_like_core() {
+        let addr = |s: &str| Address::from_str(s).unwrap().assume_checked();
+        let a = addr("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        let parsed = vec![
+            (a.clone(), Amount::from_sat(10_000)),
+            (a.clone(), Amount::from_sat(20_000)),
+            (a.clone(), Amount::from_sat(30_000)),
+        ];
+
+        // One payer takes the whole fee.
+        let out = subtract_fee_from_amounts(&parsed, &[1], 151).unwrap();
+        assert_eq!(out[0].1.to_sat(), 10_000);
+        assert_eq!(out[1].1.to_sat(), 19_849);
+        assert_eq!(out[2].1.to_sat(), 30_000);
+
+        // Two payers split it; the odd satoshi lands on the earliest recipient among the
+        // payers, not on the array's first entry.
+        let out = subtract_fee_from_amounts(&parsed, &[2, 0], 151).unwrap();
+        assert_eq!(out[0].1.to_sat(), 10_000 - 76);
+        assert_eq!(out[2].1.to_sat(), 30_000 - 75);
+        assert_eq!(out[1].1.to_sat(), 20_000);
+
+        // A zero fee is the identity (the convergence loop's first pass).
+        let out = subtract_fee_from_amounts(&parsed, &[0], 0).unwrap();
+        assert_eq!(out[0].1.to_sat(), 10_000);
+
+        // An amount at or below its share refuses with -4 naming the problem.
+        let err = subtract_fee_from_amounts(&parsed, &[0], 10_000).unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
+        assert!(err.message.contains("too small to pay the fee"), "{err:?}");
+
+        // A bad index is a parameter error, never a panic on the actor.
+        let err = subtract_fee_from_amounts(&parsed, &[7], 100).unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+    }
+
     /// A missing database with no seed is an error naming init, not a silently empty wallet.
     #[tokio::test(flavor = "multi_thread")]
     async fn missing_database_without_seed_fails_the_spawn() {
@@ -1254,10 +1514,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (handle, _task) = spawn(offline_config(dir.path(), Some(bip84_seed()))).unwrap();
         let err = handle
-            .send(vec![(
-                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                10_000,
-            )])
+            .send(
+                vec![(
+                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                    10_000,
+                )],
+                BtcSendOptions::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);

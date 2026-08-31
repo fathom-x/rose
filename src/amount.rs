@@ -65,6 +65,29 @@ pub fn value_to_zats(v: &Value) -> Result<u64, RpcError> {
     Ok(zats)
 }
 
+/// Parse a Bitcoin-Core-style `fee_rate` argument (sat/vB) into sat/kvB, mirroring Core's
+/// `AmountFromValue(fee_rate, /* decimals */ 3)`: a JSON number or string, parsed with
+/// [`parse_fixed_point`] at 3 decimal places - so `1.999` sat/vB is exactly 1999 sat/kvB.
+/// Error codes are Core's split: a negative rate is `-3` "Amount out of range" (the
+/// `AmountFromValue` range check), while exactly zero survives that check and is refused
+/// as `-8` "Invalid fee rate".
+pub fn value_to_sat_per_kvb(v: &Value) -> Result<u64, RpcError> {
+    let literal = match v {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        _ => return Err(RpcError::type_error("Amount is not a number or string")),
+    };
+    let kvb =
+        parse_fixed_point(&literal, 3).ok_or_else(|| RpcError::type_error("Invalid amount"))?;
+    if kvb < 0 {
+        return Err(RpcError::type_error("Amount out of range"));
+    }
+    if kvb == 0 {
+        return Err(RpcError::invalid_parameter("Invalid fee rate"));
+    }
+    Ok(kvb as u64)
+}
+
 /// An exact, unsigned zatoshi amount for the typed client (`crate::typed`). On the wire it is
 /// Bitcoin Core's bare JSON number with 8 decimal places: `Serialize` goes through
 /// [`zats_to_value`] and `Deserialize` through [`value_to_zats`] (the exact `ParseFixedPoint`
@@ -196,7 +219,7 @@ fn process_mantissa_digit(ch: char, mantissa: &mut i64, mantissa_tzeros: &mut i6
 /// Exact port of Bitcoin Core's [`ParseFixedPoint`] (the parser behind `AmountFromValue`),
 /// returning the value scaled by 10^`decimals` zatoshis. A decimal-library parse is not a
 /// substitute: `rust_decimal` silently truncates sub-representable mantissas to zero, so
-/// e.g. `0.0…01e+68` (= 1 zatoshi) or a 64-zero mantissa meaning 1 ZEC would parse as 0.
+/// e.g. `0.0...01e+68` (= 1 zatoshi) or a 64-zero mantissa meaning 1 ZEC would parse as 0.
 ///
 /// [`ParseFixedPoint`]: https://github.com/bitcoin/bitcoin/blob/master/src/util/strencodings.cpp
 fn parse_fixed_point(mut val: &str, decimals: i64) -> Option<i64> {
@@ -403,6 +426,46 @@ mod tests {
         assert_eq!(value_to_zats(&n).unwrap(), 150_000_000);
         let s = Value::String("0.00000001".to_string());
         assert_eq!(value_to_zats(&s).unwrap(), 1);
+    }
+
+    /// The `fee_rate` parser: sat/vB at Core's 3-decimal precision, out as sat/kvB, with
+    /// zero/negative/garbage refused rather than defaulted.
+    #[test]
+    fn fee_rate_parses_at_core_precision_and_refuses_nonpositive() {
+        let num = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        assert_eq!(value_to_sat_per_kvb(&num("1")).unwrap(), 1_000);
+        assert_eq!(value_to_sat_per_kvb(&num("25")).unwrap(), 25_000);
+        assert_eq!(value_to_sat_per_kvb(&num("1.999")).unwrap(), 1_999);
+        assert_eq!(value_to_sat_per_kvb(&num("0.001")).unwrap(), 1);
+        assert_eq!(
+            value_to_sat_per_kvb(&Value::String("2.5".to_string())).unwrap(),
+            2_500
+        );
+        // Core's error-code split: zero is -8 ("Invalid fee rate"), while negative,
+        // over-precise, and malformed are all -3 from the AmountFromValue layer.
+        use crate::error::codes;
+        assert_eq!(
+            value_to_sat_per_kvb(&num("0")).unwrap_err().code,
+            codes::RPC_INVALID_PARAMETER
+        );
+        assert_eq!(
+            value_to_sat_per_kvb(&num("-1")).unwrap_err().code,
+            codes::RPC_TYPE_ERROR
+        );
+        assert_eq!(
+            value_to_sat_per_kvb(&num("0.0001")).unwrap_err().code,
+            codes::RPC_TYPE_ERROR
+        );
+        assert_eq!(
+            value_to_sat_per_kvb(&Value::String("nope".to_string()))
+                .unwrap_err()
+                .code,
+            codes::RPC_TYPE_ERROR
+        );
+        assert_eq!(
+            value_to_sat_per_kvb(&Value::Bool(true)).unwrap_err().code,
+            codes::RPC_TYPE_ERROR
+        );
     }
 
     /// `AmountFromValue` vectors from zcashd `src/test/rpc_tests.cpp`

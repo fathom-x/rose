@@ -17,9 +17,8 @@
 
 use serde_json::{json, Value};
 
-use super::wallet_methods::param_engaged;
-use crate::amount::{signed_zats_to_value, value_to_zats, zats_to_value};
-use crate::btc::actor::{BtcConnState, BtcTxDetail, BtcTxRecord, BtcWalletHandle};
+use crate::amount::{signed_zats_to_value, value_to_sat_per_kvb, value_to_zats, zats_to_value};
+use crate::btc::actor::{BtcConnState, BtcSendOptions, BtcTxDetail, BtcTxRecord, BtcWalletHandle};
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
@@ -384,23 +383,77 @@ async fn sendtoaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Val
         }
         Some(v) => value_to_zats(v)?,
     };
-    // Params 2/3 (comment, comment_to) are metadata and safe to ignore (zecd is stateless),
-    // but subtractfeefromamount changes who pays the fee: silently ignoring it would debit
-    // the sender more than the caller intended. Reject it, same rule as the Zcash handler.
-    if req.param(4).is_some_and(param_engaged) {
-        return Err(RpcError::invalid_parameter(
-            "subtractfeefromamount is not supported for bitcoin wallets yet",
-        ));
-    }
-    // Param 9 (fee_rate) is an explicit fee instruction; the wallet estimates via the node.
-    // Silently charging a different rate than the caller named would be worse than refusing.
-    if req.param(9).is_some_and(param_engaged) {
-        return Err(RpcError::invalid_parameter(
-            "fee_rate is not supported (the wallet uses the node's smart-fee estimate)",
-        ));
-    }
-    let txid = handle.send(vec![(addr.to_string(), amount)]).await?;
+    // Params 2/3 (comment, comment_to) are metadata and safe to ignore (zecd is stateless).
+    // Param 4 (subtractfeefromamount): the fee comes out of the amount sent - the recipient
+    // receives amount minus fee and the sender is debited exactly the amount.
+    let subtract = match req.param(4) {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(RpcError::type_error(
+                "subtractfeefromamount must be a boolean",
+            ))
+        }
+    };
+    // Params 6/7 (conf_target, estimate_mode) are refused when engaged; param 9
+    // (fee_rate) is an explicit rate in sat/vB, honored verbatim instead of the
+    // upstream's estimate (Core's argument, Core's 3-decimal precision).
+    reject_fee_estimation_params(req)?;
+    let options = BtcSendOptions {
+        fee_rate_sat_per_kvb: parse_fee_rate(req.param(9))?,
+        subtract_fee_from: if subtract { vec![0] } else { Vec::new() },
+    };
+    let txid = handle
+        .send(vec![(addr.to_string(), amount)], options)
+        .await?;
     Ok(Value::String(txid))
+}
+
+/// Parse an optional `fee_rate` parameter (sat/vB) into sat/kvB, `None` when disengaged.
+/// A rate below the 1 sat/vB relay floor is refused up front, as Core refuses one below
+/// `minrelaytxfee`: a send priced under the floor builds a transaction no node relays -
+/// on bitcoind that fails late at broadcast, and over kyoto a peer's `getdata` counts as
+/// broadcast success, so the unminable transaction would be recorded at 0-conf with its
+/// inputs locked behind it and no bumpfee/abandon to free them.
+fn parse_fee_rate(v: Option<&Value>) -> Result<Option<u64>, RpcError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let kvb = value_to_sat_per_kvb(v)?;
+            if kvb < 1_000 {
+                return Err(RpcError::invalid_parameter(format!(
+                    "fee_rate ({}.{:03} sat/vB) is lower than the minimum relay fee rate \
+                     (1.000 sat/vB)",
+                    kvb / 1_000,
+                    kvb % 1_000
+                )));
+            }
+            Ok(Some(kvb))
+        }
+    }
+}
+
+/// Refuse an engaged `conf_target`/`estimate_mode` pair (the same positions, 6/7, on both
+/// send methods). The wallet estimates at one fixed target and cannot honor either, and a
+/// named target it would silently ignore is a mischarge - the refuse-don't-mischarge rule,
+/// which also covers Core's own `-8` for combining them with an explicit `fee_rate`.
+/// Core's disengaged shapes are accepted: `null`, and for `estimate_mode` also `""` and
+/// `"unset"`.
+fn reject_fee_estimation_params(req: &RpcRequest) -> Result<(), RpcError> {
+    if req.param(6).is_some_and(|v| !v.is_null()) {
+        return Err(RpcError::invalid_parameter(
+            "conf_target is not supported (the wallet estimates at a fixed target; pass an \
+             explicit fee_rate to price the send yourself)",
+        ));
+    }
+    match req.param(7) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) if s.is_empty() || s.eq_ignore_ascii_case("unset") => Ok(()),
+        Some(_) => Err(RpcError::invalid_parameter(
+            "estimate_mode is not supported (the wallet estimates at a fixed target; pass \
+             an explicit fee_rate to price the send yourself)",
+        )),
+    }
 }
 
 async fn sendmany(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
@@ -424,13 +477,51 @@ async fn sendmany(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, R
     for (addr, amount) in map {
         recipients.push((addr.clone(), value_to_zats(amount)?));
     }
-    // Param 4 (subtractfeefrom) changes who pays the fee; refuse rather than mischarge.
-    if req.param(4).is_some_and(param_engaged) {
-        return Err(RpcError::invalid_parameter(
-            "subtractfeefrom is not supported for bitcoin wallets yet",
-        ));
-    }
-    let txid = handle.send(recipients).await?;
+    // Param 4 (subtractfeefrom): the addresses whose amounts pay the fee, each of which
+    // must be a recipient - a name that matches nothing would silently shift the fee back
+    // onto the sender, the mischarge this used to refuse outright.
+    let subtract_fee_from = match req.param(4) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(addrs)) => {
+            let mut indices = Vec::with_capacity(addrs.len());
+            for a in addrs {
+                let Some(a) = a.as_str() else {
+                    return Err(RpcError::type_error(
+                        "subtractfeefrom must be an array of address strings",
+                    ));
+                };
+                let idx = recipients
+                    .iter()
+                    .position(|(addr, _)| addr == a)
+                    .ok_or_else(|| {
+                        RpcError::invalid_parameter(format!(
+                            "subtractfeefrom names an address that is not a recipient: {a}"
+                        ))
+                    })?;
+                if indices.contains(&idx) {
+                    return Err(RpcError::invalid_parameter(format!(
+                        "Invalid parameter, duplicated address: {a}"
+                    )));
+                }
+                indices.push(idx);
+            }
+            indices
+        }
+        Some(_) => {
+            return Err(RpcError::type_error(
+                "subtractfeefrom must be an array of address strings",
+            ))
+        }
+    };
+    // Params 6/7 (conf_target, estimate_mode) are refused when engaged; param 8
+    // (fee_rate) is an explicit rate in sat/vB, as on sendtoaddress (where it is
+    // param 9 - Core's own positional layouts differ between the two).
+    reject_fee_estimation_params(req)?;
+    let options = BtcSendOptions {
+        fee_rate_sat_per_kvb: parse_fee_rate(req.param(8))?,
+        subtract_fee_from,
+    };
+    let txid = handle.send(recipients, options).await?;
     Ok(Value::String(txid))
 }
 
@@ -607,6 +698,113 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+
+        // The optional send parameters are validated before any wallet work: a non-boolean
+        // subtractfeefromamount is -3, a subtractfeefrom name that is not a recipient (or
+        // a duplicated one) is -8, and a zero or malformed fee_rate is -8/-3.
+        let err = call(
+            "sendtoaddress",
+            vec![
+                json!(address.clone()),
+                json!(0.001_f64),
+                json!(null),
+                json!(null),
+                json!("yes"),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_TYPE_ERROR);
+        let err = call(
+            "sendtoaddress",
+            vec![
+                json!(address.clone()),
+                json!(0.001_f64),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(0),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        // A rate under the 1 sat/vB relay floor is refused up front (Core's minrelay
+        // posture), naming both numbers.
+        let err = call(
+            "sendtoaddress",
+            vec![
+                json!(address.clone()),
+                json!(0.001_f64),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!(0.05),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("0.050 sat/vB"), "{}", err.message);
+        // conf_target and estimate_mode cannot be honored, so engaging either is -8;
+        // the disengaged estimate_mode shapes ("", "unset") fall through to the send
+        // itself, which fails -4 offline - proof they passed validation.
+        let mut params = vec![
+            json!(address.clone()),
+            json!(0.001_f64),
+            json!(null),
+            json!(null),
+            json!(null),
+            json!(null),
+            json!(1),
+        ];
+        let err = call("sendtoaddress", params.clone()).await.unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("conf_target"), "{}", err.message);
+        params[6] = json!(null);
+        params.push(json!("economical"));
+        let err = call("sendtoaddress", params.clone()).await.unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("estimate_mode"), "{}", err.message);
+        params[7] = json!("unset");
+        let err = call("sendtoaddress", params).await.unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
+        let err = call(
+            "sendmany",
+            vec![
+                json!(""),
+                json!({ address.clone(): 0.001_f64 }),
+                json!(null),
+                json!(null),
+                json!(["not-a-recipient"]),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("not a recipient"), "{}", err.message);
+        let err = call(
+            "sendmany",
+            vec![
+                json!(""),
+                json!({ address.clone(): 0.001_f64 }),
+                json!(null),
+                json!(null),
+                json!([address.clone(), address.clone()]),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("duplicated"), "{}", err.message);
 
         let addr_info = call("getaddressinfo", vec![json!(address.clone())])
             .await

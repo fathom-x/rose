@@ -98,13 +98,39 @@ an unconfirmed, explicitly-signaling transaction); `gettransaction`'s top-level 
 the sum of the details, so a self-payment nets to zero and change never distorts it. Still
 omitted, matching the Zcash side: `walletconflicts` and `abandoned`.
 
+## Send pricing and fee subtraction (Core's optional send parameters)
+
+`sendtoaddress`/`sendmany` honor Core's optional fee parameters, at Core's positions (which
+differ between the two methods, as in Core):
+
+- **`fee_rate`** (sat/vB, Core's 3-decimal precision - `amount.rs::value_to_sat_per_kvb`)
+  prices the send verbatim, with no estimation dial at all. On the kyoto backend this is
+  the one way to price a send without trusting either mempool.space or the peers' coarse
+  signals. Bounded on both sides: a rate under the 1 sat/vB relay floor is refused up
+  front like Core's `minrelaytxfee` check (under the floor no node relays the result, and
+  over kyoto the unminable transaction would still be recorded at 0-conf, locking its
+  inputs), and an explicit rate still passes the shared sanity ceiling at the `do_send`
+  chokepoint - a fat-fingered 100000 sat/vB burns funds exactly like a dishonest signal.
+- **`conf_target`** / **`estimate_mode`** are **refused** when engaged (the wallet
+  estimates at one fixed target and cannot honor them; silently ignoring a named target
+  would mischarge) - which also covers Core's own `-8` for combining either with
+  `fee_rate`.
+- **`subtractfeefromamount`** / **`subtractfeefrom`**: the listed recipients pay the fee
+  out of their own amounts (fee / n each, the first paying recipient in recipient order
+  covering the remainder - Core's split keys on output order, not the array's order;
+  `actor.rs::subtract_fee_from_amounts`), so the sender is debited exactly
+  the stated total and "send the whole balance" works. BDK's `TxBuilder` has no
+  subtract-fee mode, so `build_subtract_fee_psbt` converges on one: a zero-fee build picks
+  the inputs (selection must target the amounts alone - the defining property of a
+  subtract-fee send), then rate-priced rebuilds over those pinned inputs walk the fee to a
+  fixed point, accepting a changeless build whose fee overshoots by at most a dust bound
+  (the no-fixed-point shape where BDK folds a sub-dust surplus into the fee, as Core
+  does).
+
 ## Not yet implemented
 
 Everything here is refused with a clear error rather than silently ignored or half-done:
 
-- **`subtractfeefromamount` and explicit `fee_rate`** on `sendtoaddress`/`sendmany`. The
-  explicit `fee_rate` matters more on the kyoto backend than on bitcoind: it is the only way
-  to price a send without trusting either mempool.space or a coarse single-block average.
 - **`walletpassphrase`** - a passphrase-encrypted bitcoin wallet cannot send yet (the seed
   is only decrypted by the identity-file custody model at startup).
 - **Address types other than bech32** (BIP 84 is the engine's only derivation): issuance is
@@ -132,11 +158,11 @@ practice: the relay floor bottoms out at `FeeRate::BROADCAST_MIN` (1 sat/vB) whe
 has sent a `feefilter`, and subsidy-only blocks average zero. A kyoto send therefore prices
 rather than refuses, and with mempool.space unreachable in a busy fee market that price can
 be low enough that the transaction sits unconfirmed, holding its inputs locked at 0-conf
-behind it. That is the accepted trade - guessing beats refusing to spend - and an explicit
-per-send `fee_rate` argument (below, **not yet implemented**) is the planned override. That
+behind it. That is the accepted trade - guessing beats refusing to spend - and the explicit
+per-send `fee_rate` argument (above) is the override. That
 mempool.space lookup is the one time a kyoto wallet contacts a server: it happens only
-while building a send and carries no wallet data. **Every rate from every source** -
-`estimatesmartfee`, mempool.space, the kyoto signals - passes one shared sanity ceiling at
+while building a send and carries no wallet data. **Every rate from every source** - the
+caller's `fee_rate`, `estimatesmartfee`, mempool.space, the kyoto signals - passes one shared sanity ceiling at
 the `do_send` chokepoint (`fees::enforce_sanity_ceiling`, 2000 sat/vB), so a dishonest
 feefilter or a broken oracle becomes a refusal naming the number, never a payment; the
 refusal deliberately also fires when the peers' *relay floor* exceeds the ceiling, since

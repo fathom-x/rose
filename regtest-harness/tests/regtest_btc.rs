@@ -1,7 +1,9 @@
 //! End-to-end test of the BDK engine's bitcoind chain source: a bitcoin wallet against a
 //! real regtest Bitcoin Core - sync from genesis, a 0-conf mempool receive, confirmation,
 //! a wallet-built send (seed-derived signers) confirmed back into the node, `sendmany`,
-//! history/UTXO shapes, and checkpoint persistence across a daemon restart.
+//! an explicit `fee_rate` priced into the node's mempool, `subtractfeefromamount`/
+//! `subtractfeefrom` (including the whole-balance drain), history/UTXO shapes, and
+//! checkpoint persistence across a daemon restart.
 //!
 //! Skips cleanly when either half is not provisioned, so plain `cargo test` and the
 //! standard CI legs (which build zecd without the `bitcoin` feature and carry no bitcoind)
@@ -484,6 +486,97 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     }
     assert_ne!(details[0]["vout"], details[1]["vout"]);
 
+    // An explicit fee_rate (param 9, sat/vB) prices the send verbatim: the node's own
+    // mempool entry proves the paid rate is the caller's number, not an estimate.
+    let rated_txid = zecd
+        .call(
+            "sendtoaddress",
+            json!([miner_addr, 0.05, null, null, false, null, null, null, null, 25]),
+        )
+        .await
+        .expect("fee_rate send");
+    let entry = node
+        .call("getmempoolentry", json!([rated_txid]))
+        .await
+        .expect("mempool entry for the rated send");
+    // BDK prices against transaction weight, so measure sat/vB the same way (weight / 4);
+    // the node's `vsize` rounds up to whole vbytes, which can read a fraction under the
+    // named rate. By weight the paid rate is never below the caller's number.
+    let fee_sat = (entry["fees"]["base"].as_f64().unwrap() * 1e8).round();
+    let rate = fee_sat * 4.0 / entry["weight"].as_f64().unwrap();
+    assert!(
+        (25.0..26.0).contains(&rate),
+        "explicit fee_rate honored: {rate} sat/vB ({entry})"
+    );
+    node.mine(1).await;
+    zecd.wait_height(105).await;
+
+    // subtractfeefromamount: the recipient receives amount minus fee, and the sender is
+    // debited exactly the stated amount - the fee no longer comes out of the change.
+    let balance_before = zecd.call("getbalance", json!([])).await.expect("balance");
+    let sffo_txid = zecd
+        .call("sendtoaddress", json!([miner_addr, 0.1, null, null, true]))
+        .await
+        .expect("subtract-fee send");
+    node.mine(1).await;
+    zecd.wait_height(106).await;
+    let tx = zecd
+        .call("gettransaction", json!([sffo_txid]))
+        .await
+        .expect("gettransaction subtract-fee");
+    let amount = tx["amount"].as_f64().unwrap();
+    let fee = tx["fee"].as_f64().unwrap();
+    assert!(amount > -0.1, "the recipient paid the fee: {tx}");
+    assert_eq!(
+        ((amount + fee) * 1e8).round() as i64,
+        -10_000_000,
+        "recipient amount plus fee is exactly the stated amount: {tx}"
+    );
+    let balance_after = zecd.call("getbalance", json!([])).await.expect("balance");
+    let debit =
+        ((balance_before.as_f64().unwrap() - balance_after.as_f64().unwrap()) * 1e8).round() as i64;
+    assert_eq!(debit, 10_000_000, "sender debited exactly the amount");
+
+    // sendmany's subtractfeefrom: only the listed recipient's amount pays the fee; the
+    // unlisted one receives its stated amount untouched.
+    let m3 = node.call("getnewaddress", json!([])).await.unwrap();
+    let m4 = node.call("getnewaddress", json!([])).await.unwrap();
+    let many_txid = zecd
+        .call(
+            "sendmany",
+            json!([
+                "",
+                {m3.as_str().unwrap(): 0.02, m4.as_str().unwrap(): 0.03},
+                null,
+                null,
+                [m4]
+            ]),
+        )
+        .await
+        .expect("sendmany subtractfeefrom");
+    node.mine(1).await;
+    zecd.wait_height(107).await;
+    let many = zecd
+        .call("gettransaction", json!([many_txid]))
+        .await
+        .expect("gettransaction sendmany subtractfeefrom");
+    let details = many["details"].as_array().expect("details array");
+    let fee = many["fee"].as_f64().unwrap();
+    let d3 = details
+        .iter()
+        .find(|d| d["address"] == m3)
+        .expect("unlisted recipient detail");
+    assert_eq!(d3["amount"].as_f64(), Some(-0.02), "{many}");
+    let d4 = details
+        .iter()
+        .find(|d| d["address"] == m4)
+        .expect("listed recipient detail");
+    assert_eq!(
+        ((d4["amount"].as_f64().unwrap() + fee) * 1e8).round() as i64,
+        -3_000_000,
+        "the listed recipient alone paid the fee: {many}"
+    );
+
     // The synced checkpoint and the balance survive a daemon restart (BDK changesets
     // persisted through zecd's own rusqlite persister) - the wallet resumes from its
     // checkpoint rather than rescanning from genesis.
@@ -492,7 +585,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .await
         .expect("balance before restart");
     zecd.restart().await;
-    zecd.wait_height(104).await;
+    zecd.wait_height(107).await;
     let balance_after = zecd
         .call("getbalance", json!([]))
         .await
@@ -503,5 +596,70 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .await
         .expect("getwalletinfo");
     assert_eq!(info["coin"], json!("bitcoin"));
-    assert_eq!(info["lastprocessedblock"]["height"], json!(104));
+    assert_eq!(info["lastprocessedblock"]["height"], json!(107));
+
+    // The whole-balance drain: sending the full balance with subtractfeefromamount empties
+    // the wallet - the case the flag exists for, and the one where coin selection must
+    // target the amount alone (selecting for amount plus fee would refuse it as
+    // insufficient). Run after the restart, so it also proves the resumed wallet spends.
+    let balance = zecd.call("getbalance", json!([])).await.expect("balance");
+    assert!(balance.as_f64().unwrap() > 0.0);
+    let drain_txid = zecd
+        .call(
+            "sendtoaddress",
+            json!([miner_addr, balance, null, null, true]),
+        )
+        .await
+        .expect("whole-balance drain");
+    node.mine(1).await;
+    zecd.wait_height(108).await;
+    let tx = zecd
+        .call("gettransaction", json!([drain_txid]))
+        .await
+        .expect("gettransaction drain");
+    assert_eq!(tx["confirmations"], json!(1), "{tx}");
+    let balance = zecd.call("getbalance", json!([])).await.expect("balance");
+    assert_eq!(balance.as_f64(), Some(0.0), "drained to zero");
+    let unspent = zecd
+        .call("listunspent", json!([]))
+        .await
+        .expect("listunspent");
+    assert_eq!(unspent, json!([]), "no change output survives a drain");
+
+    // The sub-dust surplus shape: the selected input exceeds the stated amount by less
+    // than a change output's dust bound (here 150 sats), so no exact fee fixed point
+    // exists - the surplus folds into the fee, as Core does with sub-dust change, rather
+    // than the subtract-fee loop failing to converge.
+    node.call("sendtoaddress", json!([address, 0.001]))
+        .await
+        .expect("refund one utxo");
+    node.mine(1).await;
+    zecd.wait_height(109).await;
+    let sub_dust_txid = zecd
+        .call(
+            "sendtoaddress",
+            json!([miner_addr, 0.00099850, null, null, true]),
+        )
+        .await
+        .expect("sub-dust surplus subtract-fee send");
+    node.mine(1).await;
+    zecd.wait_height(110).await;
+    let tx = zecd
+        .call("gettransaction", json!([sub_dust_txid]))
+        .await
+        .expect("gettransaction sub-dust");
+    assert_eq!(tx["confirmations"], json!(1), "{tx}");
+    let balance = zecd.call("getbalance", json!([])).await.expect("balance");
+    assert_eq!(balance.as_f64(), Some(0.0), "sub-dust surplus went to fee");
+
+    // Broadcast-failure classification: a rebroadcast of the already-confirmed
+    // transaction is a node REJECTION, and the node's own verify-family answer passes
+    // through (-27 "already in utxo set") - not a blanket -26, and not the -4 transport
+    // shape, which is reserved for obtaining no verdict at all.
+    let hex = tx["hex"].as_str().expect("tx hex").to_string();
+    let (code, msg) = zecd
+        .call("sendrawtransaction", json!([hex]))
+        .await
+        .expect_err("rebroadcast of a confirmed tx must be rejected");
+    assert_eq!(code, -27, "node's own rejection code passes through: {msg}");
 }

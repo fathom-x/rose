@@ -349,6 +349,36 @@ pub fn resolve(token: &str, network: BitcoinNetwork) -> anyhow::Result<(String, 
     Ok((host.to_string(), port))
 }
 
+/// A broadcast failure, split the way the caller must answer it.
+///
+/// A **rejection** means the node received the transaction and refused it: retrying the
+/// same bytes cannot succeed, and the node's own verify-family error code and message are
+/// the caller's answer (`-25` missing inputs, `-26` policy, `-27` already known - the same
+/// vocabulary zecd speaks, so they pass through). A **transport** failure means no verdict
+/// was obtained at all: the transaction may or may not have reached the node, retrying is
+/// the right move once the upstream is reachable, and a bitcoind connection is dropped for
+/// redial per the `Conn` convention.
+#[derive(Debug)]
+pub enum BroadcastError {
+    Rejected { code: i32, message: String },
+    Transport(anyhow::Error),
+}
+
+/// Classify a `bitcoincore-rpc` failure: only `JsonRpc(Rpc(_))` is the node itself
+/// answering with an application error - every other variant (I/O, HTTP, serde, local
+/// validation) is a failure to get a verdict.
+fn classify_broadcast_error(e: bitcoincore_rpc::Error) -> BroadcastError {
+    match e {
+        bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(rpc)) => {
+            BroadcastError::Rejected {
+                code: rpc.code,
+                message: rpc.message,
+            }
+        }
+        other => BroadcastError::Transport(anyhow!("{other}")),
+    }
+}
+
 /// A connected bitcoind: the shared blocking RPC client (the `Arc` is what the emitter holds
 /// too) plus what the dial learned. All calls are blocking - callers run under
 /// `block_in_place`.
@@ -364,13 +394,14 @@ impl BitcoindRpc {
         self.client.clone()
     }
 
-    /// Broadcast a transaction; the returned txid is the node's acceptance. An application
-    /// rejection (mempool policy, missing inputs) comes back as `Err` with bitcoind's own
-    /// message, which the RPC layer maps onto `-26`.
-    pub fn broadcast_blocking(&self, tx: &Transaction) -> anyhow::Result<Txid> {
+    /// Broadcast a transaction; the returned txid is the node's acceptance. Failures come
+    /// back classified as [`BroadcastError`]: an application rejection (mempool policy,
+    /// missing inputs) with bitcoind's own code and message, a transport failure as the
+    /// retry-shaped variant.
+    pub fn broadcast_blocking(&self, tx: &Transaction) -> Result<Txid, BroadcastError> {
         self.client
             .send_raw_transaction(tx)
-            .map_err(|e| anyhow!("{e}"))
+            .map_err(classify_broadcast_error)
     }
 
     /// The header time at `height`, for `init`'s date-birthday binary search - two cheap
@@ -625,5 +656,33 @@ mod tests {
             cookie: None,
         };
         assert!(endpoint("10.1.2.3", creds, strict).preflight().is_err());
+    }
+
+    /// The rejection/transport split: only the node itself answering an application error
+    /// classifies as a rejection (with its own code and message passed through); every
+    /// failure to obtain a verdict - I/O here, but any non-`Rpc` variant - is transport.
+    #[test]
+    fn broadcast_errors_classify_rejection_vs_transport() {
+        let rejected = classify_broadcast_error(bitcoincore_rpc::Error::JsonRpc(
+            bitcoincore_rpc::jsonrpc::Error::Rpc(bitcoincore_rpc::jsonrpc::error::RpcError {
+                code: -27,
+                message: "Transaction outputs already in utxo set".to_string(),
+                data: None,
+            }),
+        ));
+        match rejected {
+            BroadcastError::Rejected { code, message } => {
+                assert_eq!(code, -27);
+                assert!(message.contains("already in utxo set"), "{message}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        let transport = classify_broadcast_error(bitcoincore_rpc::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        assert!(
+            matches!(transport, BroadcastError::Transport(_)),
+            "{transport:?}"
+        );
     }
 }

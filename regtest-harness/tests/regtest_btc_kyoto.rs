@@ -7,7 +7,8 @@
 //! P2P fee signals (the relay floor + recent-block median - regtest has no mempool.space,
 //! so this is the one path that exercises them end-to-end) and broadcast via
 //! `submit_package`, checkpoint persistence across a restart (`ScanType::Sync`), and a
-//! second send from the resumed wallet spending the first send's change.
+//! second send from the resumed wallet spending the first send's change - priced by an
+//! explicit `fee_rate`, the operator's override for exactly this oracle-less backend.
 //!
 //! Deliberately a sibling of `regtest_btc.rs` rather than a shared module: each regtest
 //! binary is an independent stack (ports, node flags, config shape all differ here), and
@@ -464,12 +465,30 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
 
     // And the resumed wallet can spend - this send's only spendable input is the first
     // send's change, so it proves change attribution and input tracking survived both
-    // the kyoto confirmation path and the restart.
+    // the kyoto confirmation path and the restart. It carries an explicit `fee_rate`
+    // (param 9, sat/vB): on this backend that is the one way to price a send trusting
+    // neither mempool.space nor the peers' coarse signals, and the node's mempool entry
+    // proves the caller's number is what got paid.
     let second_txid = zecd
-        .call("sendtoaddress", json!([miner_addr, 0.1]))
+        .call(
+            "sendtoaddress",
+            json!([miner_addr, 0.1, null, null, false, null, null, null, null, 3]),
+        )
         .await
         .expect("second send after restart");
     node.wait_mempool_contains(&second_txid).await;
+    let entry = node
+        .call("getmempoolentry", json!([second_txid]))
+        .await
+        .expect("mempool entry for the rated send");
+    // Measured by weight, as in `regtest_btc.rs`: BDK prices against weight, and the
+    // node's rounded-up `vsize` can read a fraction under the named rate.
+    let fee_sat = (entry["fees"]["base"].as_f64().unwrap() * 1e8).round();
+    let rate = fee_sat * 4.0 / entry["weight"].as_f64().unwrap();
+    assert!(
+        (3.0..4.0).contains(&rate),
+        "explicit fee_rate honored over kyoto: {rate} sat/vB ({entry})"
+    );
     node.mine(1).await;
     zecd.wait_height(113).await;
     let balance = zecd

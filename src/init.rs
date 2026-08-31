@@ -270,7 +270,12 @@ impl HeightSearch {
 }
 
 /// [`HeightSearch`] driven by a blocking probe (the bitcoind path); one upstream call per
-/// probe.
+/// probe. The only non-test caller is the `bitcoin`-gated `bitcoin_height_for_date`, while
+/// the unit tests (pure math, feature-independent) run on every build - hence the
+/// `any(test, ...)` gate, which keeps those tests compiling everywhere without muting the
+/// dead-code lint the way an `allow` would (were the gated caller ever removed, a
+/// non-bitcoin build would flag the orphan).
+#[cfg(any(test, feature = "bitcoin"))]
 fn height_for_time(
     mut time_at: impl FnMut(u32) -> anyhow::Result<u64>,
     tip: u32,

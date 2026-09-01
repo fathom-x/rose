@@ -338,6 +338,10 @@ pub struct BtcActorConfig {
     pub endpoint: Option<BtcEndpoint>,
     /// The height the block scan starts from on an empty chain state (recorded by init).
     pub birthday: u32,
+    /// The operator's `--birthday` date when init could only record it approximately (the
+    /// kyoto date path - see `WalletStore::birthday_time`); the kyoto first sync resolves
+    /// it to a real `(height, hash)` anchor. `None` everywhere else.
+    pub birthday_time: Option<u64>,
     /// How often to poll the upstream once caught up (`[sync] interval_secs`).
     pub sync_interval: Duration,
     /// Reconnect backoff bounds (`[backend] reconnect_base_secs`/`reconnect_max_secs`).
@@ -362,6 +366,7 @@ pub fn spawn(
         wallet_holds_seed: has_seed,
         endpoint,
         birthday,
+        birthday_time,
         sync_interval,
         reconnect_base,
         reconnect_max,
@@ -432,6 +437,24 @@ pub fn spawn(
         }
     };
 
+    // The recorded birthday anchor, when one exists (written by init against a bitcoind, or
+    // by an earlier kyoto first sync's resolution): what lets a kyoto first scan start at
+    // the birthday instead of the shipped floor. An unparseable stored hash is treated as
+    // absent - the floor path re-resolves and rewrites it - never as fatal.
+    let birthday_anchor = match persister.load_birthday_anchor() {
+        Ok(anchor) => anchor.and_then(|(height, hash)| match hash.parse() {
+            Ok(hash) => Some((height, hash)),
+            Err(e) => {
+                warn!(height, "ignoring unparseable recorded birthday anchor: {e}");
+                None
+            }
+        }),
+        Err(e) => {
+            warn!("could not read the recorded birthday anchor: {e:#}");
+            None
+        }
+    };
+
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (status_tx, status_rx) = watch::channel(status_of(&wallet, BtcConnState::Down));
     let span = info_span!("wallet", name = %name);
@@ -442,6 +465,8 @@ pub fn spawn(
         network,
         endpoint,
         birthday,
+        birthday_time,
+        birthday_anchor,
         conn: None,
         at_tip: false,
         backoff: Backoff::new(reconnect_base, reconnect_max),
@@ -491,6 +516,12 @@ struct BtcActor {
     network: BitcoinNetwork,
     endpoint: Option<BtcEndpoint>,
     birthday: u32,
+    /// See [`BtcActorConfig::birthday_time`].
+    birthday_time: Option<u64>,
+    /// The recorded (or just-resolved) birthday anchor a kyoto first scan starts from -
+    /// loaded from the engine database at spawn, updated in place when the resolution task
+    /// delivers one mid-sync.
+    birthday_anchor: Option<(u32, bdk_wallet::bitcoin::BlockHash)>,
     conn: Option<Conn>,
     /// Whether the last sync pass reached the upstream's tip (drives Ready vs Syncing).
     at_tip: bool,
@@ -604,6 +635,7 @@ impl BtcActor {
             return false;
         };
         let mut reached_tip = false;
+        let mut resolved_anchor = None;
         let result = match conn {
             // Bitcoind: a bounded blocking pull. The emitter's RPC calls block, so relocate
             // the worker's other tasks for the duration, exactly as the Zcash scan does.
@@ -651,10 +683,50 @@ impl BtcActor {
                         .map(|()| 1usize)
                 }
                 // No update yet: the client is still finding peers or downloading filters.
-                Ok(None) => Ok(0),
+                // The idle poll is also where a resolved birthday anchor arrives (it can
+                // only exist before the first update - `scan_plan` launches the resolution
+                // only for a checkpoint-less wallet, and an applied update writes the
+                // checkpoint that retires the whole mechanism).
+                Ok(None) => {
+                    resolved_anchor = kyoto.try_resolved_anchor();
+                    Ok(0)
+                }
                 Err(e) => Err(e),
             },
         };
+        // Act on a resolved anchor only while the wallet is still checkpoint-less: the
+        // resolution races the first update, and if an earlier pass applied one, the scan
+        // is done - restarting a synced light client would tear down a healthy connection
+        // for nothing, and the anchor is moot from then on (`ScanType::Sync` resumes from
+        // the wallet's own checkpoint forever after).
+        if let Some((height, hash)) =
+            resolved_anchor.filter(|_| self.wallet.latest_checkpoint().height() == 0)
+        {
+            // Persist first, restart second: the anchor is what makes an interrupted first
+            // sync resume at the birthday instead of the floor, so it must survive even if
+            // the restart below never completes. A failed write only costs that
+            // durability - the in-memory anchor still steers the restart.
+            if let Err(e) = self
+                .persister
+                .save_birthday_anchor(height, &hash.to_string())
+            {
+                warn!("failed to record the resolved birthday anchor: {e:#}");
+            }
+            self.birthday_anchor = Some((height, hash));
+            info!(
+                anchor = height,
+                "birthday resolved against the synced headers; restarting the light client \
+                 at it (skipping the floor-to-birthday filter band)"
+            );
+            // A deliberate restart, not an outage: drop the connection without touching the
+            // backoff, so the next pass redials immediately and `scan_plan` picks the
+            // anchor up.
+            self.conn = None;
+            self.at_tip = false;
+            self.status_tx
+                .send_replace(status_of(&self.wallet, BtcConnState::Syncing));
+            return true;
+        }
         match result {
             Ok(applied) => {
                 self.persist("sync pass");
@@ -722,14 +794,21 @@ impl BtcActor {
             // Kyoto "connects" by starting its node task; peer discovery and header sync
             // run in the background, so this returns before the client has a tip. There is
             // nothing to hand it about unconfirmed transactions - it has no mempool.
-            BtcEndpoint::Kyoto(e) => e.connect(&self.wallet, self.birthday).map(|kyoto| {
-                info!(
-                    upstream = %endpoint.describe(),
-                    wallet_height = self.wallet.latest_checkpoint().height(),
-                    "started the light client (peer discovery runs in the background)"
-                );
-                Conn::Kyoto(kyoto)
-            }),
+            BtcEndpoint::Kyoto(e) => {
+                let birthday = crate::btc::kyoto::KyotoBirthday {
+                    height: self.birthday,
+                    time: self.birthday_time,
+                    anchor: self.birthday_anchor,
+                };
+                e.connect(&self.wallet, &birthday).map(|kyoto| {
+                    info!(
+                        upstream = %endpoint.describe(),
+                        wallet_height = self.wallet.latest_checkpoint().height(),
+                        "started the light client (peer discovery runs in the background)"
+                    );
+                    Conn::Kyoto(kyoto)
+                })
+            }
         };
         match dial {
             Ok(conn) => {
@@ -1356,6 +1435,7 @@ mod tests {
             seed,
             endpoint: None,
             birthday: 0,
+            birthday_time: None,
             sync_interval: Duration::from_secs(20),
             reconnect_base: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),

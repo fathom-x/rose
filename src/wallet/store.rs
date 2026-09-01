@@ -30,6 +30,13 @@ pub fn keys_path(wallet_dir: &Path) -> PathBuf {
 pub struct WalletStore {
     pub network: ZNetwork,
     pub birthday: BlockHeight,
+    /// The operator's `--birthday` date (unix seconds of its UTC midnight), recorded only
+    /// when `init` could not resolve it to a precise height - the kyoto date path, where
+    /// resolution is offline against the shipped scan floor. The first sync finishes the
+    /// resolution against the light client's own headers (`btc::kyoto`'s birthday-anchor
+    /// task) and persists the result in the engine's database; this field is the durable
+    /// record of what the operator asserted. `None` everywhere else.
+    pub birthday_time: Option<u64>,
     seed_ciphertext: Option<String>,
     /// True when the mnemonic is passphrase-encrypted (age scrypt) rather than wrapped to the
     /// age identity file. This is zecd's analog of Bitcoin Core's `HasEncryptionKeys()`.
@@ -47,6 +54,12 @@ struct StoreEncoding {
     mnemonic: Option<String>,
     network: Option<String>,
     birthday: Option<u32>,
+    /// See [`WalletStore::birthday_time`]. Skipped when absent so every `keys.toml` written
+    /// before the field existed (and every wallet that never records one) round-trips
+    /// unchanged; an older build reading a file that carries it simply ignores it, which
+    /// degrades to that build's floor-anchored first scan rather than failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    birthday_time: Option<u64>,
     /// `"passphrase"` when the mnemonic is scrypt/passphrase-encrypted; omitted for the legacy
     /// identity-file model so existing `keys.toml` files round-trip unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +91,7 @@ impl WalletStore {
             mnemonic: Some(encrypt_mnemonic(recipients, mnemonic)?),
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
+            birthday_time: None,
             encryption: None,
             ufvk: Some(ufvk.to_string()),
         };
@@ -95,12 +109,14 @@ impl WalletStore {
         recipients: impl Iterator<Item = &'a dyn age::Recipient>,
         mnemonic: &Mnemonic,
         birthday: BlockHeight,
+        birthday_time: Option<u64>,
         network: ZNetwork,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
             mnemonic: Some(encrypt_mnemonic(recipients, mnemonic)?),
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
+            birthday_time,
             encryption: None,
             ufvk: None,
         };
@@ -125,6 +141,7 @@ impl WalletStore {
             )?),
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
+            birthday_time: None,
             encryption: Some(ENC_PASSPHRASE.to_string()),
             ufvk: Some(ufvk.to_string()),
         };
@@ -140,6 +157,7 @@ impl WalletStore {
         passphrase: Passphrase,
         mnemonic: &Mnemonic,
         birthday: BlockHeight,
+        birthday_time: Option<u64>,
         network: ZNetwork,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
@@ -149,6 +167,7 @@ impl WalletStore {
             )?),
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
+            birthday_time,
             encryption: Some(ENC_PASSPHRASE.to_string()),
             ufvk: None,
         };
@@ -169,6 +188,7 @@ impl WalletStore {
             mnemonic: None,
             network: Some(network.name().to_string()),
             birthday: Some(u32::from(birthday)),
+            birthday_time: None,
             encryption: None,
             ufvk: Some(ufvk.to_string()),
         };
@@ -223,6 +243,7 @@ impl WalletStore {
         Ok(WalletStore {
             network,
             birthday,
+            birthday_time: encoding.birthday_time,
             seed_ciphertext: encoding.mnemonic,
             encrypted,
             pinned_ufvk: encoding.ufvk,

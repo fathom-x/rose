@@ -51,11 +51,12 @@ use bdk_kyoto::builder::{Builder, BuilderExt as _};
 use bdk_kyoto::{HashCheckpoint, Requester, ScanType, TrustedPeer, Update};
 use bdk_wallet::bitcoin::{BlockHash, FeeRate, Transaction, Txid};
 use bdk_wallet::Wallet;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::coin::BitcoinNetwork;
+use crate::init::{HeightSearch, BIRTHDAY_DATE_MARGIN_SECS};
 
 /// How many peers the node keeps connected. Two is kyoto's own example value and the point
 /// where a single dishonest peer withholding filters is detectable by disagreement, without
@@ -118,11 +119,14 @@ const FEE_BLOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// the same wallet the same way. Bumping a floor would strand a not-yet-synced wallet
 /// from an older release below the newer floor (its birthday no longer clears it),
 /// silently demoting it to the full-history path - the backward-compatibility break the
-/// fixed anchor exists to avoid. The accepted cost is a first sync that grows with the
-/// chain (~50k blocks/year on mainnet, faster on testnet3); the long-term fix is
-/// recording the birthday *hash* at init (see this directory's README), not moving the
-/// floor. The blocks are deeply buried (the mainnet one had 4389 confirmations when
-/// recorded), so no reorg can orphan them.
+/// fixed anchor exists to avoid. The growing floor-to-tip gap is instead absorbed by the
+/// **per-wallet birthday anchor**: `init` records a resolved
+/// `(height, hash)` pair whenever it dialed a bitcoind anyway, and an anchor-less kyoto
+/// first scan resolves one against its own headers ([`resolve_birthday_anchor`]) and
+/// restarts there - so these floors serve as the trusted base a resolution chains from
+/// and the fallback for wallets that predate the anchor, not as the common scan start.
+/// The blocks are deeply buried (the mainnet one had 4389 confirmations when recorded),
+/// so no reorg can orphan them.
 struct ScanFloor {
     height: u32,
     hash: &'static str,
@@ -156,11 +160,12 @@ const BTC_KYOTO_SCAN_FLOOR_TESTNET4: ScanFloor = ScanFloor {
 
 /// The offline resolution of a date birthday for a kyoto wallet (`init` will not start a
 /// P2P node to read the chain): a date at or after the network's shipped scan floor - with
-/// a day of slack over the floor block's own header time - maps to the floor height, which
-/// serves *exactly* as well as the true height, since [`recovery_floor`] starts a first
-/// scan at the floor for any birthday at or above it. An earlier date (or regtest, which
-/// ships no floor) has no offline reference; the caller falls back to the BIP 84 history
-/// floor.
+/// a day of slack over the floor block's own header time - maps to the floor height, the
+/// height an anchor-less first scan starts at for any birthday at or above it
+/// ([`recovery_floor`]). The date itself is recorded alongside
+/// (`WalletStore::birthday_time`), and the first sync refines it to the true height via
+/// [`resolve_birthday_anchor`]. An earlier date (or regtest, which ships no floor) has no
+/// offline reference; the caller falls back to the BIP 84 history floor.
 pub(crate) fn birthday_height_for_date(network: BitcoinNetwork, date: u64) -> Option<u32> {
     let floor = scan_floor(network)?;
     (date >= floor.time + 24 * 60 * 60).then_some(floor.height)
@@ -181,6 +186,74 @@ fn scan_floor(network: BitcoinNetwork) -> Option<&'static ScanFloor> {
 /// should watch for. The engine reveals addresses on demand, so this only has to cover the
 /// unused lookahead beyond what the wallet has already revealed.
 const RECOVERY_SCRIPT_LOOKAHEAD: u32 = 100;
+
+/// What a kyoto connect knows about the wallet's birthday, assembled by the actor from
+/// `keys.toml` (`height`, `time`) and the engine database's recorded anchor (`anchor`,
+/// via `btc::store::Persister::load_birthday_anchor`).
+///
+/// Together these drive [`KyotoEndpoint::scan_plan`]: a recorded anchor starts the first
+/// scan at the birthday itself; otherwise the scan starts at [`recovery_floor`] and, when
+/// `time` is present or `height` sits above that start, a background task resolves the
+/// birthday to a `(height, hash)` anchor against the light client's own headers so the
+/// actor can persist it and restart the scan there (the per-wallet anchor).
+pub struct KyotoBirthday {
+    /// The recorded birthday height (`keys.toml`).
+    pub height: u32,
+    /// The operator's `--birthday` date (unix seconds of its UTC midnight), present only
+    /// when `init` could not resolve it precisely - see `WalletStore::birthday_time`.
+    pub time: Option<u64>,
+    /// The persisted resolved anchor, once one exists.
+    pub anchor: Option<(u32, BlockHash)>,
+}
+
+/// A resolved birthday anchor: the height and hash a first scan can start from.
+type BirthdayAnchor = (u32, BlockHash);
+
+/// The birthday the anchor-resolution task is asked to resolve against the synced headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnchorTarget {
+    /// An exact recorded height: one `get_header` fetches its hash.
+    Height(u32),
+    /// An operator date (unix seconds of its UTC midnight): an interpolated header-time
+    /// search ([`HeightSearch`]), erring low by the shared one-day margin.
+    Date(u64),
+}
+
+/// How often the anchor-resolution task re-checks whether the header chain has grown far
+/// enough to answer. Header sync from the recovery start takes seconds to a minute or two,
+/// so a coarse poll costs nothing while keeping the task off the hot path.
+const ANCHOR_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How far below the node's synced tip a resolved anchor must sit, per network. An anchor
+/// is a `(height, hash)` pair the *next* first scan trusts verbatim, so a block that could
+/// still reorg out must never be recorded - a stale hash would strand that scan on a
+/// checkpoint no peer can extend (nothing clears a bad persisted anchor today), and
+/// capping the anchor deeper merely scans a few extra blocks. So the depth is priced per
+/// network by how deep reorgs actually go there:
+///
+///  * **mainnet**: the engine's fresh-wallet reorg margin
+///    (`init::BTC_FRESH_WALLET_BIRTHDAY_MARGIN`, 6) - the same judgment call made once
+///    already; at mainnet's hashrate a deeper reorg is effectively unheard of.
+///  * **testnet3/testnet4**: 100. The 20-minute difficulty-reset rule invites block storms
+///    whose reorgs run tens of blocks - far past 6 - and testnet blocks are small and
+///    plentiful, so the extra scanned band costs seconds.
+///  * **regtest**: the mainnet margin. Chains there are operator-mined and tiny; a
+///    100-block cap would leave `ceiling <= scan_start` on most test chains and the
+///    resolution would simply never fire.
+///
+/// Hardcoded convention, not a measurement: nothing observes live reorg depth. The values
+/// only trade scan work for safety margin, so erring deep is cheap everywhere it matters.
+/// `pub(crate)` because `init`'s bitcoind paths record an anchor too
+/// (`init::init_anchor_height`) and must respect the same depth - a tip-proximate anchor
+/// recorded at init is exactly as reorg-able as one resolved here.
+pub(crate) fn anchor_reorg_margin(network: BitcoinNetwork) -> u32 {
+    match network {
+        BitcoinNetwork::Main | BitcoinNetwork::Regtest => {
+            crate::init::BTC_FRESH_WALLET_BIRTHDAY_MARGIN
+        }
+        BitcoinNetwork::Testnet3 | BitcoinNetwork::Testnet4 => 100,
+    }
+}
 
 /// A resolved kyoto endpoint. Unlike [`BitcoindEndpoint`](super::chain::BitcoindEndpoint)
 /// there are no credentials to carry or gate - the P2P layer authenticates nothing - so this
@@ -270,10 +343,10 @@ impl KyotoEndpoint {
     /// `tokio` runtime, and the bridge task is spawned here too. Returns as soon as the node
     /// is running - peer discovery and header sync proceed in the background, so a caller
     /// gets a connection before the first `Update` is available.
-    pub fn connect(&self, wallet: &Wallet, birthday: u32) -> anyhow::Result<KyotoConn> {
+    pub fn connect(&self, wallet: &Wallet, birthday: &KyotoBirthday) -> anyhow::Result<KyotoConn> {
         self.preflight()?;
         let network = crate::btc::keys::network(self.network);
-        let scan_type = self.scan_type(wallet, birthday);
+        let (scan_type, resolution) = self.scan_plan(wallet, birthday);
 
         // Created so the path exists the moment the crate starts honoring it; today it stays
         // empty (see `data_dir`). Cheap, and it keeps the failure mode "empty directory"
@@ -354,6 +427,25 @@ impl KyotoEndpoint {
             }
         });
 
+        // A first scan starting below the birthday gets a resolver: a task that waits for
+        // the node's own header chain to cover the birthday, resolves it to a
+        // `(height, hash)` anchor, and hands the pair to the actor (which persists it and
+        // restarts the scan there). It rides the same channel-fed shape as the bridge - the
+        // actor polls, nothing blocks - and dies with the connection.
+        let anchor = resolution.map(|(scan_start, target)| {
+            let requester = requester.clone();
+            let margin = anchor_reorg_margin(self.network);
+            let (tx, rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                if let Some(anchor) =
+                    resolve_birthday_anchor(requester, scan_start, target, margin).await
+                {
+                    let _ = tx.send(anchor);
+                }
+            });
+            (rx, task)
+        });
+
         info!(
             upstream = %self.describe(),
             scan = ?scan_type,
@@ -364,34 +456,197 @@ impl KyotoEndpoint {
             requester,
             bridge,
             logs,
+            anchor,
         })
     }
 
-    /// Where a fresh scan starts.
+    /// Where a fresh scan starts, and whether a birthday-anchor resolution should run
+    /// beside it.
     ///
     /// A wallet that has synced before resumes from its own checkpoint
     /// ([`ScanType::Sync`], which kyoto walks back by a reorg margin itself); everything
-    /// below is the first-sync case.
-    fn scan_type(&self, wallet: &Wallet, birthday: u32) -> ScanType {
+    /// below is the first-sync case. A recorded anchor - resolved by an earlier run of the
+    /// task below, or by `init` against a bitcoind - starts the scan at the birthday
+    /// itself. Only the anchor-less first scan starts at [`recovery_floor`], and it is the
+    /// one case that wants a resolution: the task turns the recorded birthday into an
+    /// anchor so every *later* first-scan attempt (this one restarts the moment it
+    /// resolves) skips the floor-to-birthday filter band - the band that grows without
+    /// bound as the fixed shipped floors age.
+    fn scan_plan(
+        &self,
+        wallet: &Wallet,
+        birthday: &KyotoBirthday,
+    ) -> (ScanType, Option<(u32, AnchorTarget)>) {
         if wallet.latest_checkpoint().height() > 0 {
-            return ScanType::Sync;
+            return (ScanType::Sync, None);
         }
-        let floor = recovery_floor(self.network, birthday);
-        debug!(birthday, floor = floor.height, "kyoto recovery scan start");
-        ScanType::Recovery {
+        if let Some((height, hash)) = birthday.anchor {
+            debug!(
+                birthday = birthday.height,
+                anchor = height,
+                "kyoto recovery scan start (recorded birthday anchor)"
+            );
+            let scan = ScanType::Recovery {
+                used_script_index: RECOVERY_SCRIPT_LOOKAHEAD,
+                checkpoint: HashCheckpoint::new(height, hash),
+            };
+            return (scan, None);
+        }
+        let floor = recovery_floor(self.network, birthday.height);
+        let resolution = resolution_target(floor.height, birthday);
+        debug!(
+            birthday = birthday.height,
+            floor = floor.height,
+            resolving = resolution.is_some(),
+            "kyoto recovery scan start"
+        );
+        let scan = ScanType::Recovery {
             used_script_index: RECOVERY_SCRIPT_LOOKAHEAD,
             checkpoint: floor,
+        };
+        (scan, resolution.map(|target| (floor.height, target)))
+    }
+}
+
+/// Whether an anchor-less first scan starting at `scan_start` can be improved by resolving
+/// the recorded birthday, and to what target. A date always resolves (its offline record
+/// was the floor, so the true height is only known from headers); a height resolves only
+/// when it actually sits above the scan start - anchoring *at* the start would change
+/// nothing, and a birthday below it (the mainnet pre-floor restore, clamped up to SegWit
+/// activation) must not drag the scan lower.
+fn resolution_target(scan_start: u32, birthday: &KyotoBirthday) -> Option<AnchorTarget> {
+    if let Some(time) = birthday.time {
+        return Some(AnchorTarget::Date(time));
+    }
+    (birthday.height > scan_start).then_some(AnchorTarget::Height(birthday.height))
+}
+
+/// A header by height off the running node, `None` while the synced chain does not cover
+/// it (or the request fails - the caller retries on its next poll either way).
+async fn header_at(
+    requester: &Requester,
+    height: u32,
+) -> Option<bdk_wallet::bitcoin::block::Header> {
+    requester
+        .get_header(height)
+        .await
+        .ok()
+        .flatten()
+        .map(|indexed| indexed.header)
+}
+
+/// Resolve the wallet's birthday to a `(height, hash)` anchor against the light client's
+/// own synced headers - the half the per-wallet anchor deferred (the bitcoind `init` paths record
+/// theirs up front).
+///
+/// The task polls until the header chain, which starts at the recovery checkpoint the scan
+/// was launched with (`scan_start`), has grown far enough to answer, then:
+///
+///  * [`AnchorTarget::Height`]: one header fetch at the recorded height, made only once
+///    the synced chain extends `margin` blocks past it ([`anchor_reorg_margin`], per
+///    network) - so the anchor cannot name a block that could still reorg out, and a
+///    partially-synced header chain cannot cap it low.
+///  * [`AnchorTarget::Date`]: the shared interpolated header-time search
+///    ([`HeightSearch`], bracketed at `scan_start` where headers begin), for the last
+///    header at or before the date minus the shared one-day margin - erring low exactly as
+///    `init`'s bitcoind date search does. Single-digit probes, one P2P header request
+///    apiece.
+///
+/// Returns `None` - ending the task, leaving the floor-anchored scan to run as before this
+/// mechanism existed - when the resolution cannot improve on `scan_start` (the date
+/// predates the checkpoint's own time) or a request fails outright (the node stopped; the
+/// next connect spawns a fresh task). Headers not yet covering a probe merely re-poll.
+async fn resolve_birthday_anchor(
+    requester: Requester,
+    scan_start: u32,
+    target: AnchorTarget,
+    margin: u32,
+) -> Option<BirthdayAnchor> {
+    loop {
+        tokio::time::sleep(ANCHOR_POLL_INTERVAL).await;
+        let tip = match requester.chain_tip().await {
+            Ok(tip) => tip,
+            Err(_) => return None,
+        };
+        let ceiling = tip.height.saturating_sub(margin);
+        if ceiling <= scan_start {
+            continue;
+        }
+        let goal = match target {
+            AnchorTarget::Height(height) => {
+                // Wait until the synced headers reach the birthday plus the margin before
+                // recording anything: a partially-synced ceiling caught mid-header-sync
+                // would otherwise cap the anchor at wherever this poll happened to land -
+                // permanently, since a recorded anchor suppresses re-resolution. (The Date
+                // arm's ceiling-time check below is the same guard in time units.)
+                if ceiling < height {
+                    continue;
+                }
+                height
+            }
+            AnchorTarget::Date(time) => {
+                let target_time = time.saturating_sub(BIRTHDAY_DATE_MARGIN_SECS);
+                // The header tree never holds the recovery anchor itself: bip157's
+                // `BlockTree::new` starts empty with only the anchor's *hash* as tip, and
+                // headers are inserted from anchor+1 upward - so `get_header(scan_start)`
+                // answers `None` forever and a bracket probing it would never complete.
+                // The search therefore starts one above the scan start.
+                let search_lo = scan_start + 1;
+                // The search's upper endpoint must be a synced header past the target
+                // date; until the chain reaches it, keep waiting.
+                let Some(ceiling_header) = header_at(&requester, ceiling).await else {
+                    continue;
+                };
+                if u64::from(ceiling_header.time) < target_time {
+                    continue;
+                }
+                let mut search = HeightSearch::bracketed(search_lo, ceiling, target_time);
+                let mut chain_moved = false;
+                while let Some(probe) = search.next_probe() {
+                    match header_at(&requester, probe).await {
+                        Some(header) => search.observe(probe, u64::from(header.time)),
+                        // A header the tip check implied should exist (a reorg mid-search,
+                        // a flaky peer): restart the whole attempt on the next poll.
+                        None => {
+                            chain_moved = true;
+                            break;
+                        }
+                    }
+                }
+                if chain_moved {
+                    continue;
+                }
+                let answer = search.answer();
+                if answer <= search_lo {
+                    // Either the date sits at or before the first synced header (nothing
+                    // to improve - and anchoring at `search_lo` when its own time is past
+                    // the target would skip the filter of a block that could hold funds),
+                    // or the genuine answer IS the first block; one block of foregone
+                    // improvement is the price of not telling those apart.
+                    return None;
+                }
+                answer
+            }
+        };
+        match header_at(&requester, goal).await {
+            Some(header) => return Some((goal, header.block_hash())),
+            None => continue,
         }
     }
 }
 
 /// A live kyoto connection: the channel the bridge task feeds, plus the requester used for
-/// broadcast and the fee signals. Dropping it aborts both tasks, which shuts the node down.
+/// broadcast and the fee signals. Dropping it aborts every owned task, which shuts the
+/// node down.
 pub struct KyotoConn {
     updates: mpsc::Receiver<Result<Update, String>>,
     requester: Requester,
     bridge: JoinHandle<()>,
     logs: JoinHandle<()>,
+    /// The birthday-anchor resolution, when this connect launched one (see
+    /// [`resolve_birthday_anchor`]): the channel its result arrives on plus the task
+    /// itself, taken on delivery and aborted with the connection otherwise.
+    anchor: Option<(oneshot::Receiver<BirthdayAnchor>, JoinHandle<()>)>,
 }
 
 impl KyotoConn {
@@ -426,9 +681,31 @@ impl KyotoConn {
     pub async fn tip_height(&self) -> anyhow::Result<u32> {
         tip_height(self.requester.clone()).await
     }
+
+    /// The resolved birthday anchor, once the resolution task delivers one - polled by the
+    /// actor's sync pass exactly like [`Self::try_next_update`]. Never blocks. Returns the
+    /// anchor at most once; a finished (or never-launched, or failed) resolution answers
+    /// `None` forever after.
+    pub fn try_resolved_anchor(&mut self) -> Option<BirthdayAnchor> {
+        let (rx, _task) = self.anchor.as_mut()?;
+        match rx.try_recv() {
+            Ok(anchor) => {
+                self.anchor.take();
+                Some(anchor)
+            }
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            // The task ended without an answer (nothing to improve, or the node stopped):
+            // stop polling; the floor-anchored scan simply runs to completion.
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.anchor.take();
+                None
+            }
+        }
+    }
 }
 
-/// The block a first filter scan starts from, for a wallet with nothing persisted yet.
+/// The block a first filter scan starts from, for a wallet with nothing persisted yet
+/// **and no recorded birthday anchor** (`scan_plan` prefers the anchor when one exists).
 ///
 /// Kyoto anchors a recovery on a [`HashCheckpoint`] - a height *and* a hash - while `init`
 /// records only a birthday height, so the start cannot simply be the birthday. It is instead
@@ -610,6 +887,9 @@ impl Drop for KyotoConn {
         }
         self.bridge.abort();
         self.logs.abort();
+        if let Some((_, task)) = &self.anchor {
+            task.abort();
+        }
     }
 }
 
@@ -814,6 +1094,104 @@ mod tests {
             birthday_height_for_date(BitcoinNetwork::Regtest, u64::MAX),
             None
         );
+    }
+
+    fn birthday(height: u32) -> KyotoBirthday {
+        KyotoBirthday {
+            height,
+            time: None,
+            anchor: None,
+        }
+    }
+
+    #[test]
+    fn resolution_runs_only_when_it_can_improve_on_the_scan_start() {
+        // A height above the scan start is worth resolving to an anchor...
+        assert_eq!(
+            resolution_target(146_000, &birthday(150_000)),
+            Some(AnchorTarget::Height(150_000))
+        );
+        // ...one at (or below - the mainnet pre-floor restore clamped up to SegWit
+        // activation) the start would change nothing, or drag the scan lower.
+        assert_eq!(resolution_target(146_000, &birthday(146_000)), None);
+        assert_eq!(resolution_target(481_824, &birthday(100)), None);
+        // A date always resolves: its offline record was the floor itself, so only the
+        // headers know the true height.
+        let dated = KyotoBirthday {
+            time: Some(1_787_000_000),
+            ..birthday(146_000)
+        };
+        assert_eq!(
+            resolution_target(146_000, &dated),
+            Some(AnchorTarget::Date(1_787_000_000))
+        );
+    }
+
+    #[test]
+    fn the_anchor_cap_is_deeper_where_reorgs_are() {
+        // Mainnet's hashrate makes >6 unheard of; the testnets' 20-minute rule invites
+        // block storms tens of blocks deep, so their anchors sit a comfortable 100 below
+        // tip. Regtest keeps the shallow cap - a deep one would leave nothing resolvable
+        // on its tiny operator-mined chains.
+        assert_eq!(
+            anchor_reorg_margin(BitcoinNetwork::Main),
+            crate::init::BTC_FRESH_WALLET_BIRTHDAY_MARGIN
+        );
+        for network in [BitcoinNetwork::Testnet3, BitcoinNetwork::Testnet4] {
+            assert!(
+                anchor_reorg_margin(network) >= 100,
+                "{network:?} cap must clear a block-storm reorg"
+            );
+        }
+        assert_eq!(
+            anchor_reorg_margin(BitcoinNetwork::Regtest),
+            crate::init::BTC_FRESH_WALLET_BIRTHDAY_MARGIN
+        );
+    }
+
+    #[test]
+    fn a_recorded_anchor_beats_the_floor_and_needs_no_resolution() {
+        use crate::btc::keys::{tests::bip84_seed, AccountKeys};
+        use bdk_wallet::KeychainKind;
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Testnet4).unwrap();
+        let wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .create_wallet_no_persist()
+        .unwrap();
+        let endpoint = endpoint(BitcoinNetwork::Testnet4, vec![]);
+
+        // Anchor-less: the first scan starts at the shipped floor and wants a resolution
+        // for the above-floor birthday.
+        let (scan, resolution) = endpoint.scan_plan(&wallet, &birthday(150_000));
+        match scan {
+            ScanType::Recovery { checkpoint, .. } => {
+                assert_eq!(checkpoint.height, BTC_KYOTO_SCAN_FLOOR_TESTNET4.height)
+            }
+            other => panic!("expected a recovery scan, got {other:?}"),
+        }
+        assert_eq!(
+            resolution,
+            Some((
+                BTC_KYOTO_SCAN_FLOOR_TESTNET4.height,
+                AnchorTarget::Height(150_000)
+            ))
+        );
+
+        // With a recorded anchor the scan starts at the birthday itself, resolving nothing.
+        let hash: BlockHash = BTC_KYOTO_SCAN_FLOOR_TESTNET4.hash.parse().unwrap();
+        let anchored = KyotoBirthday {
+            anchor: Some((150_000, hash)),
+            ..birthday(150_000)
+        };
+        let (scan, resolution) = endpoint.scan_plan(&wallet, &anchored);
+        match scan {
+            ScanType::Recovery { checkpoint, .. } => assert_eq!(checkpoint.height, 150_000),
+            other => panic!("expected a recovery scan, got {other:?}"),
+        }
+        assert_eq!(resolution, None);
     }
 
     #[test]

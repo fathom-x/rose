@@ -404,6 +404,17 @@ impl BitcoindRpc {
             .map_err(classify_broadcast_error)
     }
 
+    /// The block hash at `height`, for `init`'s birthday anchor (the resolved
+    /// `(height, hash)` pair a kyoto first scan can start from - see
+    /// `btc::store::Persister::save_birthday_anchor`).
+    pub fn block_hash_blocking(&self, height: u32) -> anyhow::Result<String> {
+        Ok(self
+            .client
+            .get_block_hash(u64::from(height))
+            .map_err(|e| anyhow!("getblockhash {height}: {e}"))?
+            .to_string())
+    }
+
     /// The header time at `height`, for `init`'s date-birthday binary search - two cheap
     /// calls (`getblockhash` + `getblockheader`), never a block fetch.
     pub fn block_time_blocking(&self, height: u32) -> anyhow::Result<u64> {

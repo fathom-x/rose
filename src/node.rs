@@ -403,6 +403,7 @@ fn spawn_bitcoin_wallet(
         wallet_holds_seed: store.has_seed(),
         endpoint: Some(endpoint),
         birthday: u32::from(store.birthday),
+        birthday_time: store.birthday_time,
         sync_interval: Duration::from_secs(config.sync.interval_secs),
         reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
         reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),

@@ -239,8 +239,9 @@ impl ZecdKyoto {
             ),
         )
         .unwrap();
-        // Kyoto init is fully offline and refuses to anchor its own birthday; height 0
-        // scans the whole (tiny) regtest chain from the genesis recovery floor.
+        // Kyoto init is fully offline; height 0 (also what a regtest kyoto wallet now
+        // defaults to) scans the whole (tiny) regtest chain from the genesis recovery
+        // floor. Kept explicit so the suite pins the flag's height path too.
         let init = Command::new(zecd_bin())
             .args([
                 "--datadir",

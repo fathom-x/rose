@@ -48,7 +48,58 @@ impl Persister {
             conn: Connection::open_in_memory().expect("in-memory sqlite"),
         }
     }
+
+    /// Record the wallet's resolved birthday anchor: the `(height, hash)` pair a kyoto
+    /// first scan starts from instead of the shipped scan floor (`btc::kyoto`'s
+    /// `recovery_floor` precedence). Written by `init` when it dialed a bitcoind anyway
+    /// (the fresh-wallet tip anchor, the date search) and by the actor when the kyoto
+    /// birthday-anchor task resolves a recorded target against the light client's own
+    /// headers. One row, overwritten on re-resolution.
+    ///
+    /// Chain-derived cache, so it belongs in this database rather than `keys.toml`: a
+    /// missing or deleted anchor merely sends the next first scan back to the floor path,
+    /// which re-resolves and rewrites it. The bitcoind backend never reads it (its emitter
+    /// starts at the birthday height directly - no hash needed).
+    pub fn save_birthday_anchor(&mut self, height: u32, hash: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch(ANCHOR_TABLE_SQL)
+            .context("create birthday_anchor table")?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO birthday_anchor (id, height, hash) VALUES (0, ?1, ?2)",
+                rusqlite::params![height, hash],
+            )
+            .context("record birthday anchor")?;
+        Ok(())
+    }
+
+    /// The recorded birthday anchor, if any - see [`Persister::save_birthday_anchor`].
+    pub fn load_birthday_anchor(&self) -> anyhow::Result<Option<(u32, String)>> {
+        self.conn
+            .execute_batch(ANCHOR_TABLE_SQL)
+            .context("create birthday_anchor table")?;
+        self.conn
+            .query_row(
+                "SELECT height, hash FROM birthday_anchor WHERE id = 0",
+                [],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+            .context("read birthday anchor")
+    }
 }
+
+/// The single-row birthday-anchor table (see [`Persister::save_birthday_anchor`]). The
+/// `CHECK (id = 0)` pins it to one row so a re-resolution replaces rather than accumulates.
+const ANCHOR_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS birthday_anchor (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    height INTEGER NOT NULL,
+    hash TEXT NOT NULL
+)";
 
 /// Create the wallet database from a seed - `zecd init`'s half of the engine (the daemon's
 /// half is `crate::btc::actor::spawn`, which loads it back and verifies it against the same
@@ -199,6 +250,27 @@ mod tests {
             .network(keys.network),
         );
         assert!(err.is_err(), "second create over the same data must fail");
+    }
+
+    /// The birthday anchor is a single overwritten row that survives a close and reopen,
+    /// and its absence reads as `None` rather than an error (the pre-anchor wallet, and
+    /// the deliberate fallback when the row is deleted).
+    #[test]
+    fn birthday_anchor_round_trips_and_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_dir = dir.path().join("btc").join("bdk");
+        {
+            let mut persister = Persister::open(&engine_dir).unwrap();
+            assert_eq!(persister.load_birthday_anchor().unwrap(), None);
+            persister.save_birthday_anchor(146_000, "aa").unwrap();
+            // A re-resolution replaces the row rather than accumulating a second one.
+            persister.save_birthday_anchor(146_500, "bb").unwrap();
+        }
+        let persister = Persister::open(&engine_dir).unwrap();
+        assert_eq!(
+            persister.load_birthday_anchor().unwrap(),
+            Some((146_500, "bb".to_string()))
+        );
     }
 
     /// Empty changesets are not appended: reopening an untouched wallet leaves the log alone.

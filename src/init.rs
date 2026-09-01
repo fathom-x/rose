@@ -156,8 +156,10 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// height: one full day. The date's UTC midnight already precedes the wallet's actual
 /// creation moment by up to a day, header timestamps skew by at most ~2 hours, and a day
 /// of extra scan is cheap on every chain - so the resolved height provably cannot postdate
-/// the wallet's first possible transaction.
-const BIRTHDAY_DATE_MARGIN_SECS: u64 = 24 * 60 * 60;
+/// the wallet's first possible transaction. `pub(crate)` because the kyoto birthday-anchor
+/// resolution (`btc::kyoto`) applies the same margin when it resolves a recorded date
+/// against its own synced headers at first sync.
+pub(crate) const BIRTHDAY_DATE_MARGIN_SECS: u64 = 24 * 60 * 60;
 
 /// The pure state of the date->height search over block times, driven by
 /// [`height_for_time`] and [`zcash_height_for_date`] so the algorithm exists once (an
@@ -180,7 +182,11 @@ const BIRTHDAY_DATE_MARGIN_SECS: u64 = 24 * 60 * 60;
 /// Zcash side).
 ///
 /// [`answer`]: HeightSearch::answer
-struct HeightSearch {
+///
+/// `pub(crate)` (with the [`bracketed`](Self::bracketed) constructor) because the kyoto
+/// birthday-anchor resolution (`btc::kyoto`) drives the same search over the light client's
+/// own synced headers, whose chain starts at the recovery checkpoint rather than height 1.
+pub(crate) struct HeightSearch {
     lo: u32,
     hi: u32,
     t_lo: Option<u64>,
@@ -192,9 +198,19 @@ struct HeightSearch {
 
 impl HeightSearch {
     fn new(tip: u32, target: u64) -> Self {
+        Self::bracketed(1, tip, target)
+    }
+
+    /// A search over an explicit bracket `[lo, hi]`, for a chain whose headers only exist
+    /// from `lo` upward (kyoto's recovery-anchored header chain). The invariant and the
+    /// answer are unchanged: the result is the highest height in the bracket whose time is
+    /// at or below the target, and a target before `lo`'s own time answers `lo` (the caller
+    /// treats "no improvement over the bracket floor" however it likes).
+    pub(crate) fn bracketed(lo: u32, hi: u32, target: u64) -> Self {
+        let lo = lo.max(1);
         Self {
-            lo: 1,
-            hi: tip.max(1),
+            lo,
+            hi: hi.max(lo),
             t_lo: None,
             t_hi: None,
             target,
@@ -205,7 +221,7 @@ impl HeightSearch {
 
     /// The next height to fetch a block time for, or `None` once [`Self::answer`] is
     /// ready: the bracket's two endpoints first, then interpolated probes.
-    fn next_probe(&self) -> Option<u32> {
+    pub(crate) fn next_probe(&self) -> Option<u32> {
         if self.done {
             return None;
         }
@@ -234,7 +250,7 @@ impl HeightSearch {
     }
 
     /// Feed back the block time at the height [`Self::next_probe`] named.
-    fn observe(&mut self, height: u32, time: u64) {
+    pub(crate) fn observe(&mut self, height: u32, time: u64) {
         if self.t_lo.is_none() {
             self.t_lo = Some(time);
             // A target before the chain's first block: height 1 is the answer (scan
@@ -264,7 +280,7 @@ impl HeightSearch {
     }
 
     /// The highest height whose observed time is at or below the target.
-    fn answer(&self) -> u32 {
+    pub(crate) fn answer(&self) -> u32 {
         self.lo
     }
 }
@@ -865,25 +881,41 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     })
 }
 
+/// How a Bitcoin wallet's birthday resolved at init, and what to record where. `height`
+/// always lands in `keys.toml`. `time` is the operator's date, recorded (also in
+/// `keys.toml`) only when init could *not* resolve it precisely - the kyoto date path -
+/// so the first sync can finish the resolution against its own headers (`btc::kyoto`'s
+/// birthday-anchor task). `anchor` is a resolved `(height, hash)` pair, persisted into the
+/// engine's wallet database whenever init dialed a node anyway: it is what lets a kyoto
+/// first scan start at the birthday itself instead of the aging shipped scan floor,
+/// including for a wallet initialized against bitcoind and switched to kyoto later.
+#[cfg(feature = "bitcoin")]
+struct BitcoinBirthday {
+    height: u32,
+    time: Option<u64>,
+    anchor: Option<(u32, String)>,
+}
+
 /// Resolve a date birthday for a Bitcoin wallet, erring low in both shapes:
 ///  * a bitcoind upstream answers exactly - binary-search the node's headers for the last
-///    block at or before the date minus the one-day margin ([`height_for_time`]); an
-///    unreachable node is a clean refusal naming `--birthday <height>` as the offline
-///    escape hatch, like the fresh-wallet dial.
+///    block at or before the date minus the one-day margin ([`height_for_time`]), and
+///    capture that block's hash as the wallet's scan anchor; an unreachable node is a
+///    clean refusal naming `--birthday <height>` as the offline escape hatch, like the
+///    fresh-wallet dial.
 ///  * kyoto stays offline, as everywhere in `init`: a date at or after the shipped scan
-///    floor's own date maps to the floor height, which serves *exactly* as well as the
-///    true height (the first scan starts at the floor for any birthday at or above it -
-///    see `btc::kyoto`); an earlier date has no offline reference and falls back to the
-///    BIP 84 history floor, slow but never wrong.
+///    floor's own date maps to the floor height, an earlier date falls back to the BIP 84
+///    history floor - and the date itself is recorded, so the first sync refines it to the
+///    true height (and hash) against the light client's own headers and every later first
+///    scan starts there.
 ///
 /// Regtest is refused like the Zcash side: its block timestamps mean nothing.
 #[cfg(feature = "bitcoin")]
-async fn bitcoin_height_for_date(
+async fn resolve_bitcoin_date_birthday(
     config: &AppConfig,
     entry: &crate::config::WalletEntry,
     btc_network: crate::coin::BitcoinNetwork,
     date: u64,
-) -> anyhow::Result<u32> {
+) -> anyhow::Result<BitcoinBirthday> {
     if btc_network == crate::coin::BitcoinNetwork::Regtest {
         bail!(
             "--birthday takes a date only on public networks: regtest block timestamps \
@@ -895,50 +927,98 @@ async fn bitcoin_height_for_date(
     match endpoint {
         crate::btc::chain::BtcEndpoint::Bitcoind(endpoint) => {
             let target = date.saturating_sub(BIRTHDAY_DATE_MARGIN_SECS);
-            let height = tokio::task::spawn_blocking(move || -> anyhow::Result<u32> {
-                let rpc = endpoint.connect_blocking()?;
-                let tip = u32::try_from(rpc.tip_at_connect).unwrap_or(u32::MAX);
-                height_for_time(|h| rpc.block_time_blocking(h), tip, target)
-            })
-            .await
-            .context("bitcoind dial task")?
-            .with_context(|| {
-                format!(
-                    "dialing {described} to resolve the --birthday date failed. Start the \
-                     node (or point `server`/[bitcoind] at it), or pass --birthday <height> \
-                     to initialize offline"
-                )
-            })?;
+            // The anchor hash is fetched at `init_anchor_height`, not necessarily the
+            // birthday: a date the whole chain predates resolves to the tip itself, which
+            // is exactly the reorg-able block an anchor must never name.
+            let (height, anchor) =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<(u32, (u32, String))> {
+                    let rpc = endpoint.connect_blocking()?;
+                    let tip = u32::try_from(rpc.tip_at_connect).unwrap_or(u32::MAX);
+                    let height = height_for_time(|h| rpc.block_time_blocking(h), tip, target)?;
+                    let anchor_height = init_anchor_height(height, tip, btc_network);
+                    let hash = rpc.block_hash_blocking(anchor_height)?;
+                    Ok((height, (anchor_height, hash)))
+                })
+                .await
+                .context("bitcoind dial task")?
+                .with_context(|| {
+                    format!(
+                        "dialing {described} to resolve the --birthday date failed. Start the \
+                         node (or point `server`/[bitcoind] at it), or pass --birthday <height> \
+                         to initialize offline"
+                    )
+                })?;
             tracing::info!(
                 "resolved the --birthday date to height {height} (~1 day before the date's \
                  midnight UTC, so the wallet cannot miss funds)"
             );
-            Ok(height)
+            Ok(BitcoinBirthday {
+                height,
+                time: None,
+                anchor: Some(anchor),
+            })
         }
-        crate::btc::chain::BtcEndpoint::Kyoto(_) => {
-            match crate::btc::kyoto::birthday_height_for_date(btc_network, date) {
-                Some(height) => {
-                    tracing::info!(
-                        "resolved the --birthday date to height {height}, this build's \
-                         shipped scan floor - the height a kyoto first scan starts at for \
-                         any birthday above it, so no precision is lost and the resolution \
-                         stays offline"
-                    );
-                    Ok(height)
-                }
-                None => {
-                    let height = bip84_history_floor(btc_network);
-                    warn!(
-                        "the --birthday date predates this build's shipped scan floor, and \
-                         kyoto resolves dates offline against that floor alone; recording \
-                         the BIP 84 history floor (height {height}) instead - a full \
-                         history scan. Pass --birthday <height> for a faster first sync."
-                    );
-                    Ok(height)
-                }
-            }
-        }
+        crate::btc::chain::BtcEndpoint::Kyoto(_) => Ok(kyoto_date_birthday(btc_network, date)),
     }
+}
+
+/// The offline (kyoto) half of [`resolve_bitcoin_date_birthday`], shared with the
+/// fresh-wallet default (no `--birthday` = today): record the shipped scan floor when the
+/// date safely postdates it, else the BIP 84 history floor, and keep the date itself so
+/// the first sync's anchor resolution can refine the record to the true height.
+#[cfg(feature = "bitcoin")]
+fn kyoto_date_birthday(btc_network: crate::coin::BitcoinNetwork, date: u64) -> BitcoinBirthday {
+    let height = match crate::btc::kyoto::birthday_height_for_date(btc_network, date) {
+        Some(height) => {
+            tracing::info!(
+                "recorded the birthday date offline at height {height}, this build's \
+                 shipped scan floor; the first sync resolves the date to its true height \
+                 against the light client's own headers and anchors there from then on"
+            );
+            height
+        }
+        None => {
+            let height = bip84_history_floor(btc_network);
+            warn!(
+                "the birthday date predates this build's shipped scan floor, so the \
+                 offline record falls back to the BIP 84 history floor (height {height}) - \
+                 a full history scan on the first sync, refined to the date's true height \
+                 once the light client's headers cover it. Pass --birthday <height> for a \
+                 faster first sync."
+            );
+            height
+        }
+    };
+    BitcoinBirthday {
+        height,
+        time: Some(date),
+        anchor: None,
+    }
+}
+
+/// Where an `init`-recorded birthday anchor may sit: at the birthday itself, but never
+/// closer to the node's tip than the network's reorg depth
+/// (`btc::kyoto::anchor_reorg_margin`). The anchor's consumer - a kyoto first scan -
+/// trusts the recorded hash verbatim and nothing clears a bad one, so a tip-proximate
+/// block must not be recorded even though the *birthday* legitimately sits there (the
+/// bitcoind emitter starts from the birthday by height and handles reorgs itself; only
+/// the hash-anchored kyoto path needs the depth). An anchor below the birthday merely
+/// scans a few extra blocks.
+#[cfg(feature = "bitcoin")]
+fn init_anchor_height(birthday: u32, tip: u32, network: crate::coin::BitcoinNetwork) -> u32 {
+    birthday.min(tip.saturating_sub(crate::btc::kyoto::anchor_reorg_margin(network)))
+}
+
+/// The current day's 00:00:00 UTC as unix seconds - what a fresh kyoto wallet's defaulted
+/// birthday records, making the default byte-identical to an explicit
+/// `--birthday <today's date>` (the [`Birthday::Date`] encoding is a UTC midnight).
+#[cfg(feature = "bitcoin")]
+fn todays_utc_midnight() -> anyhow::Result<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is set before the unix epoch")?
+        .as_secs();
+    Ok(now - now % 86_400)
 }
 
 /// The Bitcoin half of [`init_wallet`]: same refusals (already-initialized, one spending
@@ -947,9 +1027,11 @@ async fn bitcoin_height_for_date(
 /// passphrase. The birthday is resolved exactly as the block comment below describes: an
 /// explicit height is offline, a date needs the upstream on bitcoind (offline on kyoto), a
 /// restore falls back to the BIP 84 history floor, and a freshly generated wallet dials the
-/// node to anchor just below its tip. So it is offline for an explicit height and for a
-/// restore, and needs the node for a bitcoind date search and for a fresh wallet's tip
-/// anchor - it is not the no-upstream command it was before the chain source landed.
+/// node to anchor just below its tip on bitcoind - while on kyoto it defaults to today,
+/// offline (a fresh wallet's funds cannot predate its creation, so the current date serves
+/// as well as the tip; the first sync resolves it to a real anchor). So a kyoto init is
+/// always offline; a bitcoind init needs the node for a date search and for a fresh
+/// wallet's tip anchor - not the no-upstream command it was before the chain source landed.
 #[cfg(feature = "bitcoin")]
 async fn init_bitcoin_wallet(
     config: &AppConfig,
@@ -1009,19 +1091,26 @@ async fn init_bitcoin_wallet(
     // (the same before-any-write doctrine as the Zcash path, which likewise dials its
     // upstream once at init). Four cases:
     //  * --birthday height: honored verbatim; the init stays fully offline.
-    //  * --birthday date: resolved to a height erring low (`bitcoin_height_for_date`) -
-    //    exactly via a bitcoind upstream's headers, offline via the shipped scan floor on
-    //    kyoto.
+    //  * --birthday date: resolved to a height erring low
+    //    (`resolve_bitcoin_date_birthday`) - exactly via a bitcoind upstream's headers
+    //    (capturing the block hash as the scan anchor), offline via the shipped scan floor
+    //    on kyoto (recording the date, so the first sync refines it).
     //  * restore: the seed may hold history from any point in its past, so scan everything
     //    it could possibly own - from SegWit activation, the first block a BIP 84 (bech32)
     //    output can exist in. Warned, like the Zcash restore default.
-    //  * freshly generated: no history is possible, so anchor just below the node's tip
-    //    (`fresh_wallet_birthday`, shared with the Zcash path). The one case that needs the
-    //    upstream - and the dial also verifies the node serves the wallet's chain.
-    let birthday = match birthday_opt {
-        Some(Birthday::Height(height)) => BlockHeight::from(height),
+    //  * freshly generated: no history is possible. On bitcoind, anchor just below the
+    //    node's tip (`fresh_wallet_birthday`, shared with the Zcash path), capturing the
+    //    anchor hash on the same dial - the one case that needs the upstream, and the dial
+    //    also verifies the node serves the wallet's chain. On kyoto, default to today's
+    //    date, offline, exactly as if the operator had passed it.
+    let resolved = match birthday_opt {
+        Some(Birthday::Height(height)) => BitcoinBirthday {
+            height,
+            time: None,
+            anchor: None,
+        },
         Some(Birthday::Date(date)) => {
-            BlockHeight::from(bitcoin_height_for_date(config, &entry, btc_network, date).await?)
+            resolve_bitcoin_date_birthday(config, &entry, btc_network, date).await?
         }
         None if restore => {
             let height = bip84_history_floor(btc_network);
@@ -1030,7 +1119,11 @@ async fn init_bitcoin_wallet(
                  full history rescan that is slow on mainnet. Pass --birthday <height> at or \
                  before the wallet's first transaction to speed up the initial sync."
             );
-            BlockHeight::from(height)
+            BitcoinBirthday {
+                height,
+                time: None,
+                anchor: None,
+            }
         }
         None => {
             let endpoint = crate::btc::chain::resolve_for_wallet(config, &entry)?;
@@ -1039,39 +1132,71 @@ async fn init_bitcoin_wallet(
                 crate::btc::chain::BtcEndpoint::Bitcoind(endpoint) => {
                     // The client is blocking (`bitcoincore-rpc`); `spawn_blocking` rather than
                     // the actor's `block_in_place` so a current-thread embedder can call
-                    // `init_wallet`.
-                    let rpc = tokio::task::spawn_blocking(move || endpoint.connect_blocking())
-                        .await
-                        .context("bitcoind dial task")?
-                        .with_context(|| {
-                            format!(
-                                "dialing {described} to anchor the new wallet's birthday \
-                                 failed. Start the node (or point `server`/[bitcoind] at it), \
-                                 or pass --birthday <height> to initialize offline"
-                            )
-                        })?;
-                    let tip = u32::try_from(rpc.tip_at_connect).unwrap_or(u32::MAX);
-                    BlockHeight::from(fresh_wallet_birthday(tip, birthday_margin))
+                    // `init_wallet`. The same dial also captures the birthday block's hash -
+                    // the scan anchor that lets a kyoto first scan (this wallet switched to
+                    // kyoto later) start at the birthday instead of the shipped floor.
+                    // The birthday sits `birthday_margin` (6) below the tip, but the
+                    // anchor hash is fetched at `init_anchor_height` - deeper on the
+                    // testnets, whose block storms reorg past 6 and would orphan a
+                    // tip-proximate recorded hash.
+                    let (height, anchor) = tokio::task::spawn_blocking(
+                        move || -> anyhow::Result<(u32, (u32, String))> {
+                            let rpc = endpoint.connect_blocking()?;
+                            let tip = u32::try_from(rpc.tip_at_connect).unwrap_or(u32::MAX);
+                            let height = fresh_wallet_birthday(tip, birthday_margin);
+                            let anchor_height = init_anchor_height(height, tip, btc_network);
+                            let hash = rpc.block_hash_blocking(anchor_height)?;
+                            Ok((height, (anchor_height, hash)))
+                        },
+                    )
+                    .await
+                    .context("bitcoind dial task")?
+                    .with_context(|| {
+                        format!(
+                            "dialing {described} to anchor the new wallet's birthday \
+                             failed. Start the node (or point `server`/[bitcoind] at it), \
+                             or pass --birthday <height> to initialize offline"
+                        )
+                    })?;
+                    BitcoinBirthday {
+                        height,
+                        time: None,
+                        anchor: Some(anchor),
+                    }
                 }
                 // Kyoto has a `chain_tip()`, but reaching it means starting a P2P node,
                 // discovering peers and syncing headers - seconds to minutes on a cold data
                 // directory, inside a command that is otherwise instant and fully offline.
-                // Rather than hide that behind `init`, refuse and name the flag, the same
-                // shape as the unreachable-bitcoind refusal above.
+                // `init` will not do that behind the operator's back; instead the birthday
+                // defaults to TODAY, which for a fresh wallet is exactly as good as the
+                // tip (its funds cannot predate its own creation): recorded offline like
+                // an explicit `--birthday <today's date>`, then resolved to a true
+                // `(height, hash)` anchor by the first sync. Regtest block timestamps mean
+                // nothing (and its per-run chains stay tiny), so it defaults to genesis.
                 crate::btc::chain::BtcEndpoint::Kyoto(_) => {
-                    anyhow::bail!(
-                        "a kyoto wallet cannot anchor its own birthday at init: reading the \
-                         chain tip over BIP-157 means starting a P2P node and syncing block \
-                         headers first, which `init` will not do behind your back. Pass \
-                         --birthday <YYYY-MM-DD> (today's date is the right answer for a \
-                         new wallet; resolved offline) or --birthday <height>, or \
-                         initialize against a bitcoind `server` and switch this wallet to \
-                         kyoto afterwards."
-                    );
+                    if btc_network == crate::coin::BitcoinNetwork::Regtest {
+                        tracing::info!(
+                            "no --birthday given; a fresh regtest kyoto wallet scans from \
+                             genesis (regtest chains are built per run and stay tiny)"
+                        );
+                        BitcoinBirthday {
+                            height: 0,
+                            time: None,
+                            anchor: None,
+                        }
+                    } else {
+                        tracing::info!(
+                            "no --birthday given; defaulting the fresh kyoto wallet's \
+                             birthday to today, offline - a new wallet's funds cannot \
+                             predate its creation. Pass --birthday to override."
+                        );
+                        kyoto_date_birthday(btc_network, todays_utc_midnight()?)
+                    }
                 }
             }
         }
     };
+    let birthday = BlockHeight::from(resolved.height);
 
     std::fs::create_dir_all(&wallet_dir)?;
 
@@ -1110,6 +1235,7 @@ async fn init_bitcoin_wallet(
             passphrase.clone(),
             &mnemonic,
             birthday,
+            resolved.time,
             network,
         )?,
         AtRest::Identity(recipients) => WalletStore::init_with_mnemonic_unpinned(
@@ -1117,10 +1243,18 @@ async fn init_bitcoin_wallet(
             recipients.iter().map(|r| r.as_ref() as _),
             &mnemonic,
             birthday,
+            resolved.time,
             network,
         )?,
     }
     crate::btc::store::create_wallet_db(&engine_dir, btc_network, &seed)?;
+    // The resolved birthday anchor is chain-derived cache, so it lives with the engine's
+    // own database rather than in `keys.toml`: it is what a kyoto first scan starts from
+    // instead of the shipped scan floor (`btc::kyoto::recovery_floor`'s precedence).
+    if let Some((height, hash)) = &resolved.anchor {
+        let mut persister = crate::btc::store::Persister::open(&engine_dir)?;
+        persister.save_birthday_anchor(*height, hash)?;
+    }
 
     Ok(InitOutcome {
         wallet,
@@ -1612,6 +1746,7 @@ mod tests {
             wallet_holds_seed: true,
             endpoint: None,
             birthday: 0,
+            birthday_time: None,
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),
@@ -1810,6 +1945,25 @@ mod tests {
         assert!(probes.get() <= 50, "{} probes", probes.get());
     }
 
+    #[test]
+    fn bracketed_height_search_stays_inside_its_bracket() {
+        // The kyoto birthday-anchor shape: headers only exist from the recovery checkpoint
+        // (here 400) upward, so every probe must stay inside [400, 1000].
+        let mut search = HeightSearch::bracketed(400, 1_000, 600 * 700);
+        while let Some(h) = search.next_probe() {
+            assert!((400..=1_000).contains(&h), "probe {h} left the bracket");
+            search.observe(h, u64::from(h) * 600);
+        }
+        assert_eq!(search.answer(), 700);
+        // A target before the bracket floor's own time answers the floor itself - the
+        // caller's "nothing to improve on" signal.
+        let mut search = HeightSearch::bracketed(400, 1_000, 600 * 100);
+        while let Some(h) = search.next_probe() {
+            search.observe(h, u64::from(h) * 600);
+        }
+        assert_eq!(search.answer(), 400);
+    }
+
     /// A kyoto wallet with a *date* birthday initializes fully offline: the date resolves
     /// against the shipped scan floor (or the BIP 84 history floor when it predates it),
     /// starting no P2P node and dialing nothing.
@@ -1836,9 +1990,17 @@ mod tests {
             Some(outcome.birthday),
             crate::btc::kyoto::birthday_height_for_date(BitcoinNetwork::Testnet3, recent)
         );
+        // The offline record is approximate, so the date itself is kept for the first
+        // sync's anchor resolution - and no anchor exists yet (nothing was dialed).
+        let store = WalletStore::read(&outcome.keys_path).unwrap();
+        assert_eq!(store.birthday_time, Some(recent));
+        let persister =
+            crate::btc::store::Persister::open(&config.wallets["btc"].engine_dir()).unwrap();
+        assert_eq!(persister.load_birthday_anchor().unwrap(), None);
 
         // A date from 2020 predates the floor: no offline reference, so the BIP 84
-        // history floor is recorded - slow, never wrong.
+        // history floor is recorded - slow, never wrong. The date is still kept: the
+        // first sync's resolution is what refines it.
         let dir = tempfile::tempdir().unwrap();
         let config = bitcoin_test_config(dir.path(), "kyoto", "");
         let outcome = init_wallet(
@@ -1856,6 +2018,73 @@ mod tests {
             outcome.birthday,
             bip84_history_floor(BitcoinNetwork::Testnet3)
         );
+        let store = WalletStore::read(&outcome.keys_path).unwrap();
+        assert_eq!(store.birthday_time, Some(1_600_000_000));
+    }
+
+    /// An init-recorded anchor never sits closer to the tip than the network's reorg
+    /// depth, even when the birthday itself does - and a birthday already deeper than the
+    /// margin anchors at the birthday exactly.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn init_anchor_height_respects_the_network_reorg_depth() {
+        use crate::coin::BitcoinNetwork;
+        // Mainnet: birthday = tip - 6 is already at the mainnet depth.
+        assert_eq!(
+            init_anchor_height(49_994, 50_000, BitcoinNetwork::Main),
+            49_994
+        );
+        // Testnet3/4: the same birthday is inside the 100-block storm band; the anchor
+        // drops to the depth while the birthday record stays where it was.
+        for network in [BitcoinNetwork::Testnet3, BitcoinNetwork::Testnet4] {
+            assert_eq!(init_anchor_height(49_994, 50_000, network), 49_900);
+        }
+        // A birthday already deep (a date search a day back) anchors at itself.
+        assert_eq!(
+            init_anchor_height(40_000, 50_000, BitcoinNetwork::Testnet4),
+            40_000
+        );
+        // Degenerate short chains cannot underflow.
+        assert_eq!(init_anchor_height(5, 50, BitcoinNetwork::Testnet3), 0);
+    }
+
+    /// A fresh kyoto wallet without `--birthday` defaults to today, fully offline:
+    /// byte-identical to passing today's date - the shipped floor is recorded as the
+    /// height, today's UTC midnight as the date the first sync will resolve.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_kyoto_init_without_birthday_defaults_to_today() {
+        use crate::coin::BitcoinNetwork;
+        let before = todays_utc_midnight().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), "kyoto", "");
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .unwrap();
+        let after = todays_utc_midnight().unwrap();
+        let store = WalletStore::read(&outcome.keys_path).unwrap();
+        // The recorded date is a UTC midnight between the reads (equal unless the test
+        // straddles midnight), and today is safely past the shipped floor's own date, so
+        // the offline height record is the floor.
+        let recorded = store.birthday_time.expect("the defaulted date is recorded");
+        assert!(recorded.is_multiple_of(86_400), "{recorded}");
+        assert!((before..=after).contains(&recorded), "{recorded}");
+        assert_eq!(
+            Some(outcome.birthday),
+            crate::btc::kyoto::birthday_height_for_date(BitcoinNetwork::Testnet3, recorded)
+        );
+        let persister =
+            crate::btc::store::Persister::open(&config.wallets["btc"].engine_dir()).unwrap();
+        assert_eq!(persister.load_birthday_anchor().unwrap(), None);
+        assert!(outcome.generated_mnemonic.is_some());
     }
 
     /// A generated wallet with no `--birthday` needs the node: the failed dial is an
@@ -1890,6 +2119,12 @@ mod tests {
         );
         assert!(!entry.dir.exists(), "refusal must precede writes");
     }
+
+    /// The hash [`fake_bitcoind`] serves for every `getblockhash`, so tests can assert the
+    /// recorded birthday anchor is exactly what the node answered.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    const FAKE_BITCOIND_BLOCK_HASH: &str =
+        "00000000000000000000000000000000000000000000000000000000000000aa";
 
     /// Minimal fake bitcoind: an HTTP/1.1 JSON-RPC loop answering every request with the
     /// same `getblockchaininfo` result (testnet chain at a fixed tip), echoing the request
@@ -1935,8 +2170,11 @@ mod tests {
                     .unwrap_or_else(|| "0".to_string());
                 // `get_blockchain_info` first probes the node version via `getnetworkinfo`
                 // (and branches on it for softfork-shape compatibility), so both methods
-                // must answer.
-                let result = if body.contains("getnetworkinfo") {
+                // must answer - and the fresh-wallet init now also asks `getblockhash` at
+                // the birthday it just computed, to record the scan anchor.
+                let result = if body.contains("getblockhash") {
+                    format!("\"{FAKE_BITCOIND_BLOCK_HASH}\"")
+                } else if body.contains("getnetworkinfo") {
                     "{\"version\":300200,\"subversion\":\"/Satoshi:30.2.0/\",\
                      \"protocolversion\":70016,\"localservices\":\"0000000000000409\",\
                      \"localrelay\":true,\"timeoffset\":0,\"connections\":0,\
@@ -1992,6 +2230,24 @@ mod tests {
         );
         assert_eq!(outcome.birthday, 50_000 - BTC_FRESH_WALLET_BIRTHDAY_MARGIN);
         assert!(outcome.generated_mnemonic.is_some());
+        // The same dial recorded a scan anchor (what a kyoto first scan starts from,
+        // should this wallet ever switch backends) - NOT at the tip-proximate birthday,
+        // but at the network's reorg depth (this daemon is testnet3, whose block storms
+        // reorg past the 6-block birthday margin), so the recorded hash can never be
+        // orphaned. The birthday was exact, so no date rides in keys.toml.
+        let persister =
+            crate::btc::store::Persister::open(&config.wallets["btc"].engine_dir()).unwrap();
+        let anchor_height =
+            50_000 - crate::btc::kyoto::anchor_reorg_margin(crate::coin::BitcoinNetwork::Testnet3);
+        assert!(anchor_height < outcome.birthday);
+        assert_eq!(
+            persister.load_birthday_anchor().unwrap(),
+            Some((anchor_height, FAKE_BITCOIND_BLOCK_HASH.to_string()))
+        );
+        assert_eq!(
+            WalletStore::read(&outcome.keys_path).unwrap().birthday_time,
+            None
+        );
     }
 
     /// `[keys] fresh_wallet_birthday_margin` overrides the anchor's default margin.

@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zecd btc monitor</title>
+<style>
+  :root {
+    --bg: #12151a; --panel: #1b2027; --line: #2b323c; --text: #dbe2ea;
+    --dim: #8b96a5; --accent: #f2a900; --good: #4cc38a; --bad: #e5484d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 1.5rem; max-width: 980px; margin-inline: auto;
+  }
+  h1 { font-size: 1.1rem; margin: 0; color: var(--accent); }
+  header { display: flex; justify-content: space-between; align-items: baseline;
+           flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
+  #chaininfo { color: var(--dim); font-size: .85rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+          gap: 1rem; margin-bottom: 1rem; }
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 8px; padding: 1rem; }
+  .card h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em;
+             color: var(--dim); margin: 0 0 .75rem; }
+  .bal { font-size: 1.5rem; }
+  .bal small, .sub { color: var(--dim); font-size: .8rem; display: block; }
+  label { display: block; color: var(--dim); font-size: .8rem; margin-top: .6rem; }
+  input[type=text], input[type=number] {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; padding: .45rem .5rem;
+    font: inherit;
+  }
+  .row { display: flex; gap: .75rem; align-items: center; margin-top: .75rem; }
+  button { background: var(--accent); color: #1a1200; border: 0; border-radius: 4px;
+           padding: .5rem .9rem; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--accent);
+                 border: 1px solid var(--accent); }
+  #addr { word-break: break-all; margin-top: .5rem; min-height: 1.5em; }
+  .msg { margin-top: .6rem; font-size: .85rem; word-break: break-all; min-height: 1.3em; }
+  .msg.ok { color: var(--good); } .msg.err { color: var(--bad); }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line);
+           white-space: nowrap; }
+  th { color: var(--dim); font-weight: 500; }
+  td.amt.pos { color: var(--good); } td.amt.neg { color: var(--bad); }
+  td.txid { color: var(--dim); }
+  .dot { display: inline-block; width: .55em; height: .55em; border-radius: 50%;
+         background: var(--dim); margin-right: .35em; }
+  .dot.ok { background: var(--good); } .dot.err { background: var(--bad); }
+  button.copy { background: transparent; color: var(--dim); border: 1px solid var(--line);
+                border-radius: 3px; padding: 0 .3rem; margin-left: .35rem;
+                font-size: .75rem; line-height: 1.3; font-weight: 400; }
+  button.copy:hover { color: var(--accent); border-color: var(--accent); }
+  button.copy.done { color: var(--good); border-color: var(--good); }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#9679; zecd &middot; bitcoin wallet</h1>
+  <div id="chaininfo"><span class="dot" id="conn"></span><span id="chaintext">connecting&hellip;</span></div>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <h2>Balance</h2>
+    <div class="bal"><span id="trusted">&ndash;</span> <small>tBTC spendable</small></div>
+    <span class="sub">unconfirmed: <span id="pending">&ndash;</span></span>
+    <span class="sub">immature: <span id="immature">&ndash;</span></span>
+  </div>
+
+  <div class="card">
+    <h2>Receive</h2>
+    <div class="row" style="margin-top:0">
+      <button id="newaddr">new address</button>
+      <button id="copyaddr" class="ghost" hidden>copy</button>
+    </div>
+    <div id="addr"></div>
+    <div class="msg" id="addrmsg"></div>
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1">
+    <h2>Send</h2>
+    <label>to address
+      <input type="text" id="to" placeholder="tb1&hellip;" spellcheck="false"></label>
+    <label>amount (tBTC, up to 8 decimals)
+      <input type="text" id="amount" placeholder="0.0001" inputmode="decimal"></label>
+    <label>fee rate (sat/vB, optional &mdash; blank uses the node's estimate)
+      <input type="text" id="feerate" placeholder="" inputmode="decimal"></label>
+    <div class="row">
+      <label style="margin:0"><input type="checkbox" id="subfee"> subtract fee from amount</label>
+      <button id="send">send</button>
+    </div>
+    <div class="msg" id="sendmsg"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Recent transactions</h2>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>time</th><th>type</th><th style="text-align:right">amount</th>
+                 <th>conf</th><th>address</th><th>txid</th></tr></thead>
+      <tbody id="txs"><tr><td colspan="6" style="color:var(--dim)">&ndash;</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let rpcId = 0;
+
+// One JSON-RPC call through the same-origin proxy. `raw` maps a placeholder
+// string in params to raw JSON text spliced into the body after stringify -
+// used for amounts, so what zecd parses is exactly the decimal the user typed
+// (zecd is strict about 8-dp amounts; no float round-trip on the send path).
+async function rpc(method, params = [], raw = {}) {
+  let body = JSON.stringify({ jsonrpc: "1.0", id: ++rpcId, method, params });
+  for (const [ph, text] of Object.entries(raw)) body = body.replace(`"${ph}"`, text);
+  const resp = await fetch("/rpc", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body,
+  });
+  let parsed;
+  try { parsed = JSON.parse(await resp.text()); }
+  catch { throw new Error(`HTTP ${resp.status} from zecd`); }
+  if (parsed.error) throw new Error(`${parsed.error.message} (code ${parsed.error.code})`);
+  return parsed.result;
+}
+
+const fmt = v => Number(v).toFixed(8);
+const short = (s, n = 12) => s && s.length > n ? s.slice(0, n) + "..." : (s || "");
+const copyBtn = v => v ? `<button class="copy" data-copy="${v}" title="copy">⧉</button>` : "";
+
+// One delegated handler covers the copy buttons in every re-rendered table row.
+document.addEventListener("click", async e => {
+  const btn = e.target.closest("button.copy");
+  if (!btn) return;
+  await navigator.clipboard.writeText(btn.dataset.copy);
+  btn.classList.add("done"); btn.textContent = "✓";
+  setTimeout(() => { btn.classList.remove("done"); btn.textContent = "⧉"; }, 1200);
+});
+
+async function refresh() {
+  try {
+    const [balances, height, hash, txs] = await Promise.all([
+      rpc("getbalances"),
+      rpc("getblockcount"),
+      rpc("getbestblockhash"),
+      rpc("listtransactions", ["*", 25]),
+    ]);
+    $("trusted").textContent = fmt(balances.mine.trusted);
+    $("pending").textContent = fmt(balances.mine.untrusted_pending);
+    $("immature").textContent = fmt(balances.mine.immature);
+    $("conn").className = "dot ok";
+    $("chaintext").textContent = `wallet height ${height} · ${short(hash, 16)}`;
+
+    const rows = txs.slice().reverse().map(tx => {
+      const amt = Number(tx.amount);
+      const when = tx.time ? new Date(tx.time * 1000).toLocaleString() : "";
+      return `<tr>
+        <td>${when}</td>
+        <td>${tx.category || ""}</td>
+        <td class="amt ${amt < 0 ? "neg" : "pos"}" style="text-align:right">${fmt(tx.amount)}</td>
+        <td>${tx.confirmations ?? 0}</td>
+        <td title="${tx.address || ""}">${short(tx.address, 18)}${copyBtn(tx.address)}</td>
+        <td class="txid" title="${tx.txid}">${short(tx.txid)}${copyBtn(tx.txid)}</td>
+      </tr>`;
+    });
+    $("txs").innerHTML = rows.length ? rows.join("")
+      : `<tr><td colspan="6" style="color:var(--dim)">no transactions yet</td></tr>`;
+  } catch (e) {
+    $("conn").className = "dot err";
+    $("chaintext").textContent = e.message;
+  }
+}
+
+$("newaddr").onclick = async () => {
+  $("addrmsg").textContent = "";
+  try {
+    const a = await rpc("getnewaddress");
+    $("addr").textContent = a;
+    $("copyaddr").hidden = false;
+  } catch (e) {
+    $("addrmsg").className = "msg err"; $("addrmsg").textContent = e.message;
+  }
+};
+$("copyaddr").onclick = () => navigator.clipboard.writeText($("addr").textContent);
+
+$("send").onclick = async () => {
+  const msg = $("sendmsg");
+  msg.className = "msg"; msg.textContent = "";
+  const to = $("to").value.trim();
+  const amount = $("amount").value.trim();
+  const feerate = $("feerate").value.trim();
+  if (!to) { msg.className = "msg err"; msg.textContent = "recipient address required"; return; }
+  if (!/^\d+(\.\d{1,8})?$/.test(amount) || Number(amount) <= 0) {
+    msg.className = "msg err"; msg.textContent = "amount must be a positive decimal with at most 8 places"; return;
+  }
+  if (feerate && !/^\d+(\.\d{1,3})?$/.test(feerate)) {
+    msg.className = "msg err"; msg.textContent = "fee rate must be sat/vB with at most 3 decimals"; return;
+  }
+  // sendtoaddress "address" amount comment comment_to subtractfeefromamount
+  //               replaceable conf_target estimate_mode avoid_reuse fee_rate
+  const params = [to, "__AMT__", null, null, $("subfee").checked];
+  const raw = { __AMT__: amount };
+  if (feerate) { params.push(null, null, null, null, "__FEE__"); raw.__FEE__ = feerate; }
+  if (!confirm(`Send ${amount} tBTC to\n${to}?`)) return;
+  $("send").disabled = true; msg.textContent = "sending...";
+  try {
+    const txid = await rpc("sendtoaddress", params, raw);
+    msg.className = "msg ok"; msg.textContent = `sent: ${txid}`;
+    $("to").value = ""; $("amount").value = "";
+    refresh();
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = e.message;
+  } finally {
+    $("send").disabled = false;
+  }
+};
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

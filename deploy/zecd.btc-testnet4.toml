@@ -16,8 +16,13 @@
 #
 #   docker compose -f deploy/docker-compose.btc-testnet4.yml up -d
 #   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4.toml \
-#       init --birthday 2026-08-01
+#       init --wallet btc --birthday 2026-08-01
 #   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4.toml
+#
+# `--wallet btc` is REQUIRED on init: it defaults to the literal wallet name "default" and
+# does NOT follow `default_wallet` below, so omitting it initializes a "default" Zcash
+# wallet (which dials zebra and fails here) instead of this file's [wallets.btc]. The daemon
+# line below needs no --wallet - it serves `default_wallet` for un-prefixed RPCs.
 #
 # `init` resolves the wallet's birthday four ways, and only two of them are offline. An
 # explicit `--birthday <height>` is taken verbatim; a `--birthday <YYYY-MM-DD>` date is

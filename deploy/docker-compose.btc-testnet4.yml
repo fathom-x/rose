@@ -39,6 +39,12 @@
 # needs no bitcoind wallet. Credentials are fixed dev values: testnet coins are valueless
 # and the RPC port is published on loopback only. Do not reuse this file's shape for
 # mainnet.
+#
+# The `name:` below is load-bearing - see the note in docker-compose.btc-regtest.yml: it
+# keeps this node in its own Compose project so `up -d` on the regtest/testnet3 stacks
+# cannot replace this one's `bitcoind` container.
+
+name: zecd-btc-testnet4
 
 services:
   bitcoind:
@@ -56,9 +62,31 @@ services:
       - -blockfilterindex=1
       - -peerblockfilters=1
       - -listen=1
+      # Persistent peers: on testnet4 a CPU-mined block loses a same-height tie to a
+      # better-connected miner unless it propagates fast, so this node boots wired to a
+      # set of stable, well-connected full nodes rather than relying on the ~10
+      # auto-managed outbound slots alone. -addnode connections persist and reconnect.
+      # The two DNS-seed hostnames self-heal if the pinned IPs churn; the IPs are the
+      # @wiz infrastructure cluster and durable cloud nodes (curated 2026-09-01, all
+      # full nodes serving testnet4's P2P port 48333). scripts/btc_p2p_push.py adds a
+      # submission-time fan-out on top of these.
+      - -addnode=seed.testnet4.bitcoin.sprovoost.nl
+      - -addnode=seed.testnet4.wiz.biz
+      - -addnode=103.165.192.202:48333
+      - -addnode=103.165.192.206:48333
+      - -addnode=103.165.192.208:48333
+      - -addnode=103.165.192.211:48333
+      - -addnode=103.99.168.207:48333
+      - -addnode=103.99.168.211:48333
+      - -addnode=18.204.178.177:48333
+      - -addnode=3.235.25.166:48333
+      - -addnode=208.73.202.78:48333
+      - -addnode=50.116.43.120:48333
+      - -addnode=45.94.168.5:48333
+      - -addnode=89.58.9.219:48333
     ports:
       - "127.0.0.1:48332:48332" # JSON-RPC
-      - "127.0.0.1:48333:48333" # P2P, for a future BIP-157 light client on the host
+      - "48333:48333" # P2P, public: inbound peers propagate our mined blocks (and BIP-157 clients)
     volumes:
       - bitcoind-testnet4-data:/home/bitcoin/.bitcoin
 

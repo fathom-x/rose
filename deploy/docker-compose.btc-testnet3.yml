@@ -39,6 +39,12 @@
 # needs no bitcoind wallet. Credentials are fixed dev values: testnet coins are valueless
 # and the RPC port is published on loopback only. Do not reuse this file's shape for
 # mainnet.
+#
+# The `name:` below is load-bearing - see the note in docker-compose.btc-regtest.yml: it
+# keeps this node in its own Compose project so `up -d` on the regtest/testnet4 stacks
+# cannot replace this one's `bitcoind` container.
+
+name: zecd-btc-testnet3
 
 services:
   bitcoind:

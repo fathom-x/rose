@@ -25,6 +25,15 @@
 #
 # Credentials are fixed dev values: regtest coins are valueless and the RPC port is
 # published on loopback only. Do not reuse this file's shape for mainnet.
+#
+# The `name:` below is load-bearing: without it Compose derives the project name from the
+# parent directory (`deploy`), which every btc-*.yml here would share - and since they also
+# share the `bitcoind` service name, `up -d` on one would REPLACE another's running
+# container (its data volume survives, but the node is swapped out from under you). A
+# distinct project name per network keeps the regtest/testnet3/testnet4 nodes independent,
+# so they can run side by side and never clobber each other.
+
+name: zecd-btc-regtest
 
 services:
   bitcoind:

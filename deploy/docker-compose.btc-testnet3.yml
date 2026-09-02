@@ -21,11 +21,13 @@
 #
 # Usage:
 #   docker compose -f deploy/docker-compose.btc-testnet3.yml up -d
+#   # Open UI at http://127.0.0.1:8081/
 #   alias bcli3='docker compose -f deploy/docker-compose.btc-testnet3.yml exec bitcoind \
 #       bitcoin-cli -testnet -rpcuser=btc -rpcpassword=btc'
 #   bcli3 getblockchaininfo     # wait for initialblockdownload: false
 #
-# and point a `--features bitcoin` zecd at it. deploy/zecd.btc-testnet3.toml is that
+# The stack includes bitcoind, zecd (wallet daemon), and a web UI. Point zecd (or a standalone
+# zecd instance) at it. deploy/zecd.btc-testnet3.toml is that
 # config written out and commented (host-side, not mounted here); in outline:
 #   network = "test"
 #   btc_testnet = "testnet3"    # the default - the line just makes the choice explicit
@@ -67,6 +69,34 @@ services:
       - "127.0.0.1:18333:18333" # P2P, for a future BIP-157 light client on the host
     volumes:
       - bitcoind-testnet3-data:/home/bitcoin/.bitcoin
+    networks:
+      - zecd-net
+
+  zecd-gui:
+    build:
+      context: ../scripts/zecd-gui
+      dockerfile: Dockerfile
+    container_name: zecd-gui-testnet3
+    restart: unless-stopped
+    depends_on:
+      - bitcoind
+    environment:
+      - ZECD_RPC_PASSWORD=zecd
+    ports:
+      - "127.0.0.1:8081:8080"  # UI on loopback only for dev (different port from testnet4)
+    volumes:
+      - ./zecd.btc-testnet3.toml:/config/zecd.btc-testnet3.toml:ro
+    networks:
+      - zecd-net
+    command:
+      - --conf=/config/zecd.btc-testnet3.toml
+      - --bind=0.0.0.0
+      - --port=8080
+      - --bitcoind-url=http://bitcoind:18332
+
+networks:
+  zecd-net:
+    driver: bridge
 
 volumes:
   bitcoind-testnet3-data:

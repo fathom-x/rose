@@ -1,10 +1,10 @@
-# Production Bitcoin Core **mainnet** node for zecd's BDK engine (the `bitcoin` cargo
-# feature), pinned to the same 30.2 the regtest/testnet stacks and CI run against.
+# Production Bitcoin Core **mainnet** node + web UI for zecd's BDK engine (the `bitcoin`
+# cargo feature), pinned to the same 30.2 the regtest/testnet stacks and CI run against.
 #
 # This is NOT a copy of the docker-compose.btc-{regtest,testnet3,testnet4}.yml shape -
 # those are dev nodes (fixed btc/btc creds, -rpcallowip=0.0.0.0/0) safe only because they
 # publish on loopback with valueless coins. This file is hardened for a real-money,
-# internet-facing host:
+# internet-facing host, with the UI kept loopback-only by default:
 #   - RPC auth is bitcoind's own cookie (written to the datadir, root-readable on this
 #     host; no static credential exists to leak or rotate). zecd talks to this node over
 #     kyoto light mode, which is credential-free P2P, so nothing needs an RPC password.
@@ -125,6 +125,43 @@ services:
       # Mount at /root/.bitcoin - root's default datadir (matches how the retired container
       # ran), so no -datadir flag is needed and the existing chainstate is opened directly.
       - /mnt/data/bitcoin_data:/root/.bitcoin
+
+  zecd-gui:
+    # Production UI: serves the Bitcoin wallet dashboard. Keep it on the compose network
+    # only (not published to the internet) and place it behind a reverse proxy (nginx, caddy)
+    # for TLS + auth if internet access is desired. For internal/admin-only access, the
+    # loopback binding below is fine.
+    build:
+      context: ../scripts/zecd-gui
+      dockerfile: Dockerfile.prod  # production variant with healthcheck
+    container_name: zecd-gui-mainnet
+    restart: unless-stopped
+    depends_on:
+      - bitcoind
+    environment:
+      # RPC credentials: point to zecd's wallet daemon (not bitcoind - see zecd config below).
+      # Set this via .env file or docker compose --env-file for actual deployments.
+      - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:-changeme}
+    ports:
+      # Not published to 0.0.0.0 in production. Options:
+      # - Keep loopback-only (default): admin access from this host only
+      # - Publish and proxy: docker run ... -p 127.0.0.1:8080:8080 and place nginx in front
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./zecd.btc-mainnet.toml:/config/zecd.btc-mainnet.toml:ro
+    networks:
+      btcmain:
+    command:
+      - --conf=/config/zecd.btc-mainnet.toml
+      - --bind=0.0.0.0
+      - --port=8080
+      # kyoto mode has no fee estimates; the UI will show "kyoto prices at send time" message
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/info"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 networks:
   btcmain:

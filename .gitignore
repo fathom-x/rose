@@ -18,11 +18,17 @@ keys.toml
 .cookie
 identity.txt
 zecd.toml
-# Compose reads deploy/.env automatically, and the mainnet stack sources its bitcoind
-# rpcauth line from there - so an operator following that file's instructions creates a
-# credential-bearing file here. Ignored in the tracked .gitignore (not just a local
-# .git/info/exclude) so it is ignored in every clone, not only the one it was written in.
-deploy/.env
-# ...but the docker-stack template is intentional (a checked-in example, no real secrets).
+# Compose sources stack credentials from a .env, so an operator following the instructions
+# creates a credential-bearing file. Unanchored (no leading slash), so it matches at EVERY
+# level, not just deploy/: compose reads the .env in its *project* directory, which is the
+# directory of the first -f file (deploy/ for `-f deploy/docker-compose...`) but the working
+# directory when invoked from there, so both locations are live and a rule naming only one
+# leaves the other tracked. Ignored in the tracked .gitignore (not just a local
+# .git/info/exclude) so it holds in every clone, not only the one it was written in.
+.env
+.env.*
+# ...but the .example templates are intentional (checked-in examples, no real secrets).
+!.env.example
+!.env.*.example
 !/deploy/zecd.toml
 __pycache__/

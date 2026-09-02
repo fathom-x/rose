@@ -1,8 +1,9 @@
 # zecd configuration for a Bitcoin **testnet4 kyoto** wallet - the BIP-157/158
 # compact-block-filter light client, peering over P2P with NO RPC node and NO
 # credentials. This is the light-mode twin of deploy/zecd.btc-testnet4.toml (the
-# bitcoind full-node backend); run it on a SEPARATE datadir and port so it lives
-# alongside the bitcoind wallet instead of fighting it for either.
+# bitcoind full-node backend) over the SAME wallet: both files name one datadir, and the
+# wallet DB records the wallet, not the backend, so the one testnet4 wallet is driven either
+# way by choosing a config. Only one daemon at a time - both take the datadir lock.
 #
 # Needs a zecd built with the `bitcoin` feature (a default build refuses this file:
 # `[wallets.btc] coin`/`btc_testnet` are gated behind it). Probe with:
@@ -13,6 +14,10 @@
 #   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4-kyoto.toml \
 #       init --wallet btc --birthday 2026-08-01
 #   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4-kyoto.toml
+#
+# Add `--rpcbind 0.0.0.0` only if a container must reach it (the zecd-gui service in
+# docker-compose.btc-testnet4.yml does): that publishes the RPC to the LAN behind the dev
+# password below, acceptable for valueless testnet4 coins and nothing else.
 #
 # `--wallet btc` is REQUIRED on init (it defaults to a "default" Zcash wallet otherwise;
 # see the note in deploy/zecd.btc-testnet4.toml). Kyoto cannot dial a node to anchor a
@@ -32,19 +37,26 @@
 
 network = "test"
 btc_testnet = "testnet4"
-datadir = "./data-btc-testnet4-kyoto"
+# Shared with deploy/zecd.btc-testnet4.toml on purpose (see the header). Kyoto adds its own
+# header/filter store under <wallet>/btc/kyoto and leaves the BDK database alone.
+datadir = "./data-btc-testnet4"
 default_wallet = "btc"
 
 [wallets.btc]
 coin = "bitcoin"
 # Kyoto peering. Two forms:
 #   "kyoto"                    - DNS-seeded public testnet4 peers; no local node at all.
-#   "kyoto://127.0.0.1:48333"  - pin ONE trusted peer by IP (never a DNS name), which
+#   "kyoto://<ip>:48333"       - pin ONE trusted peer by IP (never a DNS name), which
 #                                switches the node to whitelist-only. 48333 is the P2P port
 #                                the deploy/docker-compose.btc-testnet4.yml node publishes
-#                                (it runs -peerblockfilters), so this peers with your own
-#                                bitcoind while still exercising the light-client path.
-server = "kyoto://127.0.0.1:48333"
+#                                (it runs -peerblockfilters), so this peers with a node we
+#                                run while still exercising the light-client path.
+# Pinned to the project's own testnet4 node (the compose file above, deployed on the
+# 216.230.225.61 host). On that host itself, or beside a local copy of the stack, use
+# 127.0.0.1 instead.
+server = "kyoto://216.230.225.61:48333"
+# server = "kyoto://127.0.0.1:48333"
+# server = "kyoto"
 
 # No [bitcoind] section: kyoto has no server and no credentials, so the cleartext-credential
 # gate does not apply to it at all.
@@ -78,18 +90,20 @@ server = "kyoto://127.0.0.1:48333"
 # reports that, rather than leaving the chain quietly one tier shorter than it reads.
 
 [rpc]
-# zecd's own Bitcoin-Core-dialect JSON-RPC. Distinct port from the bitcoind wallet's 48232
-# so both zecd daemons can run at once.
+# zecd's own Bitcoin-Core-dialect JSON-RPC. Distinct port from the bitcoind-backed config's
+# 48232 so a client (the zecd-gui compose service, say) can tell the two apart, and so nothing
+# collides if the two are ever given separate datadirs and run at once.
 bind = "127.0.0.1"
 port = 48242
-user = "btc"
-# CHANGE-ME is only rejected on mainnet, so a testnet daemon starts with it as the literal
-# password. Set it (or supply ZECD_RPC_PASSWORD, which wins over this) and authenticate with
-# what you set.
-password = "CHANGE-ME"
+# Dev credentials, deliberately DIFFERENT from zecd.btc-testnet4.toml's (btc/ALTERNATIVE) so
+# a client's failure to authenticate tells you which daemon it reached. ZECD_RPC_PASSWORD in
+# the environment wins over this line - so leave it unset unless you mean to override both
+# configs at once.
+user = "user"
+password = "kyoto"
 
 [keys]
-age_identity = "./data-btc-testnet4-kyoto/identity.txt"
+age_identity = "./data-btc-testnet4/identity.txt"
 auto_unlock = true
 
 [sync]
@@ -97,8 +111,8 @@ interval_secs = 5
 
 [health]
 # The health server reports on Zcash wallets only, so on this bitcoin-only config /status is
-# empty and /readyz is trivially ready; poll getblockcount for sync state. Distinct port so a
-# bitcoind-backed testnet4 daemon can run beside this one.
+# empty and /readyz is trivially ready; poll getblockcount for sync state. Distinct from the
+# bitcoind-backed config's 49233 for the same reason as the [rpc] port above.
 port = 49243
 
 [log]

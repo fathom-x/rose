@@ -95,7 +95,7 @@
       <input type="text" id="amount" placeholder="0.0001" inputmode="decimal" style="flex:1">
       <button type="button" id="maxbtn" class="ghost" style="white-space:nowrap">send all</button>
     </div>
-    <label>fee rate (sat/vB, optional &mdash; blank uses the estimate below)
+    <label>fee rate (sat/vB &mdash; prefilled with the estimate below; edit to override, clear to let zecd price the send itself)
       <input type="text" id="feerate" placeholder="" inputmode="decimal"></label>
     <div class="sub" id="feeest" style="margin-top:.3rem">fee estimate: &ndash;</div>
     <div class="row">
@@ -204,26 +204,53 @@ async function loadInfo() {
 }
 
 // The fee estimate is served by the proxy, mirroring where the wallet gets its
-// rate: bitcoind's estimatesmartfee on the bitcoind backend, mempool.space on
-// kyoto (kyoto's own primary source). Blank fee-rate sends use this rate; when
-// there's no numeric estimate the endpoint returns a `note` instead.
+// rate: bitcoind's estimatesmartfee on the bitcoind backend, the [fees] oracle
+// chain on kyoto - already rounded to the whole sat/vB zecd would pay.
+//
+// The estimate is PREFILLED into the fee-rate field and sent as sendtoaddress's
+// explicit fee_rate, so the send pays exactly the number the page showed rather
+// than whatever zecd re-estimates seconds later. Refreshes keep overwriting the
+// field only while it still holds a prefilled value (data-auto); a value the user
+// typed is left alone. Two cases deliberately do NOT prefill: the proxy's own
+// test-network fallback (a made-up 1 sat/vB, which zecd applies itself where it is
+// legal and refuses on mainnet), and no estimate at all - then an auto-filled
+// field is cleared so a blank send lets zecd price it (on kyoto, from the
+// peer-derived median the page cannot see).
+function setFeePrefill(value) {
+  const f = $("feerate");
+  if (f.value && !f.dataset.auto) return;  // user-typed: keep it
+  if (value == null) {
+    f.value = ""; delete f.dataset.auto; f.placeholder = "";
+    return;
+  }
+  f.value = String(value); f.dataset.auto = "1";
+}
 async function refreshFee() {
   try {
     const r = await (await fetch("/feerate")).json();
-    if (r.error) { $("feeest").textContent = "fee estimate: unavailable (" + r.error + ")"; return; }
+    if (r.error) {
+      $("feeest").textContent = "fee estimate: unavailable (" + r.error + ")";
+      setFeePrefill(null);
+      return;
+    }
     if (r.sat_per_vb != null) {
       const src = r.source === "fallback" ? "testnet fallback"
                 : r.source === "estimatesmartfee" ? `node, target ~${r.blocks} blocks`
                 : r.source || "estimate";
-      $("feeest").textContent = `fee estimate: ${r.sat_per_vb} sat/vB (${src})`;
-      if (!$("feerate").value) $("feerate").placeholder = r.sat_per_vb + " (estimate)";
+      $("feeest").textContent = `fee estimate: ${r.sat_per_vb} sat/vB (${src})`
+        + (r.note ? ` - ${r.note}` : "");
+      setFeePrefill(r.source === "fallback" ? null : r.sat_per_vb);
     } else {
       $("feeest").textContent = "fee estimate: " + (r.note || "unavailable");
+      setFeePrefill(null);
     }
   } catch (e) {
     $("feeest").textContent = "fee estimate: unavailable";
+    setFeePrefill(null);
   }
 }
+// Typing (or clearing) the field makes it the user's; the next refresh leaves it alone.
+$("feerate").addEventListener("input", () => { delete $("feerate").dataset.auto; });
 
 $("newaddr").onclick = async () => {
   $("addrmsg").textContent = "";

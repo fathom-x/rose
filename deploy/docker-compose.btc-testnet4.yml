@@ -25,8 +25,13 @@
 #       bitcoin-cli -testnet4 -rpcuser=btc -rpcpassword=btc'
 #   bcli4 getblockchaininfo     # wait for initialblockdownload: false
 #
-# and point a `--features bitcoin` zecd at it. deploy/zecd.btc-testnet4.toml is that
-# config written out and commented (host-side, not mounted here); in outline:
+# The stack runs the NODE plus the dev web UI (scripts/zecd-gui). zecd itself is NOT a service
+# here: the published image is built without the `bitcoin` cargo feature, so it refuses
+# `coin = "bitcoin"` outright. Run zecd on the host from a `--features bitcoin` build, and see
+# the zecd-gui service below for how the containerised UI reaches it.
+#
+# deploy/zecd.btc-testnet4.toml is that zecd's config, written out and commented (host-side,
+# not mounted here); in outline:
 #   network = "test"
 #   btc_testnet = "testnet4"
 #   [wallets.btc]
@@ -95,6 +100,55 @@ services:
       - "48333:48333" # P2P, public: inbound peers propagate our mined blocks (and BIP-157 clients)
     volumes:
       - bitcoind-testnet4-data:/home/bitcoin/.bitcoin
+    networks:
+      - zecd-net
+
+  # The dev web UI (scripts/zecd-gui), a same-origin proxy in front of zecd's RPC.
+  #
+  # It takes its credentials from the mounted zecd config, but NOT the address: that config's
+  # `[rpc] bind` is 127.0.0.1, which inside this container is the container's own loopback.
+  # --rpc-url overrides just the address. host.docker.internal is the host as seen from a
+  # container on Docker Desktop (macOS/Windows); on Linux, the extra_hosts line below maps it
+  # to the bridge gateway, which Docker Desktop provides on its own.
+  #
+  # For that to resolve, the host zecd must listen past loopback - it is reached on the bridge
+  # interface, not 127.0.0.1 - so start it with `--rpcbind 0.0.0.0`. That exposes its RPC to
+  # the LAN, acceptable here only because these are valueless testnet4 coins behind a dev
+  # password. Do not carry this shape to mainnet; put zecd and the UI on one compose network
+  # instead (see docker-compose.btc-mainnet.yml).
+  zecd-gui:
+    build:
+      context: ../scripts/zecd-gui
+      dockerfile: Dockerfile
+    container_name: zecd-gui-testnet4
+    restart: unless-stopped
+    environment:
+      - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:-}
+    ports:
+      - "127.0.0.1:8080:8080"  # UI on loopback only for dev
+    volumes:
+      # Both testnet4 configs, so one service covers either backend (see the env vars below).
+      - ./zecd.btc-testnet4.toml:/config/zecd.btc-testnet4.toml:ro
+      - ./zecd.btc-testnet4-kyoto.toml:/config/zecd.btc-testnet4-kyoto.toml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - zecd-net
+    command:
+      # Defaults serve this stack's own premise: full mode against the bitcoind above. For a
+      # kyoto zecd instead, which needs no bitcoind at all:
+      #   ZECD_GUI_CONF=zecd.btc-testnet4-kyoto.toml ZECD_GUI_RPC_PORT=48242 \
+      #     docker compose -f deploy/docker-compose.btc-testnet4.yml up -d zecd-gui
+      # The port must match the chosen config's [rpc] port - only the host part is overridden.
+      - --conf=/config/${ZECD_GUI_CONF:-zecd.btc-testnet4.toml}
+      - --bind=0.0.0.0
+      - --port=8080
+      - --rpc-url=http://host.docker.internal:${ZECD_GUI_RPC_PORT:-48232}
+      - --bitcoind-url=http://bitcoind:48332
+
+networks:
+  zecd-net:
+    driver: bridge
 
 volumes:
   bitcoind-testnet4-data:

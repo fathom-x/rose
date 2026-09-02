@@ -85,7 +85,7 @@ user = "btc"
 # matching the compose stack, but this is zecd's OWN RPC password and has no counterpart to
 # match. `CHANGE-ME` is only rejected outright on mainnet, so a testnet daemon starts with it
 # as the literal password - set it, and authenticate with what you set.
-password = "CHANGE-ME"
+password = "ALTERNATIVE"
 
 [keys]
 # age identity written by `zecd init`; used to decrypt the seed for unattended sending. A

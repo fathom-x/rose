@@ -323,6 +323,11 @@ def main():
     password = os.environ.get("ZECD_RPC_PASSWORD") or rpc["password"]
     if not rpc["user"] or not password:
         sys.exit(f"no RPC password: set ZECD_RPC_PASSWORD or [rpc] password in {args.conf}")
+    # The shipped configs carry a placeholder that zecd itself refuses to start on (every
+    # network), so a proxy holding it can only ever fail auth: say so up front, the same way.
+    if password.strip().lower() == "change-me":
+        sys.exit(f"[rpc] password in {args.conf} is still the CHANGE-ME placeholder; zecd "
+                 "refuses to start on it - set ZECD_RPC_PASSWORD to the password the daemon runs with")
     # Where zecd listens. The config's own [rpc] bind/port is right whenever this proxy runs
     # beside the daemon, and wrong from inside a container - 127.0.0.1 there is the container's
     # loopback, not the host's. --rpc-url (or ZECD_RPC_URL) replaces just the address; the

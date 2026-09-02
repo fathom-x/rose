@@ -87,8 +87,8 @@ port = 18232
 user = "btc"
 # The one value in this file to change: the [bitcoind] credentials above are fixed dev values
 # matching the compose stack, but this is zecd's OWN RPC password and has no counterpart to
-# match. `CHANGE-ME` is only rejected outright on mainnet, so a testnet daemon starts with it
-# as the literal password - set it, and authenticate with what you set.
+# match. zecd refuses to start while it is the `CHANGE-ME` placeholder, on every network -
+# edit it, or supply ZECD_RPC_PASSWORD in the daemon's environment (it wins over the file).
 password = "CHANGE-ME"
 
 [keys]

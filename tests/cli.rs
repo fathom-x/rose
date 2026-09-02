@@ -172,41 +172,44 @@ fn unknown_config_field_is_rejected() {
     );
 }
 
-/// On mainnet the RPC password is spend authority, so the daemon must refuse to start while it is
-/// still the shipped placeholder - in any case, since the deploy templates use `CHANGE-ME` and the
-/// example config uses lowercase `change-me`.
+/// The RPC password is spend authority, so the daemon must refuse to start while it is still the
+/// shipped placeholder - in any case, since the deploy templates use `CHANGE-ME` and the example
+/// config uses lowercase `change-me` - and on every network: a testnet stack that comes up on the
+/// committed value is one nobody is prompted to change.
 #[test]
-fn mainnet_placeholder_password_refuses_to_start() {
-    for placeholder in ["CHANGE-ME", "change-me", " Change-Me "] {
-        let dir = tempfile::tempdir().unwrap();
-        let out = run_with_timeout(
-            {
-                let mut c = zecd();
-                c.args([
-                    "--datadir",
-                    dir.path().to_str().unwrap(),
-                    "--network",
-                    "main",
-                    "--rpcuser",
-                    "u",
-                    "--rpcpassword",
-                    placeholder,
-                ]);
-                c
-            },
-            Duration::from_secs(10),
-        );
-        assert_eq!(
-            out.status.code(),
-            Some(1),
-            "placeholder {placeholder:?} should refuse to start; stderr: {}",
-            stderr_of(&out)
-        );
-        assert!(
-            stderr_of(&out).contains("CHANGE-ME"),
-            "placeholder {placeholder:?} stderr: {}",
-            stderr_of(&out)
-        );
+fn placeholder_password_refuses_to_start_on_every_network() {
+    for network in ["main", "test", "regtest"] {
+        for placeholder in ["CHANGE-ME", "change-me", " Change-Me "] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = run_with_timeout(
+                {
+                    let mut c = zecd();
+                    c.args([
+                        "--datadir",
+                        dir.path().to_str().unwrap(),
+                        "--network",
+                        network,
+                        "--rpcuser",
+                        "u",
+                        "--rpcpassword",
+                        placeholder,
+                    ]);
+                    c
+                },
+                Duration::from_secs(10),
+            );
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "{network}: placeholder {placeholder:?} should refuse to start; stderr: {}",
+                stderr_of(&out)
+            );
+            assert!(
+                stderr_of(&out).contains("CHANGE-ME"),
+                "{network}: placeholder {placeholder:?} stderr: {}",
+                stderr_of(&out)
+            );
+        }
     }
 }
 
@@ -842,11 +845,20 @@ fn help_lists_licenses_subcommand() {
 // ---------------------------------------------------------------------------
 
 fn config_check(conf: &std::path::Path, extra: &[&str]) -> Output {
+    config_check_env(conf, extra, &[])
+}
+
+/// `config check` with extra environment - the way a deployment supplies the values a shipped
+/// sample deliberately leaves out (the RPC password, via `ZECD_RPC_PASSWORD`).
+fn config_check_env(conf: &std::path::Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
     run_with_timeout(
         {
             let mut c = zecd();
             c.args(["config", "check", "--conf", conf.to_str().unwrap()]);
             c.args(extra);
+            for (k, v) in env {
+                c.env(k, v);
+            }
             c
         },
         Duration::from_secs(10),
@@ -1279,7 +1291,14 @@ fn repo_file(rel: &str) -> std::path::PathBuf {
 
 /// The samples every build must accept: they configure the Zcash engine, which is always
 /// compiled in.
-const SAMPLE_CONFIGS: [&str; 2] = ["zecd.example.toml", "deploy/zecd.toml"];
+/// Every one of these ships the `CHANGE-ME` placeholder password, so as written each is refused
+/// on every network and each is valid once `ZECD_RPC_PASSWORD` supplies the one value the
+/// operator is told to change - both halves asserted below.
+const SAMPLE_CONFIGS: [&str; 3] = [
+    "zecd.example.toml",
+    "deploy/zecd.toml",
+    "deploy/zecd.mainnet.toml",
+];
 
 /// The Bitcoin dev-stack samples (the zecd side of `deploy/docker-compose.btc-testnet*.yml`).
 /// They select the BDK engine, so they are shipped-and-valid only for a build carrying the
@@ -1312,13 +1331,18 @@ fn shipped_sample_configs() -> Vec<&'static str> {
         .collect()
 }
 
-/// Every sample config this repo ships must be one *this* build accepts.
+/// Every sample config this repo ships must be one *this* build accepts - once the operator has
+/// supplied the one value every sample deliberately leaves as a placeholder (the RPC password,
+/// here the way a deployment does it: `ZECD_RPC_PASSWORD`, which the configs themselves document
+/// as the ConfigMap-safe way to keep it out of the TOML).
 #[test]
 fn the_sample_configs_this_repo_ships_are_valid_for_this_build() {
-    // deploy/zecd.mainnet.toml is deliberately absent - it carries the CHANGE-ME placeholder
-    // and is covered by the test below.
     for rel in shipped_sample_configs() {
-        let out = config_check(&repo_file(rel), &[]);
+        let out = config_check_env(
+            &repo_file(rel),
+            &[],
+            &[("ZECD_RPC_PASSWORD", "not-the-placeholder")],
+        );
         assert!(
             out.status.success(),
             "{rel} is shipped to operators but this build would refuse it:\n{}{}",
@@ -1328,45 +1352,28 @@ fn the_sample_configs_this_repo_ships_are_valid_for_this_build() {
     }
 }
 
-/// `deploy/zecd.mainnet.toml` is the one shipped sample that must *not* pass as written: it
-/// carries the `CHANGE-ME` RPC password, and refusing that on mainnet is a deliberate guard (an
-/// RPC password is spend authority for clients, and this one is printed in the repo). Assert
-/// both halves - the guard fires on the file as shipped, and everything else about the file is
-/// valid once the operator supplies the one value they are told to change. Without the second
-/// half a sample that had quietly rotted would still "fail as expected".
+/// No shipped sample passes *as written*: each carries the `CHANGE-ME` RPC password, and refusing
+/// that - on every network, not only mainnet - is a deliberate guard (an RPC password is spend
+/// authority for clients, and this one is printed in the repo; a testnet stack that starts on it
+/// is one nobody is prompted to change). Assert the guard fires on each file as shipped, and for
+/// that reason alone - the companion test above proves everything else about the file is valid
+/// once the password is supplied. Without both halves a sample that had quietly rotted would
+/// still "fail as expected".
 #[test]
-fn the_mainnet_sample_config_is_refused_only_for_its_placeholder_password() {
-    let conf = repo_file("deploy/zecd.mainnet.toml");
-
-    let out = config_check(&conf, &[]);
-    assert!(
-        !out.status.success(),
-        "the mainnet sample ships a placeholder password; the check must refuse it:\n{}",
-        stderr_of(&out)
-    );
-    let stderr = stderr_of(&out);
-    assert!(
-        stderr.contains("placeholder"),
-        "refused for some other reason than the placeholder password: {stderr}"
-    );
-
-    // The same file, with the password supplied the way a deployment would (the config itself
-    // documents ZECD_RPC_PASSWORD as the ConfigMap-safe way to keep it out of the TOML).
-    let out = run_with_timeout(
-        {
-            let mut c = zecd();
-            c.args(["config", "check", "--conf", conf.to_str().unwrap()]);
-            c.env("ZECD_RPC_PASSWORD", "not-the-placeholder");
-            c
-        },
-        Duration::from_secs(10),
-    );
-    assert!(
-        out.status.success(),
-        "with a real password the mainnet sample must be valid:\n{}{}",
-        stdout_of(&out),
-        stderr_of(&out)
-    );
+fn the_shipped_samples_are_refused_only_for_their_placeholder_password() {
+    for rel in shipped_sample_configs() {
+        let out = config_check(&repo_file(rel), &[]);
+        assert!(
+            !out.status.success(),
+            "{rel} ships a placeholder password; the check must refuse it:\n{}",
+            stderr_of(&out)
+        );
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("placeholder"),
+            "{rel} was refused for some other reason than the placeholder password: {stderr}"
+        );
+    }
 }
 
 /// The other side of `bitcoin_sample_configs`. The Bitcoin dev-stack samples select an engine

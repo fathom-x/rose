@@ -2216,13 +2216,6 @@ impl AppConfig {
     }
 }
 
-/// Refuse the shipped placeholder RPC password on mainnet, where the RPC credential is spend
-/// authority. The example config and the deploy templates ship `change-me`/`CHANGE-ME`, so a
-/// config that still carries it was never edited.
-///
-/// Deliberately *not* part of [`AppConfig::resolve`]: it is a startup policy, not a parse rule,
-/// and `resolve` is used by tooling (`config check`) that must be able to describe such a config
-/// rather than fail to build it. Both the daemon and `zecd config check` call this, so the two
 /// Refuse a configuration that opts into multiple spending wallets **when it is the `zecd`
 /// daemon that would run it**.
 ///
@@ -2252,18 +2245,28 @@ pub fn reject_multiple_spenders_in_daemon(config: &AppConfig) -> anyhow::Result<
     Ok(())
 }
 
-/// always agree on the verdict.
+/// Refuse the shipped placeholder RPC password, on every network. The example config and the
+/// deploy templates ship `change-me`/`CHANGE-ME`, so a config that still carries it was never
+/// edited - and the RPC credential is spend authority, so a daemon must not come up behind a
+/// password printed in a public repository. The rule used to apply to mainnet only, which let
+/// every testnet sample start on the literal placeholder; a testnet stack that just works on
+/// the committed value is one nobody is prompted to change, so now nothing does.
+///
+/// Deliberately *not* part of [`AppConfig::resolve`]: it is a startup policy, not a parse rule,
+/// and `resolve` is used by tooling (`config check`, `config show`) that must be able to
+/// describe such a config rather than fail to build it. Both the daemon and `zecd config check`
+/// call this, so the two always agree on the verdict.
 pub fn reject_placeholder_password(config: &AppConfig) -> anyhow::Result<()> {
-    if matches!(config.network, ZNetwork::Main)
-        && config
-            .rpc
-            .password
-            .as_deref()
-            .is_some_and(|p| p.trim().eq_ignore_ascii_case("change-me"))
+    if config
+        .rpc
+        .password
+        .as_deref()
+        .is_some_and(|p| p.trim().eq_ignore_ascii_case("change-me"))
     {
         anyhow::bail!(
-            "[rpc] password is still the example placeholder \"CHANGE-ME\"; \
-             set a real password before running on mainnet"
+            "[rpc] password is still the example placeholder \"CHANGE-ME\"; set a real password \
+             (in the file, via [rpc] password_file, or as ZECD_RPC_PASSWORD in the environment) \
+             before starting - on any network"
         );
     }
     Ok(())

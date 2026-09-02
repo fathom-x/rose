@@ -134,6 +134,7 @@ bind = "127.0.0.1"
 port = 18232
 # If user/password are omitted, a bitcoind-style cookie file is generated at <datadir>/.cookie.
 user = "zec"
+# Placeholder: zecd refuses to start while the password is `change-me`, on every network.
 password = "change-me"
 # The RPC password is spend-equivalent for clients, so in a ConfigMap+Secret split keep it
 # OUT of this (ConfigMap-bound) file. Source it from a mounted Secret file or the environment

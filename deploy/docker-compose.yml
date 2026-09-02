@@ -37,6 +37,10 @@ services:
     command: ["--datadir=/var/lib/zecd", "--conf=/etc/zecd/zecd.toml"]
     environment:
       - RUST_LOG=info
+      # Required: zecd.toml ships the CHANGE-ME placeholder, which zecd refuses to start on
+      # (every network). Set the real one in deploy/.env (gitignored); it wins over the file.
+      # Compose refuses to start the service while it is unset or empty.
+      - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:?set ZECD_RPC_PASSWORD in deploy/.env - zecd refuses the config's CHANGE-ME placeholder}
     volumes:
       - ./zecd.toml:/etc/zecd/zecd.toml:ro
       - zecd-data:/var/lib/zecd

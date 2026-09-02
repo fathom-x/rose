@@ -26,6 +26,9 @@ reconnect_max_secs = 60
 bind = "0.0.0.0"
 port = 18232
 user = "zec"
+# Placeholder: zecd refuses to start while the password is `CHANGE-ME`, on every network. The
+# compose stack supplies the real one as ZECD_RPC_PASSWORD (from deploy/.env, gitignored),
+# which wins over this line - so leave the file alone and set the variable.
 password = "CHANGE-ME"
 
 [keys]

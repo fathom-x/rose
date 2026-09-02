@@ -38,6 +38,10 @@ bare `docker run`.
 
 ```bash
 # start zecd on the host, reachable from the container
+# The configs ship a CHANGE-ME placeholder that zecd refuses to start on, so the password
+# lives in the environment: once in deploy/.env for compose, once for the host daemon.
+echo "ZECD_RPC_PASSWORD=$(openssl rand -base64 24)" > deploy/.env    # gitignored
+export ZECD_RPC_PASSWORD=$(sed -n 's/^ZECD_RPC_PASSWORD=//p' deploy/.env)
 # (the config names the datadir, ./data-btc-testnet4 relative to the repo root)
 ./target/release/zecd --conf deploy/zecd.btc-testnet4.toml --rpcbind 0.0.0.0
 
@@ -52,6 +56,7 @@ Then open http://127.0.0.1:8080/
 cd scripts/zecd-gui
 docker build -t zecd-gui .
 docker run --rm -p 8080:8080 \
+  -e ZECD_RPC_PASSWORD \
   -v $(pwd)/../../deploy:/config:ro \
   --add-host host.docker.internal:host-gateway \
   zecd-gui \
@@ -66,14 +71,17 @@ The server is stdlib-only, so for local testing this is the shortest path and si
 address problem entirely:
 
 ```bash
-python3 scripts/zecd-gui/serve.py --conf deploy/zecd.btc-testnet4-kyoto.toml
+ZECD_RPC_PASSWORD=... python3 scripts/zecd-gui/serve.py --conf deploy/zecd.btc-testnet4-kyoto.toml
 ```
 
 ## Configuration
 
 ### Environment Variables
 
-- `ZECD_RPC_PASSWORD` - Override the RPC password from the config file
+- `ZECD_RPC_PASSWORD` - The RPC password. Effectively required: the shipped configs carry a
+  `CHANGE-ME` placeholder that zecd refuses to start on (every network) and that `serve.py`
+  refuses for the same reason, so the daemon and the proxy each take the real value from this
+  variable. It wins over `[rpc] password` in the file.
 
 ### Command-line Arguments
 
@@ -133,12 +141,12 @@ dependencies, so there is nothing to install.
 
 - Check that zecd is running: `docker ps` or local `ps aux | grep zecd`
 - Verify the RPC password: `echo $ZECD_RPC_PASSWORD`
-- Test the connection: `curl -u user:kyoto http://localhost:48242/` (the kyoto config's port and credentials)
+- Test the connection: `curl -u "btc:$ZECD_RPC_PASSWORD" http://localhost:48242/` (the kyoto config's port and user)
 
-### "no RPC password"
+### "no RPC password" / "still the CHANGE-ME placeholder"
 
-- Set `ZECD_RPC_PASSWORD` environment variable
-- Or ensure `[rpc] password` is in the config file at `/config/zecd.btc-testnet4.toml`
+- Set the `ZECD_RPC_PASSWORD` environment variable to the password the host zecd runs with
+  (compose reads it from `deploy/.env`; the daemon needs it in its own environment)
 
 ### "no [bitcoind] credentials"
 

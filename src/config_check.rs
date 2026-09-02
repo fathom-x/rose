@@ -672,24 +672,29 @@ mod tests {
         );
     }
 
-    /// The mainnet placeholder refusal is the daemon's, reached through the shared helper.
+    /// The placeholder refusal is the daemon's, reached through the shared helper - and it
+    /// holds on every network, not only mainnet (a testnet stack that starts on the committed
+    /// value is one nobody is prompted to change).
     #[test]
-    fn mainnet_placeholder_password_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = resolve(
-            &format!(
-                "network = \"main\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"change-me\"\n",
-                dir.path()
-            ),
-            dir.path(),
-        );
-        assert!(
-            errors(&inspect(&config))
-                .iter()
-                .any(|e| e.contains("CHANGE-ME")),
-            "{:?}",
-            inspect(&config)
-        );
+    fn placeholder_password_is_an_error_on_every_network() {
+        for network in ["main", "test", "regtest"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = resolve(
+                &format!(
+                    "network = \"{network}\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\n\
+                     password = \"change-me\"\n",
+                    dir.path()
+                ),
+                dir.path(),
+            );
+            assert!(
+                errors(&inspect(&config))
+                    .iter()
+                    .any(|e| e.contains("CHANGE-ME")),
+                "{network}: {:?}",
+                inspect(&config)
+            );
+        }
     }
 
     /// A credentialed `zebra://` endpoint on a public host is refused by the cleartext gate at

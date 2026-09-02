@@ -16,8 +16,8 @@
 #   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4-kyoto.toml
 #
 # Add `--rpcbind 0.0.0.0` only if a container must reach it (the zecd-gui service in
-# docker-compose.btc-testnet4.yml does): that publishes the RPC to the LAN behind the dev
-# password below, acceptable for valueless testnet4 coins and nothing else.
+# docker-compose.btc-testnet4.yml does): that publishes the RPC to the LAN behind the RPC
+# password, acceptable for valueless testnet4 coins and nothing else.
 #
 # `--wallet btc` is REQUIRED on init (it defaults to a "default" Zcash wallet otherwise;
 # see the note in deploy/zecd.btc-testnet4.toml). Kyoto cannot dial a node to anchor a
@@ -95,12 +95,13 @@ server = "kyoto://216.230.225.61:48333"
 # collides if the two are ever given separate datadirs and run at once.
 bind = "127.0.0.1"
 port = 48242
-# Dev credentials, deliberately DIFFERENT from zecd.btc-testnet4.toml's (btc/ALTERNATIVE) so
-# a client's failure to authenticate tells you which daemon it reached. ZECD_RPC_PASSWORD in
-# the environment wins over this line - so leave it unset unless you mean to override both
-# configs at once.
-user = "user"
-password = "kyoto"
+user = "btc"
+# The one value in this file you MUST change: zecd refuses to start while it is the `CHANGE-ME`
+# placeholder, on every network, testnet included. Either edit this line or leave it and supply
+# ZECD_RPC_PASSWORD in the daemon's environment (it wins over the file) - the latter is what
+# the zecd-gui compose service expects, since the UI proxy reads the same variable. Same rule
+# and same variable for deploy/zecd.btc-testnet4.toml, so one value serves either config.
+password = "CHANGE-ME"
 
 [keys]
 age_identity = "./data-btc-testnet4/identity.txt"

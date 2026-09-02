@@ -51,9 +51,10 @@ impl NodeBuilder {
         // Single-instance guard: take the exclusive datadir lock before opening any wallet, and
         // hold it for the node's whole lifetime (the guard rides on the `Node`). See `crate::lock`.
         let datadir_lock = crate::lock::lock_datadir(&self.config.datadir)?;
-        // The example/deploy configs ship with a placeholder RPC password; on mainnet that is
-        // spend authority, so refuse to start until it has been changed. Shared with
-        // `zecd config check`, which reports the same refusal without starting anything.
+        // The example/deploy configs ship with a placeholder RPC password, which is spend
+        // authority printed in a public repo, so refuse to start until it has been changed - on
+        // every network. Shared with `zecd config check`, which reports the same refusal
+        // without starting anything.
         config::reject_placeholder_password(&self.config)?;
         actor::install_panic_hook();
         Ok(PreparedNode {

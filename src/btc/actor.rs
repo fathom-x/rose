@@ -47,8 +47,10 @@ const COMMAND_BUFFER: usize = 64;
 /// like the Zcash engine's).
 const SYNC_BLOCKS_PER_PASS: usize = 512;
 
-/// The confirmation target handed to `estimatesmartfee` for wallet-built sends.
-const FEE_TARGET_BLOCKS: u16 = 6;
+/// The confirmation target for wallet-built sends: handed to bitcoind's `estimatesmartfee`,
+/// and read as `crate::btc::fees::TARGET_BLOCKS` from each HTTP fee oracle on the kyoto
+/// backend, so switching backends does not silently reprice a send. One number, here.
+pub(crate) const FEE_TARGET_BLOCKS: u16 = 6;
 
 /// The most a subtract-fee build's fee may overshoot the converged guess and still be
 /// accepted: the conservative dust bound (546 sat, P2PKH's - above the ~294 sat bound of
@@ -336,6 +338,9 @@ pub struct BtcActorConfig {
     /// The wallet's bitcoind upstream. `None` runs the actor with no sync loop (offline
     /// command service - what the pre-chain-source engine always did, kept for tests).
     pub endpoint: Option<BtcEndpoint>,
+    /// The fee-oracle chain (`[fees]`), consulted only on the kyoto backend - a bitcoind
+    /// upstream answers with `estimatesmartfee` and never reaches it.
+    pub fees: crate::config::FeesConfig,
     /// The height the block scan starts from on an empty chain state (recorded by init).
     pub birthday: u32,
     /// The operator's `--birthday` date when init could only record it approximately (the
@@ -365,6 +370,7 @@ pub fn spawn(
         seed,
         wallet_holds_seed: has_seed,
         endpoint,
+        fees,
         birthday,
         birthday_time,
         sync_interval,
@@ -464,6 +470,7 @@ pub fn spawn(
         seed,
         network,
         endpoint,
+        fees,
         birthday,
         birthday_time,
         birthday_anchor,
@@ -515,6 +522,8 @@ struct BtcActor {
     seed: Option<SecretVec<u8>>,
     network: BitcoinNetwork,
     endpoint: Option<BtcEndpoint>,
+    /// See [`BtcActorConfig::fees`].
+    fees: crate::config::FeesConfig,
     birthday: u32,
     /// See [`BtcActorConfig::birthday_time`].
     birthday_time: Option<u64>,
@@ -1067,21 +1076,35 @@ impl BtcActor {
             Some(Conn::Kyoto(kyoto)) => kyoto.requester(),
             None => return Err(anyhow::anyhow!("no upstream connection")),
         };
-        // Kyoto has no fee estimator of its own worth the name, so ask mempool.space for a
-        // real forward estimate first and keep the on-chain signals as the fallback. A
-        // failure here is not a failed send - it degrades to what the light client can see
-        // by itself. `crate::btc::fees` documents what the lookup does and does not reveal.
-        let network = self.network;
-        match crate::btc::fees::recommended_fee_rate(network).await {
-            Ok(Some(rate)) => return Ok(Some(rate)),
-            // No oracle for this network (regtest); the on-chain signals are all there is.
-            Ok(None) => {}
-            Err(e) => warn!(
-                "mempool.space fee lookup failed ({e:#}); falling back to kyoto's own \
-                 relay floor and recent-block fee median"
-            ),
+        // Kyoto has no fee estimator of its own worth the name, so walk the configured oracle
+        // chain (`[fees] sources`, by default mempool.space then Esplora) for a real forward
+        // estimate and keep the on-chain signals as the last tier. A tier failing is not a
+        // failed send - the chain degrades to the next one, and past the last of them to what
+        // the light client can see by itself. `crate::btc::fees` documents what the lookups do
+        // and do not reveal, and how to point them at an instance the operator runs.
+        let chain = crate::btc::fees::oracle_chain(&self.fees, self.network);
+        for tier in chain {
+            match tier {
+                crate::btc::fees::FeeTier::Http { source, url } => {
+                    match crate::btc::fees::http_fee_rate(source, &url).await {
+                        Ok(rate) => return Ok(Some(rate)),
+                        Err(e) => warn!(
+                            source = source.as_str(),
+                            %url,
+                            "fee lookup failed ({e:#}); falling through to the next fee source"
+                        ),
+                    }
+                }
+                crate::btc::fees::FeeTier::PeerMedian => {
+                    return crate::btc::kyoto::estimate_fee_rate(requester).await
+                }
+            }
         }
-        crate::btc::kyoto::estimate_fee_rate(requester).await
+        // Every tier was skipped (no endpoint for this network) or failed. `do_send` turns
+        // this into the same refusal-on-mainnet / 1 sat/vB-on-testnet posture a bitcoind with
+        // no fee data gets, so an operator who removed `peer_median` from the chain lands
+        // there deliberately rather than on a peer-dictated rate.
+        Ok(None)
     }
 
     /// Broadcast in whichever dialect is connected: bitcoind's `sendrawtransaction`, or a
@@ -1434,6 +1457,7 @@ mod tests {
             wallet_holds_seed: seed.is_some(),
             seed,
             endpoint: None,
+            fees: crate::config::FeesConfig::default(),
             birthday: 0,
             birthday_time: None,
             sync_interval: Duration::from_secs(20),

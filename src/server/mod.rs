@@ -323,6 +323,8 @@ mod tests {
             zebra: Default::default(),
             #[cfg(feature = "bitcoin")]
             bitcoind: Default::default(),
+            #[cfg(feature = "bitcoin")]
+            fees: Default::default(),
             rpc: rpc.clone(),
             keys: KeysConfig {
                 age_identity: None,

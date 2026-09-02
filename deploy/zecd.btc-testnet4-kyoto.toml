@@ -25,9 +25,9 @@
 #   - NO 0-conf receives: an incoming payment is invisible until it confirms, and
 #     getbalances' untrusted_pending stays empty.
 #   - NO eviction reporting.
-#   - NO estimatesmartfee: sends price from mempool.space + a block-median floor, or the
-#     explicit `fee_rate` argument. (The btc-ui fee estimate reads bitcoind, so it does not
-#     apply to a kyoto wallet - use fee_rate there.)
+#   - NO estimatesmartfee: sends price from the [fees] oracle chain below (mempool.space,
+#     then a Blockstream-style Esplora, then a peer-derived block median), or from the
+#     explicit `fee_rate` argument.
 # In exchange it needs no node, no credentials, and reveals no addresses to a server.
 
 network = "test"
@@ -48,6 +48,34 @@ server = "kyoto://127.0.0.1:48333"
 
 # No [bitcoind] section: kyoto has no server and no credentials, so the cleartext-credential
 # gate does not apply to it at all.
+
+# [fees] - where a kyoto send gets its fee rate, since a filter client has no
+# estimatesmartfee. The tiers are tried in order and the first answer wins; every answer,
+# whatever its source, still passes the 2000 sat/vB sanity ceiling before it can price a
+# send. Defaults (what this file runs with):
+#
+#   sources = ["mempool_space", "esplora", "peer_median"]
+#
+# `peer_median` is the only tier that contacts no server: it is kyoto's own BIP-133 relay
+# floor and a median of recent blocks' fee averages, which is a floor and a backward-looking
+# average rather than a forward estimate - hence the HTTP oracles ahead of it.
+#
+# The two HTTP tiers are the one time a kyoto wallet talks to a server, and what they learn
+# is that this IP is about to build a transaction (never an address, an amount, or which
+# transaction resulted). Two ways to spend that differently:
+#
+#   * Point them at instances you run, which removes the disclosure rather than accepting it:
+# [fees]
+# mempool_space_url = "https://mempool.internal/api/v1/fees/recommended"
+# esplora_url       = "http://esplora.internal:3002/api/fee-estimates"
+#
+#   * Or drop them, for kyoto's original no-server posture at the cost of the estimate:
+# [fees]
+# sources = ["peer_median"]
+#
+# NB Blockstream.info runs no **testnet4** Esplora, so on this network the `esplora` tier is
+# skipped unless `esplora_url` names an instance that does serve it - `zecd config check`
+# reports that, rather than leaving the chain quietly one tier shorter than it reads.
 
 [rpc]
 # zecd's own Bitcoin-Core-dialect JSON-RPC. Distinct port from the bitcoind wallet's 48232

@@ -402,6 +402,7 @@ fn spawn_bitcoin_wallet(
         seed,
         wallet_holds_seed: store.has_seed(),
         endpoint: Some(endpoint),
+        fees: config.fees.clone(),
         birthday: u32::from(store.birthday),
         birthday_time: store.birthday_time,
         sync_interval: Duration::from_secs(config.sync.interval_secs),
@@ -648,6 +649,8 @@ pub(crate) mod testutil {
             zebra: Default::default(),
             #[cfg(feature = "bitcoin")]
             bitcoind: Default::default(),
+            #[cfg(feature = "bitcoin")]
+            fees: Default::default(),
             rpc,
             keys: KeysConfig {
                 age_identity: None,

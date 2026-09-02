@@ -623,6 +623,7 @@ mod tests {
             seed: Some(bip84_seed()),
             wallet_holds_seed: true,
             endpoint: None,
+            fees: crate::config::FeesConfig::default(),
             birthday: 0,
             birthday_time: None,
             sync_interval: std::time::Duration::from_secs(20),

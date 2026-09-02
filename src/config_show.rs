@@ -155,6 +155,54 @@ pub fn render(config: &AppConfig) -> String {
             &["rpc_user", "rpc_password"],
             config.bitcoind.rpc_user.is_some() || config.bitcoind.rpc_password.is_some(),
         );
+
+        // `[fees]` - the kyoto backend's fee-oracle chain. `sources` renders always (the
+        // effective order is the thing an operator wants to read back); each URL renders only
+        // when overridden, since "unset" means the built-in per-network endpoint, which is not
+        // one value this key could carry. Each tier's *resolved* endpoint rides as a note, so
+        // a tier that is inert on this network - Blockstream runs no testnet4 Esplora - says
+        // so here rather than only in `config check`.
+        table(&mut s, "fees");
+        let sources: Vec<String> = config
+            .fees
+            .sources
+            .iter()
+            .map(|source| source.as_str().to_string())
+            .collect();
+        kv(&mut s, "sources", list_val(&sources));
+        for (key, source, configured) in [
+            (
+                "mempool_space_url",
+                crate::config::FeeSource::MempoolSpace,
+                config.fees.mempool_space_url.as_deref(),
+            ),
+            (
+                "esplora_url",
+                crate::config::FeeSource::Esplora,
+                config.fees.esplora_url.as_deref(),
+            ),
+        ] {
+            if !config.fees.sources.contains(&source) {
+                continue;
+            }
+            match (
+                configured,
+                crate::btc::fees::endpoint_for(&config.fees, source, btc_network),
+            ) {
+                (Some(url), _) => kv_note(&mut s, key, str_val(url), "overrides the built-in"),
+                // Unset: there is no value this key could carry (the built-in endpoint is
+                // per-network, not a config value), so the resolved URL rides as a comment -
+                // which is also how a tier that is inert on this network says so.
+                (None, Some(built_in)) => {
+                    s.push_str(&format!("# {key} unset - using {built_in}\n"))
+                }
+                (None, None) => s.push_str(&format!(
+                    "# {key} unset and no built-in endpoint for this network - the {} \
+                     source is skipped\n",
+                    source.as_str()
+                )),
+            }
+        }
     }
 
     table(&mut s, "rpc");
@@ -616,6 +664,55 @@ mod tests {
             "{testnet4}"
         );
         assert_eq!(testnet4, render(&resolve_from(&testnet4, dir.path())));
+    }
+
+    /// The kyoto fee chain renders its effective order, names each tier's resolved endpoint
+    /// (which is where an inert tier becomes visible), and round-trips.
+    #[test]
+    #[cfg(feature = "bitcoin")]
+    fn the_fee_oracle_chain_renders_its_effective_endpoints_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let show = |body: &str| render(&resolve_from(body, dir.path()));
+
+        // Defaults on testnet4: both tiers named, but only mempool.space resolves - Blockstream
+        // runs no testnet4 Esplora, and the rendering says so rather than implying two oracles.
+        let first = show(&format!(
+            "network = \"test\"\nbtc_testnet = \"testnet4\"\ndatadir = {:?}\n",
+            dir.path()
+        ));
+        assert!(
+            first.contains("sources = [\"mempool_space\", \"esplora\", \"peer_median\"]"),
+            "{first}"
+        );
+        assert!(
+            first.contains("# mempool_space_url unset - using https://mempool.space/testnet4/"),
+            "{first}"
+        );
+        assert!(
+            first.contains("# esplora_url unset and no built-in endpoint"),
+            "{first}"
+        );
+        assert_eq!(first, render(&resolve_from(&first, dir.path())));
+
+        // An override renders as the real key - the one shape here that is a config value - and
+        // survives a re-resolve, so `config show | config check` stays a valid pipeline.
+        let overridden = show(&format!(
+            "network = \"test\"\nbtc_testnet = \"testnet4\"\ndatadir = {:?}\n\
+             [fees]\nsources = [\"esplora\", \"peer_median\"]\n\
+             esplora_url = \"http://esplora.internal/api/fee-estimates\"\n",
+            dir.path()
+        ));
+        assert!(
+            overridden.contains("sources = [\"esplora\", \"peer_median\"]"),
+            "{overridden}"
+        );
+        assert!(
+            overridden.contains("esplora_url = \"http://esplora.internal/api/fee-estimates\""),
+            "{overridden}"
+        );
+        // A source not in the chain renders nothing at all: its endpoint is never asked.
+        assert!(!overridden.contains("mempool_space_url"), "{overridden}");
+        assert_eq!(overridden, render(&resolve_from(&overridden, dir.path())));
     }
 
     /// Every value the file left unset appears, filled in by this build - the whole point of the

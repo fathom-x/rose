@@ -183,6 +183,47 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
         }
     }
 
+    // The kyoto fee-oracle chain. A tier that cannot answer on this network is legal and
+    // simply skipped at send time (see `btc::fees::oracle_chain`), but silently: an operator
+    // reading `sources` would believe there are two HTTP oracles when there is one, and would
+    // find out only when the first is down. Report it here, where the fix - name an instance
+    // in the override, or accept the shorter chain - is one line away.
+    #[cfg(feature = "bitcoin")]
+    {
+        let btc_network =
+            crate::coin::BitcoinNetwork::from_environment(config.network, config.btc_testnet);
+        // Reported only where it can bite: the chain is the *kyoto* backend's fee source, and
+        // a bitcoind-backed wallet prices from `estimatesmartfee` without ever reaching it. So
+        // a config with no kyoto wallet - including one being edited ahead of any bitcoin
+        // wallet at all - is not nagged about a chain nothing walks.
+        let has_kyoto_wallet = config.wallets.values().any(|w| {
+            w.coin == crate::coin::Coin::Bitcoin
+                && matches!(
+                    crate::btc::chain::resolve_for_wallet(config, w),
+                    Ok(crate::btc::chain::BtcEndpoint::Kyoto(_))
+                )
+        });
+        for source in &config.fees.sources {
+            if *source == crate::config::FeeSource::PeerMedian || !has_kyoto_wallet {
+                continue;
+            }
+            if crate::btc::fees::endpoint_for(&config.fees, *source, btc_network).is_none() {
+                let key = match source {
+                    crate::config::FeeSource::MempoolSpace => "mempool_space_url",
+                    _ => "esplora_url",
+                };
+                findings.push(Finding::warning(format!(
+                    "[fees] sources names \"{}\", but no public instance serves {} \
+                     and [fees] {key} is unset: that source is skipped, so the fee chain is \
+                     shorter than it reads. Point {key} at an instance, or drop the source \
+                     from the list",
+                    source.as_str(),
+                    btc_network.name()
+                )));
+            }
+        }
+    }
+
     for (name, wallet) in &config.wallets {
         // A bitcoin wallet's endpoint has its own grammar and preflight (`crate::btc::chain`),
         // and none of the Zcash warnings below apply to it.
@@ -783,6 +824,52 @@ mod tests {
             "{}",
             summary(&config)
         );
+    }
+
+    /// A fee source with no instance on this network is skipped silently at send time, so the
+    /// check is the only place it can be noticed - but only where the chain is actually walked
+    /// (a kyoto wallet), since a bitcoind-backed wallet never consults it.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn an_unreachable_fee_source_is_reported_for_a_kyoto_wallet_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = |server: &str| {
+            format!(
+                "network = \"test\"\nbtc_testnet = \"testnet4\"\ndatadir = {:?}\n\
+                 [wallets.btc]\ncoin = \"bitcoin\"\nserver = \"{server}\"\n",
+                dir.path()
+            )
+        };
+        let names_esplora = |findings: &[Finding]| {
+            warnings(findings)
+                .iter()
+                .any(|w| w.contains("[fees] sources names \"esplora\""))
+        };
+
+        // Blockstream runs no testnet4 Esplora, so the default chain's middle tier is inert.
+        let kyoto = inspect(&resolve(&wallet("kyoto"), dir.path()));
+        assert!(names_esplora(&kyoto), "{kyoto:?}");
+        // Naming an instance that does serve it closes the finding...
+        let overridden = inspect(&resolve(
+            &format!(
+                "{}[fees]\nesplora_url = \"http://esplora.internal/api/fee-estimates\"\n",
+                wallet("kyoto")
+            ),
+            dir.path(),
+        ));
+        assert!(!names_esplora(&overridden), "{overridden:?}");
+        // ...and so does dropping the tier, which is the other half of the advice.
+        let shortened = inspect(&resolve(
+            &format!(
+                "{}[fees]\nsources = [\"mempool_space\", \"peer_median\"]\n",
+                wallet("kyoto")
+            ),
+            dir.path(),
+        ));
+        assert!(!names_esplora(&shortened), "{shortened:?}");
+        // A bitcoind upstream prices from estimatesmartfee and never reads the chain at all.
+        let bitcoind = inspect(&resolve(&wallet("bitcoind"), dir.path()));
+        assert!(!names_esplora(&bitcoind), "{bitcoind:?}");
     }
 
     #[test]

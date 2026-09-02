@@ -136,6 +136,9 @@ pub struct AppConfig {
     /// `[bitcoind]` credentials for bitcoin wallets' upstream (the BDK engine's full mode).
     #[cfg(feature = "bitcoin")]
     pub bitcoind: BitcoindConfig,
+    /// `[fees]` - the fee-oracle chain the BDK engine's kyoto (light) mode prices sends from.
+    #[cfg(feature = "bitcoin")]
+    pub fees: FeesConfig,
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
     pub sync: SyncConfig,
@@ -594,6 +597,95 @@ pub struct BitcoindConfig {
     pub rpc_cookie: Option<PathBuf>,
 }
 
+/// One tier of the kyoto backend's fee-oracle chain, named in `[fees] sources`.
+///
+/// A BIP-157 light client has no `estimatesmartfee`, so the kyoto spend path walks these in
+/// the configured order and takes the first answer. Each tier is independently skippable,
+/// which is what makes the list worth having: naming fewer sources is how an operator trades
+/// a forward estimate for zero third-party contact (`sources = ["peer_median"]`), or the
+/// reverse. The bitcoind backend never consults any of them - it has a local estimator.
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeSource {
+    /// mempool.space's `/api/v1/fees/recommended`, read as `hourFee` - its own projected-block
+    /// heuristic for a ~6 block target.
+    MempoolSpace,
+    /// A Blockstream-style Esplora `/fee-estimates`, read at the `"6"` key - a node's
+    /// `estimatesmartfee`, so a different estimator than the tier above rather than a mirror.
+    Esplora,
+    /// Kyoto's own peers: the BIP-133 relay floor and a median of recent blocks' fee averages.
+    /// No server and no URL - see [`crate::btc::kyoto::estimate_fee_rate`].
+    PeerMedian,
+}
+
+/// The fallback chain when `[fees] sources` is unset: the forward estimate first, a second
+/// independent HTTP oracle when it is down, and the no-third-party signals last.
+#[cfg(feature = "bitcoin")]
+pub const DEFAULT_FEE_SOURCES: [FeeSource; 3] = [
+    FeeSource::MempoolSpace,
+    FeeSource::Esplora,
+    FeeSource::PeerMedian,
+];
+
+#[cfg(feature = "bitcoin")]
+impl FeeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FeeSource::MempoolSpace => "mempool_space",
+            FeeSource::Esplora => "esplora",
+            FeeSource::PeerMedian => "peer_median",
+        }
+    }
+
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "mempool_space" => Ok(FeeSource::MempoolSpace),
+            "esplora" => Ok(FeeSource::Esplora),
+            "peer_median" => Ok(FeeSource::PeerMedian),
+            other => Err(anyhow::anyhow!(
+                "invalid [fees] source {other:?}: expected \"mempool_space\", \"esplora\" or \
+                 \"peer_median\""
+            )),
+        }
+    }
+}
+
+/// `[fees]` - the kyoto backend's fee-oracle chain: which sources to ask, in what order, and
+/// (optionally) at which endpoints instead of the built-in public ones.
+///
+/// The overrides are the answer to the privacy cost the chain otherwise carries: pointed at a
+/// self-hosted mempool.space or Esplora instance, the fee lookup goes to infrastructure the
+/// operator controls, the same posture `kyoto://<peer>` gives block data. They are also the
+/// only way to reach a tier on a network the public instances do not serve (Blockstream runs
+/// no testnet4 Esplora) or from a restricted network.
+///
+/// The value type lives here (shared layer); the engine resolves it into an ordered endpoint
+/// chain at its edge (`crate::btc::fees`).
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeesConfig {
+    /// The tiers to consult, in order. Defaults to [`DEFAULT_FEE_SOURCES`]. An empty list is
+    /// legal and means "no estimation at all" - every send must then carry an explicit
+    /// `fee_rate`, since mainnet refuses to guess and the test networks fall to 1 sat/vB.
+    pub sources: Vec<FeeSource>,
+    /// Full URL for the [`FeeSource::MempoolSpace`] tier, replacing the built-in per-network
+    /// endpoint. Unset uses the public instance (and skips the tier where there is none).
+    pub mempool_space_url: Option<String>,
+    /// Full URL for the [`FeeSource::Esplora`] tier, same rule.
+    pub esplora_url: Option<String>,
+}
+
+#[cfg(feature = "bitcoin")]
+impl Default for FeesConfig {
+    fn default() -> Self {
+        Self {
+            sources: DEFAULT_FEE_SOURCES.to_vec(),
+            mempool_space_url: None,
+            esplora_url: None,
+        }
+    }
+}
+
 /// `[zebra]` - credentials for the `zebra://host:port` endpoint (direct-to-zebrad mode).
 /// A cookie file wins over user/password, and nothing set means no auth (zebrad with
 /// `enable_cookie_auth = false`).
@@ -940,6 +1032,9 @@ struct ConfigFile {
     /// the section as an unknown field, consistent with `coin = "bitcoin"` being refused.
     #[cfg(feature = "bitcoin")]
     bitcoind: Option<BitcoindFile>,
+    /// `[fees]`, same rule as `[bitcoind]`: a section only the BDK engine has any use for.
+    #[cfg(feature = "bitcoin")]
+    fees: Option<FeesFile>,
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
     sync: Option<SyncFile>,
@@ -1054,6 +1149,17 @@ struct BitcoindFile {
     rpc_user: Option<String>,
     rpc_password: Option<String>,
     rpc_cookie: Option<PathBuf>,
+}
+
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeesFile {
+    /// Ordered tier names (`mempool_space` / `esplora` / `peer_median`); unset is
+    /// [`DEFAULT_FEE_SOURCES`].
+    sources: Option<Vec<String>>,
+    mempool_space_url: Option<String>,
+    esplora_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1861,6 +1967,49 @@ impl AppConfig {
             }
         };
 
+        #[cfg(feature = "bitcoin")]
+        let fees = {
+            let fees_file = file.fees.unwrap_or_default();
+            // An unset list is the built-in chain; an explicit one is taken verbatim, so an
+            // operator can drop a tier (or all of them) rather than only reorder. A repeated
+            // name is refused rather than deduplicated: asking one oracle twice is never what
+            // was meant, and silently collapsing it hides the typo.
+            let sources = match fees_file.sources {
+                None => DEFAULT_FEE_SOURCES.to_vec(),
+                Some(names) => {
+                    let mut sources: Vec<FeeSource> = Vec::with_capacity(names.len());
+                    for name in &names {
+                        let source = FeeSource::parse(name)?;
+                        if sources.contains(&source) {
+                            anyhow::bail!("[fees] sources names {name:?} more than once");
+                        }
+                        sources.push(source);
+                    }
+                    sources
+                }
+            };
+            // An empty string is "unset", so a template that ships the key blank falls back to
+            // the built-in endpoint instead of failing.
+            let mempool_space_url = fees_file.mempool_space_url.filter(|u| !u.trim().is_empty());
+            let esplora_url = fees_file.esplora_url.filter(|u| !u.trim().is_empty());
+            // Validate the overrides here, where every entry point shares the rule: the daemon
+            // and `config check` refuse an unusable fee endpoint identically, at startup,
+            // rather than at the first send.
+            for (key, url) in [
+                ("mempool_space_url", mempool_space_url.as_deref()),
+                ("esplora_url", esplora_url.as_deref()),
+            ] {
+                if let Some(url) = url {
+                    crate::btc::fees::validate_endpoint_override(key, url)?;
+                }
+            }
+            FeesConfig {
+                sources,
+                mempool_space_url,
+                esplora_url,
+            }
+        };
+
         let rpc_file = file.rpc.unwrap_or(RpcFile {
             bind: None,
             port: None,
@@ -2054,6 +2203,8 @@ impl AppConfig {
             zebra,
             #[cfg(feature = "bitcoin")]
             bitcoind,
+            #[cfg(feature = "bitcoin")]
+            fees,
             rpc,
             keys,
             sync,
@@ -3575,6 +3726,80 @@ mod tests {
         .unwrap();
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         assert!(AppConfig::resolve(&cli).is_err());
+    }
+
+    #[cfg(all(feature = "cli", feature = "bitcoin"))]
+    #[test]
+    fn the_fee_source_chain_defaults_and_is_overridable() {
+        use clap::Parser as _;
+        // No `[fees]` at all is the built-in chain: a forward estimate first, a second
+        // independent oracle behind it, the no-third-party signals last.
+        let cli = Cli::parse_from(["zecd"]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.fees.sources, DEFAULT_FEE_SOURCES.to_vec());
+        assert!(cfg.fees.mempool_space_url.is_none());
+        assert!(cfg.fees.esplora_url.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        // Reordered, shortened, and both endpoints redirected at instances the operator runs -
+        // the shape that turns the fee lookup from a third-party disclosure into a private one.
+        std::fs::write(
+            &conf,
+            "[fees]\nsources = [\"esplora\", \"peer_median\"]\n\
+             mempool_space_url = \"https://mempool.internal/api/v1/fees/recommended\"\n\
+             esplora_url = \"http://esplora.internal:3002/api/fee-estimates\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(
+            cfg.fees.sources,
+            vec![FeeSource::Esplora, FeeSource::PeerMedian]
+        );
+        assert_eq!(
+            cfg.fees.esplora_url.as_deref(),
+            Some("http://esplora.internal:3002/api/fee-estimates")
+        );
+        // Set but unnamed in `sources`: kept as configured (resolve records, it does not
+        // second-guess), and simply never asked.
+        assert!(cfg.fees.mempool_space_url.is_some());
+    }
+
+    #[cfg(all(feature = "cli", feature = "bitcoin"))]
+    #[test]
+    fn a_fee_chain_that_could_not_work_is_refused_at_resolve() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        let resolve = |body: &str| {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            AppConfig::resolve(&cli)
+        };
+
+        // A misspelled tier names the accepted values rather than silently dropping one - a
+        // dropped oracle is invisible until the one above it is down.
+        let err = resolve("[fees]\nsources = [\"mempool\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mempool_space"), "{err}");
+        // A repeat is a typo, not a request to ask one oracle twice.
+        assert!(resolve("[fees]\nsources = [\"esplora\", \"esplora\"]\n").is_err());
+        // An override that could never be fetched fails at startup, not at the first send.
+        assert!(resolve("[fees]\nesplora_url = \"esplora.example/api\"\n").is_err());
+        assert!(resolve("[fees]\nmempool_space_url = \"ftp://mempool.example/x\"\n").is_err());
+        // An empty override is "unset": a template shipping the key blank still starts, on the
+        // built-in endpoint.
+        let cfg = resolve("[fees]\nesplora_url = \"\"\n").unwrap();
+        assert!(cfg.fees.esplora_url.is_none());
+        // An empty list is legal and means no estimation at all - every send must then carry
+        // an explicit fee rate.
+        assert!(resolve("[fees]\nsources = []\n")
+            .unwrap()
+            .fees
+            .sources
+            .is_empty());
     }
 
     #[test]

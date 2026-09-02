@@ -76,6 +76,53 @@ def read_rpc_config(conf_path):
     }
 
 
+# The built-in per-network endpoints of each HTTP fee tier, mirroring src/btc/fees.rs. A
+# network absent from a table has no public instance of that source, so the tier is skipped -
+# note Blockstream runs mainnet and testnet3 only, so an `esplora` tier on testnet4 is inert
+# here for exactly the reason it is inert in the wallet.
+FEE_ENDPOINTS = {
+    "mempool_space": {
+        "main": "https://mempool.space/api/v1/fees/recommended",
+        "mainnet": "https://mempool.space/api/v1/fees/recommended",
+        "test": "https://mempool.space/testnet/api/v1/fees/recommended",
+        "testnet3": "https://mempool.space/testnet/api/v1/fees/recommended",
+        "testnet4": "https://mempool.space/testnet4/api/v1/fees/recommended",
+    },
+    "esplora": {
+        "main": "https://blockstream.info/api/fee-estimates",
+        "mainnet": "https://blockstream.info/api/fee-estimates",
+        "test": "https://blockstream.info/testnet/api/fee-estimates",
+        "testnet3": "https://blockstream.info/testnet/api/fee-estimates",
+    },
+}
+
+DEFAULT_FEE_SOURCES = ["mempool_space", "esplora", "peer_median"]
+
+
+def kyoto_fee_tiers(config, net):
+    """The config's HTTP fee tiers as ordered (source, url) pairs.
+
+    Mirrors `btc::fees::oracle_chain`: [fees] sources in order, each at its override or its
+    built-in per-network endpoint, skipping any with neither. `peer_median` is dropped here
+    because it is not an HTTP source - the page cannot query kyoto's peers, it can only name
+    the fallback - so an empty result means the preview has nothing to show, not that the
+    wallet cannot price a send.
+    """
+    fees = config.get("fees", {})
+    overrides = {
+        "mempool_space": fees.get("mempool_space_url"),
+        "esplora": fees.get("esplora_url"),
+    }
+    tiers = []
+    for source in fees.get("sources", DEFAULT_FEE_SOURCES):
+        if source == "peer_median":
+            continue
+        url = (overrides.get(source) or "").strip() or FEE_ENDPOINTS.get(source, {}).get(net)
+        if url:
+            tiers.append((source, url))
+    return tuple(tiers)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     # Filled in by main() before the server starts.
     upstream_url = None
@@ -83,7 +130,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     bitcoind_url = None  # None if no [bitcoind] creds were found
     bitcoind_auth = None
     backend = "bitcoind"  # "bitcoind" | "kyoto", from the config
-    mempool_base = None  # mempool.space base URL for this network, for a kyoto estimate
+    fee_tiers = ()  # ordered (source, url) HTTP fee tiers, mirroring [fees] (set by main)
     info_json = b"{}"  # which config this proxy is serving (set by main)
 
     def do_GET(self):
@@ -131,25 +178,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.relay(200, json.dumps(out).encode())
 
     def serve_feerate_kyoto(self):
-        """A kyoto wallet prices from mempool.space first (btc/fees.rs), then a peer-derived
-        recent-block median. The page can't see the peer path, but it can query the same
-        mempool.space instance the wallet prefers - the closest honest preview of what a
-        kyoto send would cost. If it's unreachable, say so and name the block-median fallback
-        the wallet uses instead."""
-        if not self.mempool_base:
-            return self.relay(200, json.dumps(
-                {"note": "kyoto prices at send time from mempool.space + recent-block medians"}).encode())
-        url = self.mempool_base + "/api/v1/fees/recommended"
-        try:
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                f = json.loads(resp.read())
-        except (urllib.error.HTTPError, OSError, ValueError) as e:
-            return self.relay(200, json.dumps(
-                {"note": f"mempool.space unreachable ({e}); kyoto falls back to a recent-block median"}).encode())
-        # hourFee is the ~6-block/~1-hour target zecd's kyoto path actually reads
-        # (src/btc/fees.rs), so preview that field, not the faster (pricier) ones.
-        sat = f.get("hourFee") or f.get("halfHourFee") or f.get("minimumFee")
-        self.relay(200, json.dumps({"sat_per_vb": sat, "source": "mempool.space hourFee"}).encode())
+        """A kyoto wallet walks the [fees] oracle chain at send time (src/btc/fees.rs): each
+        HTTP tier in turn, then a peer-derived recent-block median. The page can't see the
+        peer path, but it can walk the same HTTP tiers, in the same order, at the same
+        endpoints this config resolves - the closest honest preview of what a kyoto send
+        would cost. If they're all unreachable, say so and name the fallback the wallet uses
+        instead."""
+        attempts = []
+        for source, url in self.fee_tiers:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    body = json.loads(resp.read())
+            except (urllib.error.HTTPError, OSError, ValueError) as e:
+                attempts.append(f"{source} ({e})")
+                continue
+            # Both tiers are read at the ~6-block target zecd reads them at (hourFee, and
+            # Esplora's "6" key), so the preview matches the send rather than a faster,
+            # pricier number.
+            sat = body.get("hourFee") if source == "mempool_space" else body.get("6")
+            if not sat:
+                attempts.append(f"{source} (no 6-block estimate)")
+                continue
+            out = {"sat_per_vb": sat, "source": f"{source} ({url})"}
+            if attempts:
+                out["note"] = "fell back past " + ", ".join(attempts)
+            return self.relay(200, json.dumps(out).encode())
+        tried = "; ".join(attempts) if attempts else "no HTTP fee source configured for this network"
+        self.relay(200, json.dumps(
+            {"note": f"{tried}; kyoto falls back to a recent-block median"}).encode())
 
     def do_POST(self):
         if self.path != "/rpc":
@@ -238,14 +294,7 @@ def main():
     backend = "kyoto" if (srv or "").lower().startswith("kyoto") else "bitcoind"
     net = config.get("btc_testnet") or config.get("network") or "?"
     Handler.backend = backend
-    # mempool.space instance per network, for the kyoto fee estimate (kyoto's own source).
-    Handler.mempool_base = {
-        "testnet4": "https://mempool.space/testnet4",
-        "testnet3": "https://mempool.space/testnet",
-        "test": "https://mempool.space/testnet",
-        "mainnet": "https://mempool.space",
-        "main": "https://mempool.space",
-    }.get(net)
+    Handler.fee_tiers = kyoto_fee_tiers(config, net)
     Handler.info_json = json.dumps({
         "conf": os.path.basename(args.conf),
         "network": net,
@@ -257,7 +306,24 @@ def main():
     server = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
     print(f"UI:   http://{args.bind}:{args.port}/")
     print(f"zecd: {Handler.upstream_url}  (credentials from {args.conf})")
-    print(f"fee:  {Handler.bitcoind_url or '(no [bitcoind] creds; fee estimate disabled)'}")
+    if backend == "kyoto":
+        # The chain zecd would walk, annotated where this page differs from it: it can query
+        # the HTTP oracles but not kyoto's peers, and a source with no instance on this
+        # network is one zecd skips too.
+        live = {source for source, _ in Handler.fee_tiers}
+        def label(source):
+            if source in live:
+                return source
+            if source == "peer_median":
+                return "peer_median (no HTTP preview)"
+            return f"{source} (skipped: no instance for {net})"
+        chain = " -> ".join(
+            label(source)
+            for source in config.get("fees", {}).get("sources", DEFAULT_FEE_SOURCES)
+        )
+        print(f"fee:  {chain or '(no sources)'}  (the [fees] chain zecd walks at send time)")
+    else:
+        print(f"fee:  {Handler.bitcoind_url or '(no [bitcoind] creds; fee estimate disabled)'}")
     print(f"cfg:  {os.path.basename(args.conf)}  net={net}  wallet={wallet_name}  backend={backend}")
     try:
         server.serve_forever()

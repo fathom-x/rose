@@ -24,7 +24,7 @@ bitcoind backend has. The differences are behavioral, not cosmetic:
 | Credentials | rpcauth/cookie, cleartext-locality gated | none - nothing secret on the wire |
 | 0-conf receives | yes (mempool pass at tip) | **no** - filters are block-derived |
 | Eviction reporting | yes | **no** |
-| Fee estimation | `estimatesmartfee` | mempool.space, falling back to a relay floor + one-block average |
+| Fee estimation | `estimatesmartfee` | the `[fees]` oracle chain (mempool.space, then Esplora), falling back to a relay floor + block median |
 | Birthday at `init` | dials once for the tip | **defaults to today**, offline; `--birthday` overrides |
 | Fresh-wallet scan start | the birthday | the recorded birthday anchor, else a shipped checkpoint at/below the birthday (see below) |
 
@@ -132,8 +132,8 @@ differ between the two methods, as in Core):
 
 - **`fee_rate`** (sat/vB, Core's 3-decimal precision - `amount.rs::value_to_sat_per_kvb`)
   prices the send verbatim, with no estimation dial at all. On the kyoto backend this is
-  the one way to price a send without trusting either mempool.space or the peers' coarse
-  signals. Bounded on both sides: a rate under the 1 sat/vB relay floor is refused up
+  the one way to price a send without trusting either an HTTP fee oracle or the peers'
+  coarse signals. Bounded on both sides: a rate under the 1 sat/vB relay floor is refused up
   front like Core's `minrelaytxfee` check (under the floor no node relays the result, and
   over kyoto the unminable transaction would still be recorded at 0-conf, locking its
   inputs), and an explicit rate still passes the shared sanity ceiling at the `do_send`
@@ -190,21 +190,39 @@ Everything here is refused with a clear error rather than silently ignored or ha
 
 Deliberate posture, not a gap: the fee fallback (1 sat/vB on test networks, hard refusal on
 mainnet when the upstream has no answer) mirrors bitcoind's own `fallbackfee` defaults. On
-the kyoto backend "the upstream" is a chain of two - mempool.space first (`btc/fees.rs`),
-then the light client's own relay floor and a **median of the last five blocks' fee
-averages** (each anchored to a coinbase the merkle root of a PoW-validated header commits
-to, so a peer cannot inflate one without mining; the median blunts single-block outliers,
-and a 20% upward bias covers the average's lag behind a rising market) - and that chain
-**always produces a number**, so the mainnet refusal is a bitcoind-backend rule in
-practice: the relay floor bottoms out at `FeeRate::BROADCAST_MIN` (1 sat/vB) when no peer
-has sent a `feefilter`, and subsidy-only blocks average zero. A kyoto send therefore prices
-rather than refuses, and with mempool.space unreachable in a busy fee market that price can
-be low enough that the transaction sits unconfirmed, holding its inputs locked at 0-conf
-behind it. That is the accepted trade - guessing beats refusing to spend - and the explicit
-per-send `fee_rate` argument (above) is the override. That
-mempool.space lookup is the one time a kyoto wallet contacts a server: it happens only
-while building a send and carries no wallet data. **Every rate from every source** - the
-caller's `fee_rate`, `estimatesmartfee`, mempool.space, the kyoto signals - passes one shared sanity ceiling at
+the kyoto backend "the upstream" is the configurable chain in `[fees] sources`
+(`btc/fees.rs`): **mempool.space**, then a **Blockstream-style Esplora**, then the light
+client's own relay floor and a **median of the last five blocks' fee averages** (each
+anchored to a coinbase the merkle root of a PoW-validated header commits to, so a peer
+cannot inflate one without mining; the median blunts single-block outliers, and a 20%
+upward bias covers the average's lag behind a rising market). Two HTTP oracles rather than
+one because they are run by different operators and compute their numbers differently -
+mempool.space projects blocks from its own mempool view, Esplora reports a node's
+`estimatesmartfee` - so one being down no longer drops the send straight to the peers'
+signals. The estimate's character does change when the fallback engages, which is the
+accepted cost of having one.
+
+That chain **always produces a number** while it ends in `peer_median`, so the mainnet
+refusal is a bitcoind-backend rule in practice: the relay floor bottoms out at
+`FeeRate::BROADCAST_MIN` (1 sat/vB) when no peer has sent a `feefilter`, and subsidy-only
+blocks average zero. A kyoto send therefore prices rather than refuses, and with both
+oracles unreachable in a busy fee market that price can be low enough that the transaction
+sits unconfirmed, holding its inputs locked at 0-conf behind it. That is the accepted trade
+- guessing beats refusing to spend - and the explicit per-send `fee_rate` argument (above)
+is the override. An operator who prefers the opposite trade drops `peer_median` from
+`sources`, which restores the refusal.
+
+Those HTTP lookups are the only time a kyoto wallet contacts a server: they happen only
+while building a send and carry no wallet data. Both endpoints are overridable
+(`[fees] mempool_space_url` / `esplora_url`), which is the real answer to that disclosure -
+pointed at instances the operator runs, the fee lookup reaches infrastructure they control,
+the same posture `kyoto://<peer>` gives block data. It is also how a tier reaches a network
+the public instances do not serve: Blockstream runs **no testnet4 Esplora**, so on the
+network the dev stack targets that tier is skipped unless an override names one (`zecd
+config check` reports it rather than leaving the chain quietly shorter than it reads).
+`sources = ["peer_median"]` is the no-server posture outright. **Every rate from every
+source** - the caller's `fee_rate`, `estimatesmartfee`, either HTTP oracle, the kyoto
+signals - passes one shared sanity ceiling at
 the `do_send` chokepoint (`fees::enforce_sanity_ceiling`, 2000 sat/vB), so a dishonest
 feefilter or a broken oracle becomes a refusal naming the number, never a payment; the
 refusal deliberately also fires when the peers' *relay floor* exceeds the ceiling, since

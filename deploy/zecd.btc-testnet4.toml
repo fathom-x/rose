@@ -81,10 +81,12 @@ rpc_password = "btc"
 bind = "127.0.0.1"
 port = 48232
 user = "btc"
-# The one value in this file to change: the [bitcoind] credentials above are fixed dev values
-# matching the compose stack, but this is zecd's OWN RPC password and has no counterpart to
-# match. `CHANGE-ME` is only rejected outright on mainnet, so a testnet daemon starts with it
-# as the literal password - set it, and authenticate with what you set.
+# zecd's OWN RPC password - unlike the [bitcoind] credentials above it has no counterpart to
+# match. A fixed dev value, acceptable only because these are valueless testnet4 coins on a
+# loopback port; it is deliberately DIFFERENT from deploy/zecd.btc-testnet4-kyoto.toml's
+# (user/kyoto) so a client's failure to authenticate tells you which daemon it reached.
+# ZECD_RPC_PASSWORD in the environment wins over this line - leave it unset unless you mean
+# to override both configs at once (the zecd-gui compose service reads the same variable).
 password = "ALTERNATIVE"
 
 [keys]

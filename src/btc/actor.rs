@@ -1077,13 +1077,18 @@ impl BtcActor {
             None => return Err(anyhow::anyhow!("no upstream connection")),
         };
         // Kyoto has no fee estimator of its own worth the name, so walk the configured oracle
-        // chain (`[fees] sources`, by default mempool.space then Esplora) for a real forward
-        // estimate and keep the on-chain signals as the last tier. A tier failing is not a
-        // failed send - the chain degrades to the next one, and past the last of them to what
-        // the light client can see by itself. `crate::btc::fees` documents what the lookups do
-        // and do not reveal, and how to point them at an instance the operator runs.
+        // chain (`[fees] sources`, by default mempool.space then Esplora then the on-chain
+        // signals) and take the first answer. A tier failing is not a failed send - the chain
+        // degrades to the next one, whichever kind it is: an operator who lists `peer_median`
+        // first gets the HTTP oracles only when the peers cannot answer, which is the
+        // privacy-maximal order and the reason the list is ordered at all. Only the LAST tier's
+        // failure is the chain's failure, and it is reported as that tier reported it (an HTTP
+        // tier's `Err` becomes the `Ok(None)` below; the peer tier's `Err` stays an `Err`, as
+        // it always was when it stood alone at the end). `crate::btc::fees` documents what the
+        // lookups do and do not reveal, and how to point them at an instance the operator runs.
         let chain = crate::btc::fees::oracle_chain(&self.fees, self.network);
-        for tier in chain {
+        let last = chain.len().saturating_sub(1);
+        for (i, tier) in chain.into_iter().enumerate() {
             match tier {
                 crate::btc::fees::FeeTier::Http { source, url } => {
                     match crate::btc::fees::http_fee_rate(source, &url).await {
@@ -1096,7 +1101,21 @@ impl BtcActor {
                     }
                 }
                 crate::btc::fees::FeeTier::PeerMedian => {
-                    return crate::btc::kyoto::estimate_fee_rate(requester).await
+                    let attempt = crate::btc::kyoto::estimate_fee_rate(requester.clone()).await;
+                    if i == last {
+                        return attempt;
+                    }
+                    match attempt {
+                        Ok(Some(rate)) => return Ok(Some(rate)),
+                        Ok(None) => warn!(
+                            "the peer-derived fee median had no answer; falling through to the \
+                             next fee source"
+                        ),
+                        Err(e) => warn!(
+                            "peer-derived fee median failed ({e:#}); falling through to the next \
+                             fee source"
+                        ),
+                    }
                 }
             }
         }

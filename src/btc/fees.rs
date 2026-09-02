@@ -10,7 +10,9 @@
 //! The chain is `[fees] sources`, by default mempool.space -> Esplora -> the peer-derived
 //! median ([`crate::config::DEFAULT_FEE_SOURCES`]). [`oracle_chain`] resolves it against the
 //! network into the tiers that can actually answer, and the caller walks them in order,
-//! taking the first success. Two independent oracles rather than one is the point: they are
+//! taking the first success - every tier falls through on failure, the peer-derived one
+//! included, so `["peer_median", "mempool_space"]` asks a server only when the peers cannot
+//! answer. Two independent oracles rather than one is the point: they are
 //! run by different operators and compute their numbers differently (mempool.space projects
 //! blocks from its own mempool view; Esplora reports a node's `estimatesmartfee`), so one
 //! being down, rate-limiting, or wrong does not leave the send pricing itself off the relay

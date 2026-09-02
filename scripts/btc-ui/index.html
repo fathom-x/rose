@@ -61,7 +61,10 @@
 </head>
 <body>
 <header>
-  <h1>&#9679; zecd &middot; bitcoin wallet</h1>
+  <div>
+    <h1>&#9679; zecd &middot; bitcoin wallet</h1>
+    <div id="cfgbadge" class="sub" style="margin-top:.2rem">&ndash;</div>
+  </div>
   <div id="chaininfo"><span class="dot" id="conn"></span><span id="chaintext">connecting&hellip;</span></div>
 </header>
 
@@ -87,10 +90,14 @@
     <h2>Send</h2>
     <label>to address
       <input type="text" id="to" placeholder="tb1&hellip;" spellcheck="false"></label>
-    <label>amount (tBTC, up to 8 decimals)
-      <input type="text" id="amount" placeholder="0.0001" inputmode="decimal"></label>
-    <label>fee rate (sat/vB, optional &mdash; blank uses the node's estimate)
+    <label>amount (tBTC, up to 8 decimals)</label>
+    <div style="display:flex;gap:.5rem;margin-top:.15rem">
+      <input type="text" id="amount" placeholder="0.0001" inputmode="decimal" style="flex:1">
+      <button type="button" id="maxbtn" class="ghost" style="white-space:nowrap">send all</button>
+    </div>
+    <label>fee rate (sat/vB, optional &mdash; blank uses the estimate below)
       <input type="text" id="feerate" placeholder="" inputmode="decimal"></label>
+    <div class="sub" id="feeest" style="margin-top:.3rem">fee estimate: &ndash;</div>
     <div class="row">
       <label style="margin:0"><input type="checkbox" id="subfee"> subtract fee from amount</label>
       <button id="send">send</button>
@@ -114,6 +121,8 @@
 "use strict";
 const $ = id => document.getElementById(id);
 let rpcId = 0;
+let spendable = 0;  // latest confirmed balance, for the "send all" button
+let backend = "";   // "bitcoind" | "kyoto", from /info
 
 // One JSON-RPC call through the same-origin proxy. `raw` maps a placeholder
 // string in params to raw JSON text spliced into the body after stringify -
@@ -153,6 +162,7 @@ async function refresh() {
       rpc("getbestblockhash"),
       rpc("listtransactions", ["*", 25]),
     ]);
+    spendable = Number(balances.mine.trusted);
     $("trusted").textContent = fmt(balances.mine.trusted);
     $("pending").textContent = fmt(balances.mine.untrusted_pending);
     $("immature").textContent = fmt(balances.mine.immature);
@@ -179,6 +189,42 @@ async function refresh() {
   }
 }
 
+// Which config/backend this proxy is serving, shown in the header so it's always
+// clear whether you're on the bitcoind full node or a kyoto light client (they
+// behave differently: no 0-conf receives and no bitcoind fee estimate on kyoto).
+async function loadInfo() {
+  try {
+    const i = await (await fetch("/info")).json();
+    backend = i.backend;
+    $("cfgbadge").textContent =
+      `${i.network} · ${i.backend} · ${i.wallet}  (${i.conf})`;
+    document.title = `zecd btc – ${i.network}/${i.backend}`;
+    refreshFee();
+  } catch (e) { $("cfgbadge").textContent = ""; }
+}
+
+// The fee estimate is served by the proxy, mirroring where the wallet gets its
+// rate: bitcoind's estimatesmartfee on the bitcoind backend, mempool.space on
+// kyoto (kyoto's own primary source). Blank fee-rate sends use this rate; when
+// there's no numeric estimate the endpoint returns a `note` instead.
+async function refreshFee() {
+  try {
+    const r = await (await fetch("/feerate")).json();
+    if (r.error) { $("feeest").textContent = "fee estimate: unavailable (" + r.error + ")"; return; }
+    if (r.sat_per_vb != null) {
+      const src = r.source === "fallback" ? "testnet fallback"
+                : r.source === "estimatesmartfee" ? `node, target ~${r.blocks} blocks`
+                : r.source || "estimate";
+      $("feeest").textContent = `fee estimate: ${r.sat_per_vb} sat/vB (${src})`;
+      if (!$("feerate").value) $("feerate").placeholder = r.sat_per_vb + " (estimate)";
+    } else {
+      $("feeest").textContent = "fee estimate: " + (r.note || "unavailable");
+    }
+  } catch (e) {
+    $("feeest").textContent = "fee estimate: unavailable";
+  }
+}
+
 $("newaddr").onclick = async () => {
   $("addrmsg").textContent = "";
   try {
@@ -190,6 +236,17 @@ $("newaddr").onclick = async () => {
   }
 };
 $("copyaddr").onclick = () => navigator.clipboard.writeText($("addr").textContent);
+
+// "send all": fill the amount with the whole spendable balance and force
+// subtract-fee on (draining the wallet needs the fee taken out of the amount,
+// or there is nothing left to pay it). The user still reviews and hits Send.
+$("maxbtn").onclick = () => {
+  const msg = $("sendmsg");
+  if (!(spendable > 0)) { msg.className = "msg err"; msg.textContent = "no spendable balance"; return; }
+  $("amount").value = fmt(spendable);   // exact 8dp of the confirmed balance
+  $("subfee").checked = true;
+  msg.className = "msg"; msg.textContent = "amount set to full balance; fee will be taken from it";
+};
 
 $("send").onclick = async () => {
   const msg = $("sendmsg");
@@ -223,8 +280,10 @@ $("send").onclick = async () => {
   }
 };
 
+loadInfo();  // sets backend, then kicks the first fee refresh
 refresh();
 setInterval(refresh, 5000);
+setInterval(refreshFee, 30000);  // fee estimate changes slowly; poll less often
 </script>
 </body>
 </html>

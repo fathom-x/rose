@@ -70,6 +70,12 @@ services:
       # @wiz infrastructure cluster and durable cloud nodes (curated 2026-09-01, all
       # full nodes serving testnet4's P2P port 48333). scripts/btc_p2p_push.py adds a
       # submission-time fan-out on top of these.
+      #
+      # First, the project's own testnet4 node (this file, deployed on the 216.230.225.61
+      # host, P2P published on 48333). Running this compose on a laptop peers it with that
+      # node directly; on the 216.230.225.61 host itself Core detects the self-connection by
+      # nonce and drops it, so the entry is harmless there.
+      - -addnode=216.230.225.61:48333
       - -addnode=seed.testnet4.bitcoin.sprovoost.nl
       - -addnode=seed.testnet4.wiz.biz
       - -addnode=103.165.192.202:48333

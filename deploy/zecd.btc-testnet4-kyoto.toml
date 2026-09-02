@@ -1,0 +1,78 @@
+# zecd configuration for a Bitcoin **testnet4 kyoto** wallet - the BIP-157/158
+# compact-block-filter light client, peering over P2P with NO RPC node and NO
+# credentials. This is the light-mode twin of deploy/zecd.btc-testnet4.toml (the
+# bitcoind full-node backend); run it on a SEPARATE datadir and port so it lives
+# alongside the bitcoind wallet instead of fighting it for either.
+#
+# Needs a zecd built with the `bitcoin` feature (a default build refuses this file:
+# `[wallets.btc] coin`/`btc_testnet` are gated behind it). Probe with:
+#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4-kyoto.toml \
+#       config check
+#
+# Bring-up (no bitcoind RPC needed for the wallet itself - see the server note):
+#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4-kyoto.toml \
+#       init --wallet btc --birthday 2026-08-01
+#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4-kyoto.toml
+#
+# `--wallet btc` is REQUIRED on init (it defaults to a "default" Zcash wallet otherwise;
+# see the note in deploy/zecd.btc-testnet4.toml). Kyoto cannot dial a node to anchor a
+# birthday, so a freshly generated wallet defaults to **today** (funds cannot predate the
+# wallet); `--birthday` takes a height or a YYYY-MM-DD date, resolved offline against the
+# shipped scan floor. A restore with no birthday scans from the SegWit-activation floor.
+#
+# What kyoto gives up versus the bitcoind backend (behavioral, not bugs - filters cover
+# blocks only, so there is no mempool):
+#   - NO 0-conf receives: an incoming payment is invisible until it confirms, and
+#     getbalances' untrusted_pending stays empty.
+#   - NO eviction reporting.
+#   - NO estimatesmartfee: sends price from mempool.space + a block-median floor, or the
+#     explicit `fee_rate` argument. (The btc-ui fee estimate reads bitcoind, so it does not
+#     apply to a kyoto wallet - use fee_rate there.)
+# In exchange it needs no node, no credentials, and reveals no addresses to a server.
+
+network = "test"
+btc_testnet = "testnet4"
+datadir = "./data-btc-testnet4-kyoto"
+default_wallet = "btc"
+
+[wallets.btc]
+coin = "bitcoin"
+# Kyoto peering. Two forms:
+#   "kyoto"                    - DNS-seeded public testnet4 peers; no local node at all.
+#   "kyoto://127.0.0.1:48333"  - pin ONE trusted peer by IP (never a DNS name), which
+#                                switches the node to whitelist-only. 48333 is the P2P port
+#                                the deploy/docker-compose.btc-testnet4.yml node publishes
+#                                (it runs -peerblockfilters), so this peers with your own
+#                                bitcoind while still exercising the light-client path.
+server = "kyoto://127.0.0.1:48333"
+
+# No [bitcoind] section: kyoto has no server and no credentials, so the cleartext-credential
+# gate does not apply to it at all.
+
+[rpc]
+# zecd's own Bitcoin-Core-dialect JSON-RPC. Distinct port from the bitcoind wallet's 48232
+# so both zecd daemons can run at once.
+bind = "127.0.0.1"
+port = 48242
+user = "btc"
+# CHANGE-ME is only rejected on mainnet, so a testnet daemon starts with it as the literal
+# password. Set it (or supply ZECD_RPC_PASSWORD, which wins over this) and authenticate with
+# what you set.
+password = "CHANGE-ME"
+
+[keys]
+age_identity = "./data-btc-testnet4-kyoto/identity.txt"
+auto_unlock = true
+
+[sync]
+interval_secs = 5
+
+[health]
+# The health server reports on Zcash wallets only, so on this bitcoin-only config /status is
+# empty and /readyz is trivially ready; poll getblockcount for sync state. Distinct port so a
+# bitcoind-backed testnet4 daemon can run beside this one.
+port = 49243
+
+[log]
+level = "info"
+format = "text"

@@ -48,7 +48,7 @@
 #     [wallets.btc]
 #     coin = "bitcoin"
 #     server = "kyoto://127.0.0.1:8333"      # this host
-#     server = "kyoto://<this node's public ip>:8333"   # from elsewhere
+#     server = "kyoto://216.230.225.61:8333"           # from elsewhere (this node's public ip)
 #     server = "kyoto"                        # or don't use this node at all: the network's
 #                                             # DNS seeds find public filter-serving peers
 #   Prefer the trusted-peer forms: naming a peer makes the light client whitelist-only, so
@@ -95,6 +95,13 @@ services:
       # Accept inbound P2P. Implicit in Core's defaults, stated here because publishing 8333
       # below only matters if the node is listening.
       - -listen=1
+      # Persistent peer: the project's own mainnet node (this file, deployed on the
+      # 216.230.225.61 host - see deploy/docker-compose.btc-mainnet.yml there). Running this
+      # compose elsewhere (a laptop) keeps that node wired in alongside the ~10 auto-managed
+      # outbound slots, so blocks and filters come from a peer we run. -addnode reconnects on
+      # drop. On the 216.230.225.61 host itself this dials its own published port; Core spots
+      # the self-connection by nonce and drops it, so it is harmless there, just a log line.
+      - -addnode=216.230.225.61:8333
     networks:
       btcmain:
     ports:

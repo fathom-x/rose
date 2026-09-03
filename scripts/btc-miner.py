@@ -21,18 +21,23 @@ to freshness).
 
 Stdlib only. Defaults target the deploy/docker-compose.btc-testnet4.yml node.
 
-    python3 scripts/btc-miner.py --address tb1q... --watch <txid>
-    python3 scripts/btc-miner.py --url http://127.0.0.1:18443 --address bcrt1q... --blocks 101
+By default it runs as a live "good testnet citizen" service (the deployed shape): it
+polls the local zecd for unconfirmed wallet transactions and mines ONE
+mempool-inclusive block whenever one is actually waiting - so it confirms your sends
+(and everyone else's pending txs, at no extra cost) without grinding when there is
+nothing to do. It asks zecd rather than deriving addresses from an xpub because zecd
+already tracks its own txs and issues new addresses over time; a static xpub would
+drift.
+
+    ZECD_RPC_PASSWORD=... python3 scripts/btc-miner.py
+
+--no-watch-mempool is the one-shot mode: mine --blocks N blocks on the current tip
+and exit, no zecd needed when --address is given. That is what drives a regtest dev
+stack and doubles as the e2e test of the block construction.
+
+    python3 scripts/btc-miner.py --no-watch-mempool --address tb1q... --watch <txid>
+    python3 scripts/btc-miner.py --no-watch-mempool --url http://127.0.0.1:18443 --address bcrt1q... --blocks 101
     python3 scripts/btc-miner.py --bench
-
-Or run it as a live "good testnet citizen" service (the deployed shape): it polls
-the local zecd for unconfirmed wallet transactions and mines ONE mempool-inclusive
-block whenever one is actually waiting - so it confirms your sends (and everyone
-else's pending txs, at no extra cost) without grinding when there is nothing to do.
-It asks zecd rather than deriving addresses from an xpub because zecd already
-tracks its own txs and issues new addresses over time; a static xpub would drift.
-
-    ZECD_RPC_PASSWORD=... python3 scripts/btc-miner.py --watch-mempool
 
 Add --blocks N to mine pending wallet txs to N confirmations instead of one: a lone
 block at a contested height is orphaned whenever a competing min-diff miner's block
@@ -42,6 +47,13 @@ chain, so confirmations mined by anyone stand the miner down.
 
 Omit --address and it fetches a fresh payout address from zecd (getnewaddress) at
 startup - so a service unit needs no address pinned in it; pass --address to pin one.
+
+When a competing block shows up at our height (a same-height tie the node resolves
+by first-seen), the miner adopts that block's transactions: it reads them off the
+node and resubmits each to our own mempool, so whatever the rival miner confirmed
+that we never saw rides into our next block too. Anything already known, conflicting
+with our chain, or coinbase-derived is skipped by the node itself. --no-adopt-fork-txs
+turns it off.
 """
 
 import argparse
@@ -254,8 +266,87 @@ MINED_BLOCKS = []
 # Last contested-fork state we warned about, so the check is quiet until it changes.
 _LAST_FORK_STATE = None
 
+# getchaintips statuses for a non-active tip the node could still adopt (a
+# competing chain): fully validated, headers valid but blocks not fully validated,
+# or headers only. "invalid" (rejected) is excluded.
+CONTENDING_TIP_STATUSES = {"valid-fork", "valid-headers", "headers-only"}
 
-def check_fork_contention(rpc):
+# Statuses whose block data the node holds on disk, so getblock can read the txs.
+# "headers-only" has none (and btc_p2p_push only pushes blocks, it cannot fetch one).
+FORK_TX_READABLE_STATUSES = {"valid-fork", "valid-headers"}
+
+# Competing blocks whose transactions have already been resubmitted to our mempool.
+_ADOPTED_FORK_BLOCKS = set()
+
+
+def adopt_fork_txs(rpc, competitors):
+    """Feed a competing chain's transactions into our own mempool so they ride into
+    the next block we mine on OUR chain. The node does the real work: each tx is
+    resubmitted with sendrawtransaction, which accepts whatever is valid against our
+    chain (and getblocktemplate then includes it) and rejects the rest - the rival's
+    coinbase and anything spending it, double-spends of inputs our block already
+    spent, non-standard txs. Txs already in our mempool or our chain are skipped as
+    already known. Only the gain is real: txs the rival miner saw that never reached
+    us by relay. Each competing block is harvested once."""
+    try:
+        in_mempool = set(rpc("getrawmempool"))
+    except Exception as e:
+        log(f"  adopt-fork-txs: getrawmempool failed ({e}); skipping")
+        return
+    for t in competitors:
+        if t["status"] not in FORK_TX_READABLE_STATUSES:
+            continue
+        # Walk the fork from its tip down to the first block on our active chain,
+        # bounded by the reported branch length.
+        h = t["hash"]
+        for _ in range(max(1, t.get("branchlen", 1))):
+            if h in _ADOPTED_FORK_BLOCKS:
+                break
+            try:
+                hdr = rpc("getblockheader", [h])
+                if hdr.get("confirmations", -1) >= 0:
+                    break  # reached our chain: the fork point
+                block = rpc("getblock", [h, 2])
+            except Exception as e:
+                log(f"  adopt-fork-txs: cannot read competing block {h[:16]}... ({e})")
+                break
+            _ADOPTED_FORK_BLOCKS.add(h)
+            txs = block["tx"][1:]  # skip the rival coinbase
+            adopted = known = 0
+            rejected = []
+            for tx in txs:
+                if tx["txid"] in in_mempool:
+                    known += 1
+                    continue
+                try:
+                    # maxfeerate 0: no fee-rate cap - the fee is the sender's, and the
+                    # rival already confirmed it, so refusing it only orphans them.
+                    rpc("sendrawtransaction", [tx["hex"], 0])
+                    adopted += 1
+                    in_mempool.add(tx["txid"])
+                except RuntimeError as e:
+                    if "(-27)" in str(e):  # already in mempool / already in our chain
+                        known += 1
+                    else:
+                        rejected.append((tx["txid"], str(e)))
+                except OSError as e:
+                    log(f"  adopt-fork-txs: bitcoind unreachable ({e}); stopping")
+                    return
+            log(
+                f"  adopt-fork-txs: competing block h={block['height']} {h[:16]}... "
+                f"({len(txs)} txs): adopted {adopted}, already known {known}, "
+                f"rejected {len(rejected)}"
+            )
+            for txid, why in rejected[:5]:
+                log(f"    rejected {txid[:16]}...: {why}")
+            if len(rejected) > 5:
+                log(f"    ... and {len(rejected) - 5} more")
+            h = hdr.get("previousblockhash")
+            if not h:
+                break
+
+
+def check_fork_contention(rpc, adopt=False):
     """Warn if our node holds a minority fork - a competing chain exists at or above
     our tip height that the node has not switched to. This is the case the reorg
     detector cannot see: at equal height/work the node keeps its own (first-seen)
@@ -263,7 +354,9 @@ def check_fork_contention(rpc):
     still reports it confirmed and we keep mining a doomed private continuation on it.
     A longer competitor will eventually trigger a real reorg (caught by
     note_tip_change); this surfaces the contention before that. Deduplicated: it logs
-    only when the contested state changes, so a steady fork does not flood the log."""
+    only when the contested state changes, so a steady fork does not flood the log.
+    With adopt=True the competitors' transactions are also resubmitted to our mempool
+    (adopt_fork_txs), so they ride into our next block."""
     global _LAST_FORK_STATE
     try:
         tips = rpc("getchaintips")
@@ -272,8 +365,12 @@ def check_fork_contention(rpc):
     active = next((t for t in tips if t["status"] == "active"), None)
     if active is None:
         return
+    # Only tips that could actually contest ours: an "invalid" tip is one the node
+    # has rejected outright, and it will never switch to it, so it is not contention.
     competitors = [
-        t for t in tips if t["status"] != "active" and t["height"] >= active["height"]
+        t
+        for t in tips
+        if t["status"] in CONTENDING_TIP_STATUSES and t["height"] >= active["height"]
     ]
     state = (active["hash"], frozenset(t["hash"] for t in competitors))
     if state == _LAST_FORK_STATE:
@@ -291,6 +388,8 @@ def check_fork_contention(rpc):
     for t in competitors:
         log(f"  competing: h={t['height']} {t['hash'][:16]}... {t['status']} branchlen={t['branchlen']}")
     log("  a longer competitor will reorg us here; until then the network may be ignoring our chain")
+    if adopt:
+        adopt_fork_txs(rpc, competitors)
 
 
 def note_tip_change(rpc, prev, where):
@@ -322,11 +421,14 @@ def note_tip_change(rpc, prev, where):
             pass
 
 
-def mine_one(rpc, args, chain, work_check=None):
+def mine_one(rpc, args, chain, work_check=None, our_txids=()):
     """Mine one block on the current tip. Returns True on accept, False on a
     submitblock reject, or None if it stood down because work_check() went false
     (the watched tx confirmed elsewhere) at a re-template point. work_check is
-    None outside watch-mempool mode, so mine_one then persists until it mines."""
+    None outside watch-mempool mode, so mine_one then persists until it mines.
+    our_txids are the transactions we are mining FOR (the pending wallet txs, or the
+    --watch list); a block that loses a same-height race is pushed to peers only if
+    the winner fails to carry one of them."""
     while True:
         if work_check is not None and not work_check():
             log("pending work cleared (confirmed elsewhere) - standing down")
@@ -359,13 +461,15 @@ def mine_one(rpc, args, chain, work_check=None):
             mark = "included" if w in {t["txid"] for t in tmpl["transactions"]} else "NOT in template"
             log(f"watch {w[:16]}...: {mark}")
 
-        result = mine_template(rpc, args, prev, ntime, bits, target, submit_time, tmpl, payout)
-        if result == "tipmoved":
+        result = mine_template(
+            rpc, args, prev, ntime, bits, target, submit_time, tmpl, payout, our_txids
+        )
+        if result in ("tipmoved", "racelost"):
             continue  # re-template on the new tip (work_check re-runs at the top)
         return result  # True (accepted) or False (rejected)
 
 
-def mine_template(rpc, args, prev, ntime, bits, target, submit_time, tmpl, payout):
+def mine_template(rpc, args, prev, ntime, bits, target, submit_time, tmpl, payout, our_txids=()):
     """Grind a solution for one fixed (prev, ntime) header, then submit it - holding
     it back until `submit_time` if the min-diff window has not opened yet, which is
     what pre-grinds the block during the wait so it broadcasts the instant the window
@@ -373,8 +477,10 @@ def mine_template(rpc, args, prev, ntime, bits, target, submit_time, tmpl, payou
     re-templates and re-grinds whenever the tx set changes (same prev/ntime/bits -
     only the merkle side of the header differs), keeping the earlier solution as the
     fallback if a re-grind is unfinished at the window: freshness costs otherwise-idle
-    CPU, never the race. Returns True/False from submitblock, or "tipmoved" if the tip
-    changed (during a grind or the hold) and the caller should re-template.
+    CPU, never the race. Returns True/False from submitblock, "tipmoved" if the tip
+    changed (during a grind or the hold), or "racelost" if the block was valid but a
+    rival's block at the same height reached the node first; in both of the latter
+    cases the caller should re-template.
 
     On a nonce-space sweep with no solution it re-rolls the coinbase extranonce for a
     fresh 2^32 search rather than bumping ntime, so `submit_time` stays put."""
@@ -516,10 +622,52 @@ def mine_template(rpc, args, prev, ntime, bits, target, submit_time, tmpl, payou
         MINED_BLOCKS.append((height, bhash))
         if getattr(args, "broadcast_peers", 0) > 0:
             broadcast_to_peers(rpc, args, block_hex)
-        check_fork_contention(rpc)
+        check_fork_contention(rpc, adopt=getattr(args, "adopt_fork_txs", False))
         return True
+    if res == "inconclusive":
+        # Core's answer when the block is valid and stored but was not connected:
+        # the node already held a block at this height (a rival's, arriving in the
+        # same instant) and keeps it by first-seen. Not a build problem.
+        log(f"block VALID but lost the same-height race at {height}: {bhash}")
+        handle_race_lost(rpc, args, height, txs, block_hex, our_txids)
+        return "racelost"
     log(f"submitblock rejected: {res} (block {bhash})")
     return False
+
+
+def handle_race_lost(rpc, args, height, txs, block_hex, our_txids):
+    """Decide whether a race-lost block is worth contesting. The rival's block won
+    first-seen on OUR node, but the race that matters is which chain reaches the
+    real-difficulty miners first, and pushing ours directly to peers can still win
+    that. We contest only when there is something to gain: one of the transactions we
+    are mining for is in our block and NOT in the winner's. If the winner already
+    confirms them, the rival did our job and fighting it would only fork the network
+    for nothing."""
+    ours_in_block = {t["txid"] for t in txs} & set(our_txids)
+    if not ours_in_block:
+        log("  none of our transactions are in it; not contesting the winner")
+        return
+    try:
+        winner = rpc("getblock", [rpc("getblockhash", [height]), 1])
+    except Exception as e:
+        log(f"  cannot read the winning block at {height} ({e}); not contesting")
+        return
+    missing = ours_in_block - set(winner["tx"])
+    if not missing:
+        log(
+            f"  the winning block {winner['hash'][:16]}... already confirms our "
+            f"{len(ours_in_block)} tx(es); not contesting"
+        )
+        return
+    log(
+        f"  the winning block {winner['hash'][:16]}... lacks {len(missing)} of our tx(es): "
+        + ", ".join(t[:16] + "..." for t in sorted(missing))
+    )
+    if getattr(args, "broadcast_peers", 0) > 0:
+        log("  pushing our block to peers so the wider network can pick it instead")
+        broadcast_to_peers(rpc, args, block_hex)
+    else:
+        log("  (--broadcast-peers is off; nothing more to do)")
 
 
 def broadcast_to_peers(rpc, args, block_hex):
@@ -582,7 +730,7 @@ def watch_mempool(node, zecd, args, chain):
     while True:
         # Surface a minority-fork state that developed since we mined (a competing
         # block arrived after our accept). Deduplicated, so a steady fork is quiet.
-        check_fork_contention(node)
+        check_fork_contention(node, adopt=args.adopt_fork_txs)
         pending = pending_wallet_txids(node, zecd, args.blocks)
         if not pending:
             time.sleep(args.poll)
@@ -602,7 +750,11 @@ def watch_mempool(node, zecd, args, chain):
         # Stand down cleanly if the tx confirms elsewhere while we wait on the window.
         try:
             r = mine_one(
-                node, args, chain, work_check=lambda: bool(pending_wallet_txids(node, zecd, args.blocks))
+                node,
+                args,
+                chain,
+                work_check=lambda: bool(pending_wallet_txids(node, zecd, args.blocks)),
+                our_txids=pending,
             )
         except OSError as e:
             # A bitcoind restart (container recreate, upgrade) drops the RPC socket
@@ -653,15 +805,27 @@ def main():
         help="on an accepted block, also push it directly over P2P to this many peers "
         "(addresses from the node's own pool), so it enters the network from more "
         "origins than the node's ~10 connections and wins the same-height propagation "
-        "race. 0 = off (rely on the node's relay); 30 is a good start for a public testnet",
+        "race. A block that loses that race on our own node is pushed too, but only "
+        "if the winning block lacks one of the transactions we are mining for. "
+        "0 = off (rely on the node's relay); 30 is a good start for a public testnet",
+    )
+    ap.add_argument(
+        "--adopt-fork-txs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="when a competing block appears at our height, resubmit its transactions "
+        "to our own mempool so they ride into the next block we mine (the node "
+        "validates them; conflicts and the rival coinbase are skipped). Default on",
     )
     ap.add_argument("--bench", action="store_true", help="benchmark the hash loop and exit")
     ap.add_argument(
         "--watch-mempool",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="run continuously; mine mempool-inclusive blocks whenever an unconfirmed "
         "wallet tx (per zecd) is in the node's mempool, until it reaches --blocks "
-        "confirmations",
+        "confirmations. Default on; --no-watch-mempool mines --blocks blocks on the "
+        "current tip and exits",
     )
     ap.add_argument("--zecd-url", default="http://127.0.0.1:48232", help="zecd RPC to poll (watch-mempool)")
     ap.add_argument("--zecd-user", default="btc")
@@ -729,7 +893,7 @@ def main():
     log(f"chain {chain}, tip {info['blocks']}, mining {args.blocks} block(s) with {args.jobs} workers")
     mined = 0
     while mined < args.blocks:
-        result = mine_one(node, args, chain)
+        result = mine_one(node, args, chain, our_txids=set(args.watch))
         if result is True:
             mined += 1
         elif result is False:

@@ -112,10 +112,13 @@ services:
   # to the bridge gateway, which Docker Desktop provides on its own.
   #
   # For that to resolve, the host zecd must listen past loopback - it is reached on the bridge
-  # interface, not 127.0.0.1 - so start it with `--rpcbind 0.0.0.0`. That exposes its RPC to
-  # the LAN, acceptable here only because these are valueless testnet4 coins behind a dev
-  # password. Do not carry this shape to mainnet; put zecd and the UI on one compose network
-  # instead (see docker-compose.btc-mainnet.yml).
+  # interface, not 127.0.0.1. On a laptop `--rpcbind 0.0.0.0` is the simple answer: it exposes
+  # the RPC to the LAN behind the RPC password, acceptable for valueless testnet4 coins. On an
+  # INTERNET-FACING host bind the docker bridge gateway alone instead, which is what
+  # host-gateway resolves to - `--rpcbind 172.17.0.1`, or whatever
+  # `docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'` prints - so the
+  # port is reachable from containers and from nowhere else. Do not carry either shape to
+  # mainnet; run the UI on the host network there (see docker-compose.btc-mainnet.yml).
   zecd-gui:
     build:
       context: ../scripts/zecd-gui

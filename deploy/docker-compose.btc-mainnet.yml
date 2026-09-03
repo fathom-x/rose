@@ -54,9 +54,11 @@
 #   Prefer the trusted-peer forms: naming a peer makes the light client whitelist-only, so
 #   its fee signals (the BIP-133 feefilter, the tip-block fee average) and block data all
 #   come from this node rather than from anonymous peers a dishonest one could hide among.
-#   `zecd init` on a kyoto wallet needs an explicit --birthday (it will not start a P2P node
-#   to read the tip); today's date (--birthday YYYY-MM-DD, resolved offline) or the current
-#   block height is the right answer for a new wallet.
+#   `zecd init` on a kyoto wallet is offline (it will not start a P2P node to read the tip):
+#   a fresh wallet's birthday defaults to today's date, resolved against the shipped scan
+#   floor, and the first sync refines it to a real (height, hash) from kyoto's own headers.
+#   Pass --birthday <height|YYYY-MM-DD> only to start EARLIER, i.e. restoring a seed with
+#   history.
 #
 services:
   bitcoind:

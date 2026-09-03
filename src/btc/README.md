@@ -22,7 +22,7 @@ bitcoind backend has. The differences are behavioral, not cosmetic:
 | | `bitcoind` | `kyoto` |
 |---|---|---|
 | Credentials | rpcauth/cookie, cleartext-locality gated | none - nothing secret on the wire |
-| 0-conf receives | yes (mempool pass at tip) | **no** - filters are block-derived |
+| 0-conf receives | yes (mempool pass at tip) | **no** - filters are block-derived (an opt-in feed is designed below, not built) |
 | Eviction reporting | yes | **no** |
 | Fee estimation | `estimatesmartfee` | the `[fees]` oracle chain (mempool.space, then Esplora), falling back to a relay floor + block median |
 | Birthday at `init` | dials once for the tip | **defaults to today**, offline; `--birthday` overrides |
@@ -180,8 +180,55 @@ Everything here is refused with a clear error rather than silently ignored or ha
   seen evicted, only superseded at confirmation.
 - **A mempool for the kyoto backend.** BIP-158 filters cover blocks only, so on that
   backend an incoming payment is invisible until it confirms and `getbalances`'
-  `untrusted_pending` stays empty. Nothing in BIP-157 fixes this; watching peers' `inv`
-  announcements would be a different mechanism.
+  `untrusted_pending` stays empty. Nothing in BIP-157 fixes this. Two mechanisms could,
+  and one of them is designed and verified but not built:
+  - **A mempool.space feed (designed 2026-09-03).** The public websocket
+    (`wss://mempool.space/api/v1/ws`, per-network paths like `/testnet4/api/v1/ws`, no key)
+    answers `{"track-mempool": true}` with a `mempool-transactions` delta every ~2s -
+    `{sequence, added, removed, replaced, mined}` - where every `added` entry is a **full
+    Esplora-shape transaction**: version, locktime, each input with its `prevout` script,
+    address and value, witness and sequence, each output with script, address and value,
+    plus fee, vsize and first-seen (backend `websocket-handler.ts`, `MempoolDelta`;
+    checked against the live instance and the source). That is enough to match
+    **locally**, so no address and no txid of interest ever leaves the wallet: the
+    disclosure is one long-lived connection saying a wallet is online at this IP, strictly
+    less than any per-address backend and removable outright with a self-hosted instance.
+    Shape: a bridge task owning the socket (the kyoto update-bridge pattern, since the
+    read is not cancel-safe) feeding a channel the actor drains; the actor rebuilds a
+    `bitcoin::Transaction` from the JSON and **checks its txid against the reported one**
+    (integrity of the reconstruction, not validity), runs `is_mine` over outputs and over
+    `prevout` scripts, and applies matches with `apply_unconfirmed_txs` and `removed` with
+    `apply_evicted_txs` - the same two calls the bitcoind backend's mempool pass makes;
+    confirmation stays the filter scan's job. **Deltas only**: there is no snapshot on
+    subscribe and the full set is 5.8 MB of txids on mainnet plus a fetch per transaction,
+    so whatever is already in the mempool at connect is invisible until it confirms - a
+    blind spot the scan closes within a block or two, and the reason a reconnect needs no
+    catch-up. Config would mirror `[fees]`: a `[mempool]` section with a source name, a URL
+    override validated at `resolve` (`ws://` allowed for a self-hosted instance, the same
+    argument as the fee overrides), **off by default**, kyoto only (`config check` warning
+    on a bitcoind wallet, which has a real mempool), with the feed's state on
+    `getwalletinfo`. Trust is the existing 0-conf posture: the oracle's mempool is not our
+    peers' and could lie, and both only move `untrusted_pending`, never confirmed state.
+    The cost that keeps it opt-in is bandwidth - 2 to 20 KB of JSON per transaction (asm
+    strings, ancestor data), several GB a day at mainnet ingress, negligible on testnet4 -
+    plus the always-on connection. The parser deserves an `#[ignore]`d live shape test
+    like `the_public_oracles_still_answer_in_the_shape_we_parse`.
+  - **Unfiltered transaction relay from the trusted peer.** No server at all, raw-size
+    bandwidth, and the wallet matches every relayed transaction locally. It needs the
+    `bip157` crate to expose transaction relay, which it does not today.
+- **A bitcoin-only daemon still pays two Zcash startup costs** (seen on a full-mode
+  testnet4 deployment with no Zcash wallet, 2026-09-03). The `starting zecd` banner
+  reports `backend=zebra://...`, the Zcash `[backend] server` default, which nothing dials;
+  it should name the wallets' actual upstreams. And `ProvingKeys::spawn_build` runs
+  unconditionally, ~4s of CPU plus the memory two proving keys hold, for a daemon that
+  will never send a Zcash transaction; gate it on at least one loaded Zcash wallet and keep
+  the lazy first-send build as the fallback. Both are `node.rs`/`daemon.rs` wiring, neither
+  affects correctness.
+- **`[rpc] bind` is one address.** A host that must serve both loopback clients and a
+  container across the docker bridge has to choose `0.0.0.0` (every interface, wrong on a
+  public host) or the bridge gateway alone and repoint every local client (`--zecd-url`,
+  `curl`). A list of bind addresses would remove the choice; daemon-wide, not engine-specific,
+  noted here because the kyoto/UI deployments are where it bites.
 - **Health/readiness integration** - `/healthz`/`/readyz`/`/status` speak Zcash-sync
   vocabulary and do not aggregate bitcoin wallets' sync state yet.
 - **`rescan` / `export-ufvk` / `derive-address`** refuse bitcoin wallets (each names why and

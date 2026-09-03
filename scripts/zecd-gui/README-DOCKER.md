@@ -22,9 +22,12 @@ nothing and every call returns 502.
 credentials. Two consequences worth knowing before you use it:
 
 - **The host must listen past loopback.** A container reaches the host on the bridge
-  interface, not `127.0.0.1`, so start zecd with `--rpcbind 0.0.0.0`. That publishes its RPC
-  to your LAN behind only the dev password - fine for valueless testnet coins, not for
-  mainnet.
+  interface, not `127.0.0.1`. On a laptop, `--rpcbind 0.0.0.0` publishes the RPC to your LAN
+  behind the RPC password - fine for valueless testnet coins. On an internet-facing server,
+  bind the docker bridge gateway alone, which is what `host.docker.internal` resolves to:
+  `--rpcbind 172.17.0.1` (confirm with
+  `docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'`). Neither shape is
+  for mainnet.
 - **`host.docker.internal` needs help on Linux.** Docker Desktop (macOS/Windows) provides it;
   elsewhere add `extra_hosts: ["host.docker.internal:host-gateway"]`, as the compose stacks do.
 

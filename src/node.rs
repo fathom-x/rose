@@ -367,6 +367,8 @@ async fn stop_actors(
 /// model allows it (identity file + auto-unlock, exactly the Zcash actor's startup rule),
 /// and spawn the BDK actor. A passphrase-encrypted wallet starts without its seed - the
 /// wallet database already exists from init, so only the binding verification is skipped.
+/// A watch-only wallet has no seed at all; its pinned account xpub takes the seed's place
+/// for the binding verification (and for rebuilding a deleted database).
 #[cfg(feature = "bitcoin")]
 fn spawn_bitcoin_wallet(
     config: &AppConfig,
@@ -396,12 +398,27 @@ fn spawn_bitcoin_wallet(
     } else {
         None
     };
+    let imported_keys = match store.pinned_xpub() {
+        Some(xpub) => Some(
+            crate::btc::keys::AccountKeys::from_xpub(xpub, entry.bitcoin_network()).map_err(
+                |e| anyhow::anyhow!("wallet '{name}': the xpub pinned in keys.toml: {e}"),
+            )?,
+        ),
+        None if store.has_seed() => None,
+        None => anyhow::bail!(
+            "wallet '{}' has neither a seed nor an imported xpub in {} (not a wallet zecd \
+             created); re-run `zecd init` for it",
+            name,
+            keys_path.display()
+        ),
+    };
     crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
         name: name.to_string(),
         engine_dir: entry.engine_dir(),
         network: entry.bitcoin_network(),
         seed,
         wallet_holds_seed: store.has_seed(),
+        imported_keys,
         endpoint: Some(endpoint),
         fees: config.fees.clone(),
         birthday: u32::from(store.birthday),

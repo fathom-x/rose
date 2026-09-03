@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
     match &cli.command {
         Some(Command::Init(args)) => zecd::init::run(&config, args).await,
         Some(Command::ExportUfvk(args)) => zecd::init::export_ufvk(&config, args),
+        Some(Command::ExportXpub(args)) => zecd::init::export_xpub(&config, args),
         Some(Command::DeriveAddress(args)) => zecd::derive_address::run(&config, args),
         Some(Command::Rescan(args)) => zecd::init::rescan(&config, args),
         Some(Command::ChainInfo(args)) => zecd::chain_probe::run(&config, args).await,

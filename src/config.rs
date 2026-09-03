@@ -1385,6 +1385,9 @@ pub enum Command {
     /// Print a wallet's Unified Full Viewing Key (for pairing a watch-only instance via
     /// `init --ufvk`), then exit.
     ExportUfvk(ExportUfvkArgs),
+    /// Print a Bitcoin wallet's account xpub with its key origin (for pairing a watch-only
+    /// instance via `init --xpub`), then exit.
+    ExportXpub(ExportXpubArgs),
     /// Derive receiving addresses offline - no chain, no wallet database, no daemon - from an
     /// initialized wallet's `keys.toml`, a BIP-39 mnemonic, or a Unified Full Viewing Key, then
     /// exit.
@@ -1457,6 +1460,14 @@ pub struct InitArgs {
     #[arg(long, value_name = "UFVK", conflicts_with_all = ["restore", "encrypt"])]
     pub ufvk: Option<String>,
 
+    /// Create a watch-only **Bitcoin** wallet from this account xpub instead of a mnemonic
+    /// (export it from the spending wallet with `export-xpub`; the form is
+    /// `[fingerprint/84'/coin'/0']xpub...`). The wallet sees balances, history, and
+    /// addresses, but holds no spending material - spend RPCs are disabled. Only a
+    /// `coin = "bitcoin"` wallet accepts it; a Zcash wallet takes `--ufvk`.
+    #[arg(long, value_name = "XPUB", conflicts_with_all = ["restore", "encrypt", "ufvk"])]
+    pub xpub: Option<String>,
+
     /// Optional birthday: a block height, or a UTC date as YYYY-MM-DD - the date is
     /// resolved to a height with a ~1-day safety margin, so it need not be exact (an early
     /// birthday only scans more; funds can never predate the wallet). Defaults to near the
@@ -1524,6 +1535,14 @@ pub struct ConfigShowArgs {}
 #[derive(Debug, clap::Args)]
 pub struct ExportUfvkArgs {
     /// Wallet name (selects <datadir>/<name>).
+    #[arg(long, default_value = "default")]
+    pub wallet: String,
+}
+
+#[cfg(feature = "cli")]
+#[derive(Debug, clap::Args)]
+pub struct ExportXpubArgs {
+    /// Wallet name (selects <datadir>/<name>); must be a `coin = "bitcoin"` wallet.
     #[arg(long, default_value = "default")]
     pub wallet: String,
 }

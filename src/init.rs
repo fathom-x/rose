@@ -21,7 +21,7 @@ use crate::backend;
 use crate::chain::ChainSource as _;
 use crate::config::{AppConfig, WalletEntry};
 #[cfg(feature = "cli")]
-use crate::config::{ExportUfvkArgs, InitArgs, RescanArgs};
+use crate::config::{ExportUfvkArgs, ExportXpubArgs, InitArgs, RescanArgs};
 use crate::network::ZNetwork;
 use crate::pools::{Receiver, ReceiverSet};
 use crate::wallet::keys;
@@ -475,6 +475,11 @@ pub enum InitKey {
     Restore(MnemonicInput),
     /// A watch-only wallet from this encoded Unified Full Viewing Key.
     WatchOnly(String),
+    /// A watch-only **Bitcoin** wallet from this account xpub (the
+    /// `[fingerprint/84'/coin'/0']xpub` form `export-xpub` prints). Refused by a Zcash
+    /// wallet, exactly as [`InitKey::WatchOnly`] is by a Bitcoin one: the two viewing-key
+    /// encodings are coin-specific, and a wallet's coin is its configuration's.
+    Xpub(String),
 }
 
 /// What to create - the library-facing form of the `zecd init` flags.
@@ -516,6 +521,8 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     // the deferred callbacks, so their prompts fire at the same points they always have.
     let key = if let Some(encoded) = &args.ufvk {
         InitKey::WatchOnly(encoded.clone())
+    } else if let Some(encoded) = &args.xpub {
+        InitKey::Xpub(encoded.clone())
     } else if args.restore {
         let file = args.mnemonic_file.clone();
         InitKey::Restore(MnemonicInput::Deferred(Box::new(move || {
@@ -556,8 +563,9 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     }
     if outcome.watch_only {
         eprintln!(
-            "Watch-only wallet (imported UFVK): balances, history, and addresses are \
-             available; spending and wallet-encryption RPCs are disabled."
+            "Watch-only wallet (imported {}): balances, history, and addresses are \
+             available; spending and wallet-encryption RPCs are disabled.",
+            if args.xpub.is_some() { "xpub" } else { "UFVK" }
         );
     } else if outcome.encrypted {
         eprintln!(
@@ -643,6 +651,14 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
         ),
         InitKey::Restore(input) => (None, Some(input)),
         InitKey::Generate => (None, None),
+        InitKey::Xpub(_) => {
+            return Err(anyhow!(
+                "cannot create wallet '{}' with --xpub: an account xpub is a Bitcoin key, \
+                 and this is a Zcash wallet (a watch-only Zcash wallet takes --ufvk; a \
+                 Bitcoin wallet is one configured with coin = \"bitcoin\")",
+                wallet
+            ))
+        }
     };
     let restore = restore_input.is_some();
 
@@ -1060,22 +1076,38 @@ async fn init_bitcoin_wallet(
         ));
     }
 
-    let restore_input = match key {
+    // Watch-only init: parse and validate the xpub up front (before any directory or
+    // network I/O) so a malformed or wrong-network key fails fast and leaves nothing
+    // behind. `Some` keys mean this is a watch-only wallet; `None` means it will hold a
+    // seed. A UFVK names the other coin's key, refused the same way the Zcash path refuses
+    // an xpub.
+    let (imported, restore_input) = match key {
         InitKey::WatchOnly(_) => {
             return Err(anyhow!(
                 "cannot create wallet '{}' with --ufvk: a Unified Full Viewing Key is a Zcash \
-                 key, and watch-only Bitcoin wallets (descriptor import) are not supported yet",
+                 key, and this is a Bitcoin wallet (a watch-only Bitcoin wallet takes --xpub, \
+                 exported from the spending wallet with `zecd export-xpub`)",
                 wallet
             ))
         }
-        InitKey::Restore(input) => Some(input),
-        InitKey::Generate => None,
+        InitKey::Xpub(encoded) => (
+            Some(crate::btc::keys::AccountKeys::from_xpub(
+                &encoded,
+                btc_network,
+            )?),
+            None,
+        ),
+        InitKey::Restore(input) => (None, Some(input)),
+        InitKey::Generate => (None, None),
     };
-    let restore = restore_input.is_some();
+    // An imported key may hold history from any point in its past, exactly like a restored
+    // seed: the two share the birthday rules below.
+    let restore = restore_input.is_some() || imported.is_some();
 
     // One spending wallet per coin (the same invariant the daemon enforces at startup),
-    // surfaced at init time. The library opt-in skips it, as on the Zcash path.
-    if !config.keys.allow_multiple_spending_wallets {
+    // surfaced at init time. Watch-only inits are exempt: any number are allowed. The
+    // library opt-in skips it, as on the Zcash path.
+    if imported.is_none() && !config.keys.allow_multiple_spending_wallets {
         if let Some(existing) = existing_bitcoin_spending_wallet(config, &wallet) {
             return Err(anyhow!(
                 "cannot create spending wallet '{}': wallet '{}' already holds spending keys \
@@ -1095,9 +1127,10 @@ async fn init_bitcoin_wallet(
     //    (`resolve_bitcoin_date_birthday`) - exactly via a bitcoind upstream's headers
     //    (capturing the block hash as the scan anchor), offline via the shipped scan floor
     //    on kyoto (recording the date, so the first sync refines it).
-    //  * restore: the seed may hold history from any point in its past, so scan everything
-    //    it could possibly own - from SegWit activation, the first block a BIP 84 (bech32)
-    //    output can exist in. Warned, like the Zcash restore default.
+    //  * restore, or an imported xpub: the key may hold history from any point in its
+    //    past, so scan everything it could possibly own - from SegWit activation, the first
+    //    block a BIP 84 (bech32) output can exist in. Warned, like the Zcash restore
+    //    default.
     //  * freshly generated: no history is possible. On bitcoind, anchor just below the
     //    node's tip (`fresh_wallet_birthday`, shared with the Zcash path), capturing the
     //    anchor hash on the same dial - the one case that needs the upstream, and the dial
@@ -1200,6 +1233,36 @@ async fn init_bitcoin_wallet(
 
     std::fs::create_dir_all(&wallet_dir)?;
 
+    // Watch-only: no seed, so no at-rest secret and no identity file to create. keys.toml
+    // pins the (canonically re-encoded) key, then the database is built from it - the same
+    // order as the seed path, for the same self-healing reason (the daemon's spawn
+    // recreates a missing database from the pin).
+    if let Some(keys) = imported {
+        WalletStore::init_bitcoin_view_only(
+            &keys_path,
+            birthday,
+            resolved.time,
+            network,
+            &keys.export(),
+        )?;
+        crate::btc::store::create_wallet_db(&engine_dir, &keys)?;
+        if let Some((height, hash)) = &resolved.anchor {
+            let mut persister = crate::btc::store::Persister::open(&engine_dir)?;
+            persister.save_birthday_anchor(*height, hash)?;
+        }
+        return Ok(InitOutcome {
+            wallet,
+            wallet_dir,
+            keys_path,
+            network,
+            birthday: u32::from(birthday),
+            watch_only: true,
+            encrypted: false,
+            identity_path: None,
+            generated_mnemonic: None,
+        });
+    }
+
     let identity_path = config
         .keys
         .age_identity
@@ -1215,6 +1278,7 @@ async fn init_bitcoin_wallet(
         EncryptionInput::AgeIdentity => AtRest::Identity(ensure_identity(&identity_path).await?),
     };
 
+    let restore_input_was_none = restore_input.is_none();
     let mnemonic = match restore_input {
         Some(input) => input.resolve()?,
         None => Mnemonic::generate(Count::Words24),
@@ -1247,7 +1311,10 @@ async fn init_bitcoin_wallet(
             network,
         )?,
     }
-    crate::btc::store::create_wallet_db(&engine_dir, btc_network, &seed)?;
+    crate::btc::store::create_wallet_db(
+        &engine_dir,
+        &crate::btc::keys::AccountKeys::from_seed(&seed, btc_network)?,
+    )?;
     // The resolved birthday anchor is chain-derived cache, so it lives with the engine's
     // own database rather than in `keys.toml`: it is what a kyoto first scan starts from
     // instead of the shipped scan floor (`btc::kyoto::recovery_floor`'s precedence).
@@ -1265,7 +1332,7 @@ async fn init_bitcoin_wallet(
         watch_only: false,
         encrypted: matches!(at_rest, AtRest::Passphrase(_)),
         identity_path: matches!(at_rest, AtRest::Identity(_)).then_some(identity_path),
-        generated_mnemonic: (!restore).then_some(mnemonic),
+        generated_mnemonic: restore_input_was_none.then_some(mnemonic),
     })
 }
 
@@ -1328,8 +1395,9 @@ pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<St
     #[cfg(feature = "bitcoin")]
     if entry.coin == crate::coin::Coin::Bitcoin {
         return Err(anyhow!(
-            "wallet '{}' is a Bitcoin wallet; a Unified Full Viewing Key is a Zcash key and \
-             descriptor export is not supported yet",
+            "wallet '{}' is a Bitcoin wallet; a Unified Full Viewing Key is a Zcash key. Use \
+             `zecd export-xpub` for its account xpub (and `init --xpub` on the watch-only \
+             side)",
             wallet
         ));
     }
@@ -1363,6 +1431,86 @@ pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<St
         .ufvk()
         .ok_or_else(|| anyhow!("account has no unified full viewing key"))?;
     Ok(ufvk.encode(&network))
+}
+
+/// `zecd export-xpub`: print a Bitcoin wallet's account xpub with its key origin
+/// (`[fingerprint/84'/coin'/0']xpub...`) to stdout, for setting up a watch-only zecd
+/// elsewhere (`init --xpub`). The Bitcoin counterpart of [`export_ufvk`]: read from the
+/// wallet database's public descriptors, so it works for locked and passphrase-encrypted
+/// wallets alike and never touches spending material. Offline: no upstream connection.
+#[cfg(feature = "cli")]
+pub fn export_xpub(config: &AppConfig, args: &ExportXpubArgs) -> anyhow::Result<()> {
+    let encoded = export_xpub_string(config, &args.wallet)?;
+    eprintln!(
+        "Account xpub for wallet '{}' (grants full VIEW access - balances and all \
+         transaction history - but cannot spend):",
+        args.wallet
+    );
+    println!("{encoded}");
+    Ok(())
+}
+
+/// The encoded account key behind [`export_xpub`] - the library core, which reads the
+/// wallet database and prints nothing. The result parses back with `init --xpub`
+/// (`btc::keys::AccountKeys::from_xpub`) into the identical descriptors.
+pub fn export_xpub_string(config: &AppConfig, wallet: &str) -> anyhow::Result<String> {
+    let entry = resolve_wallet_entry(config, wallet);
+    // Without the engine every configured wallet is a Zcash wallet (`coin = "bitcoin"` is
+    // refused at config resolution), so the refusal below covers that build entirely.
+    #[cfg(feature = "bitcoin")]
+    let is_bitcoin = entry.coin == crate::coin::Coin::Bitcoin;
+    #[cfg(not(feature = "bitcoin"))]
+    let is_bitcoin = false;
+    if !is_bitcoin {
+        return Err(anyhow!(
+            "wallet '{}' is a Zcash wallet; an account xpub is a Bitcoin key. Use `zecd \
+             export-ufvk` for its Unified Full Viewing Key (and `init --ufvk` on the \
+             watch-only side)",
+            wallet
+        ));
+    }
+    #[cfg(not(feature = "bitcoin"))]
+    {
+        let _ = entry;
+        unreachable!("a Bitcoin wallet cannot be configured without the engine")
+    }
+    #[cfg(feature = "bitcoin")]
+    {
+        let keys_path = entry.keys_path();
+        if !WalletStore::exists(&keys_path) {
+            return Err(anyhow!(
+                "wallet '{}' is not initialized ({} missing)",
+                wallet,
+                keys_path.display()
+            ));
+        }
+        // The key encoding is network-scoped (xpub/tpub); refuse a network flag that
+        // contradicts the wallet on disk rather than emit a key the watch-only side would
+        // reject.
+        let st = WalletStore::read(&keys_path)?;
+        ensure_store_matches(&st, wallet, config.network)?;
+
+        // Read-only in effect and lock-free (it must run beside a live daemon): the
+        // database is WAL-mode, so this load is a concurrent reader of the actor's writer.
+        let engine_dir = entry.engine_dir();
+        if !crate::btc::store::wallet_db_path(&engine_dir).exists() {
+            return Err(anyhow!(
+                "wallet '{}' has no wallet database yet at {} (start the daemon once to \
+                 build it, then export)",
+                wallet,
+                engine_dir.display()
+            ));
+        }
+        let mut persister = crate::btc::store::Persister::open(&engine_dir)?;
+        let wallet_db = bdk_wallet::PersistedWallet::load(
+            &mut persister,
+            bdk_wallet::Wallet::load()
+                .check_network(crate::btc::keys::network(entry.bitcoin_network())),
+        )
+        .map_err(|e| anyhow!("load bitcoin wallet database: {e}"))?
+        .ok_or_else(|| anyhow!("wallet '{}' has an empty wallet database", wallet))?;
+        Ok(crate::btc::keys::AccountKeys::from_wallet(&wallet_db)?.export())
+    }
 }
 
 /// `zecd rescan`: the recovery path for a broken wallet database - e.g. a persistent
@@ -1696,7 +1844,8 @@ mod tests {
             format!(
                 "network = \"test\"\ndatadir = {:?}\n\
                  [wallets.btc]\ncoin = \"bitcoin\"\n\
-                 [wallets.btc2]\ncoin = \"bitcoin\"\n",
+                 [wallets.btc2]\ncoin = \"bitcoin\"\n\
+                 [wallets.btc3]\ncoin = \"bitcoin\"\n",
                 dir.path()
             ),
         )
@@ -1744,6 +1893,7 @@ mod tests {
             network: entry.bitcoin_network(),
             seed: Some(seed),
             wallet_holds_seed: true,
+            imported_keys: None,
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
             birthday: 0,
@@ -1805,7 +1955,120 @@ mod tests {
         .await
         .err()
         .expect("--ufvk on a bitcoin wallet must be refused");
-        assert!(ufvk.to_string().contains("--ufvk"), "{ufvk}");
+        assert!(ufvk.to_string().contains("--xpub"), "{ufvk}");
+
+        // The watch-only pairing flow: export the spender's account xpub (offline, from
+        // its database) and build `btc2` from it. A watch-only wallet is exempt from the
+        // per-coin spender guard that refused `btc2` as a spender just above.
+        let exported = export_xpub_string(&config, "btc").unwrap();
+        assert!(
+            exported.starts_with("[73c5da0a/84'/1'/0']tpub"),
+            "the BIP 84 vector's fingerprint at the testnet account path: {exported}"
+        );
+        let view = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc2".to_string(),
+                key: InitKey::Xpub(exported.clone()),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Height(0)),
+            },
+        )
+        .await
+        .expect("a watch-only bitcoin wallet beside the spender");
+        assert!(view.watch_only);
+        assert!(!view.encrypted);
+        assert!(view.identity_path.is_none(), "no seed, no identity file");
+        assert!(view.generated_mnemonic.is_none());
+        assert_eq!(view.birthday, 0);
+        let view_store = WalletStore::read(&view.keys_path).unwrap();
+        assert!(!view_store.has_seed(), "watch-only holds no mnemonic");
+        assert_eq!(view_store.pinned_xpub(), Some(exported.as_str()));
+        assert_eq!(view_store.pinned_ufvk(), None);
+
+        // The daemon's watch-only spawn path: pinned keys alone open the database, the
+        // wallet reports no private keys, and it derives the spender's very first
+        // address (revealed above) at its own index 0.
+        let view_entry = &config.wallets["btc2"];
+        let imported = crate::btc::keys::AccountKeys::from_xpub(
+            view_store.pinned_xpub().unwrap(),
+            view_entry.bitcoin_network(),
+        )
+        .unwrap();
+        let (view_handle, _task) = crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
+            name: "btc2".to_string(),
+            engine_dir: view_entry.engine_dir(),
+            network: view_entry.bitcoin_network(),
+            seed: None,
+            wallet_holds_seed: false,
+            imported_keys: Some(imported),
+            endpoint: None,
+            fees: crate::config::FeesConfig::default(),
+            birthday: 0,
+            birthday_time: None,
+            sync_interval: std::time::Duration::from_secs(20),
+            reconnect_base: std::time::Duration::from_secs(1),
+            reconnect_max: std::time::Duration::from_secs(60),
+            shutdown: tokio::sync::watch::channel(false).1,
+        })
+        .unwrap();
+        assert!(!view_handle.has_seed);
+        assert_eq!(view_handle.new_address().await.unwrap(), address);
+        // And it re-exports the exact key it was built from.
+        assert_eq!(export_xpub_string(&config, "btc2").unwrap(), exported);
+
+        // A malformed key never gets as far as writing anything.
+        let bad = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc3".to_string(),
+                key: InitKey::Xpub("tpubnotakey".to_string()),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Height(0)),
+            },
+        )
+        .await
+        .err()
+        .expect("a malformed xpub must be refused");
+        assert!(bad.to_string().contains("invalid account xpub"), "{bad}");
+        assert!(!config.wallets["btc3"].keys_path().exists());
+    }
+
+    /// The coin-specific key flags refuse the other coin's wallet, naming the right flag.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xpub_and_ufvk_flags_are_coin_specific() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.zec]\n[wallets.btc]\ncoin = \"bitcoin\"\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+        let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let config = AppConfig::resolve(&cli).unwrap();
+        let err = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "zec".to_string(),
+                key: InitKey::Xpub("[73c5da0a/84'/1'/0']tpubwhatever".to_string()),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .err()
+        .expect("--xpub on a zcash wallet must be refused");
+        assert!(err.to_string().contains("--ufvk"), "{err}");
+        assert!(!config.wallets["zec"].keys_path().exists());
+        let err = export_xpub_string(&config, "zec").unwrap_err();
+        assert!(err.to_string().contains("export-ufvk"), "{err}");
+        let err = export_xpub_string(&config, "btc").unwrap_err();
+        assert!(err.to_string().contains("not initialized"), "{err}");
     }
 
     /// Bitcoin-wallet config whose `[bitcoind]` points at `server`; wallet `btc` on testnet.

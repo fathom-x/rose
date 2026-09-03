@@ -101,17 +101,16 @@ const ANCHOR_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS birthday_anchor (
     hash TEXT NOT NULL
 )";
 
-/// Create the wallet database from a seed - `zecd init`'s half of the engine (the daemon's
+/// Create the wallet database from the account's public keys (seed-derived for a spending
+/// wallet, imported for a watch-only one) - `zecd init`'s half of the engine (the daemon's
 /// half is `crate::btc::actor::spawn`, which loads it back and verifies it against the same
-/// seed). Refuses a database that already holds wallet data, mirroring init's
+/// keys). Refuses a database that already holds wallet data, mirroring init's
 /// no-preexisting-account refusal on the Zcash side.
 pub fn create_wallet_db(
     engine_dir: &Path,
-    network: crate::coin::BitcoinNetwork,
-    seed: &secrecy::SecretVec<u8>,
+    keys: &crate::btc::keys::AccountKeys,
 ) -> anyhow::Result<()> {
     use bdk_wallet::{KeychainKind, PersistedWallet, Wallet};
-    let keys = crate::btc::keys::AccountKeys::from_seed(seed, network)?;
     let mut persister = Persister::open(engine_dir)?;
     PersistedWallet::create(
         &mut persister,

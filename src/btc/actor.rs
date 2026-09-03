@@ -224,9 +224,9 @@ pub struct BtcSendOptions {
 pub struct BtcWalletHandle {
     pub name: String,
     pub network: BitcoinNetwork,
-    /// Whether the wallet's `keys.toml` holds a seed (false would be a watch-only import,
-    /// which the engine does not build yet; the flag exists so `getwalletinfo` reports
-    /// `private_keys_enabled` from the same signal the Zcash side does).
+    /// Whether the wallet's `keys.toml` holds a seed: false for a watch-only wallet built
+    /// from an imported account xpub, so `getwalletinfo` reports `private_keys_enabled`
+    /// (and `listunspent` its `spendable`) from the same signal the Zcash side does.
     pub has_seed: bool,
     cmd_tx: mpsc::Sender<BtcCommand>,
     status_rx: watch::Receiver<BtcSyncStatus>,
@@ -335,6 +335,11 @@ pub struct BtcActorConfig {
     /// absent for a passphrase-encrypted wallet at startup even though the wallet is a
     /// spender. Drives the handle's `has_seed` (and thus watch-only reporting).
     pub wallet_holds_seed: bool,
+    /// A watch-only wallet's imported account keys (`keys.toml`'s `xpub` pin, parsed by the
+    /// caller for the wallet's network). Plays the seed's role for everything but signing:
+    /// creates a missing database and verifies an existing one's descriptors. `None` for a
+    /// seed wallet; a wallet with neither is refused at spawn.
+    pub imported_keys: Option<AccountKeys>,
     /// The wallet's bitcoind upstream. `None` runs the actor with no sync loop (offline
     /// command service - what the pre-chain-source engine always did, kept for tests).
     pub endpoint: Option<BtcEndpoint>,
@@ -369,6 +374,7 @@ pub fn spawn(
         network,
         seed,
         wallet_holds_seed: has_seed,
+        imported_keys,
         endpoint,
         fees,
         birthday,
@@ -378,15 +384,19 @@ pub fn spawn(
         reconnect_max,
         shutdown,
     } = config;
-    let keys = seed
-        .as_ref()
-        .map(|seed| AccountKeys::from_seed(seed, network))
-        .transpose()?;
+    // The account's public keys, from whichever source this wallet has: the seed for a
+    // spending wallet (absent at startup for a passphrase-encrypted one), the imported
+    // xpub for a watch-only wallet. Either is enough to create and to verify the database.
+    let keys = match &seed {
+        Some(seed) => Some(AccountKeys::from_seed(seed, network)?),
+        None => imported_keys,
+    };
     let mut persister = Persister::open(&engine_dir)?;
     let mut load = Wallet::load().check_network(keys::network(network));
     if let Some(keys) = &keys {
-        // Assert the stored descriptors against the seed-derived ones; a mismatch fails the
-        // load (and thus the spawn) with a descriptor error.
+        // Assert the stored descriptors against the known ones (seed-derived, or the
+        // pinned import); a mismatch fails the load (and thus the spawn) with a descriptor
+        // error.
         load = load
             .descriptor(
                 KeychainKind::External,
@@ -428,8 +438,8 @@ pub fn spawn(
         None => {
             let keys = keys.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "wallet database is empty and no seed is available to create it \
-                     (run `zecd init` for this wallet first)"
+                    "wallet database is empty and no key material (seed or imported xpub) \
+                     is available to create it (run `zecd init` for this wallet first)"
                 )
             })?;
             PersistedWallet::create(
@@ -468,6 +478,7 @@ pub fn spawn(
         wallet,
         persister,
         seed,
+        watch_only: !has_seed,
         network,
         endpoint,
         fees,
@@ -520,6 +531,10 @@ struct BtcActor {
     wallet: PersistedWallet<Persister>,
     persister: Persister,
     seed: Option<SecretVec<u8>>,
+    /// True for a wallet with no seed on disk at all (an imported-xpub watch-only wallet),
+    /// as opposed to one whose seed is merely absent right now: the send refusal names the
+    /// right one of the two.
+    watch_only: bool,
     network: BitcoinNetwork,
     endpoint: Option<BtcEndpoint>,
     /// See [`BtcActorConfig::fees`].
@@ -1182,11 +1197,19 @@ impl BtcActor {
         // Checked here but borrowed only at the signing step below: the fee and broadcast
         // calls take `&mut self`, so holding a `&self.seed` across them would not borrow-check.
         if self.seed.is_none() {
+            // Bitcoin Core's -4 for a wallet that cannot sign, worded for which of the two
+            // shapes this is: a watch-only wallet has nothing to unlock, ever; a locked
+            // spending wallet has a seed the custody model did not hand over.
             return Err(RpcError::new(
                 codes::RPC_WALLET_ERROR,
-                "Error: Private keys are disabled for this wallet, or the wallet is locked \
-                 (bitcoin wallets have no walletpassphrase yet - use an identity-file wallet \
-                 with auto_unlock for unattended sending)",
+                if self.watch_only {
+                    "Error: Private keys are disabled for this wallet (watch-only, built from \
+                     an imported xpub); spend from the paired spending wallet"
+                } else {
+                    "Error: Private keys are disabled for this wallet, or the wallet is locked \
+                     (bitcoin wallets have no walletpassphrase yet - use an identity-file \
+                     wallet with auto_unlock for unattended sending)"
+                },
             ));
         }
         if self.conn.is_none() {
@@ -1475,6 +1498,7 @@ mod tests {
             network: BitcoinNetwork::Main,
             wallet_holds_seed: seed.is_some(),
             seed,
+            imported_keys: None,
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
             birthday: 0,
@@ -1577,6 +1601,65 @@ mod tests {
             "a network flip is configuration, not tampering: {err:#}"
         );
         assert!(err.to_string().contains("btc_testnet"), "{err:#}");
+    }
+
+    /// The watch-only shape: imported keys alone create the database and serve the same
+    /// addresses the seed wallet would; a send is refused with Core's -4 naming the
+    /// watch-only custody; the seed then loads the same database (the descriptors match),
+    /// and a foreign import over it is the binding mismatch, exactly as a swapped
+    /// database is for a seed wallet.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn imported_xpub_builds_a_watch_only_wallet_the_seed_can_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Main).unwrap();
+        let imported = AccountKeys::from_xpub(&keys.export(), BitcoinNetwork::Main).unwrap();
+        let first_address = {
+            let cfg = BtcActorConfig {
+                imported_keys: Some(imported.clone()),
+                ..offline_config(dir.path(), None)
+            };
+            let (handle, _task) = spawn(cfg).unwrap();
+            assert!(!handle.has_seed, "no seed on disk");
+            let err = handle
+                .send(
+                    vec![(
+                        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                        10_000,
+                    )],
+                    BtcSendOptions::default(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::RPC_WALLET_ERROR);
+            assert!(err.message.contains("watch-only"), "{}", err.message);
+            handle.new_address().await.unwrap()
+        };
+        // The BIP 84 reference vector's first address: the import derived the seed's keys.
+        assert_eq!(first_address, "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu");
+
+        // The seed reopens the database the import created (descriptor check passes) and
+        // continues the same keychain.
+        {
+            let (handle, _task) = spawn(offline_config(dir.path(), Some(bip84_seed()))).unwrap();
+            assert!(handle.has_seed);
+            assert_eq!(
+                handle.new_address().await.unwrap(),
+                "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g"
+            );
+        }
+
+        // A different account's import over this database is tampering, typed as such.
+        let other_seed = SecretVec::new(vec![7u8; 64]);
+        let other = AccountKeys::from_seed(&other_seed, BitcoinNetwork::Main).unwrap();
+        let err = spawn(BtcActorConfig {
+            imported_keys: Some(other),
+            ..offline_config(dir.path(), None)
+        })
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<BtcBindingMismatch>().is_some(),
+            "a foreign import over an existing database is a binding mismatch: {err:#}"
+        );
     }
 
     /// Core's subtract-fee division: `fee / n` per listed recipient, the first paying

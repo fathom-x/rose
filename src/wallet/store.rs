@@ -47,6 +47,13 @@ pub struct WalletStore {
     /// diverting deposits to a foreign account. `None` only for a `keys.toml` written before
     /// this field existed; the daemon backfills it trust-on-first-use.
     pinned_ufvk: Option<String>,
+    /// A watch-only **Bitcoin** wallet's imported account key (`init --xpub`, the
+    /// `[fingerprint/84'/coin'/0']xpub` form `export-xpub` prints). The Bitcoin analog of
+    /// the UFVK pin: it is the only key material such a wallet has, so it is what the
+    /// daemon verifies the BDK database's descriptors against at every start (a seed wallet
+    /// verifies against the seed instead and pins nothing here), and what a deleted
+    /// database is rebuilt from. `None` for every seed wallet and every Zcash wallet.
+    pinned_xpub: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -68,6 +75,10 @@ struct StoreEncoding {
     /// pre-pin `keys.toml` round-trips unchanged until the daemon backfills it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ufvk: Option<String>,
+    /// See [`WalletStore::pinned_xpub`]. Skipped when absent, so every non-watch-only
+    /// `keys.toml` round-trips unchanged and an older build simply ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xpub: Option<String>,
 }
 
 impl WalletStore {
@@ -94,6 +105,7 @@ impl WalletStore {
             birthday_time: None,
             encryption: None,
             ufvk: Some(ufvk.to_string()),
+            xpub: None,
         };
         write_keys_atomic(keys_path, &encoding, true)
     }
@@ -119,6 +131,7 @@ impl WalletStore {
             birthday_time,
             encryption: None,
             ufvk: None,
+            xpub: None,
         };
         write_keys_atomic(keys_path, &encoding, true)
     }
@@ -144,6 +157,7 @@ impl WalletStore {
             birthday_time: None,
             encryption: Some(ENC_PASSPHRASE.to_string()),
             ufvk: Some(ufvk.to_string()),
+            xpub: None,
         };
         write_keys_atomic(keys_path, &encoding, true)
     }
@@ -170,6 +184,7 @@ impl WalletStore {
             birthday_time,
             encryption: Some(ENC_PASSPHRASE.to_string()),
             ufvk: None,
+            xpub: None,
         };
         write_keys_atomic(keys_path, &encoding, true)
     }
@@ -191,6 +206,32 @@ impl WalletStore {
             birthday_time: None,
             encryption: None,
             ufvk: Some(ufvk.to_string()),
+            xpub: None,
+        };
+        write_keys_atomic(keys_path, &encoding, true)
+    }
+
+    /// Create a new `keys.toml` for a watch-only **Bitcoin** wallet (imported account xpub):
+    /// network, birthday, and the pinned key, no mnemonic. The same key also lives in the
+    /// BDK database's descriptors; the copy pinned here is what startup verifies that
+    /// database against, and what rebuilds it if it is deleted. No spending material on
+    /// disk at all - the Bitcoin counterpart of [`WalletStore::init_view_only`].
+    #[cfg(feature = "bitcoin")]
+    pub fn init_bitcoin_view_only(
+        keys_path: &Path,
+        birthday: BlockHeight,
+        birthday_time: Option<u64>,
+        network: ZNetwork,
+        xpub: &str,
+    ) -> anyhow::Result<()> {
+        let encoding = StoreEncoding {
+            mnemonic: None,
+            network: Some(network.name().to_string()),
+            birthday: Some(u32::from(birthday)),
+            birthday_time,
+            encryption: None,
+            ufvk: None,
+            xpub: Some(xpub.to_string()),
         };
         write_keys_atomic(keys_path, &encoding, true)
     }
@@ -247,6 +288,7 @@ impl WalletStore {
             seed_ciphertext: encoding.mnemonic,
             encrypted,
             pinned_ufvk: encoding.ufvk,
+            pinned_xpub: encoding.xpub,
         })
     }
 
@@ -288,6 +330,12 @@ impl WalletStore {
     /// The pinned account UFVK, if this `keys.toml` carries one (see the field docs).
     pub fn pinned_ufvk(&self) -> Option<&str> {
         self.pinned_ufvk.as_deref()
+    }
+
+    /// The imported account xpub of a watch-only Bitcoin wallet, if this `keys.toml` is one
+    /// (see the field docs).
+    pub fn pinned_xpub(&self) -> Option<&str> {
+        self.pinned_xpub.as_deref()
     }
 
     /// Test-only: remove the `ufvk` pin from an existing `keys.toml`, simulating a file

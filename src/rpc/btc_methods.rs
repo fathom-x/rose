@@ -622,6 +622,7 @@ mod tests {
             network: entry.bitcoin_network(),
             seed: Some(bip84_seed()),
             wallet_holds_seed: true,
+            imported_keys: None,
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
             birthday: 0,

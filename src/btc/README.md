@@ -12,7 +12,12 @@ mempool pass at tip for 0-conf, reorg recovery, restart resume), tracks Core's
 trusted/untrusted confirmation semantics, and sends (per-send seed-derived signers,
 `estimatesmartfee`-driven fees, inputs locked at 0-conf against the next selection).
 Phase 3 adds the **kyoto** backend (`server = "kyoto"`): a BIP-157/158 compact-block-filter
-light client over P2P, with no server and no credentials to provision.
+light client over P2P, with no server and no credentials to provision. **Watch-only
+wallets** pair with a spender through the account xpub: `zecd export-xpub` prints it with
+its key origin, `zecd init --xpub` builds a seedless wallet from it (any number beside the
+one spender), `keys.toml` pins it, and the wallet syncs, reports and refuses to spend
+exactly as a UFVK watch-only Zcash wallet does. Import is BIP 84 first-account keys only,
+the one derivation the engine has.
 
 ## The two backends are not equivalent
 
@@ -231,9 +236,11 @@ Everything here is refused with a clear error rather than silently ignored or ha
   noted here because the kyoto/UI deployments are where it bites.
 - **Health/readiness integration** - `/healthz`/`/readyz`/`/status` speak Zcash-sync
   vocabulary and do not aggregate bitcoin wallets' sync state yet.
-- **`rescan` / `export-ufvk` / `derive-address`** refuse bitcoin wallets (each names why and
-  what to do instead); a bitcoin equivalent of offline address derivation and the
-  wipe-and-rescan flow is future work.
+- **`rescan` / `derive-address`** refuse bitcoin wallets (each names why and what to do
+  instead); a bitcoin equivalent of offline address derivation and the wipe-and-rescan
+  flow is future work (deleting the wallet database by hand already rebuilds it from the
+  seed or the pinned xpub on the next start, which the watch-only regtest exercises).
+  `export-ufvk` refuses too, pointing at `export-xpub`.
 
 Deliberate posture, not a gap: the fee fallback (1 sat/vB on test networks, hard refusal on
 mainnet when the upstream has no answer) mirrors bitcoind's own `fallbackfee` defaults. On

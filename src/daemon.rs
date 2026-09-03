@@ -248,9 +248,10 @@ pub(crate) fn ensure_single_spending_wallet(
             anyhow::bail!(
                 "multiple {} spending wallets configured ('{first}' and '{second}'); zecd \
                  allows at most one wallet with spending keys per coin (any number of \
-                 watch-only UFVK wallets may be loaded alongside it). Convert one to \
-                 watch-only (`zecd export-ufvk` + `zecd init --ufvk`) or remove it from the \
-                 configuration. An application embedding zecd as a library can instead set \
+                 watch-only wallets may be loaded alongside it). Convert one to watch-only \
+                 (`zecd export-ufvk` + `zecd init --ufvk` for Zcash, `zecd export-xpub` + \
+                 `zecd init --xpub` for Bitcoin) or remove it from the configuration. An \
+                 application embedding zecd as a library can instead set \
                  [keys] allow_multiple_spending_wallets.",
                 coin.name()
             );

@@ -513,8 +513,9 @@ jobs:
   # accepted by the node's mempool, sendmany, change attribution, checkpoint persistence
   # across a restart (regtest_btc), the same over the kyoto BIP-157 light client
   # (regtest_btc_kyoto), and three suites that run over BOTH chain sources: the watch-only
-  # xpub pairing (regtest_btc_watchonly), restore from mnemonic (regtest_btc_restore), and
-  # a live reorg (regtest_btc_reorg). Its own small job rather than a leg of the `regtest` matrix: it needs
+  # xpub pairing (regtest_btc_watchonly), restore from mnemonic (regtest_btc_restore), a
+  # live reorg (regtest_btc_reorg), and a hung node (regtest_btc_hang). Its own small job
+  # rather than a leg of the `regtest` matrix: it needs
   # neither zebra, nor the funder, nor the chain snapshot, and the matrix legs' zecd is the
   # default-feature build (where the same test self-skips by design). A debug zecd is
   # deliberate - the test does no Orchard proving, and the debug build halves the job's
@@ -584,4 +585,5 @@ jobs:
           cargo test --locked --no-fail-fast \
             --test regtest_btc --test regtest_btc_kyoto \
             --test regtest_btc_watchonly --test regtest_btc_restore --test regtest_btc_reorg \
+            --test regtest_btc_hang \
             -- --nocapture

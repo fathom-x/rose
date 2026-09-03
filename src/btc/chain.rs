@@ -34,6 +34,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _};
 use bdk_bitcoind_rpc::bitcoincore_rpc::{self, RpcApi as _};
@@ -138,12 +139,28 @@ impl BitcoindEndpoint {
     /// mainnet blocks would corrupt silently, so a mismatch is refused, not warned).
     ///
     /// Blocking (the underlying client is synchronous); the actor calls it under
-    /// `tokio::task::block_in_place`.
+    /// `tokio::task::block_in_place`. Every request the client makes carries
+    /// [`RPC_DEADLINE`] as its socket deadline - the only thing that can notice a node that
+    /// *hangs* without dying (a stopped process's sockets stay open and keep accepting), and
+    /// what bounds how long one sync pass can park the actor's command loop.
     pub fn connect_blocking(&self) -> anyhow::Result<BitcoindRpc> {
         self.preflight()?;
         let url = format!("http://{}:{}", self.host, self.port);
-        let client = bitcoincore_rpc::Client::new(&url, self.auth.to_rpc_auth())
-            .with_context(|| format!("construct RPC client for {}", self.describe()))?;
+        let (user, password) = self
+            .auth
+            .to_rpc_auth()
+            .get_user_pass()
+            .with_context(|| format!("read credentials for {}", self.describe()))?;
+        let mut transport = bitcoincore_rpc::jsonrpc::simple_http::Builder::new()
+            .url(&url)
+            .with_context(|| format!("construct RPC client for {}", self.describe()))?
+            .timeout(RPC_DEADLINE);
+        if let Some(user) = user {
+            transport = transport.auth(user, password);
+        }
+        let client = bitcoincore_rpc::Client::from_jsonrpc(
+            bitcoincore_rpc::jsonrpc::Client::with_transport(transport.build()),
+        );
         let info = client
             .get_blockchain_info()
             .with_context(|| format!("getblockchaininfo from {}", self.describe()))?;
@@ -163,6 +180,17 @@ impl BitcoindEndpoint {
         })
     }
 }
+
+/// The per-request socket deadline on the bitcoind JSON-RPC connection (read and write).
+/// Explicit rather than the transport crate's default so a dependency bump cannot silently
+/// remove it: without a deadline a hung node parks the actor's sync pass forever, and with
+/// it the pass fails, the connection is dropped, and the reconnect loop takes over (each
+/// attempt bounded the same way). The transport retries a request once on a fresh socket
+/// when the first attempt's socket breaks, so the worst case for one hung request - and
+/// for how long one sync pass can park the actor's command loop - is **twice** this
+/// (`regtest_btc_hang.rs` measures it). Comfortably above a `getblock` of a full mainnet
+/// block over loopback; in line with the Zcash backend's per-RPC deadline.
+pub const RPC_DEADLINE: Duration = Duration::from_secs(15);
 
 /// A resolved bitcoin upstream, in either dialect. The engine's counterpart of the Zcash
 /// side's [`crate::chain::AnySource`]: the two backends share nothing but this seam, because

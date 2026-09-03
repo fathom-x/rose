@@ -177,6 +177,29 @@ impl BitcoinD {
         self.spawn(extra).await;
     }
 
+    /// Pause the node with SIGSTOP, simulating a *hung* upstream: its sockets stay open
+    /// and accepting, but no request is ever answered - the failure a kill cannot
+    /// reproduce and only a per-request deadline can detect. Resume with
+    /// [`BitcoinD::resume`].
+    pub fn pause(&self) {
+        self.signal("STOP");
+    }
+
+    /// Resume a [`BitcoinD::pause`]d node (SIGCONT); it picks up where it stopped.
+    pub fn resume(&self) {
+        self.signal("CONT");
+    }
+
+    fn signal(&self, sig: &str) {
+        let pid = self.proc.as_ref().expect("node is running").0.id();
+        let status = Command::new("kill")
+            .arg(format!("-{sig}"))
+            .arg(pid.to_string())
+            .status()
+            .expect("spawn kill");
+        assert!(status.success(), "kill -{sig} {pid} exited with {status}");
+    }
+
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         // The node wallet lives at /wallet/miner once created; wallet-agnostic calls
         // route fine through the bare endpoint until then, and after createwallet every

@@ -235,7 +235,10 @@ Everything here is refused with a clear error rather than silently ignored or ha
   `curl`). A list of bind addresses would remove the choice; daemon-wide, not engine-specific,
   noted here because the kyoto/UI deployments are where it bites.
 - **Health/readiness integration** - `/healthz`/`/readyz`/`/status` speak Zcash-sync
-  vocabulary and do not aggregate bitcoin wallets' sync state yet.
+  vocabulary and do not aggregate bitcoin wallets' sync state yet. Per wallet, the
+  connection state is on `getwalletinfo` as the zecd extension `upstream_connected`
+  (false once a hung or unreachable upstream is noticed - the bitcoind client's
+  per-request deadline is `chain::RPC_DEADLINE`, 15s - true again after a reconnect).
 - **`rescan` / `derive-address`** refuse bitcoin wallets (each names why and what to do
   instead); a bitcoin equivalent of offline address derivation and the wipe-and-rescan
   flow is future work (deleting the wallet database by hand already rebuilds it from the

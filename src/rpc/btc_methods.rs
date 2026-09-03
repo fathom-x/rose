@@ -176,6 +176,12 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
             "hash": status.synced_hash,
             "height": status.synced_height,
         },
+        // zecd extension: whether the wallet's chain source is connected right now. The
+        // Zcash side answers this through `getpeerinfo`, which Bitcoin wallets do not
+        // serve (nothing here has peers in Core's sense); this is the one signal that a
+        // hung or unreachable upstream has been noticed - it flips false when the actor
+        // drops the connection and back once a reconnect succeeds.
+        "upstream_connected": status.conn_state != BtcConnState::Down,
         // zecd extension: which engine serves this wallet. The Zcash handler reports its own
         // extensions (pools, transparent) here; `coin` is the field a mixed-coin deployment
         // tells wallets apart by.

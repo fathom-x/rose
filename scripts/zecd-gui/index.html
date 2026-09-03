@@ -57,6 +57,11 @@
                 font-size: .75rem; line-height: 1.3; font-weight: 400; }
   button.copy:hover { color: var(--accent); border-color: var(--accent); }
   button.copy.done { color: var(--good); border-color: var(--good); }
+  #watchonly { display: none; background: #3a2e00; border: 1px solid var(--accent);
+               border-radius: 8px; padding: .75rem 1rem; margin-bottom: 1rem; }
+  #watchonly b { color: var(--accent); }
+  body.watchonly #watchonly { display: block; }
+  body.watchonly #sendcard { opacity: .55; }
 </style>
 </head>
 <body>
@@ -68,10 +73,16 @@
   <div id="chaininfo"><span class="dot" id="conn"></span><span id="chaintext">connecting&hellip;</span></div>
 </header>
 
+<div id="watchonly" role="status">
+  <b>Watch-only wallet.</b> This wallet was built from an imported xpub and holds no
+  spending keys: balances, addresses and history are live, <b>sending is disabled here</b>.
+  Spend from the paired spending wallet.
+</div>
+
 <div class="grid">
   <div class="card">
     <h2>Balance</h2>
-    <div class="bal"><span id="trusted">&ndash;</span> <small>tBTC spendable</small></div>
+    <div class="bal"><span id="trusted">&ndash;</span> <small><span class="unit">tBTC</span> spendable</small></div>
     <span class="sub">unconfirmed: <span id="pending">&ndash;</span></span>
     <span class="sub">immature: <span id="immature">&ndash;</span></span>
   </div>
@@ -86,11 +97,11 @@
     <div class="msg" id="addrmsg"></div>
   </div>
 
-  <div class="card" style="grid-column: 1 / -1">
+  <div class="card" id="sendcard" style="grid-column: 1 / -1">
     <h2>Send</h2>
     <label>to address
       <input type="text" id="to" placeholder="tb1&hellip;" spellcheck="false"></label>
-    <label>amount (tBTC, up to 8 decimals)</label>
+    <label>amount (<span class="unit">tBTC</span>, up to 8 decimals)</label>
     <div style="display:flex;gap:.5rem;margin-top:.15rem">
       <input type="text" id="amount" placeholder="0.0001" inputmode="decimal" style="flex:1">
       <button type="button" id="maxbtn" class="ghost" style="white-space:nowrap">send all</button>
@@ -123,6 +134,24 @@ const $ = id => document.getElementById(id);
 let rpcId = 0;
 let spendable = 0;  // latest confirmed balance, for the "send all" button
 let backend = "";   // "bitcoind" | "kyoto", from /info
+let unit = "tBTC";  // "BTC" on mainnet, from /info
+let watchOnly = null;  // getwalletinfo.private_keys_enabled === false; null until known
+
+// A watch-only wallet (init --xpub) serves the whole read surface but has nothing to sign
+// with: zecd answers every send with -4. Rather than let the user fill in a form that can
+// only fail, say so at the top of the page and disable the send controls. Re-evaluated on
+// every refresh, so a wallet swapped behind the proxy is reflected without a reload.
+const SEND_CONTROLS = ["to", "amount", "maxbtn", "feerate", "subfee", "send"];
+function setWatchOnly(flag) {
+  if (flag === watchOnly) return;
+  const changed = watchOnly !== null;  // false on the first refresh, which merely learns it
+  watchOnly = flag;
+  document.body.classList.toggle("watchonly", flag);
+  for (const id of SEND_CONTROLS) $(id).disabled = flag;
+  $("sendmsg").className = "msg";
+  $("sendmsg").textContent = flag ? "watch-only wallet: sending is disabled" : "";
+  if (changed || flag) loadInfo();  // the header badge names the mode too
+}
 
 // One JSON-RPC call through the same-origin proxy. `raw` maps a placeholder
 // string in params to raw JSON text spliced into the body after stringify -
@@ -156,18 +185,23 @@ document.addEventListener("click", async e => {
 
 async function refresh() {
   try {
-    const [balances, height, hash, txs] = await Promise.all([
+    const [balances, height, hash, txs, info] = await Promise.all([
       rpc("getbalances"),
       rpc("getblockcount"),
       rpc("getbestblockhash"),
       rpc("listtransactions", ["*", 25]),
+      rpc("getwalletinfo"),
     ]);
+    setWatchOnly(info.private_keys_enabled === false);
     spendable = Number(balances.mine.trusted);
     $("trusted").textContent = fmt(balances.mine.trusted);
     $("pending").textContent = fmt(balances.mine.untrusted_pending);
     $("immature").textContent = fmt(balances.mine.immature);
     $("conn").className = "dot ok";
-    $("chaintext").textContent = `wallet height ${height} · ${short(hash, 16)}`;
+    // upstream_connected is zecd's per-wallet signal for the chain source; false means a
+    // hung or unreachable node has been noticed and the heights shown are the last known.
+    const upstream = info.upstream_connected === false ? " · upstream disconnected" : "";
+    $("chaintext").textContent = `wallet height ${height} · ${short(hash, 16)}${upstream}`;
 
     const rows = txs.slice().reverse().map(tx => {
       const amt = Number(tx.amount);
@@ -196,9 +230,13 @@ async function loadInfo() {
   try {
     const i = await (await fetch("/info")).json();
     backend = i.backend;
+    unit = (i.network === "main" || i.network === "mainnet") ? "BTC" : "tBTC";
+    for (const el of document.querySelectorAll(".unit")) el.textContent = unit;
+    $("to").placeholder = unit === "BTC" ? "bc1\u2026" : "tb1\u2026";
+    const mode = watchOnly ? " · watch-only" : "";
     $("cfgbadge").textContent =
-      `${i.network} · ${i.backend} · ${i.wallet}  (${i.conf})`;
-    document.title = `zecd btc – ${i.network}/${i.backend}`;
+      `${i.network} · ${i.backend} · ${i.wallet}${mode}  (${i.conf})`;
+    document.title = `zecd btc – ${i.network}/${i.backend}${mode}`;
     refreshFee();
   } catch (e) { $("cfgbadge").textContent = ""; }
 }
@@ -278,6 +316,7 @@ $("maxbtn").onclick = () => {
 $("send").onclick = async () => {
   const msg = $("sendmsg");
   msg.className = "msg"; msg.textContent = "";
+  if (watchOnly) { msg.className = "msg err"; msg.textContent = "watch-only wallet: sending is disabled"; return; }
   const to = $("to").value.trim();
   const amount = $("amount").value.trim();
   const feerate = $("feerate").value.trim();
@@ -293,7 +332,7 @@ $("send").onclick = async () => {
   const params = [to, "__AMT__", null, null, $("subfee").checked];
   const raw = { __AMT__: amount };
   if (feerate) { params.push(null, null, null, null, "__FEE__"); raw.__FEE__ = feerate; }
-  if (!confirm(`Send ${amount} tBTC to\n${to}?`)) return;
+  if (!confirm(`Send ${amount} ${unit} to\n${to}?`)) return;
   $("send").disabled = true; msg.textContent = "sending...";
   try {
     const txid = await rpc("sendtoaddress", params, raw);

@@ -1316,10 +1316,11 @@ fn bitcoin_sample_configs() -> &'static [&'static str] {
     &[]
 }
 
-const BITCOIN_SAMPLE_CONFIGS: [&str; 3] = [
+const BITCOIN_SAMPLE_CONFIGS: [&str; 4] = [
     "deploy/zecd.btc-testnet3.toml",
     "deploy/zecd.btc-testnet4.toml",
     "deploy/zecd.btc-testnet4-kyoto.toml",
+    "deploy/zecd.btc-mainnet.toml",
 ];
 
 /// Every sample config, for whichever engines this build carries.
@@ -1395,12 +1396,15 @@ fn the_bitcoin_sample_configs_need_the_engine_they_select() {
             stdout_of(&out)
         );
         let stderr = stderr_of(&out);
-        // A default build refuses a bitcoin sample for the missing engine one of two ways:
-        // the `[bitcoind]` section trips deny_unknown_fields at parse (the full-node samples),
-        // or - for a kyoto sample, which has no `[bitcoind]` because kyoto needs no
-        // credentials - `btc_testnet`/`coin` is refused at resolve behind the feature.
+        // A default build refuses a bitcoin sample for the missing engine one of three ways:
+        // the `[bitcoind]` section trips deny_unknown_fields at parse (the full-node samples);
+        // for a kyoto sample, which has no `[bitcoind]` because kyoto needs no credentials,
+        // `btc_testnet` is refused at resolve behind the feature (the testnet4 kyoto sample);
+        // and a mainnet kyoto sample, which has neither key, reaches the coin doctrine check
+        // itself, which names the engines this build carries.
         let refused_for_missing_engine = stderr.contains("unknown field `bitcoind`")
-            || stderr.contains("requires a zecd build with the `bitcoin` feature");
+            || stderr.contains("requires a zecd build with the `bitcoin` feature")
+            || stderr.contains("unsupported coin \"bitcoin\"");
         assert!(
             refused_for_missing_engine,
             "{rel} was refused for some reason other than the missing engine: {stderr}"

@@ -53,6 +53,28 @@ docker compose -f deploy/docker-compose.btc-testnet4.yml up -d
 
 Then open http://127.0.0.1:8080/
 
+### Mainnet: host network, nothing published
+
+`deploy/docker-compose.btc-mainnet.yml` runs the UI on the **host network** instead. The
+mainnet config binds zecd's RPC to `127.0.0.1:8232`, and on the host network the container
+reaches that address as-is, so there is no `--rpc-url`, no `host.docker.internal`, and no
+`--rpcbind` past loopback on the daemon: the spend surface never leaves loopback. The UI
+binds `127.0.0.1:8080` on the host; front it with a reverse proxy for TLS and auth if it must
+be reachable remotely. Linux only.
+
+```bash
+cp deploy/.env.mainnet.example deploy/.env && $EDITOR deploy/.env    # one variable
+export ZECD_RPC_PASSWORD=$(sed -n 's/^ZECD_RPC_PASSWORD=//p' deploy/.env)
+./target/release/zecd --conf deploy/zecd.btc-mainnet.toml init --wallet btc   # once; record the mnemonic
+./target/release/zecd --conf deploy/zecd.btc-mainnet.toml
+docker compose -f deploy/docker-compose.btc-mainnet.yml up -d zecd-gui
+```
+
+To keep the seed off the dashboard host entirely, run the UI against a **watch-only**
+wallet: `zecd export-xpub --wallet btc` on the spender, `zecd init --xpub <key>` where the
+dashboard runs. The page reads `getwalletinfo.private_keys_enabled`, announces the
+watch-only wallet at the top, and disables its send form.
+
 ### One-off container against a host zecd
 
 ```bash
@@ -116,6 +138,7 @@ Whatever the topology, the rule is the same: the config supplies the credentials
 | Host, UI in a container | `http://host.docker.internal:<rpc port>` | zecd `--rpcbind 0.0.0.0`; `--add-host host.docker.internal:host-gateway` on Linux |
 | A container on the same network | `http://<service name>:<rpc port>` | both on one Docker network; needs a `--features bitcoin` image (none published) |
 | Host, UI also on the host | omit it | nothing - the config's `127.0.0.1` is already right |
+| Host, UI in a container on the host network (mainnet) | omit it | `network_mode: host`, UI `--bind 127.0.0.1`; zecd stays on loopback |
 
 ## Development
 
@@ -170,3 +193,6 @@ docker run -p 9000:8080 zecd-gui
 - Credentials are passed via environment variables (not baked into the image)
 - Use `--bind 0.0.0.0` in containers, but consider a reverse proxy (nginx, traefik) in production
 - Mount the config as read-only (`:ro`) to prevent accidental modification
+- On mainnet prefer `network_mode: host` with the UI bound to loopback over publishing the
+  daemon's RPC past `127.0.0.1` (the mainnet compose file does this), and consider pointing
+  the UI at a watch-only wallet so the dashboard host holds no seed

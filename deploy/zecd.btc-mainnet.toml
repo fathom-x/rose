@@ -1,0 +1,86 @@
+# zecd configuration for a Bitcoin **mainnet kyoto** wallet - the BIP-157/158
+# compact-block-filter light client, peering over P2P with the node that
+# deploy/docker-compose.btc-mainnet.yml runs. NO RPC credentials to the node: kyoto is
+# credential-free, and the node's RPC stays loopback-and-cookie for host admin only.
+#
+# REAL MONEY. Read before running:
+#   * The seed lives in <datadir>/btc/keys.toml, encrypted to the age identity file named
+#     under [keys]; `auto_unlock = true` means the daemon decrypts it at start, so anyone who
+#     can read that identity file can spend. Keep the datadir on this host only, root-owned,
+#     backed up with the mnemonic that `init` prints (record it offline; it is printed once).
+#   * The RPC password is the spend credential. This file ships the CHANGE-ME placeholder,
+#     which zecd refuses to start on: supply ZECD_RPC_PASSWORD in the daemon's environment
+#     (it wins over the file), the same value deploy/.env gives the zecd-gui container.
+#   * [rpc] binds 127.0.0.1 and must stay there. The UI container runs on the host network
+#     (docker-compose.btc-mainnet.yml) precisely so nothing has to be published past loopback.
+#   * Watch-only is an option for the UI: `zecd export-xpub --wallet btc` here, then
+#     `init --xpub <key>` on the box that runs the dashboard, and that box holds no seed at
+#     all. The UI detects a watch-only wallet, says so, and disables its send form.
+#
+# Needs a zecd built with the `bitcoin` feature (a default build refuses this file). Probe:
+#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-mainnet.toml config check
+#
+# Bring-up (offline: kyoto init does not dial the node):
+#   export ZECD_RPC_PASSWORD=...                       # the value in deploy/.env
+#   ./target/release/zecd --conf deploy/zecd.btc-mainnet.toml init --wallet btc
+#   ./target/release/zecd --conf deploy/zecd.btc-mainnet.toml
+#
+# `--wallet btc` is REQUIRED on init (it defaults to a "default" Zcash wallet otherwise). A
+# freshly generated kyoto wallet's birthday defaults to today (funds cannot predate the
+# wallet) and the first sync resolves it against the node's headers - from the shipped scan
+# floor that is a few thousand filters, minutes. Pass `--birthday <height|YYYY-MM-DD>` only
+# to restore a seed with history, which is the slow case (a restore with no birthday scans
+# from SegWit activation).
+#
+# What kyoto gives up versus the bitcoind backend (filters cover blocks only, no mempool):
+#   - NO 0-conf receives: an incoming payment is invisible until it confirms.
+#   - NO eviction reporting.
+#   - NO estimatesmartfee: sends price from the [fees] oracle chain (mempool.space, then
+#     Blockstream's Esplora - both serve mainnet - then a peer-derived block median), or from
+#     an explicit `fee_rate`, which the UI passes from its own preview of the same chain.
+
+network = "main"
+datadir = "./data-btc-mainnet"
+default_wallet = "btc"
+
+[wallets.btc]
+coin = "bitcoin"
+# The project's own mainnet node, as a pinned trusted peer (never a DNS name). Naming one
+# peer makes the light client whitelist-only, so block data and the peer-derived fee
+# signals all come from a node we run. Beside the compose stack on the same host:
+server = "kyoto://127.0.0.1:8333"
+# From elsewhere, the node's public P2P port:
+# server = "kyoto://216.230.225.61:8333"
+# Or no node of ours at all - DNS-seeded public filter-serving peers:
+# server = "kyoto"
+
+# [fees] defaults apply: sources = ["mempool_space", "esplora", "peer_median"], both HTTP
+# oracles at their public mainnet endpoints. Point them at instances you run to remove the
+# "this IP is building a transaction" disclosure, or drop to ["peer_median"] for no server
+# contact at all (see deploy/zecd.btc-testnet4-kyoto.toml for the shapes).
+
+[rpc]
+# zecd's own Bitcoin-Core-dialect JSON-RPC: loopback only. This is the spend surface.
+bind = "127.0.0.1"
+port = 8232
+user = "btc"
+# Refused as-is on every network; ZECD_RPC_PASSWORD in the environment wins over this line.
+password = "CHANGE-ME"
+
+[keys]
+age_identity = "./data-btc-mainnet/identity.txt"
+auto_unlock = true
+
+[sync]
+interval_secs = 20
+
+[health]
+# Reports on Zcash wallets only, so on this config /status is empty and /readyz trivially
+# ready; poll getblockcount / getwalletinfo.upstream_connected for sync state. Loopback, and
+# a port distinct from the testnet4 configs' 49233/49243 so the stacks can run side by side.
+bind = "127.0.0.1"
+port = 9243
+
+[log]
+level = "info"
+format = "json"

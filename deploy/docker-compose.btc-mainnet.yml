@@ -129,41 +129,39 @@ services:
       - /mnt/data/bitcoin_data:/root/.bitcoin
 
   zecd-gui:
-    # Production UI: serves the Bitcoin wallet dashboard. Keep it on the compose network
-    # only (not published to the internet) and place it behind a reverse proxy (nginx, caddy)
-    # for TLS + auth if internet access is desired. For internal/admin-only access, the
-    # loopback binding below is fine.
+    # The wallet dashboard (scripts/zecd-gui), proxying to the zecd that runs ON THE HOST
+    # from deploy/zecd.btc-mainnet.toml (no published image carries the bitcoin engine).
+    #
+    # Host network, deliberately. That config binds zecd's RPC - the spend credential's
+    # surface - to 127.0.0.1, and on the host network the container reaches it at exactly
+    # that address, read from the mounted config. So unlike the testnet stacks there is no
+    # --rpc-url, no host.docker.internal, and no `--rpcbind` past loopback on the daemon:
+    # spend authority never leaves 127.0.0.1. The UI itself binds 127.0.0.1:8080 on the
+    # host (no `ports:` - there is nothing to publish on the host network); put a reverse
+    # proxy with TLS and auth in front for remote access. Linux only (host networking),
+    # which this node's host is.
+    #
+    # The UI does not talk to bitcoind, so it neither depends on it nor joins its network.
+    # Liveness is the image's own HEALTHCHECK (Dockerfile.prod, urllib-based - the image
+    # has no curl, so a compose-level curl healthcheck would only ever report unhealthy).
     build:
       context: ../scripts/zecd-gui
-      dockerfile: Dockerfile.prod  # production variant with healthcheck
+      dockerfile: Dockerfile.prod
     container_name: zecd-gui-mainnet
     restart: unless-stopped
-    depends_on:
-      - bitcoind
+    network_mode: host
     environment:
-      # RPC credentials: point to zecd's wallet daemon (not bitcoind - see zecd config below).
-      # Set this via .env file or docker compose --env-file for actual deployments.
-      - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:-changeme}
-    ports:
-      # Not published to 0.0.0.0 in production. Options:
-      # - Keep loopback-only (default): admin access from this host only
-      # - Publish and proxy: docker run ... -p 127.0.0.1:8080:8080 and place nginx in front
-      - "127.0.0.1:8080:8080"
+      # The host zecd's RPC password, from deploy/.env (see deploy/.env.mainnet.example).
+      # Required: an unset value fails `up` rather than starting a proxy that can only 401.
+      - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:?set ZECD_RPC_PASSWORD in deploy/.env}
     volumes:
       - ./zecd.btc-mainnet.toml:/config/zecd.btc-mainnet.toml:ro
-    networks:
-      btcmain:
     command:
       - --conf=/config/zecd.btc-mainnet.toml
-      - --bind=0.0.0.0
+      - --bind=127.0.0.1
       - --port=8080
-      # kyoto mode has no fee estimates; the UI will show "kyoto prices at send time" message
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/info"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      # Point this at a WATCH-ONLY wallet (init --xpub from the spender's export-xpub) to
+      # run the dashboard on a box with no seed; the page detects it and disables sending.
 
 networks:
   btcmain:

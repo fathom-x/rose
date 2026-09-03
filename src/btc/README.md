@@ -115,6 +115,43 @@ with no `--birthday` still faces the long scan - its history may genuinely preda
 anchor - but a restore given an explicit height or date gets the same anchor treatment as
 a generated wallet.
 
+### A rejected header batch parks the node, so zecd redials from an older checkpoint
+
+`bip157` keeps its header tree in memory and, on a batch it cannot accept, sends a
+`Warning::UnexpectedSyncError`, bans the peer, and carries on with the tree it has. When
+the rejection was the tree's own mistake that is a permanent stall: no `Update` ever
+arrives, nothing on the update stream says why, and the wallet reports `Ready` at whatever
+height it last applied. The mistake exists (2026-09-03, the testnet4 wallet, stuck 27
+blocks behind on a hash the network had abandoned): `BlockTree::accept_header` requires a
+header that extends a *fork* to carry the fork parent's `bits`. That is true between
+mainnet retargets and false on every min-difficulty network, where the 20-minute rule
+lets CPU miners produce `1d00ffff` blocks between ASIC blocks at the real target - so a
+fork whose second header is ASIC-mined, the usual shape of a testnet4 reorg, is rejected as
+`InvalidPow` and never reorged onto. Upstream master has the same code.
+
+zecd handles it at its seam rather than patching the crate (`kyoto.rs`, module doc):
+
+- The warning drain classifies the warning (`fatal_sync_warning`) and fails the update
+  stream with `KyotoFailure::HeaderSync`. The actor treats that like a bitcoind transport
+  failure - drop the connection, redial with backoff - and the redial builds a **fresh**
+  tree from the wallet's checkpoint chain, whose tip carries no bits requirement, so the
+  fork is accepted on the retry. The outage is honest while it lasts: `Down`, then
+  `Syncing`, never `Ready`.
+- bdk_kyoto's `ScanType::Sync` starts that tree 7 blocks back, enough for a shallow fork.
+  A deeper one (testnet reorgs run tens of blocks) would restart *on* the stale branch and
+  fail again, so the actor counts consecutive header-sync failures and escalates: from the
+  second failure each redial is a `ScanType::Recovery` from an older checkpoint on the
+  wallet's own chain (`resync_depth`: 16, 64, 256... blocks below the tip;
+  `resync_checkpoint` picks the wallet's checkpoint at or below that height), bottoming
+  out at the first-scan start - the recorded birthday anchor or the shipped floor, never
+  genesis. A delivered update resets the count. The recovery scan watches the same script
+  lookahead a first scan does, a superset of `Sync`'s, so the rescanned band cannot miss
+  an address revealed since.
+
+The `HeaderSync`/`Stream` split on `KyotoFailure` is deliberate: a node that merely stopped
+or lost its peers redials at the same depth, so a flaky peer does not walk the restart point
+down the chain. The fix that removes the workaround belongs upstream (2140-dev/kyoto).
+
 ## History accounting: the Zcash side's shape (Core's)
 
 `listtransactions`/`gettransaction details` emit **one entry per wallet-relevant output** -

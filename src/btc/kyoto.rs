@@ -40,6 +40,33 @@
 //!
 //! Fee estimation has no `estimatesmartfee` equivalent either; see [`KyotoConn::estimate_fee_rate`]
 //! for what is used instead and how coarse it is.
+//!
+//! ## A header-sync failure is a reconnect, escalating to an older checkpoint
+//!
+//! `bip157` reports a header batch it cannot accept as a [`Warning::UnexpectedSyncError`],
+//! bans the peer, and keeps its in-memory header tree - which, when the rejection was the
+//! tree's own fault, leaves the node parked on a stale tip forever: no update ever arrives,
+//! and nothing else in the stream says so. The case that made this concrete (2026-09-03, the
+//! testnet4 wallet): `BlockTree::accept_header` requires a header that *extends a fork* to
+//! carry the fork parent's `bits`, a rule that is only true between mainnet retargets. On a
+//! min-difficulty network the bits alternate block by block (the 20-minute rule lets CPU
+//! miners produce `1d00ffff` blocks between ASIC blocks at the real target), so a fork whose
+//! second header is ASIC-mined - the ordinary shape of a testnet4 reorg - is rejected, the
+//! reorg never happens, and the wallet reports `Ready` at a height the network abandoned.
+//! Still present in upstream master.
+//!
+//! zecd works around it at its seam rather than patching the crate: the warning drain
+//! classifies that warning ([`fatal_sync_warning`]) and fails the update stream with
+//! [`KyotoFailure::HeaderSync`], which the actor treats like any transport failure - drop
+//! the connection, redial with backoff. A redial builds a **fresh** header tree from the
+//! wallet's own checkpoint chain, whose tip carries no bits requirement, so the fork is
+//! accepted on the retry. bdk_kyoto's `ScanType::Sync` starts that tree 7 blocks back, which
+//! covers a shallow fork; deeper ones (testnet reorgs run tens of blocks) would restart *on*
+//! the stale branch and fail again, so the actor counts consecutive header-sync failures and
+//! [`resync_depth`] escalates each further redial geometrically from the wallet's checkpoint
+//! chain ([`resync_checkpoint`]), bottoming out at the first-scan start (the recorded
+//! birthday anchor or the shipped floor) - never genesis. A delivered update resets the count.
+//! While it lasts the outage is honest: the wallet reports `Down`/`Syncing`, not `Ready`.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -48,8 +75,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context as _};
 use bdk_kyoto::bip157::{AddrV2, ServiceFlags};
 use bdk_kyoto::builder::{Builder, BuilderExt as _};
-use bdk_kyoto::{HashCheckpoint, Requester, ScanType, TrustedPeer, Update};
+use bdk_kyoto::{HashCheckpoint, Requester, ScanType, TrustedPeer, Update, Warning};
 use bdk_wallet::bitcoin::{BlockHash, FeeRate, Transaction, Txid};
+use bdk_wallet::chain::CheckPoint;
 use bdk_wallet::Wallet;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -186,6 +214,84 @@ fn scan_floor(network: BitcoinNetwork) -> Option<&'static ScanFloor> {
 /// should watch for. The engine reveals addresses on demand, so this only has to cover the
 /// unused lookahead beyond what the wallet has already revealed.
 const RECOVERY_SCRIPT_LOOKAHEAD: u32 = 100;
+
+/// How far back the *second* consecutive header-sync failure restarts the light client, in
+/// blocks below the wallet's checkpoint tip, and the factor each further failure multiplies
+/// it by (see [`resync_depth`]). The first failure needs no depth of its own: a plain redial
+/// already starts 7 blocks back (bdk_kyoto's `ScanType::Sync`), enough for a shallow fork.
+/// 16 then 64 covers the reorg depths testnet actually produces within two more redials;
+/// past that the schedule is only there to guarantee convergence on the first-scan start.
+const RESYNC_BASE_DEPTH: u32 = 16;
+const RESYNC_ESCALATION: u32 = 4;
+
+/// Why the update stream stopped delivering. The actor reacts to both by dropping the
+/// connection and redialing with backoff; only [`Self::HeaderSync`] additionally counts
+/// toward the escalating resync depth (see the module doc), so a node that merely stopped
+/// does not push the next redial deeper into the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KyotoFailure {
+    /// The node rejected a header batch (a [`Warning::UnexpectedSyncError`]) and will not
+    /// advance until it is rebuilt from an older checkpoint.
+    HeaderSync(String),
+    /// The node stopped, or lost every peer: the bridge's own `update()` failed or the
+    /// channel closed.
+    Stream(String),
+}
+
+impl std::fmt::Display for KyotoFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HeaderSync(why) => write!(
+                f,
+                "kyoto rejected a header batch and is parked on its current tip: {why}"
+            ),
+            Self::Stream(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+impl std::error::Error for KyotoFailure {}
+
+/// The warnings after which the node makes no further progress on its own - a rejected
+/// header batch parks it on its current tip (the module doc's fork case), so the only way
+/// forward is a rebuilt tree. Every other warning is transient or informational (peer
+/// churn, a fork under evaluation, a rejected broadcast) and the node handles it itself.
+pub(crate) fn fatal_sync_warning(warning: &Warning) -> Option<String> {
+    match warning {
+        Warning::UnexpectedSyncError { warning } => Some(warning.clone()),
+        _ => None,
+    }
+}
+
+/// How far below the wallet's checkpoint tip the next redial should rebuild the light
+/// client, given how many header-sync failures in a row preceded it. `None` is a plain
+/// `ScanType::Sync` redial (which bdk_kyoto already starts 7 blocks back): the first retry,
+/// and the steady state. From the second failure on, [`RESYNC_BASE_DEPTH`] multiplied by
+/// [`RESYNC_ESCALATION`] per further failure, saturating - a saturated depth resolves to the
+/// first-scan start in [`resync_checkpoint`].
+pub(crate) fn resync_depth(consecutive_header_failures: u32) -> Option<u32> {
+    let escalations = consecutive_header_failures.checked_sub(2)?;
+    Some(RESYNC_BASE_DEPTH.saturating_mul(RESYNC_ESCALATION.saturating_pow(escalations)))
+}
+
+/// The checkpoint a resync `depth` blocks below `tip` restarts from: the wallet's own
+/// checkpoint at that height, or the nearest one below it (the chain is sparse away from
+/// the tip), clamped at `first_scan_start` - the recorded birthday anchor or the shipped
+/// floor - because nothing the wallet holds predates that and a restart at genesis would
+/// re-download every filter on the network.
+pub(crate) fn resync_checkpoint(
+    tip: &CheckPoint,
+    depth: u32,
+    first_scan_start: HashCheckpoint,
+) -> HashCheckpoint {
+    let target = tip.height().saturating_sub(depth);
+    match tip.floor_at(target) {
+        Some(cp) if cp.height() > first_scan_start.height => {
+            HashCheckpoint::new(cp.height(), cp.hash())
+        }
+        _ => first_scan_start,
+    }
+}
 
 /// What a kyoto connect knows about the wallet's birthday, assembled by the actor from
 /// `keys.toml` (`height`, `time`) and the engine database's recorded anchor (`anchor`,
@@ -343,10 +449,18 @@ impl KyotoEndpoint {
     /// `tokio` runtime, and the bridge task is spawned here too. Returns as soon as the node
     /// is running - peer discovery and header sync proceed in the background, so a caller
     /// gets a connection before the first `Update` is available.
-    pub fn connect(&self, wallet: &Wallet, birthday: &KyotoBirthday) -> anyhow::Result<KyotoConn> {
+    ///
+    /// `resync` is the escalating restart depth from [`resync_depth`] - `None` on a healthy
+    /// (re)dial, `Some` after repeated header-sync failures (see the module doc).
+    pub fn connect(
+        &self,
+        wallet: &Wallet,
+        birthday: &KyotoBirthday,
+        resync: Option<u32>,
+    ) -> anyhow::Result<KyotoConn> {
         self.preflight()?;
         let network = crate::btc::keys::network(self.network);
-        let (scan_type, resolution) = self.scan_plan(wallet, birthday);
+        let (scan_type, resolution) = self.scan_plan(wallet, birthday, resync);
 
         // Created so the path exists the moment the crate starts honoring it; today it stays
         // empty (see `data_dir`). Cheap, and it keeps the failure mode "empty directory"
@@ -391,6 +505,12 @@ impl KyotoEndpoint {
         // two drains are joined, not `select!`ed with a shared break: one stream closing
         // must not discard the survivor - the warning stream carries the sole surfacing
         // of a P2P broadcast rejection (see `broadcast`).
+        // The bridge channel: `update()` is not cancel-safe and resolves only at tip, so it
+        // gets a task of its own (below) and hands the actor a channel it can poll without
+        // blocking. The warning drain holds a sender too - a fatal warning is the one signal
+        // that the node has parked itself, and it only ever surfaces on that stream.
+        let (tx, rx) = mpsc::channel(UPDATE_CHANNEL_BOUND);
+        let fail_tx = tx.clone();
         let describe = self.describe();
         let logs = tokio::spawn(async move {
             let mut info = logging.info_subscriber;
@@ -403,14 +523,16 @@ impl KyotoEndpoint {
             let warn_drain = async {
                 while let Some(msg) = warns.recv().await {
                     warn!(upstream = %describe, "kyoto: {msg}");
+                    if let Some(why) = fatal_sync_warning(&msg) {
+                        // A closed channel means the actor already dropped this
+                        // connection; nothing left to tell it.
+                        let _ = fail_tx.send(Err(KyotoFailure::HeaderSync(why))).await;
+                    }
                 }
             };
             tokio::join!(info_drain, warn_drain);
         });
 
-        // The bridge: `update()` is not cancel-safe and resolves only at tip, so it gets a
-        // task of its own and hands the actor a channel it can poll without blocking.
-        let (tx, rx) = mpsc::channel(UPDATE_CHANNEL_BOUND);
         let bridge = tokio::spawn(async move {
             loop {
                 match updates.update().await {
@@ -420,7 +542,11 @@ impl KyotoEndpoint {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(format!("{e}"))).await;
+                        let _ = tx
+                            .send(Err(KyotoFailure::Stream(format!(
+                                "kyoto update stream failed: {e}"
+                            ))))
+                            .await;
                         break;
                     }
                 }
@@ -472,13 +598,35 @@ impl KyotoEndpoint {
     /// anchor so every *later* first-scan attempt (this one restarts the moment it
     /// resolves) skips the floor-to-birthday filter band - the band that grows without
     /// bound as the fixed shipped floors age.
+    ///
+    /// A synced wallet redialing after repeated header-sync failures (`resync`) restarts
+    /// that many blocks below its own tip instead, as a recovery scan over the same script
+    /// lookahead a first scan uses - a superset of what `Sync` would watch, so the rescanned
+    /// band cannot miss a script the wallet has revealed since.
     fn scan_plan(
         &self,
         wallet: &Wallet,
         birthday: &KyotoBirthday,
+        resync: Option<u32>,
     ) -> (ScanType, Option<(u32, AnchorTarget)>) {
-        if wallet.latest_checkpoint().height() > 0 {
-            return (ScanType::Sync, None);
+        let tip = wallet.latest_checkpoint();
+        if tip.height() > 0 {
+            let Some(depth) = resync else {
+                return (ScanType::Sync, None);
+            };
+            let checkpoint = resync_checkpoint(&tip, depth, self.first_scan_start(birthday));
+            info!(
+                depth,
+                from = checkpoint.height,
+                wallet_tip = tip.height(),
+                "kyoto resync after repeated header-sync failures: rebuilding the light \
+                 client from an older checkpoint"
+            );
+            let scan = ScanType::Recovery {
+                used_script_index: RECOVERY_SCRIPT_LOOKAHEAD,
+                checkpoint,
+            };
+            return (scan, None);
         }
         if let Some((height, hash)) = birthday.anchor {
             debug!(
@@ -505,6 +653,18 @@ impl KyotoEndpoint {
             checkpoint: floor,
         };
         (scan, resolution.map(|target| (floor.height, target)))
+    }
+}
+
+impl KyotoEndpoint {
+    /// Where a first scan of this wallet starts: the recorded birthday anchor when there is
+    /// one, else the network's recovery floor for the birthday - the lowest block a resync
+    /// ever restarts from, since nothing the wallet holds can predate it.
+    fn first_scan_start(&self, birthday: &KyotoBirthday) -> HashCheckpoint {
+        match birthday.anchor {
+            Some((height, hash)) => HashCheckpoint::new(height, hash),
+            None => recovery_floor(self.network, birthday.height),
+        }
     }
 }
 
@@ -639,7 +799,7 @@ async fn resolve_birthday_anchor(
 /// broadcast and the fee signals. Dropping it aborts every owned task, which shuts the
 /// node down.
 pub struct KyotoConn {
-    updates: mpsc::Receiver<Result<Update, String>>,
+    updates: mpsc::Receiver<Result<Update, KyotoFailure>>,
     requester: Requester,
     bridge: JoinHandle<()>,
     logs: JoinHandle<()>,
@@ -653,16 +813,18 @@ impl KyotoConn {
     /// The next completed sync, or `None` when the client has not reached tip since the last
     /// one. Never blocks - the awaiting happens in the bridge task.
     ///
-    /// An `Err` means the update stream died (the node stopped, or lost every peer); the
-    /// actor treats it like a bitcoind transport error and reconnects with backoff.
-    pub fn try_next_update(&mut self) -> anyhow::Result<Option<Update>> {
+    /// An `Err` means the stream will deliver nothing more on this connection - the node
+    /// stopped or lost every peer ([`KyotoFailure::Stream`]), or parked itself on a header
+    /// batch it rejected ([`KyotoFailure::HeaderSync`]); the actor treats both like a
+    /// bitcoind transport error and reconnects with backoff, the latter deeper each time.
+    pub fn try_next_update(&mut self) -> Result<Option<Update>, KyotoFailure> {
         match self.updates.try_recv() {
             Ok(Ok(update)) => Ok(Some(update)),
-            Ok(Err(e)) => Err(anyhow!("kyoto update stream failed: {e}")),
+            Ok(Err(e)) => Err(e),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                Err(anyhow!("the kyoto node stopped running"))
-            }
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(KyotoFailure::Stream(
+                "the kyoto node stopped running".to_string(),
+            )),
         }
     }
 
@@ -1165,7 +1327,7 @@ mod tests {
 
         // Anchor-less: the first scan starts at the shipped floor and wants a resolution
         // for the above-floor birthday.
-        let (scan, resolution) = endpoint.scan_plan(&wallet, &birthday(150_000));
+        let (scan, resolution) = endpoint.scan_plan(&wallet, &birthday(150_000), None);
         match scan {
             ScanType::Recovery { checkpoint, .. } => {
                 assert_eq!(checkpoint.height, BTC_KYOTO_SCAN_FLOOR_TESTNET4.height)
@@ -1186,7 +1348,7 @@ mod tests {
             anchor: Some((150_000, hash)),
             ..birthday(150_000)
         };
-        let (scan, resolution) = endpoint.scan_plan(&wallet, &anchored);
+        let (scan, resolution) = endpoint.scan_plan(&wallet, &anchored, None);
         match scan {
             ScanType::Recovery { checkpoint, .. } => assert_eq!(checkpoint.height, 150_000),
             other => panic!("expected a recovery scan, got {other:?}"),
@@ -1244,5 +1406,148 @@ mod tests {
         assert!(endpoint(BitcoinNetwork::Main, two)
             .describe()
             .contains("2 trusted peers"));
+    }
+
+    #[test]
+    fn a_rejected_header_batch_is_the_only_fatal_warning() {
+        let fatal = Warning::UnexpectedSyncError {
+            warning: "Unexpected header syncing error: the target work does not adhere to \
+                      basic transition requirements."
+                .to_string(),
+        };
+        let why = fatal_sync_warning(&fatal).expect("a rejected batch parks the node");
+        assert!(why.contains("transition requirements"), "{why}");
+        for transient in [
+            Warning::NeedConnections {
+                connected: 0,
+                required: 1,
+            },
+            Warning::PeerTimedOut,
+            Warning::CouldNotConnect,
+            Warning::PotentialStaleTip,
+            Warning::EvaluatingFork,
+            Warning::ChannelDropped,
+        ] {
+            assert_eq!(fatal_sync_warning(&transient), None, "{transient:?}");
+        }
+    }
+
+    #[test]
+    fn the_resync_depth_starts_on_the_second_failure_and_escalates_geometrically() {
+        // A healthy dial and the first retry are plain `Sync` redials (7 blocks back).
+        assert_eq!(resync_depth(0), None);
+        assert_eq!(resync_depth(1), None);
+        assert_eq!(resync_depth(2), Some(16));
+        assert_eq!(resync_depth(3), Some(64));
+        assert_eq!(resync_depth(4), Some(256));
+        assert_eq!(resync_depth(5), Some(1024));
+        // Saturates rather than wrapping; a saturated depth clamps to the first-scan start.
+        assert_eq!(resync_depth(40), Some(u32::MAX));
+        assert_eq!(resync_depth(u32::MAX), Some(u32::MAX));
+    }
+
+    fn hash(n: u8) -> BlockHash {
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        BlockHash::from_byte_array([n; 32])
+    }
+
+    #[test]
+    fn the_resync_checkpoint_walks_the_wallets_own_chain_and_clamps_at_the_first_scan_start() {
+        use bdk_wallet::chain::BlockId;
+        // A sparse checkpoint chain, as a synced wallet's is away from the tip.
+        let tip = [(0u32, 0u8), (100, 1), (110, 2), (120, 3), (130, 4)]
+            .into_iter()
+            .fold(None::<CheckPoint>, |cp, (height, n)| {
+                let id = BlockId {
+                    height,
+                    hash: hash(n),
+                };
+                Some(match cp {
+                    None => CheckPoint::new(id),
+                    Some(cp) => cp.insert(id),
+                })
+            })
+            .unwrap();
+        let start = HashCheckpoint::new(100, hash(1));
+
+        // Exactly on a checkpoint, and between two (floor to the one below the target).
+        let at = resync_checkpoint(&tip, 10, start);
+        assert_eq!((at.height, at.hash), (120, hash(3)));
+        let between = resync_checkpoint(&tip, 15, start);
+        assert_eq!((between.height, between.hash), (110, hash(2)));
+        // Reaching the first-scan start, or below it (genesis is on the chain but is never
+        // chosen), yields the start itself.
+        let clamped = resync_checkpoint(&tip, 30, start);
+        assert_eq!((clamped.height, clamped.hash), (100, hash(1)));
+        let saturated = resync_checkpoint(&tip, u32::MAX, start);
+        assert_eq!((saturated.height, saturated.hash), (100, hash(1)));
+        // A start below the wallet's chain lets the wallet's own checkpoints win down to it.
+        let lower = HashCheckpoint::new(90, hash(9));
+        let own = resync_checkpoint(&tip, 30, lower);
+        assert_eq!((own.height, own.hash), (100, hash(1)));
+        let past = resync_checkpoint(&tip, 100, lower);
+        assert_eq!((past.height, past.hash), (90, hash(9)));
+    }
+
+    /// A synced wallet redials with `Sync` unless a resync depth is given, in which case it
+    /// restarts as a recovery scan from its own chain that far back - the birthday anchor
+    /// bounding it below.
+    #[test]
+    fn a_synced_wallet_resyncs_from_its_own_chain_only_when_asked() {
+        use crate::btc::keys::{tests::bip84_seed, AccountKeys};
+        use bdk_wallet::chain::BlockId;
+        use bdk_wallet::KeychainKind;
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Testnet4).unwrap();
+        let mut wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .create_wallet_no_persist()
+        .unwrap();
+        let chain = [(160_000u32, 1u8), (160_010, 2), (160_020, 3)]
+            .into_iter()
+            .fold(wallet.latest_checkpoint(), |cp, (height, n)| {
+                cp.insert(BlockId {
+                    height,
+                    hash: hash(n),
+                })
+            });
+        wallet
+            .apply_update(Update {
+                chain: Some(chain),
+                ..Default::default()
+            })
+            .unwrap();
+        let endpoint = endpoint(BitcoinNetwork::Testnet4, vec![]);
+        let anchored = KyotoBirthday {
+            anchor: Some((150_000, hash(7))),
+            ..birthday(150_000)
+        };
+
+        let (scan, resolution) = endpoint.scan_plan(&wallet, &anchored, None);
+        assert!(matches!(scan, ScanType::Sync), "{scan:?}");
+        assert_eq!(resolution, None);
+
+        let (scan, resolution) = endpoint.scan_plan(&wallet, &anchored, Some(15));
+        match scan {
+            ScanType::Recovery {
+                used_script_index,
+                checkpoint,
+            } => {
+                assert_eq!((checkpoint.height, checkpoint.hash), (160_000, hash(1)));
+                assert_eq!(used_script_index, RECOVERY_SCRIPT_LOOKAHEAD);
+            }
+            other => panic!("expected a recovery scan, got {other:?}"),
+        }
+        assert_eq!(resolution, None);
+
+        let (scan, _) = endpoint.scan_plan(&wallet, &anchored, Some(u32::MAX));
+        match scan {
+            ScanType::Recovery { checkpoint, .. } => {
+                assert_eq!((checkpoint.height, checkpoint.hash), (150_000, hash(7)))
+            }
+            other => panic!("expected a recovery scan, got {other:?}"),
+        }
     }
 }

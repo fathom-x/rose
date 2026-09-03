@@ -34,7 +34,7 @@ use tracing::{debug, error, info, info_span, warn, Instrument as _};
 use crate::backoff::Backoff;
 use crate::btc::chain::{BitcoindRpc, BroadcastError, BtcEndpoint};
 use crate::btc::keys::{self, AccountKeys};
-use crate::btc::kyoto::KyotoConn;
+use crate::btc::kyoto::{KyotoConn, KyotoFailure};
 use crate::btc::store::Persister;
 use crate::coin::BitcoinNetwork;
 use crate::error::{codes, RpcError};
@@ -490,6 +490,7 @@ pub fn spawn(
         backoff: Backoff::new(reconnect_base, reconnect_max),
         next_attempt: Instant::now(),
         reconnect_warned: false,
+        header_sync_failures: 0,
         sync_interval,
         status_tx,
         cmd_rx,
@@ -553,6 +554,11 @@ struct BtcActor {
     next_attempt: Instant,
     /// WARN once per outage, then DEBUG (the logging convention for reconnect streams).
     reconnect_warned: bool,
+    /// Kyoto only: header-sync failures since the last delivered update. Each one deepens
+    /// the next redial's restart checkpoint (`kyoto::resync_depth`), so a fork the light
+    /// client cannot reorg onto from 7 blocks back is retried from further down the
+    /// wallet's own chain rather than from the same stale tip forever.
+    header_sync_failures: u32,
     sync_interval: Duration,
     status_tx: watch::Sender<BtcSyncStatus>,
     cmd_rx: mpsc::Receiver<BtcCommand>,
@@ -701,6 +707,7 @@ impl BtcActor {
             Conn::Kyoto(kyoto) => match kyoto.try_next_update() {
                 Ok(Some(update)) => {
                     reached_tip = true;
+                    self.header_sync_failures = 0;
                     self.wallet
                         .apply_update(update)
                         .map_err(|e| anyhow::anyhow!("apply kyoto update: {e}"))
@@ -715,7 +722,13 @@ impl BtcActor {
                     resolved_anchor = kyoto.try_resolved_anchor();
                     Ok(0)
                 }
-                Err(e) => Err(e),
+                // The node parked itself on a rejected header batch: count it, so the
+                // redial below (via `drop_conn`) restarts from an older checkpoint.
+                Err(e @ KyotoFailure::HeaderSync(_)) => {
+                    self.header_sync_failures = self.header_sync_failures.saturating_add(1);
+                    Err(anyhow::anyhow!(e))
+                }
+                Err(e) => Err(anyhow::anyhow!(e)),
             },
         };
         // Act on a resolved anchor only while the wallet is still checkpoint-less: the
@@ -777,7 +790,7 @@ impl BtcActor {
                 // Transport or apply failure: drop the connection and retry with backoff.
                 // (An apply failure would recur, but reconnecting rebuilds the emitter from
                 // the wallet's own checkpoint, which is also the reorg recovery path.)
-                warn!("sync error against the bitcoind upstream: {e:#}");
+                warn!("sync error against the upstream (reconnecting with backoff): {e:#}");
                 self.drop_conn();
                 true
             }
@@ -824,7 +837,8 @@ impl BtcActor {
                     time: self.birthday_time,
                     anchor: self.birthday_anchor,
                 };
-                e.connect(&self.wallet, &birthday).map(|kyoto| {
+                let resync = crate::btc::kyoto::resync_depth(self.header_sync_failures);
+                e.connect(&self.wallet, &birthday, resync).map(|kyoto| {
                     info!(
                         upstream = %endpoint.describe(),
                         wallet_height = self.wallet.latest_checkpoint().height(),

@@ -17,6 +17,8 @@
 //! lightwalletd is built from a release tag. `zecd` itself is the built release binary; the
 //! funder's `zecd` comes from `$ZECD_FUNDER_BIN` (see [`funder_bin`]).
 
+pub mod btc;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

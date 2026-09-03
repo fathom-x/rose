@@ -508,10 +508,13 @@ jobs:
           echo "== captured logs (${{ matrix.node }}) =="
           ls -la "$RUNNER_TEMP/regtest-logs" 2>/dev/null || echo "(no logs were written)"
 
-  # The BDK engine's live e2e (regtest-harness/tests/regtest_btc.rs): a `--features bitcoin`
+  # The BDK engine's live e2es (regtest-harness/tests/regtest_btc*.rs): a `--features bitcoin`
   # zecd against a real regtest Bitcoin Core - receive at 0-conf, confirm, wallet-built send
   # accepted by the node's mempool, sendmany, change attribution, checkpoint persistence
-  # across a restart. Its own small job rather than a leg of the `regtest` matrix: it needs
+  # across a restart (regtest_btc), the same over the kyoto BIP-157 light client
+  # (regtest_btc_kyoto), and three suites that run over BOTH chain sources: the watch-only
+  # xpub pairing (regtest_btc_watchonly), restore from mnemonic (regtest_btc_restore), and
+  # a live reorg (regtest_btc_reorg). Its own small job rather than a leg of the `regtest` matrix: it needs
   # neither zebra, nor the funder, nor the chain snapshot, and the matrix legs' zecd is the
   # default-feature build (where the same test self-skips by design). A debug zecd is
   # deliberate - the test does no Orchard proving, and the debug build halves the job's
@@ -563,7 +566,7 @@ jobs:
       - name: Build zecd with the bitcoin engine
         run: cargo build --locked --features bitcoin --bin zecd
 
-      - name: Run the bitcoind and kyoto e2es
+      - name: Run the Bitcoin e2es
         working-directory: regtest-harness
         env:
           ZECD_BIN: ${{ github.workspace }}/target/debug/zecd
@@ -574,6 +577,11 @@ jobs:
           "$BITCOIND_BIN" --version | head -1
           # Both chain-source dialects against the same pinned Core: the bitcoind JSON-RPC
           # backend, then the kyoto BIP-157 light client (which needs the node's
-          # -blockfilterindex/-peerblockfilters, flags the test passes itself). cargo runs
-          # the two binaries sequentially; each brings up its own isolated stack.
-          cargo test --locked --test regtest_btc --test regtest_btc_kyoto -- --nocapture
+          # -blockfilterindex/-peerblockfilters, flags the tests pass themselves), then the
+          # dual-backend suites. cargo runs the binaries sequentially; each test brings up
+          # its own isolated stack. --no-fail-fast so one failing binary still lets the
+          # others report.
+          cargo test --locked --no-fail-fast \
+            --test regtest_btc --test regtest_btc_kyoto \
+            --test regtest_btc_watchonly --test regtest_btc_restore --test regtest_btc_reorg \
+            -- --nocapture

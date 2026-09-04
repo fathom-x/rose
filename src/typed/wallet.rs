@@ -345,6 +345,32 @@ pub struct ReceivedByAddress {
     pub confirmations: i64,
     pub label: String,
     pub txids: Vec<String>,
+    /// zecd extension, Bitcoin wallets only (`rpc/btc_methods.rs::listreceivedbyaddress`):
+    /// the address's external-keychain derivation index.
+    #[serde(default)]
+    pub address_index: Option<u32>,
+}
+
+/// `listdescriptors` (`rpc/btc_methods.rs::listdescriptors`), Bitcoin wallets only.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Descriptors {
+    pub wallet_name: String,
+    pub descriptors: Vec<DescriptorEntry>,
+}
+
+/// One entry of [`Descriptors`]: a public descriptor and where its keychain stands.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DescriptorEntry {
+    /// `wpkh([fp/84'/c'/0']xpub/{0,1}/*)#checksum` - the account xpub rides inside.
+    pub desc: String,
+    pub timestamp: u64,
+    pub active: bool,
+    pub internal: bool,
+    pub range: Vec<u32>,
+    pub next: u32,
+    pub next_index: u32,
 }
 
 /// `z_getaddressforaccount` (`rpc/wallet_methods.rs::z_getaddressforaccount`).
@@ -657,6 +683,15 @@ impl Client<'_> {
             include_empty.map(|b| json!(b)),
         ]);
         self.call_typed("listreceivedbyaddress", params).await
+    }
+
+    /// `listdescriptors ( private )`: the wallet's public descriptors (Bitcoin wallets).
+    pub async fn list_descriptors(
+        &self,
+        private: Option<bool>,
+    ) -> Result<Descriptors, ClientError> {
+        let params = Self::positional(vec![private.map(|b| json!(b))]);
+        self.call_typed("listdescriptors", params).await
     }
 
     /// `listwallets`: the loaded wallet names.
@@ -977,6 +1012,40 @@ mod tests {
 
     /// Fixture from a shielded `listunspent` entry (ironwood note) and a transparent
     /// coinbase one.
+    /// Fixture: the shape `rpc/btc_methods.rs::listdescriptors` emits for a testnet4 wallet
+    /// (descriptor strings abbreviated; the field set is what matters).
+    #[test]
+    fn descriptors_decode() {
+        let v = serde_json::json!({
+            "wallet_name": "btc",
+            "descriptors": [
+                { "desc": "wpkh([d34db33f/84'/1'/0']tpubDC.../0/*)#abcd1234", "timestamp": 0,
+                  "active": true, "internal": false, "range": [0, 32], "next": 7, "next_index": 7 },
+                { "desc": "wpkh([d34db33f/84'/1'/0']tpubDC.../1/*)#efgh5678", "timestamp": 0,
+                  "active": true, "internal": true, "range": [0, 26], "next": 1, "next_index": 1 },
+            ],
+        });
+        let d: Descriptors = serde_json::from_value(v).unwrap();
+        assert_eq!(d.wallet_name, "btc");
+        assert_eq!(d.descriptors.len(), 2);
+        assert!(!d.descriptors[0].internal && d.descriptors[1].internal);
+        assert_eq!(d.descriptors[0].next_index, 7);
+        assert_eq!(d.descriptors[0].range, vec![0, 32]);
+        // The Bitcoin extension on `listreceivedbyaddress` decodes, and its absence (the
+        // Zcash handler's shape) is tolerated.
+        let with: ReceivedByAddress = serde_json::from_value(serde_json::json!({
+            "address": "tb1q...", "amount": 0.5, "confirmations": 3, "label": "",
+            "txids": ["ab"], "address_index": 6
+        }))
+        .unwrap();
+        assert_eq!(with.address_index, Some(6));
+        let without: ReceivedByAddress = serde_json::from_value(serde_json::json!({
+            "address": "u1...", "amount": 0.5, "confirmations": 3, "label": "", "txids": []
+        }))
+        .unwrap();
+        assert_eq!(without.address_index, None);
+    }
+
     #[test]
     fn unspent_decodes() {
         let shielded = serde_json::json!({

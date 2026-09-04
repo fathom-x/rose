@@ -102,6 +102,44 @@ pub struct BtcAddressInfo {
     pub derivation: Option<(bool, u32)>,
 }
 
+/// One revealed external address with every output that ever paid it - the raw material of
+/// `listreceivedbyaddress`, whose `minconf`/`include_empty`/filter rules the RPC layer
+/// applies. Internal (change) addresses are never listed: Core's `listreceivedbyaddress`
+/// counts receiving addresses only, and so does the Zcash handler.
+#[derive(Clone, Debug)]
+pub struct BtcAddressReceipts {
+    pub address: String,
+    /// The external-keychain derivation index (`m/84'/c'/0'/0/<index>`).
+    pub index: u32,
+    pub receipts: Vec<BtcReceipt>,
+}
+
+/// One output paying a wallet address.
+#[derive(Clone, Debug)]
+pub struct BtcReceipt {
+    pub txid: String,
+    pub amount_sat: u64,
+    /// 0 while the paying transaction is unconfirmed.
+    pub confirmations: u64,
+}
+
+/// One of the wallet's two public descriptors, Core's `listdescriptors` vocabulary.
+#[derive(Clone, Debug)]
+pub struct BtcDescriptor {
+    /// The descriptor string with its checksum: `wpkh([fp/84'/c'/0']xpub/0/*)#....`.
+    pub desc: String,
+    /// The change (internal) keychain, as opposed to the receiving one.
+    pub internal: bool,
+    /// The next index to be revealed on this keychain.
+    pub next_index: u32,
+    /// The end of the range the wallet currently watches: `next_index` plus the keychain's
+    /// lookahead - Core's `range[1]`, the keypool analogue.
+    pub range_end: u32,
+    /// Core's `timestamp` (the descriptor's birth time): the wallet's recorded birthday time
+    /// when `init` was given a date, else 0.
+    pub timestamp: u64,
+}
+
 /// One wallet-relevant output of a wallet transaction - Bitcoin Core's per-output history
 /// vocabulary, the same accounting the Zcash side's `tx_entries` uses: a multi-recipient
 /// send yields one `send` detail per recipient, a payment to one of the wallet's own
@@ -198,6 +236,12 @@ enum BtcCommand {
         txid: String,
         reply: oneshot::Sender<Result<Option<BtcTxRecord>, RpcError>>,
     },
+    ReceivedByAddress {
+        reply: oneshot::Sender<Result<Vec<BtcAddressReceipts>, RpcError>>,
+    },
+    Descriptors {
+        reply: oneshot::Sender<Result<Vec<BtcDescriptor>, RpcError>>,
+    },
 }
 
 /// Caller-supplied send options - the optional `sendtoaddress`/`sendmany` parameters the
@@ -293,6 +337,18 @@ impl BtcWalletHandle {
 
     pub async fn get_transaction(&self, txid: String) -> Result<Option<BtcTxRecord>, RpcError> {
         self.dispatch(|reply| BtcCommand::GetTransaction { txid, reply })
+            .await
+    }
+
+    /// Every revealed receiving address with the outputs that paid it, ascending by index.
+    pub async fn received_by_address(&self) -> Result<Vec<BtcAddressReceipts>, RpcError> {
+        self.dispatch(|reply| BtcCommand::ReceivedByAddress { reply })
+            .await
+    }
+
+    /// The wallet's public descriptors (receiving, then change).
+    pub async fn descriptors(&self) -> Result<Vec<BtcDescriptor>, RpcError> {
+        self.dispatch(|reply| BtcCommand::Descriptors { reply })
             .await
     }
 
@@ -1007,7 +1063,82 @@ impl BtcActor {
                 };
                 let _ = reply.send(result);
             }
+            BtcCommand::ReceivedByAddress { reply } => {
+                let _ = reply.send(Ok(self.received_by_address()));
+            }
+            BtcCommand::Descriptors { reply } => {
+                let _ = reply.send(Ok(self.descriptors()));
+            }
         }
+    }
+
+    /// Every revealed external address, with every output in the wallet's transaction graph
+    /// that pays it. Revealed-but-never-paid addresses come back with no receipts, which is
+    /// what lets `listreceivedbyaddress include_empty` enumerate the issued set; nothing
+    /// beyond the last revealed index is listed, since the wallet never handed those out.
+    fn received_by_address(&self) -> Vec<BtcAddressReceipts> {
+        let network = self.wallet.network();
+        let mut by_index: std::collections::BTreeMap<u32, BtcAddressReceipts> = self
+            .wallet
+            .spk_index()
+            .revealed_keychain_spks(KeychainKind::External)
+            .filter_map(|(index, spk)| {
+                let address = Address::from_script(&spk, network).ok()?.to_string();
+                Some((
+                    index,
+                    BtcAddressReceipts {
+                        address,
+                        index,
+                        receipts: Vec::new(),
+                    },
+                ))
+            })
+            .collect();
+        for wtx in self.wallet.transactions() {
+            let txid = wtx.tx_node.txid.to_string();
+            let confirmations = match &wtx.chain_position {
+                bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => {
+                    self.confirmations(Some(anchor.block_id.height))
+                }
+                bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => 0,
+            };
+            for txout in &wtx.tx_node.tx.output {
+                let Some((KeychainKind::External, index)) =
+                    self.wallet.derivation_of_spk(txout.script_pubkey.clone())
+                else {
+                    continue;
+                };
+                if let Some(entry) = by_index.get_mut(&index) {
+                    entry.receipts.push(BtcReceipt {
+                        txid: txid.clone(),
+                        amount_sat: txout.value.to_sat(),
+                        confirmations,
+                    });
+                }
+            }
+        }
+        by_index.into_values().collect()
+    }
+
+    /// The two public descriptors the wallet scans with - receiving first, change second -
+    /// each with where its keychain stands. Public material only: the database holds no
+    /// private descriptor, and the seed-derived signer exists only for the duration of a
+    /// send.
+    fn descriptors(&self) -> Vec<BtcDescriptor> {
+        let lookahead = self.wallet.spk_index().lookahead();
+        [KeychainKind::External, KeychainKind::Internal]
+            .into_iter()
+            .map(|keychain| {
+                let next_index = self.wallet.next_derivation_index(keychain);
+                BtcDescriptor {
+                    desc: self.wallet.public_descriptor(keychain).to_string(),
+                    internal: keychain == KeychainKind::Internal,
+                    next_index,
+                    range_end: next_index.saturating_add(lookahead),
+                    timestamp: self.birthday_time.unwrap_or(0),
+                }
+            })
+            .collect()
     }
 
     /// Every wallet transaction as a wire-shaped record with its per-output fan-out, oldest

@@ -394,6 +394,55 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     assert_eq!(unspent[0]["confirmations"], json!(1));
     assert_eq!(unspent[0]["safe"], json!(true));
 
+    // `listreceivedbyaddress` with `include_empty` enumerates every issued receiving
+    // address with its derivation index (zecd's `address_index` extension) - the one that
+    // was funded carries the amount and txid, the default minconf hides nothing at 1 conf,
+    // and change never appears. Without `include_empty` only the funded address is listed.
+    let received = zecd
+        .call("listreceivedbyaddress", json!([0, true]))
+        .await
+        .expect("listreceivedbyaddress");
+    let funded = received
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|e| e["address"] == json!(address))
+        .expect("the funded address is listed");
+    assert_eq!(funded["amount"].as_f64(), Some(1.0), "{funded}");
+    assert_eq!(funded["confirmations"], json!(1));
+    assert_eq!(funded["txids"], json!([fund_txid]));
+    assert_eq!(funded["label"], json!(""));
+    assert!(funded["address_index"].is_u64(), "{funded}");
+    let only_funded = zecd
+        .call("listreceivedbyaddress", json!([]))
+        .await
+        .expect("listreceivedbyaddress default");
+    assert_eq!(only_funded.as_array().map(Vec::len), Some(1));
+    assert_eq!(only_funded[0]["address"], json!(address));
+
+    // `listdescriptors` is Core's shape over the two public descriptors, the xpub inside;
+    // the private form is refused (the database holds no private material).
+    let descriptors = zecd
+        .call("listdescriptors", json!([]))
+        .await
+        .expect("listdescriptors");
+    let descs = descriptors["descriptors"].as_array().expect("descriptors");
+    assert_eq!(descs.len(), 2, "{descriptors}");
+    let external = descs[0]["desc"].as_str().expect("desc");
+    assert!(
+        external.starts_with("wpkh([") && external.contains("/0/*)#"),
+        "{external}"
+    );
+    assert_eq!(descs[0]["internal"], json!(false));
+    assert_eq!(descs[1]["internal"], json!(true));
+    assert!(descs[1]["desc"].as_str().unwrap().contains("/1/*)#"));
+    assert!(
+        descs[0]["next_index"].as_u64().unwrap() >= 1,
+        "{descriptors}"
+    );
+    let private = zecd.call("listdescriptors", json!([true])).await;
+    assert!(private.is_err(), "private descriptors must be refused");
+
     // The wallet builds, signs (seed-derived signers), and broadcasts a send; the node's
     // mempool accepting it is the proof the signatures are valid.
     let miner_addr = node

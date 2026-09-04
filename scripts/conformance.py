@@ -401,7 +401,7 @@ def main() -> int:
     # compares the address (Bitcoin Core's pair, ported from zallet). This wallet is shielded-only
     # (no transparent addresses to own), so the happy-path round-trip is covered by the
     # regtest_transparent e2e; here we assert the argument/error contract, which is
-    # network-independent. A "t2…" regtest P2SH address is a valid transparent address that does
+    # network-independent. A "t2..." regtest P2SH address is a valid transparent address that does
     # not refer to a key.
     P2SH_ADDR = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v"
     try:
@@ -586,6 +586,13 @@ def main() -> int:
             ck(f"{m} raises (removed in stateless mode)", False)
         except JSONRPCException as e:
             ck(f"{m} -> method not found (-32601)", e.code == -32601, e.code)
+    # Descriptor-wallet methods exist for the BDK engine only; a Zcash wallet cannot serve
+    # them, and a method a wallet cannot serve is indistinguishable from one that does not exist.
+    try:
+        rpc.call("listdescriptors")
+        ck("listdescriptors raises on a Zcash wallet", False)
+    except JSONRPCException as e:
+        ck("listdescriptors -> method not found (-32601) on a Zcash wallet", e.code == -32601, e.code)
     # A non-empty label argument to getnewaddress is rejected (-8); the address itself is fine.
     try:
         rpc.call("getnewaddress", "mylabel")

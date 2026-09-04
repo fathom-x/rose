@@ -11,14 +11,18 @@
 //!
 //! Scope: address issuance, the wallet-shaped reads, the wallet's local chain view
 //! (`getblockcount`/`getbestblockhash` answer from the wallet's own synced checkpoint, the
-//! same authority the Zcash handlers use), history (`listtransactions`/`gettransaction`),
-//! and sends (`sendtoaddress`/`sendmany`/`sendrawtransaction`) - built, signed with
+//! same authority the Zcash handlers use), history (`listtransactions`/`gettransaction`,
+//! `listreceivedbyaddress` - which with `include_empty` is also the enumeration of every
+//! issued receiving address, each tagged with its derivation index), the public descriptors
+//! (`listdescriptors`, Core's shape, the xpub included), and sends (`sendtoaddress`/`sendmany`/`sendrawtransaction`) - built, signed with
 //! seed-derived signers, and broadcast through the wallet's bitcoind upstream.
 
 use serde_json::{json, Value};
 
 use crate::amount::{signed_zats_to_value, value_to_sat_per_kvb, value_to_zats, zats_to_value};
-use crate::btc::actor::{BtcConnState, BtcSendOptions, BtcTxDetail, BtcTxRecord, BtcWalletHandle};
+use crate::btc::actor::{
+    BtcConnState, BtcReceipt, BtcSendOptions, BtcTxDetail, BtcTxRecord, BtcWalletHandle,
+};
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
@@ -40,6 +44,8 @@ pub(crate) const BITCOIN_METHODS: &[&str] = &[
     "getbestblockhash",
     "listtransactions",
     "gettransaction",
+    "listreceivedbyaddress",
+    "listdescriptors",
     "sendtoaddress",
     "sendmany",
     "sendrawtransaction",
@@ -65,6 +71,8 @@ pub(crate) async fn dispatch(
         "getbestblockhash" => Ok(json!(handle.status().synced_hash)),
         "listtransactions" => listtransactions(handle, req).await,
         "gettransaction" => gettransaction(handle, req).await,
+        "listreceivedbyaddress" => listreceivedbyaddress(handle, req).await,
+        "listdescriptors" => listdescriptors(handle, req).await,
         "sendtoaddress" => sendtoaddress(handle, req).await,
         "sendmany" => sendmany(handle, req).await,
         "sendrawtransaction" => sendrawtransaction(handle, req).await,
@@ -379,6 +387,118 @@ async fn gettransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Va
         obj["blockheight"] = json!(height);
     }
     Ok(obj)
+}
+
+/// `listreceivedbyaddress [minconf] [include_empty] [include_watchonly] [address_filter]
+/// [include_immature_coinbase]` - Core's shape over the wallet's receiving addresses, the same
+/// semantics as the Zcash handler: change is never counted, `label` is always `""`,
+/// `include_watchonly` is accepted and ignored (watch-only is wallet-level), and
+/// `include_immature_coinbase` is accepted and ignored (an address this wallet hands out is
+/// never a coinbase destination). `include_empty` unions every address the wallet has ever
+/// revealed, which makes `listreceivedbyaddress 0 true` the enumeration of the issued set -
+/// Core has no `listaddresses` either. Each entry carries zecd's `address_index` extension,
+/// the external-keychain derivation index `getaddressinfo` reports as `address_index`, so a
+/// caller reconciling an issued range never needs one `getaddressinfo` per address.
+/// Entries ascend by index. A filter naming an address that is not the wallet's answers `[]`.
+async fn listreceivedbyaddress(
+    handle: &BtcWalletHandle,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let minconf = match req.param(0) {
+        None | Some(Value::Null) => 1,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| RpcError::invalid_parameter("minconf must be a non-negative integer"))?,
+    };
+    let flag = |v: Option<&Value>, name: &str| -> Result<bool, RpcError> {
+        match v {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(_) => Err(RpcError::type_error(format!("{name} must be a boolean"))),
+        }
+    };
+    let include_empty = flag(req.param(1), "include_empty")?;
+    let _include_watchonly = flag(req.param(2), "include_watchonly")?;
+    let filter = match req.param(3) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(a)) => {
+            // The actor's parse enforces validity and the wallet's network, as Core does
+            // before matching (an invalid filter is an error, a foreign one matches nothing).
+            handle.address_info(a.clone()).await?;
+            Some(a.clone())
+        }
+        Some(_) => return Err(RpcError::type_error("address_filter must be a string")),
+    };
+    let _include_immature_coinbase = flag(req.param(4), "include_immature_coinbase")?;
+    let entries: Vec<Value> = handle
+        .received_by_address()
+        .await?
+        .into_iter()
+        .filter(|a| filter.as_deref().is_none_or(|f| f == a.address))
+        .filter_map(|a| {
+            let counted: Vec<&BtcReceipt> = a
+                .receipts
+                .iter()
+                .filter(|r| r.confirmations >= minconf)
+                .collect();
+            if counted.is_empty() && !include_empty {
+                return None;
+            }
+            let amount: u64 = counted.iter().map(|r| r.amount_sat).sum();
+            let confirmations = counted.iter().map(|r| r.confirmations).min().unwrap_or(0);
+            let mut txids: Vec<&str> = counted.iter().map(|r| r.txid.as_str()).collect();
+            txids.dedup();
+            Some(json!({
+                "address": a.address,
+                "amount": zats_to_value(amount),
+                "confirmations": confirmations,
+                "label": "",
+                "txids": txids,
+                "address_index": a.index,
+            }))
+        })
+        .collect();
+    Ok(Value::Array(entries))
+}
+
+/// `listdescriptors [private]` - Bitcoin Core's shape: the wallet's two public descriptors
+/// (receiving `/0/*`, change `/1/*`), each with its next unused index and the range the
+/// wallet watches. This is where the account xpub is read over RPC (`zecd export-xpub` is
+/// the offline route). `private = true` is refused with `-4`: the database holds public
+/// descriptors only and the seed never leaves the process, so there is no private
+/// descriptor to return - Core answers a private-keys-disabled wallet the same way.
+async fn listdescriptors(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    match req.param(0) {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(RpcError::wallet(
+                "Private descriptors are not available over RPC: the wallet database holds \
+                 public descriptors only and the seed never leaves the process (the mnemonic \
+                 in keys.toml is the private backup)",
+            ))
+        }
+        Some(_) => return Err(RpcError::type_error("private must be a boolean")),
+    }
+    let descriptors: Vec<Value> = handle
+        .descriptors()
+        .await?
+        .into_iter()
+        .map(|d| {
+            json!({
+                "desc": d.desc,
+                "timestamp": d.timestamp,
+                "active": true,
+                "internal": d.internal,
+                "range": [0, d.range_end],
+                "next": d.next_index,
+                "next_index": d.next_index,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "wallet_name": handle.name,
+        "descriptors": descriptors,
+    }))
 }
 
 async fn sendtoaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {

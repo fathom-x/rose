@@ -65,6 +65,7 @@ pub const ALL_METHODS: &[&str] = &[
     "listunspent",
     "getreceivedbyaddress",
     "listreceivedbyaddress",
+    "listdescriptors",
     "listwallets",
     // Wallet - writes / async
     "getnewaddress",
@@ -141,6 +142,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("listunspent", 5),
     ("getreceivedbyaddress", 3),
     ("listreceivedbyaddress", 5),
+    ("listdescriptors", 1),
     ("listwallets", 0),
     // Wallet - writes / async
     ("getnewaddress", 2),
@@ -177,14 +179,15 @@ enum MethodCoins {
 
 /// The coins that serve each dispatched method.
 ///
-/// Three tiers. `All` marks the wallet-independent shell (control methods and the registry
+/// Four tiers. `All` marks the wallet-independent shell (control methods and the registry
 /// list), which no engine is involved in serving. The nine `z_*` methods are Zcash-only by
 /// nature (shielded sends, the shielding/merge sweeps, the async-operation trio, zcashd's
-/// account address derivation). Everything else is the shared Bitcoin-Core dialect *in
-/// shape*, but each method is listed for a coin only once that coin's engine actually serves
-/// it - a method the engine cannot serve yet must read as method-not-found, not reach a
-/// Zcash-typed handler. The BDK engine's surface grows by moving entries from `ZCASH_ONLY`
-/// to `ZCASH_AND_BITCOIN` alongside the handler branch that serves them.
+/// account address derivation). `BITCOIN_ONLY` holds the Core methods that only make sense
+/// for a descriptor wallet (`listdescriptors`). Everything else is the shared Bitcoin-Core
+/// dialect *in shape*, but each method is listed for a coin only once that coin's engine
+/// actually serves it - a method the engine cannot serve yet must read as method-not-found,
+/// not reach a Zcash-typed handler. The BDK engine's surface grows by moving entries from
+/// `ZCASH_ONLY` to `ZCASH_AND_BITCOIN` alongside the handler branch that serves them.
 ///
 /// Kept in lockstep with [`ALL_METHODS`] by the `method_coins_table_matches_all_methods` test.
 const ZCASH_ONLY: &[Coin] = &[Coin::Zcash];
@@ -192,6 +195,13 @@ const ZCASH_ONLY: &[Coin] = &[Coin::Zcash];
 /// set is identical to [`ZCASH_ONLY`], so the table needs no cfg of its own).
 const ZCASH_AND_BITCOIN: &[Coin] = &[
     Coin::Zcash,
+    #[cfg(feature = "bitcoin")]
+    Coin::Bitcoin,
+];
+/// Methods only the BDK engine serves (a descriptor wallet has descriptors; a Zcash account
+/// has viewing keys, exported offline by `export-ufvk`). Empty in a build without the
+/// feature, so the gate answers `-32601` everywhere, exactly as for an unknown method.
+const BITCOIN_ONLY: &[Coin] = &[
     #[cfg(feature = "bitcoin")]
     Coin::Bitcoin,
 ];
@@ -241,7 +251,11 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("gettransaction", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("listunspent", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("getreceivedbyaddress", MethodCoins::Only(ZCASH_ONLY)),
-    ("listreceivedbyaddress", MethodCoins::Only(ZCASH_ONLY)),
+    (
+        "listreceivedbyaddress",
+        MethodCoins::Only(ZCASH_AND_BITCOIN),
+    ),
+    ("listdescriptors", MethodCoins::Only(BITCOIN_ONLY)),
     ("getaddressinfo", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("z_listtransactions", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - writes
@@ -432,6 +446,11 @@ async fn dispatch_zecd(
             wallet_methods::z_getaddressforaccount(state, wallet, req).await
         }
 
+        // Bitcoin-only, served by `btc_methods` above; for every other wallet the coin gate
+        // has already answered -32601, so this arm is never reached. It exists so the
+        // dispatch table and `ALL_METHODS` stay in lockstep (the test scans these arms).
+        "listdescriptors" => Err(RpcError::method_not_found(&req.method)),
+
         other => Err(RpcError::method_not_found(other)),
     }
 }
@@ -514,6 +533,9 @@ mod tests {
             "ping",
             "listwallets",
         ];
+        /// Core methods with no Zcash meaning at all: the only entries allowed to leave
+        /// Zcash out of their coin set.
+        const BITCOIN_ONLY_METHODS: &[&str] = &["listdescriptors"];
         for (method, coins) in super::METHOD_COINS {
             if method.starts_with("z_") {
                 assert_eq!(
@@ -532,10 +554,18 @@ mod tests {
                         WALLET_INDEPENDENT.iter().all(|m| m != method),
                         "{method} is wallet-independent and should be MethodCoins::All"
                     );
-                    assert!(
-                        coins.contains(&Coin::Zcash),
-                        "{method}: every wallet-touching method is served for Zcash"
-                    );
+                    if BITCOIN_ONLY_METHODS.contains(method) {
+                        assert_eq!(
+                            *coins,
+                            super::BITCOIN_ONLY,
+                            "{method} is a descriptor-wallet method and must be gated to Bitcoin"
+                        );
+                    } else {
+                        assert!(
+                            coins.contains(&Coin::Zcash),
+                            "{method}: every other wallet-touching method is served for Zcash"
+                        );
+                    }
                 }
             }
         }

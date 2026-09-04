@@ -49,6 +49,16 @@
   th { color: var(--dim); font-weight: 500; }
   td.amt.pos { color: var(--good); } td.amt.neg { color: var(--bad); }
   td.txid { color: var(--dim); }
+  tfoot td { border-bottom: none; border-top: 2px solid var(--line); color: var(--dim); }
+  .tabs { display: flex; gap: .25rem; border-bottom: 1px solid var(--line); margin-bottom: .75rem; }
+  .tab { background: transparent; color: var(--dim); border: none; border-bottom: 2px solid transparent;
+         padding: .4rem .8rem; font-size: .95rem; cursor: pointer; border-radius: 0; }
+  .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  #xpub { font-family: ui-monospace, monospace; font-size: .8rem; word-break: break-all;
+          margin-bottom: .75rem; }
+  #xpub-origin { color: var(--dim); font-family: ui-monospace, monospace; font-size: .8rem;
+                 min-height: 1.2em; }
+  tfoot td.amt { font-weight: 600; }
   .dot { display: inline-block; width: .55em; height: .55em; border-radius: 50%;
          background: var(--dim); margin-right: .35em; }
   .dot.ok { background: var(--good); } .dot.err { background: var(--bad); }
@@ -118,13 +128,36 @@
 </div>
 
 <div class="card">
-  <h2>Recent transactions</h2>
-  <div class="tablewrap">
-    <table>
-      <thead><tr><th>time</th><th>type</th><th style="text-align:right">amount</th>
-                 <th>conf</th><th>address</th><th>txid</th></tr></thead>
-      <tbody id="txs"><tr><td colspan="6" style="color:var(--dim)">&ndash;</td></tr></tbody>
-    </table>
+  <div class="tabs" role="tablist">
+    <button class="tab active" data-tab="txs" role="tab">Transactions</button>
+    <button class="tab" data-tab="addrs" role="tab">Addresses</button>
+  </div>
+  <div id="pane-txs" class="pane">
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>time</th><th style="text-align:right">debit</th>
+                   <th style="text-align:right">credit</th><th style="text-align:right">fee</th>
+                   <th>conf</th><th>address</th><th>txid</th>
+                   <th style="text-align:right">net</th></tr></thead>
+        <tbody id="txs"><tr><td colspan="8" style="color:var(--dim)">&ndash;</td></tr></tbody>
+        <!-- Totals over the wallet's whole history, not just the rows shown above. -->
+        <tfoot id="txtotals"></tfoot>
+      </table>
+    </div>
+  </div>
+  <div id="pane-addrs" class="pane" hidden>
+    <!-- The account xpub, from listdescriptors: the receiving descriptor's key with its
+         origin. Public material only; zecd refuses the private form. -->
+    <label style="margin-top:0">account xpub</label>
+    <div id="xpub-origin" title="key origin: master key fingerprint / BIP 84 derivation path"></div>
+    <div id="xpub" style="color:var(--dim)">&ndash;</div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>index</th><th>address</th><th style="text-align:right">balance</th>
+                   <th style="text-align:right">received</th><th>txs</th></tr></thead>
+        <tbody id="addrs"><tr><td colspan="5" style="color:var(--dim)">&ndash;</td></tr></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -171,6 +204,10 @@ async function rpc(method, params = [], raw = {}) {
 }
 
 const fmt = v => Number(v).toFixed(8);
+// Amounts are 8-dp decimals; sum them as integer satoshis so a long history cannot
+// accumulate float drift, then format the integer back to 8 dp.
+const toSats = v => Math.round(Number(v) * 1e8);
+const fmtSats = n => (n < 0 ? "-" : "") + (Math.abs(n) / 1e8).toFixed(8);
 const short = (s, n = 12) => s && s.length > n ? s.slice(0, n) + "..." : (s || "");
 const copyBtn = v => v ? `<button class="copy" data-copy="${v}" title="copy">⧉</button>` : "";
 
@@ -183,14 +220,64 @@ document.addEventListener("click", async e => {
   setTimeout(() => { btn.classList.remove("done"); btn.textContent = "⧉"; }, 1200);
 });
 
+// The Addresses tab: the account xpub (the receiving descriptor's origin-qualified key,
+// e.g. [d34db33f/84'/1'/0']tpub...) and every address the wallet has handed out, by index.
+function renderAddresses(received, descriptors, unspent) {
+  const ext = descriptors && descriptors.descriptors
+    ? descriptors.descriptors.find(d => !d.internal) : null;
+  if (ext) {
+    // desc = wpkh([<fingerprint>/84'/c'/0']<xpub>/0/*)#checksum: the bracketed key origin
+    // goes beside the label, the key itself on its own line.
+    const m = /\[([^\]]+)\]([A-Za-z0-9]+)/.exec(ext.desc);
+    $("xpub").style.color = "";
+    // Origin is "<fingerprint>/<path>": the master key fingerprint (identifies the seed the
+    // key came from) and the hardened BIP 84 path down to this account.
+    const [fp, ...path] = (m ? m[1] : "").split("/");
+    $("xpub-origin").innerHTML = m
+      ? `fingerprint: ${fp}<br>path: m/${path.join("/")}`
+      : "";
+    $("xpub").innerHTML = m
+      ? `${m[2]}${copyBtn(m[2])}`
+      : `${ext.desc}${copyBtn(ext.desc)}`;
+  } else {
+    $("xpub").style.color = "var(--dim)";
+    $("xpub-origin").innerHTML = "";
+    $("xpub").textContent = "unavailable (listdescriptors failed)";
+  }
+  const balance = new Map();   // address -> unspent satoshis
+  for (const u of unspent || []) balance.set(u.address, (balance.get(u.address) || 0) + toSats(u.amount));
+  const rows = (received || []).slice().sort((a, b) => a.address_index - b.address_index)
+    .map(a => {
+      const bal = balance.get(a.address) || 0;
+      return `<tr>
+        <td>${a.address_index ?? ""}</td>
+        <td title="${a.address}">${a.address}${copyBtn(a.address)}</td>
+        <td class="amt ${bal > 0 ? "pos" : ""}" style="text-align:right">${unspent ? fmtSats(bal) : "?"}</td>
+        <td style="text-align:right">${fmt(a.amount)}</td>
+        <td>${(a.txids || []).length}</td>
+      </tr>`;
+    });
+  $("addrs").innerHTML = rows.length ? rows.join("")
+    : `<tr><td colspan="5" style="color:var(--dim)">${received ? "no addresses issued yet" : "unavailable (listreceivedbyaddress failed)"}</td></tr>`;
+}
+
 async function refresh() {
   try {
-    const [balances, height, hash, txs, info] = await Promise.all([
+    const [balances, height, hash, txs, info, received, descriptors, unspent] = await Promise.all([
       rpc("getbalances"),
       rpc("getblockcount"),
       rpc("getbestblockhash"),
-      rpc("listtransactions", ["*", 25]),
+      // The whole history in one call: the table shows the newest rows, the footer
+      // sums every transfer to and from the wallet.
+      rpc("listtransactions", ["*", 1000000]),
       rpc("getwalletinfo"),
+      // Every issued receiving address with its index (include_empty), and the public
+      // descriptors for the xpub. Both are bitcoin-wallet methods; a failure here must not
+      // take the transactions tab down with it.
+      rpc("listreceivedbyaddress", [0, true]).catch(() => null),
+      rpc("listdescriptors").catch(() => null),
+      // Per-address balances: every unspent output (0-conf included), summed by address.
+      rpc("listunspent", [0]).catch(() => null),
     ]);
     setWatchOnly(info.private_keys_enabled === false);
     spendable = Number(balances.mine.trusted);
@@ -203,20 +290,56 @@ async function refresh() {
     const upstream = info.upstream_connected === false ? " · upstream disconnected" : "";
     $("chaintext").textContent = `wallet height ${height} · ${short(hash, 16)}${upstream}`;
 
-    const rows = txs.slice().reverse().map(tx => {
-      const amt = Number(tx.amount);
+    // A fee belongs to the transaction as a whole (the surplus of its inputs over its
+    // outputs, claimed by the block's coinbase), not to any recipient row - Core merely
+    // repeats the transaction's `fee` on every send entry it fans out to. So each funded
+    // transaction gets one synthetic `fee` row of its own, placed just before its send
+    // rows in history order (below them once the list is shown newest first), with the
+    // coinbase named as the counterparty; recipient rows carry no fee.
+    const entries = [];
+    const feeRowFor = new Set();
+    for (const tx of txs) {
+      const sats = toSats(tx.amount);
+      if (tx.fee !== undefined && sats < 0 && !feeRowFor.has(tx.txid)) {
+        feeRowFor.add(tx.txid);
+        const fee = -toSats(tx.fee);
+        const payee = tx.blockheight ? `coinbase, block ${tx.blockheight}` : "coinbase (unmined)";
+        entries.push({ tx: { ...tx, category: "fee", address: payee }, debit: 0, credit: 0,
+                       fee, net: -fee, synthetic: true });
+      }
+      entries.push({ tx, debit: sats < 0 ? -sats : 0, credit: sats >= 0 ? sats : 0, fee: 0,
+                     net: sats });
+    }
+    const rows = entries.slice(-25).reverse().map(({ tx, debit, credit, fee, net, synthetic }) => {
       const when = tx.time ? new Date(tx.time * 1000).toLocaleString() : "";
       return `<tr>
         <td>${when}</td>
-        <td>${tx.category || ""}</td>
-        <td class="amt ${amt < 0 ? "neg" : "pos"}" style="text-align:right">${fmt(tx.amount)}</td>
+        <td class="amt neg" style="text-align:right">${debit ? fmtSats(debit) : ""}</td>
+        <td class="amt pos" style="text-align:right">${credit ? fmtSats(credit) : ""}</td>
+        <td class="amt neg" style="text-align:right">${fee ? fmtSats(fee) : ""}</td>
         <td>${tx.confirmations ?? 0}</td>
-        <td title="${tx.address || ""}">${short(tx.address, 18)}${copyBtn(tx.address)}</td>
+        <td title="${tx.address || ""}">${synthetic ? tx.address : short(tx.address, 18) + copyBtn(tx.address)}</td>
         <td class="txid" title="${tx.txid}">${short(tx.txid)}${copyBtn(tx.txid)}</td>
+        <td class="amt ${net < 0 ? "neg" : "pos"}" style="text-align:right">${fmtSats(net)}</td>
       </tr>`;
     });
     $("txs").innerHTML = rows.length ? rows.join("")
-      : `<tr><td colspan="6" style="color:var(--dim)">no transactions yet</td></tr>`;
+      : `<tr><td colspan="8" style="color:var(--dim)">no transactions yet</td></tr>`;
+    // Footer: each column summed over the whole history (Core reports a send's amount
+    // without its fee, so debits and fees are separate columns); net = credits - debits -
+    // fees, which is what the wallet's balance should equal once everything confirms.
+    const sum = key => entries.reduce((acc, e) => acc + e[key], 0);
+    const outSats = sum("debit"), inSats = sum("credit"), feeSats = sum("fee");
+    const net = inSats - outSats - feeSats;
+    $("txtotals").innerHTML = txs.length ? `<tr>
+        <td>total over ${new Set(txs.map(t => t.txid)).size} transactions, ${entries.length} rows</td>
+        <td class="amt neg" style="text-align:right" title="sum of debits">${fmtSats(outSats)}</td>
+        <td class="amt pos" style="text-align:right" title="sum of credits">${fmtSats(inSats)}</td>
+        <td class="amt neg" style="text-align:right" title="sum of fees">${fmtSats(feeSats)}</td>
+        <td colspan="3"></td>
+        <td class="amt ${net < 0 ? "neg" : "pos"}" style="text-align:right" title="credits - debits - fees">${fmtSats(net)}</td>
+      </tr>` : "";
+    renderAddresses(received, descriptors, unspent);
   } catch (e) {
     $("conn").className = "dot err";
     $("chaintext").textContent = e.message;
@@ -350,6 +473,14 @@ loadInfo();  // sets backend, then kicks the first fee refresh
 refresh();
 setInterval(refresh, 5000);
 setInterval(refreshFee, 30000);  // fee estimate changes slowly; poll less often
+
+// Tabs: one pane visible at a time; the choice is not persisted.
+for (const tab of document.querySelectorAll(".tab")) {
+  tab.addEventListener("click", () => {
+    for (const t of document.querySelectorAll(".tab")) t.classList.toggle("active", t === tab);
+    for (const pane of document.querySelectorAll(".pane")) pane.hidden = pane.id !== `pane-${tab.dataset.tab}`;
+  });
+}
 </script>
 </body>
 </html>

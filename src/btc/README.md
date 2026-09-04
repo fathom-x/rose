@@ -258,14 +258,6 @@ Everything here is refused with a clear error rather than silently ignored or ha
   - **Unfiltered transaction relay from the trusted peer.** No server at all, raw-size
     bandwidth, and the wallet matches every relayed transaction locally. It needs the
     `bip157` crate to expose transaction relay, which it does not today.
-- **A bitcoin-only daemon still pays two Zcash startup costs** (seen on a full-mode
-  testnet4 deployment with no Zcash wallet, 2026-09-03). The `starting zecd` banner
-  reports `backend=zebra://...`, the Zcash `[backend] server` default, which nothing dials;
-  it should name the wallets' actual upstreams. And `ProvingKeys::spawn_build` runs
-  unconditionally, ~4s of CPU plus the memory two proving keys hold, for a daemon that
-  will never send a Zcash transaction; gate it on at least one loaded Zcash wallet and keep
-  the lazy first-send build as the fallback. Both are `node.rs`/`daemon.rs` wiring, neither
-  affects correctness.
 - **`[rpc] bind` is one address.** A host that must serve both loopback clients and a
   container across the docker bridge has to choose `0.0.0.0` (every interface, wrong on a
   public host) or the bridge gateway alone and repoint every local client (`--zecd-url`,

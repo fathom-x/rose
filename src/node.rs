@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 use crate::backend;
@@ -67,6 +67,18 @@ impl NodeBuilder {
     pub async fn start(self) -> anyhow::Result<Node> {
         self.prepare()?.start().await
     }
+}
+
+/// How many of the configured Zcash wallets are initialized (`keys.toml` present) and so
+/// will actually be spawned - the gate for the background proving-key build, which only a
+/// Zcash send can ever consume. Bitcoin wallets never count, whatever the build.
+fn zcash_wallets_to_spawn(config: &AppConfig) -> usize {
+    config
+        .wallets
+        .values()
+        .filter(|entry| entry.coin == crate::coin::Coin::Zcash)
+        .filter(|entry| WalletStore::exists(&entry.keys_path()))
+        .count()
 }
 
 /// A node that has passed the fail-fast checks ([`NodeBuilder::prepare`]) but has not yet
@@ -122,6 +134,12 @@ impl PreparedNode {
         // the health and RPC listeners) - leaving the node unreachable and not syncing for the
         // whole window. The first send awaits `ProvingKeys::get`; by then it is normally long
         // finished.
+        //
+        // Only a Zcash wallet can ever await the keys, so the background build is kicked off
+        // only when at least one *initialized* Zcash wallet is about to be spawned: a
+        // bitcoin-only daemon used to pay ~4s of CPU and hold two proving keys for sends it
+        // could never make. The handle still exists in that case, so the lazy first-send
+        // build stays the fallback for any wallet that does get spawned.
         let orchard_keys = if config.spend.cache_proving_key {
             // Also build the PostNu6_3 (Ironwood) proving key when this network can activate
             // NU6.3, so post-NU6.3 sends prove the Ironwood bundle from the cache instead of
@@ -132,16 +150,23 @@ impl PreparedNode {
                 .network
                 .activation_height(NetworkUpgrade::Nu6_3)
                 .is_some();
-            info!(
-                "building Orchard proving key{} in the background (cached for all sends)",
-                if build_ironwood {
-                    " + Ironwood (PostNu6_3) proving key"
-                } else {
-                    ""
-                }
-            );
             let keys = actor::ProvingKeys::new(build_ironwood);
-            keys.spawn_build();
+            if zcash_wallets_to_spawn(&config) > 0 {
+                info!(
+                    "building Orchard proving key{} in the background (cached for all sends)",
+                    if build_ironwood {
+                        " + Ironwood (PostNu6_3) proving key"
+                    } else {
+                        ""
+                    }
+                );
+                keys.spawn_build();
+            } else {
+                debug!(
+                    "no initialized Zcash wallet to spawn; skipping the background proving-key \
+                     build (a Zcash send would build the keys on demand)"
+                );
+            }
             Some(keys)
         } else {
             None

@@ -56,7 +56,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         network = config.network.name(),
         datadir = %config.datadir.display(),
-        backend = %config.backend.server,
+        upstreams = %upstream_summary(&config),
         "starting zecd"
     );
     // Fail-fast phase first (datadir lock, placeholder-password refusal, panic hook), then the
@@ -177,6 +177,39 @@ where
 /// cross the network in the clear. A password passed via `--rpcpassword` on the command line
 /// (`password_on_cli`) is called out separately: it leaks to any local user through
 /// `/proc/<pid>/cmdline` and `ps`, independent of the bind address.
+/// The banner's `upstreams` field: every configured wallet with the endpoint it will
+/// actually dial, resolved by that wallet's own engine - `name=zebra-rpc 127.0.0.1:8234`,
+/// `name=kyoto (p2p, trusted peer ...)` - rather than the Zcash `[backend] server`
+/// default, which a bitcoin-only daemon reported while nothing dialed it. Resolution is the
+/// same pure token parse the spawn path runs, so a token that fails here fails the spawn
+/// too; the banner just says so rather than pre-empting that error.
+#[cfg(feature = "server")]
+fn upstream_summary(config: &AppConfig) -> String {
+    if config.wallets.is_empty() {
+        return "none configured".to_string();
+    }
+    config
+        .wallets
+        .iter()
+        .map(|(name, entry)| {
+            let described = match entry.coin {
+                crate::coin::Coin::Zcash => {
+                    crate::backend::resolve_for_wallet(config, entry).map(|s| s.describe())
+                }
+                #[cfg(feature = "bitcoin")]
+                crate::coin::Coin::Bitcoin => {
+                    crate::btc::chain::resolve_for_wallet(config, entry).map(|e| e.describe())
+                }
+            };
+            match described {
+                Ok(upstream) => format!("{name}={upstream}"),
+                Err(_) => format!("{name}=<unresolvable server token>"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(feature = "server")]
 fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
     if !rpc.auth.is_empty() {
@@ -292,6 +325,46 @@ mod tests {
         let err = ensure_single_spending_wallet(&two_btc, false)
             .expect_err("two bitcoin spenders must be rejected");
         assert!(err.to_string().contains("bitcoin"), "{err}");
+    }
+
+    /// The banner names each wallet's own upstream, resolved by its engine, instead of the
+    /// Zcash `[backend] server` default - so a bitcoin-only daemon no longer announces a
+    /// zebra it never dials, and a per-wallet override shows as what it resolves to.
+    #[cfg(all(feature = "cli", feature = "server"))]
+    #[test]
+    fn banner_names_each_wallets_resolved_upstream() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        let bitcoin_wallet = if cfg!(feature = "bitcoin") {
+            "[wallets.btc]\ncoin = \"bitcoin\"\nserver = \"kyoto://10.0.0.7:48333\"\n"
+        } else {
+            ""
+        };
+        let toml = format!(
+            "network = \"test\"\ndatadir = \"{}\"\n[wallets.zec]\n[wallets.lwd]\nserver = \"zecrocks\"\n{bitcoin_wallet}",
+            dir.path().display()
+        );
+        std::fs::write(&conf, toml).unwrap();
+        let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cfg = crate::config::AppConfig::resolve(&cli).unwrap();
+
+        let summary = super::upstream_summary(&cfg);
+        assert!(
+            summary.contains("zec=zebra-rpc 127.0.0.1:18234"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("lwd=lightwalletd testnet.zec.rocks:443 (tls=true)"),
+            "{summary}"
+        );
+        #[cfg(feature = "bitcoin")]
+        assert!(
+            summary.contains("btc=kyoto (p2p, trusted peer 10.0.0.7:48333)"),
+            "{summary}"
+        );
+        // The raw default token never appears: every entry is a resolved endpoint.
+        assert!(!summary.contains("zebra://"), "{summary}");
     }
 
     #[test]

@@ -9,12 +9,22 @@ It asserts the fields/types BTCPay-style integrations and Bitcoin RPC libraries 
 amounts round-trip as exact decimals (not floats), batching works, and errors carry the
 expected Bitcoin Core codes.
 
-Usage:  python3 scripts/conformance.py [--url http://127.0.0.1:18232/] [--user u] [--password p]
+Usage:  python3 scripts/conformance.py [--coin zcash|bitcoin] [--url http://127.0.0.1:18232/]
+                                       [--user u] [--password p]
                                        [--passphrase <wallet passphrase>]
 
-`--passphrase`: the wallet passphrase, when the wallet under test is encrypted. Enables the
-full encryption state machine (lock/unlock/passphrase-change round-trips); the wallet is left
-as it was found (same passphrase, unlocked).
+`--coin` selects the engine the wallet under test runs on (default `zcash`). The checks are
+organised as sections, each tagged with the coins it applies to - a readable copy of
+`rpc::METHOD_COINS`: a section tagged with both coins asserts the shared Bitcoin-Core shape
+against either engine, a Zcash-only one covers the `z_*` extensions, the chain reads and the
+shielded fields, a Bitcoin-only one the descriptor-wallet surface (`listdescriptors`, the
+BIP 84 derivation fields). A method served for a new coin gets its checks by adding the tag.
+In Bitcoin mode every send check rejects at argument parsing, so the suite moves no funds.
+
+`--passphrase`: the wallet passphrase, when the wallet under test is encrypted (Zcash only -
+the Bitcoin engine has no passphrase RPCs). Enables the full encryption state machine
+(lock/unlock/passphrase-change round-trips); the wallet is left as it was found (same
+passphrase, unlocked).
 """
 import argparse
 import base64
@@ -66,28 +76,38 @@ class AuthServiceProxy:
         return self._post(payload)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="http://127.0.0.1:18232/")
-    ap.add_argument("--user", default="u")
-    ap.add_argument("--password", default="p")
-    ap.add_argument("--passphrase", default="",
-                    help="wallet passphrase (enables the encrypted-wallet state-machine checks)")
-    args = ap.parse_args()
-    rpc = AuthServiceProxy(args.url, args.user, args.password)
+ZCASH = "zcash"
+BITCOIN = "bitcoin"
+BOTH = (ZCASH, BITCOIN)
 
-    passed = failed = 0
+# The sections, in run order. Each is `(title, coins, fn)`; `main` runs the ones tagged
+# with the selected coin, in this order, so the Zcash run is the same sequence of checks
+# it always was.
+SECTIONS = []
 
-    def ck(name, cond, detail=""):
-        nonlocal passed, failed
-        if cond:
-            passed += 1
-            print(f"  PASS {name} {detail}")
-        else:
-            failed += 1
-            print(f"  FAIL {name} {detail}")
 
-    print("== getblockchaininfo fields/types ==")
+def section(title, *coins):
+    def register(fn):
+        SECTIONS.append((title, frozenset(coins), fn))
+        return fn
+    return register
+
+
+class Ctx:
+    """What the sections share: the client, the check recorder, the arguments, and the
+    handful of values one section establishes for later ones (the tip, the wallet info,
+    the balance, a fresh own address)."""
+
+    def __init__(self, rpc, ck, args):
+        self.rpc = rpc
+        self.ck = ck
+        self.args = args
+        self.coin = args.coin
+
+
+@section("getblockchaininfo fields/types", ZCASH)
+def s_getblockchaininfo(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     bci = rpc.call("getblockchaininfo")
     for f in ("chain", "blocks", "headers", "bestblockhash", "verificationprogress",
               "initialblockdownload", "pruned", "difficulty", "warnings"):
@@ -96,16 +116,29 @@ def main() -> int:
     ck("blocks is int", isinstance(bci["blocks"], int))
     ck("bestblockhash 64-hex", isinstance(bci["bestblockhash"], str) and len(bci["bestblockhash"]) == 64)
 
-    print("== blocks/hash consistency ==")
+
+@section("blocks/hash consistency", *BOTH)
+def s_chain_tip(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     # The classic poller pattern must hold: getblockhash(getblockcount()) succeeds and
     # agrees with getbestblockhash (all three describe the fully-scanned block).
     count = rpc.call("getblockcount")
     ck("getblockcount is int", isinstance(count, int))
     best = rpc.call("getbestblockhash")
-    at_count = rpc.call("getblockhash", count)
-    ck("getblockhash(getblockcount()) == getbestblockhash", best == at_count, f"{best} != {at_count}")
+    if ctx.coin == ZCASH:
+        at_count = rpc.call("getblockhash", count)
+        ck("getblockhash(getblockcount()) == getbestblockhash", best == at_count, f"{best} != {at_count}")
+    else:
+        # The Bitcoin engine serves no getblockhash; the pair describes the wallet's own
+        # synced checkpoint, which getwalletinfo.lastprocessedblock repeats (checked there).
+        ck("getbestblockhash 64-hex", isinstance(best, str) and len(best) == 64, best)
+    ctx.count, ctx.best = count, best
 
-    print("== waitfor block RPCs ==")
+
+@section("waitfor block RPCs", ZCASH)
+def s_waitfor(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
+    count, best = ctx.count, ctx.best
     # These answer "has the wallet scanned to height N?" - the question a balance poll cannot,
     # since an incoming payment is credited from the mempool before its block is scanned. All
     # three return {hash, height} describing the fully-scanned block, and a timeout returns that
@@ -177,7 +210,10 @@ def main() -> int:
     except JSONRPCException as e:
         ck("waitforblock bad hash -> code -8", e.code == -8, e.code)
 
-    print("== control methods ==")
+
+@section("control methods", *BOTH)
+def s_control(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     h = rpc.call("help")
     ck("help is a string naming methods", isinstance(h, str) and "getblockchaininfo" in h)
     up = rpc.call("uptime")
@@ -192,7 +228,10 @@ def main() -> int:
        all("duration" in c for c in ri.get("active_commands", [])))
     ck("getrpcinfo has logpath", "logpath" in ri)
 
-    print("== fee & mempool stubs ==")
+
+@section("fee & mempool stubs", ZCASH)
+def s_fee_stubs(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     esf = rpc.call("estimatesmartfee", 2)
     ck("estimatesmartfee.feerate is Decimal",
        isinstance(esf.get("feerate"), decimal.Decimal), repr(esf.get("feerate")))
@@ -205,13 +244,19 @@ def main() -> int:
     ck("getmempoolinfo.mempoolminfee is Decimal",
        isinstance(mp.get("mempoolminfee"), decimal.Decimal), repr(mp.get("mempoolminfee")))
 
-    print("== getnetworkinfo fields ==")
+
+@section("getnetworkinfo fields", ZCASH)
+def s_getnetworkinfo(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     ni = rpc.call("getnetworkinfo")
     for f in ("version", "subversion", "protocolversion", "connections", "relayfee", "networks", "warnings"):
         ck(f"has {f}", f in ni)
     ck("relayfee is Decimal", isinstance(ni["relayfee"], decimal.Decimal), repr(ni["relayfee"]))
 
-    print("== getpeerinfo shape ==")
+
+@section("getpeerinfo shape", ZCASH)
+def s_getpeerinfo(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     pi = rpc.call("getpeerinfo")
     ck("getpeerinfo is list", isinstance(pi, list))
     # Reflects the active lightwalletd upstream; on a synced daemon there should be one "peer".
@@ -221,46 +266,82 @@ def main() -> int:
     cc = rpc.call("getconnectioncount")
     ck("getconnectioncount matches getpeerinfo", cc == len(pi), f"{cc} != {len(pi)}")
 
-    print("== getwalletinfo fields ==")
+
+@section("getwalletinfo fields", *BOTH)
+def s_getwalletinfo(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     wi = rpc.call("getwalletinfo")
     for f in ("walletname", "balance", "unconfirmed_balance", "immature_balance", "txcount", "paytxfee"):
         ck(f"has {f}", f in wi)
     ck("balance is Decimal (not float)", isinstance(wi["balance"], decimal.Decimal), repr(wi["balance"]))
-    # A seeded wallet can sign; only watch-only (init --ufvk) wallets report False here.
+    # A seeded wallet can sign; only watch-only (init --ufvk / --xpub) wallets report False here.
     ck("private_keys_enabled is True", wi.get("private_keys_enabled") is True,
        repr(wi.get("private_keys_enabled")))
-    # The transparent observability block appears only when [pools] transparent is enabled; this
-    # daemon is shielded-only, so it must be absent (the default response shape is unchanged). The
-    # present-and-populated case is asserted by the regtest_transparent e2e.
-    ck("getwalletinfo omits transparent block when disabled", "transparent" not in wi)
-    # `scanning` is Core's union: an object while scanning or draining the enhancement backlog,
-    # literal False when idle. When it is an object it carries zecd's `pending_enhancements`
-    # extension - the only route to the backlog count for a caller with no health server (an
-    # embedded node, or any pure JSON-RPC client). This suite usually runs against a caught-up
-    # daemon, so accept either shape and only constrain the object form.
     scanning = wi.get("scanning")
-    ck("getwalletinfo scanning is an object or False",
-       scanning is False or isinstance(scanning, dict), repr(scanning))
-    # `enhanced_through` is top-level, NOT inside `scanning` - that object is False once the
-    # wallet is idle, which is precisely when a consumer following history as a log is ready to
-    # advance its cursor and therefore needs the watermark. The field must be present (possibly
-    # null) in both states, which is the property this asserts.
-    ck("getwalletinfo carries a top-level enhanced_through", "enhanced_through" in wi, wi.keys())
-    ck("enhanced_through is a height or null",
-       wi["enhanced_through"] is None
-       or (isinstance(wi["enhanced_through"], int) and wi["enhanced_through"] >= 0),
-       repr(wi.get("enhanced_through")))
-    ck("enhanced_through is not nested inside scanning",
-       not (isinstance(scanning, dict) and "enhanced_through" in scanning), repr(scanning))
-    if isinstance(scanning, dict):
-        ck("scanning carries pending_enhancements", "pending_enhancements" in scanning,
-           repr(scanning))
-        ck("pending_enhancements is a non-negative integer",
-           isinstance(scanning.get("pending_enhancements"), int)
-           and scanning["pending_enhancements"] >= 0,
-           repr(scanning.get("pending_enhancements")))
+    if ctx.coin == ZCASH:
+        # The transparent observability block appears only when [pools] transparent is enabled; this
+        # daemon is shielded-only, so it must be absent (the default response shape is unchanged). The
+        # present-and-populated case is asserted by the regtest_transparent e2e.
+        ck("getwalletinfo omits transparent block when disabled", "transparent" not in wi)
+        # `scanning` is Core's union: an object while scanning or draining the enhancement backlog,
+        # literal False when idle. When it is an object it carries zecd's `pending_enhancements`
+        # extension - the only route to the backlog count for a caller with no health server (an
+        # embedded node, or any pure JSON-RPC client). This suite usually runs against a caught-up
+        # daemon, so accept either shape and only constrain the object form.
+        ck("getwalletinfo scanning is an object or False",
+           scanning is False or isinstance(scanning, dict), repr(scanning))
+        # `enhanced_through` is top-level, NOT inside `scanning` - that object is False once the
+        # wallet is idle, which is precisely when a consumer following history as a log is ready to
+        # advance its cursor and therefore needs the watermark. The field must be present (possibly
+        # null) in both states, which is the property this asserts.
+        ck("getwalletinfo carries a top-level enhanced_through", "enhanced_through" in wi, wi.keys())
+        ck("enhanced_through is a height or null",
+           wi["enhanced_through"] is None
+           or (isinstance(wi["enhanced_through"], int) and wi["enhanced_through"] >= 0),
+           repr(wi.get("enhanced_through")))
+        ck("enhanced_through is not nested inside scanning",
+           not (isinstance(scanning, dict) and "enhanced_through" in scanning), repr(scanning))
+        if isinstance(scanning, dict):
+            ck("scanning carries pending_enhancements", "pending_enhancements" in scanning,
+               repr(scanning))
+            ck("pending_enhancements is a non-negative integer",
+               isinstance(scanning.get("pending_enhancements"), int)
+               and scanning["pending_enhancements"] >= 0,
+               repr(scanning.get("pending_enhancements")))
+    else:
+        # The Bitcoin engine's extensions: `coin` names the engine, `lastprocessedblock` (Core
+        # master's field) is the wallet's own synced checkpoint - the same pair getblockcount /
+        # getbestblockhash answer - and `upstream_connected` is the one signal that the chain
+        # source is reachable (Bitcoin wallets serve no getpeerinfo).
+        ck("getwalletinfo.coin is bitcoin", wi.get("coin") == "bitcoin", repr(wi.get("coin")))
+        lpb = wi.get("lastprocessedblock")
+        ck("lastprocessedblock is {hash,height}",
+           isinstance(lpb, dict) and set(lpb) == {"hash", "height"}, lpb)
+        # The wallet may still be applying blocks while this runs (a catch-up, or a block that
+        # just landed), so compare against a fresh read and let the three settle (bounded)
+        # rather than pinning the tip captured earlier.
+        agrees = False
+        for _ in range(40):
+            count_now, best_now = rpc.call("getblockcount"), rpc.call("getbestblockhash")
+            lpb = rpc.call("getwalletinfo")["lastprocessedblock"]
+            if lpb == {"hash": best_now, "height": count_now}:
+                agrees = True
+                break
+            time.sleep(0.5)
+        ck("lastprocessedblock == {getbestblockhash, getblockcount}", agrees, lpb)
+        ck("upstream_connected is a bool", isinstance(wi.get("upstream_connected"), bool),
+           repr(wi.get("upstream_connected")))
+        ck("getwalletinfo scanning is an object or False",
+           scanning is False or isinstance(scanning, dict), repr(scanning))
+        ck("txcount is an int", isinstance(wi["txcount"], int), repr(wi["txcount"]))
+        # No passphrase RPCs on this engine, so no encryption state to report.
+        ck("getwalletinfo omits unlocked_until", "unlocked_until" not in wi)
+    ctx.wi = wi
 
-    print("== amounts are exact decimals ==")
+
+@section("amounts are exact decimals", *BOTH)
+def s_amounts(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     bal = rpc.call("getbalance")
     ck("getbalance is Decimal", isinstance(bal, decimal.Decimal), repr(bal))
     ck("getunconfirmedbalance is Decimal",
@@ -284,8 +365,12 @@ def main() -> int:
         ck("getbalance non-numeric minconf raises", False)
     except JSONRPCException as e:
         ck("getbalance non-numeric minconf -> code -3", e.code == -3, e.code)
+    ctx.bal = bal
 
-    print("== getblockheader ==")
+
+@section("getblockheader", ZCASH)
+def s_getblockheader(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     tip_hash = rpc.call("getblockhash", rpc.call("getblockcount"))
     hdr = rpc.call("getblockheader", tip_hash)
     for f in ("hash", "confirmations", "height", "time", "mediantime"):
@@ -311,92 +396,139 @@ def main() -> int:
     except JSONRPCException as e:
         ck("verbose=false -> code -8", e.code == -8, e.code)
 
-    print("== getbalances ==")
+
+@section("getbalances", *BOTH)
+def s_getbalances(ctx):
+    rpc, ck, bal = ctx.rpc, ctx.ck, ctx.bal
     gb = rpc.call("getbalances")
     mine = gb.get("mine", {})
     for f in ("trusted", "untrusted_pending", "immature"):
         ck(f"mine.{f} is Decimal", isinstance(mine.get(f), decimal.Decimal), repr(mine.get(f)))
     ck("mine.trusted == getbalance", mine.get("trusted") == bal)
-    # zecd extension: mine.coinbase is the portion of trusted that is mature transparent
-    # coinbase - spendable only via z_shieldcoinbase, so it is broken out for callers to see
-    # how much of trusted cannot move through the regular send paths. A subset of trusted (not
-    # a fourth bucket): the Core triple still totals the wallet. This wallet holds no coinbase,
-    # so the value is zero; the populated case is asserted by the regtest coinbase e2e.
-    ck("mine.coinbase is Decimal", isinstance(mine.get("coinbase"), decimal.Decimal),
-       repr(mine.get("coinbase")))
-    ck("mine.coinbase is a subset of trusted",
-       decimal.Decimal(0) <= mine.get("coinbase") <= mine.get("trusted"),
-       repr(mine.get("coinbase")))
+    if ctx.coin == ZCASH:
+        # zecd extension: mine.coinbase is the portion of trusted that is mature transparent
+        # coinbase - spendable only via z_shieldcoinbase, so it is broken out for callers to see
+        # how much of trusted cannot move through the regular send paths. A subset of trusted (not
+        # a fourth bucket): the Core triple still totals the wallet. This wallet holds no coinbase,
+        # so the value is zero; the populated case is asserted by the regtest coinbase e2e.
+        ck("mine.coinbase is Decimal", isinstance(mine.get("coinbase"), decimal.Decimal),
+           repr(mine.get("coinbase")))
+        ck("mine.coinbase is a subset of trusted",
+           decimal.Decimal(0) <= mine.get("coinbase") <= mine.get("trusted"),
+           repr(mine.get("coinbase")))
 
-    print("== addresses ==")
-    # zecd is stateless: getnewaddress takes no label (a label would be off-chain state with no
-    # on-chain source). A non-empty label argument is rejected -8 (checked below).
-    addr = rpc.call("getnewaddress")
-    ck("getnewaddress unified",
-       isinstance(addr, str) and addr.startswith(("u1", "utest1", "uregtest1")))
-    va = rpc.call("validateaddress", addr)
-    ck("validateaddress.isvalid", va["isvalid"] is True)
-    ck("validateaddress echoes address", va.get("address") == addr)
-    # Extension fields: the address's receiver verdicts (a default getnewaddress UA always
-    # exposes an Orchard receiver in the default Orchard-only config).
-    ck("validateaddress has isvalid_orchard", "isvalid_orchard" in va)
-    ck("validateaddress.isvalid_orchard on Orchard UA", va["isvalid_orchard"] is True)
-    # receiver_types enumerates the pools an address can receive into; an Orchard-only UA
-    # carries "orchard".
-    ck("validateaddress.receiver_types lists orchard",
-       isinstance(va.get("receiver_types"), list) and "orchard" in va["receiver_types"],
-       va.get("receiver_types"))
-    # A per-call receiver override (constrained to enabled pools) still yields a UA. "unified"
-    # and "orchard" are always valid against the default config; an unknown type is -5.
-    a2 = rpc.call("getnewaddress", "", "orchard")
-    ck("getnewaddress orchard override",
-       isinstance(a2, str) and a2.startswith(("u1", "utest1", "uregtest1")))
-    ck("getnewaddress orchard override isvalid_orchard",
-       rpc.call("validateaddress", a2)["isvalid_orchard"] is True)
-    try:
-        rpc.call("getnewaddress", "", "boguspool")
-        ck("getnewaddress unknown receiver raises", False)
-    except JSONRPCException as e:
-        ck("getnewaddress unknown receiver -> -5", e.code == -5, e.code)
-    # Transparent receiving is off by default: address_type "transparent" is rejected (-8) unless
-    # the wallet opts in via [pools] transparent = true. (The transparent happy path is covered by
-    # the regtest_transparent e2e, which enables it.)
-    try:
-        rpc.call("getnewaddress", "", "transparent")
-        ck("getnewaddress transparent on shielded-only wallet raises", False)
-    except JSONRPCException as e:
-        ck("getnewaddress transparent -> -8 when disabled", e.code == -8, e.code)
-    # Bitcoin Core returns only the verdict + error details for invalid input.
-    bad = rpc.call("validateaddress", "not-an-address")
-    ck("invalid validateaddress.isvalid False", bad["isvalid"] is False)
-    ck("invalid validateaddress has no address echo",
-       "address" not in bad and "scriptPubKey" not in bad and "isscript" not in bad)
-    ck("invalid validateaddress has error fields",
-       "error" in bad and "error_locations" in bad)
-    ai = rpc.call("getaddressinfo", addr)
-    ck("getaddressinfo.ismine", ai["ismine"] is True)
-    ck("getaddressinfo has no isvalid", "isvalid" not in ai)
-    for f in ("scriptPubKey", "solvable", "iswatchonly", "isscript", "iswitness", "labels",
-              "isvalid_orchard", "receiver_types"):
-        ck(f"getaddressinfo has {f}", f in ai)
-    # zecd is stateless: the labels field is retained for Core shape but is always empty.
-    ck("getaddressinfo.labels always empty (stateless)", ai["labels"] == [], repr(ai["labels"]))
-    # Own addresses are solvable; iswatchonly is deprecated/always false in Core master
-    # (these hold on watch-only wallets too - the signal is private_keys_enabled).
-    ck("getaddressinfo.solvable on own address", ai["solvable"] is True)
-    ck("getaddressinfo.iswatchonly always False", ai["iswatchonly"] is False)
-    # The BIP 44 derivation fields describe a transparent address's place in the address chain, so
-    # they are absent entirely for a shielded one (rather than present-and-null). Their populated
-    # form is asserted in the transparent regtest e2e.
-    for f in ("hdkeypath", "address_index", "ischange"):
-        ck(f"getaddressinfo omits {f} for a shielded address", f not in ai)
+
+@section("addresses", *BOTH)
+def s_addresses(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
+    if ctx.coin == ZCASH:
+        # zecd is stateless: getnewaddress takes no label (a label would be off-chain state with no
+        # on-chain source). A non-empty label argument is rejected -8 (checked below).
+        addr = rpc.call("getnewaddress")
+        ck("getnewaddress unified",
+           isinstance(addr, str) and addr.startswith(("u1", "utest1", "uregtest1")))
+        va = rpc.call("validateaddress", addr)
+        ck("validateaddress.isvalid", va["isvalid"] is True)
+        ck("validateaddress echoes address", va.get("address") == addr)
+        # Extension fields: the address's receiver verdicts (a default getnewaddress UA always
+        # exposes an Orchard receiver in the default Orchard-only config).
+        ck("validateaddress has isvalid_orchard", "isvalid_orchard" in va)
+        ck("validateaddress.isvalid_orchard on Orchard UA", va["isvalid_orchard"] is True)
+        # receiver_types enumerates the pools an address can receive into; an Orchard-only UA
+        # carries "orchard".
+        ck("validateaddress.receiver_types lists orchard",
+           isinstance(va.get("receiver_types"), list) and "orchard" in va["receiver_types"],
+           va.get("receiver_types"))
+        # A per-call receiver override (constrained to enabled pools) still yields a UA. "unified"
+        # and "orchard" are always valid against the default config; an unknown type is -5.
+        a2 = rpc.call("getnewaddress", "", "orchard")
+        ck("getnewaddress orchard override",
+           isinstance(a2, str) and a2.startswith(("u1", "utest1", "uregtest1")))
+        ck("getnewaddress orchard override isvalid_orchard",
+           rpc.call("validateaddress", a2)["isvalid_orchard"] is True)
+        try:
+            rpc.call("getnewaddress", "", "boguspool")
+            ck("getnewaddress unknown receiver raises", False)
+        except JSONRPCException as e:
+            ck("getnewaddress unknown receiver -> -5", e.code == -5, e.code)
+        # Transparent receiving is off by default: address_type "transparent" is rejected (-8) unless
+        # the wallet opts in via [pools] transparent = true. (The transparent happy path is covered by
+        # the regtest_transparent e2e, which enables it.)
+        try:
+            rpc.call("getnewaddress", "", "transparent")
+            ck("getnewaddress transparent on shielded-only wallet raises", False)
+        except JSONRPCException as e:
+            ck("getnewaddress transparent -> -8 when disabled", e.code == -8, e.code)
+        # Bitcoin Core returns only the verdict + error details for invalid input.
+        bad = rpc.call("validateaddress", "not-an-address")
+        ck("invalid validateaddress.isvalid False", bad["isvalid"] is False)
+        ck("invalid validateaddress has no address echo",
+           "address" not in bad and "scriptPubKey" not in bad and "isscript" not in bad)
+        ck("invalid validateaddress has error fields",
+           "error" in bad and "error_locations" in bad)
+        ai = rpc.call("getaddressinfo", addr)
+        ck("getaddressinfo.ismine", ai["ismine"] is True)
+        ck("getaddressinfo has no isvalid", "isvalid" not in ai)
+        for f in ("scriptPubKey", "solvable", "iswatchonly", "isscript", "iswitness", "labels",
+                  "isvalid_orchard", "receiver_types"):
+            ck(f"getaddressinfo has {f}", f in ai)
+        # zecd is stateless: the labels field is retained for Core shape but is always empty.
+        ck("getaddressinfo.labels always empty (stateless)", ai["labels"] == [], repr(ai["labels"]))
+        # Own addresses are solvable; iswatchonly is deprecated/always false in Core master
+        # (these hold on watch-only wallets too - the signal is private_keys_enabled).
+        ck("getaddressinfo.solvable on own address", ai["solvable"] is True)
+        ck("getaddressinfo.iswatchonly always False", ai["iswatchonly"] is False)
+        # The BIP 44 derivation fields describe a transparent address's place in the address chain, so
+        # they are absent entirely for a shielded one (rather than present-and-null). Their populated
+        # form is asserted in the transparent regtest e2e.
+        for f in ("hdkeypath", "address_index", "ischange"):
+            ck(f"getaddressinfo omits {f} for a shielded address", f not in ai)
+    else:
+        # The engine derives BIP 84 native segwit and nothing else: a bech32 address on every
+        # network, `bech32` the only accepted address_type, labels refused like the Zcash side.
+        addr = rpc.call("getnewaddress")
+        ck("getnewaddress bech32",
+           isinstance(addr, str) and addr.startswith(("bc1q", "tb1q", "bcrt1q")), addr)
+        ck("getnewaddress accepts address_type bech32",
+           rpc.call("getnewaddress", "", "bech32").startswith(("bc1q", "tb1q", "bcrt1q")))
+        try:
+            rpc.call("getnewaddress", "", "legacy")
+            ck("getnewaddress legacy raises", False)
+        except JSONRPCException as e:
+            ck("getnewaddress legacy -> -8 (bech32 only)", e.code == -8, e.code)
+        va = rpc.call("validateaddress", addr)
+        ck("validateaddress.isvalid", va["isvalid"] is True)
+        ck("validateaddress echoes address", va.get("address") == addr)
+        # Bitcoin Core returns only the verdict for invalid input.
+        bad = rpc.call("validateaddress", "not-an-address")
+        ck("invalid validateaddress.isvalid False", bad["isvalid"] is False)
+        ck("invalid validateaddress has no address echo", "address" not in bad)
+        ai = rpc.call("getaddressinfo", addr)
+        ck("getaddressinfo.ismine", ai["ismine"] is True)
+        ck("getaddressinfo has no isvalid", "isvalid" not in ai)
+        ck("getaddressinfo.solvable on own address", ai["solvable"] is True)
+        ck("getaddressinfo.iswatchonly always False", ai["iswatchonly"] is False)
+        # The BIP 84 derivation fields are present for every own address: Core's hdkeypath
+        # (receiving keychain, so /0/<index>) and ischange, plus zecd's address_index.
+        ck("getaddressinfo.ischange False on a receiving address", ai.get("ischange") is False,
+           repr(ai.get("ischange")))
+        ck("getaddressinfo.address_index is an int", isinstance(ai.get("address_index"), int),
+           repr(ai.get("address_index")))
+        ck("getaddressinfo.hdkeypath is the BIP 84 receiving path",
+           isinstance(ai.get("hdkeypath"), str)
+           and ai["hdkeypath"].startswith("m/84'/") and "'/0'/0/" in ai["hdkeypath"]
+           and ai["hdkeypath"].endswith(f"/{ai.get('address_index')}"), ai.get("hdkeypath"))
     try:
         rpc.call("getaddressinfo", "not-an-address")
         ck("getaddressinfo invalid raises", False)
     except JSONRPCException as e:
         ck("getaddressinfo invalid -> code -5", e.code == -5, e.code)
+    ctx.addr = addr
 
-    print("== signmessage / verifymessage ==")
+
+@section("signmessage / verifymessage", ZCASH)
+def s_signmessage(ctx):
+    rpc, ck, addr = ctx.rpc, ctx.ck, ctx.addr
     # signmessage signs with a transparent address's key; verifymessage recovers the signer and
     # compares the address (Bitcoin Core's pair, ported from zallet). This wallet is shielded-only
     # (no transparent addresses to own), so the happy-path round-trip is covered by the
@@ -436,7 +568,10 @@ def main() -> int:
     # real transparent key are covered by the src/rpc/signmessage.rs unit tests - which pin
     # zallet's forum vector - and the regtest_transparent e2e.)
 
-    print("== z_getaddressforaccount ==")
+
+@section("z_getaddressforaccount", ZCASH)
+def s_z_getaddressforaccount(ctx):
+    rpc, ck, addr = ctx.rpc, ctx.ck, ctx.addr
     # zcashd-syntax derivation of a Unified Address for the wallet's single account (0). zecd is
     # shielded-only: the default config is Orchard-only, so a default UA carries just "orchard".
     a = rpc.call("z_getaddressforaccount", 0)
@@ -532,10 +667,14 @@ def main() -> int:
     except JSONRPCException as e:
         ck("z_getaddressforaccount no args -> -1", e.code == -1, e.code)
 
-    print("== received-by-address ==")
-    recv = rpc.call("getreceivedbyaddress", addr)
-    ck("getreceivedbyaddress is Decimal", isinstance(recv, decimal.Decimal), repr(recv))
-    ck("fresh address received 0", recv == 0)
+
+@section("received-by-address", *BOTH)
+def s_received_by_address(ctx):
+    rpc, ck, addr = ctx.rpc, ctx.ck, ctx.addr
+    if ctx.coin == ZCASH:
+        recv = rpc.call("getreceivedbyaddress", addr)
+        ck("getreceivedbyaddress is Decimal", isinstance(recv, decimal.Decimal), repr(recv))
+        ck("fresh address received 0", recv == 0)
     lra = rpc.call("listreceivedbyaddress", 1, True)
     ck("listreceivedbyaddress is list", isinstance(lra, list))
     fresh = next((e for e in lra if e.get("address") == addr), None)
@@ -546,13 +685,23 @@ def main() -> int:
         ck("fresh entry amount 0", fresh.get("amount") == 0, repr(fresh.get("amount")))
         ck("fresh entry confirmations 0", fresh.get("confirmations") == 0, repr(fresh.get("confirmations")))
         ck("fresh entry no txids", fresh.get("txids") == [], repr(fresh.get("txids")))
+        if ctx.coin == BITCOIN:
+            # zecd extension: the receiving keychain index, the same value getaddressinfo
+            # reports - so an issued range reconciles from this one call.
+            ck("entry carries address_index", isinstance(fresh.get("address_index"), int),
+               repr(fresh.get("address_index")))
+            ck("address_index matches getaddressinfo",
+               fresh.get("address_index") == rpc.call("getaddressinfo", addr).get("address_index"))
+            ck("entries ascend by address_index",
+               [e["address_index"] for e in lra] == sorted(e["address_index"] for e in lra))
     # include_immature_coinbase (Core's 3rd/5th parameter). This wallet holds no coinbase, so
     # the flag must be accepted on both methods and change nothing; the maturity behaviour it
     # governs is exercised live in the coinbase regtest e2e.
-    recv_imm = rpc.call("getreceivedbyaddress", addr, 1, True)
-    ck("getreceivedbyaddress include_immature_coinbase is Decimal",
-       isinstance(recv_imm, decimal.Decimal), repr(recv_imm))
-    ck("no coinbase -> include_immature_coinbase changes nothing", recv_imm == recv)
+    if ctx.coin == ZCASH:
+        recv_imm = rpc.call("getreceivedbyaddress", addr, 1, True)
+        ck("getreceivedbyaddress include_immature_coinbase is Decimal",
+           isinstance(recv_imm, decimal.Decimal), repr(recv_imm))
+        ck("no coinbase -> include_immature_coinbase changes nothing", recv_imm == recv)
     lra_imm = rpc.call("listreceivedbyaddress", 1, True, False, None, True)
     ck("listreceivedbyaddress include_immature_coinbase is list", isinstance(lra_imm, list))
     ck("no coinbase -> listed entries unchanged", lra_imm == lra)
@@ -565,13 +714,23 @@ def main() -> int:
     lra_f_used = rpc.call("listreceivedbyaddress", 1, False, False, addr)
     ck("address_filter on an unused address without include_empty is empty",
        lra_f_used == [], repr(lra_f_used))
-    try:
-        rpc.call("getreceivedbyaddress", "not-an-address")
-        ck("invalid address raises", False)
-    except JSONRPCException as e:
-        ck("invalid address -> code -5", e.code == -5, e.code)
+    if ctx.coin == ZCASH:
+        try:
+            rpc.call("getreceivedbyaddress", "not-an-address")
+            ck("invalid address raises", False)
+        except JSONRPCException as e:
+            ck("invalid address -> code -5", e.code == -5, e.code)
+    else:
+        try:
+            rpc.call("listreceivedbyaddress", 1, True, False, "not-an-address")
+            ck("invalid address_filter raises", False)
+        except JSONRPCException as e:
+            ck("invalid address_filter -> code -5", e.code == -5, e.code)
 
-    print("== stateless: label methods are removed ==")
+
+@section("stateless: label methods are removed", *BOTH)
+def s_labels_removed(ctx):
+    rpc, ck, addr = ctx.rpc, ctx.ck, ctx.addr
     # zecd keeps no off-chain label store, so the label-dedicated methods are not implemented at
     # all - every one is method-not-found (-32601), like any unknown method.
     for m, params in (
@@ -586,13 +745,14 @@ def main() -> int:
             ck(f"{m} raises (removed in stateless mode)", False)
         except JSONRPCException as e:
             ck(f"{m} -> method not found (-32601)", e.code == -32601, e.code)
-    # Descriptor-wallet methods exist for the BDK engine only; a Zcash wallet cannot serve
-    # them, and a method a wallet cannot serve is indistinguishable from one that does not exist.
-    try:
-        rpc.call("listdescriptors")
-        ck("listdescriptors raises on a Zcash wallet", False)
-    except JSONRPCException as e:
-        ck("listdescriptors -> method not found (-32601) on a Zcash wallet", e.code == -32601, e.code)
+    if ctx.coin == ZCASH:
+        # Descriptor-wallet methods exist for the BDK engine only; a Zcash wallet cannot serve
+        # them, and a method a wallet cannot serve is indistinguishable from one that does not exist.
+        try:
+            rpc.call("listdescriptors")
+            ck("listdescriptors raises on a Zcash wallet", False)
+        except JSONRPCException as e:
+            ck("listdescriptors -> method not found (-32601) on a Zcash wallet", e.code == -32601, e.code)
     # A non-empty label argument to getnewaddress is rejected (-8); the address itself is fine.
     try:
         rpc.call("getnewaddress", "mylabel")
@@ -600,24 +760,73 @@ def main() -> int:
     except JSONRPCException as e:
         ck("getnewaddress label -> code -8", e.code == -8, e.code)
 
-    print("== wallets ==")
+
+@section("listdescriptors", BITCOIN)
+def s_listdescriptors(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
+    # Core's shape over the wallet's two public BIP 84 descriptors: the receiving chain
+    # (/0/*) first, change (/1/*) second, the origin-qualified account xpub inside both, and
+    # the keychain's next index. Public material only.
+    ld = rpc.call("listdescriptors")
+    ck("listdescriptors has wallet_name", isinstance(ld.get("wallet_name"), str), ld.get("wallet_name"))
+    ds = ld.get("descriptors")
+    ck("listdescriptors has two descriptors", isinstance(ds, list) and len(ds) == 2, ds)
+    for d, internal, chain in ((ds[0], False, "/0/*)#"), (ds[1], True, "/1/*)#")):
+        for f in ("desc", "timestamp", "active", "internal", "range", "next", "next_index"):
+            ck(f"descriptor has {f}", f in d, d.keys())
+        ck(f"descriptor internal={internal}", d.get("internal") is internal, d.get("internal"))
+        ck("descriptor is an origin-qualified wpkh",
+           isinstance(d.get("desc"), str) and d["desc"].startswith("wpkh([") and chain in d["desc"],
+           d.get("desc"))
+        ck("descriptor is active", d.get("active") is True)
+        ck("descriptor range is [0, n]",
+           isinstance(d.get("range"), list) and len(d["range"]) == 2 and d["range"][0] == 0
+           and d["range"][1] >= d.get("next", 0), d.get("range"))
+        ck("descriptor next == next_index", d.get("next") == d.get("next_index"))
+    # Both keychains share one account key: the bracketed origin and the key are identical
+    # up to the chain suffix.
+    ck("both descriptors carry the same account key",
+       ds[0]["desc"].split("/0/*")[0] == ds[1]["desc"].split("/1/*")[0])
+    # The private form is refused: the database holds public descriptors only and the seed
+    # never leaves the process (Core answers a private-keys-disabled wallet the same way).
+    try:
+        rpc.call("listdescriptors", True)
+        ck("listdescriptors private raises", False)
+    except JSONRPCException as e:
+        ck("listdescriptors private -> code -4", e.code == -4, e.code)
+    try:
+        rpc.call("listdescriptors", "yes")
+        ck("listdescriptors non-boolean raises", False)
+    except JSONRPCException as e:
+        ck("listdescriptors non-boolean -> code -3", e.code == -3, e.code)
+
+
+@section("wallets", *BOTH)
+def s_wallets(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     lw = rpc.call("listwallets")
     ck("listwallets is a non-empty list of strings",
        isinstance(lw, list) and bool(lw) and all(isinstance(w, str) for w in lw), lw)
 
-    print("== listunspent ==")
+
+@section("listunspent", *BOTH)
+def s_listunspent(ctx):
+    rpc, ck, addr = ctx.rpc, ctx.ck, ctx.addr
     lu = rpc.call("listunspent")
     ck("listunspent is list", isinstance(lu, list))
     if lu:
         u = lu[0]
-        for f in ("txid", "vout", "address", "amount", "confirmations",
-                  "spendable", "solvable", "safe", "pool"):
+        fields = ("txid", "vout", "address", "amount", "confirmations", "spendable", "solvable", "safe")
+        if ctx.coin == ZCASH:
+            fields += ("pool",)
+        for f in fields:
             ck(f"utxo has {f}", f in u)
         ck("utxo amount is Decimal", isinstance(u["amount"], decimal.Decimal))
-        # zecd extension: every note is labelled with its shielded pool.
-        ck("utxo pool is a known shielded pool",
-           all(e["pool"] in ("sapling", "orchard", "ironwood") for e in lu),
-           [e["pool"] for e in lu])
+        if ctx.coin == ZCASH:
+            # zecd extension: every note is labelled with its shielded pool.
+            ck("utxo pool is a known shielded pool",
+               all(e["pool"] in ("sapling", "orchard", "ironwood") for e in lu),
+               [e["pool"] for e in lu])
     ck("listunspent include_unsafe=false only safe",
        all(e["safe"] for e in rpc.call("listunspent", 0, 9999999, [], False)))
     # A freshly generated address has no notes; the filter validates its entries.
@@ -633,8 +842,16 @@ def main() -> int:
         ck("listunspent duplicated filter address raises", False)
     except JSONRPCException as e:
         ck("listunspent duplicated filter address -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("listunspent", "one")
+        ck("listunspent non-numeric minconf raises", False)
+    except JSONRPCException as e:
+        ck("listunspent non-numeric minconf -> code -3", e.code == -3, e.code)
 
-    print("== history ==")
+
+@section("history", *BOTH)
+def s_history(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     txs = rpc.call("listtransactions", "*", 20)
     ck("listtransactions is list", isinstance(txs, list))
     if txs:
@@ -653,6 +870,15 @@ def main() -> int:
             ck("mined tx time == blocktime", t["time"] == t["blocktime"])
         else:
             ck("unmined tx has trusted", "trusted" in t)
+        if ctx.coin == BITCOIN:
+            ck("tx label is empty (stateless)", t.get("label") == "", repr(t.get("label")))
+            ck("tx bip125-replaceable is yes/no/unknown",
+               t.get("bip125-replaceable") in ("yes", "no", "unknown"), t.get("bip125-replaceable"))
+            sends = [e for e in txs if e["category"] == "send"]
+            if sends:
+                ck("send entries carry a negative Decimal fee",
+                   all(isinstance(e.get("fee"), decimal.Decimal) and e["fee"] < 0 for e in sends),
+                   [e.get("fee") for e in sends])
         gt = rpc.call("gettransaction", t["txid"])
         ck("gettransaction amount Decimal", isinstance(gt["amount"], decimal.Decimal))
         ck("gettransaction has details list", isinstance(gt.get("details"), list))
@@ -662,22 +888,26 @@ def main() -> int:
         if gt["confirmations"] > 0:
             ck("gettransaction mined has blockhash", "blockhash" in gt)
 
-        print("== getrawtransaction ==")
-        raw = rpc.call("getrawtransaction", t["txid"])
-        ck("getrawtransaction returns hex", isinstance(raw, str) and len(raw) % 2 == 0 and raw)
-        if gt.get("hex"):
-            ck("getrawtransaction matches gettransaction.hex", raw == gt["hex"])
-        v = rpc.call("getrawtransaction", t["txid"], 1)
-        ck("verbose is object", isinstance(v, dict))
-        for f in ("hex", "txid", "size", "version", "locktime", "vin", "vout"):
-            ck(f"verbose has {f}", f in v)
-        ck("verbose txid echoes", v.get("txid") == t["txid"])
-        ck("verbose hex matches", v.get("hex") == raw)
-        ck("verbose vin/vout are lists", isinstance(v.get("vin"), list) and isinstance(v.get("vout"), list))
+        if ctx.coin == ZCASH:
+            print("== getrawtransaction ==")
+            raw = rpc.call("getrawtransaction", t["txid"])
+            ck("getrawtransaction returns hex", isinstance(raw, str) and len(raw) % 2 == 0 and raw)
+            if gt.get("hex"):
+                ck("getrawtransaction matches gettransaction.hex", raw == gt["hex"])
+            v = rpc.call("getrawtransaction", t["txid"], 1)
+            ck("verbose is object", isinstance(v, dict))
+            for f in ("hex", "txid", "size", "version", "locktime", "vin", "vout"):
+                ck(f"verbose has {f}", f in v)
+            ck("verbose txid echoes", v.get("txid") == t["txid"])
+            ck("verbose hex matches", v.get("hex") == raw)
+            ck("verbose vin/vout are lists", isinstance(v.get("vin"), list) and isinstance(v.get("vout"), list))
 
+
+@section("z_listtransactions (extension)", ZCASH)
+def s_z_listtransactions(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     # z_listtransactions is a zecd EXTENSION (no such method in zcashd) with zcashd's z_*
     # vocabulary, so it is checked for self-consistency, not held to a bitcoind shape.
-    print("== z_listtransactions (extension) ==")
     ztx = rpc.call("z_listtransactions", 20)
     ck("z_listtransactions is list", isinstance(ztx, list))
     if ztx:
@@ -728,7 +958,10 @@ def main() -> int:
     except JSONRPCException as e:
         ck("z_listtransactions non-integer start_height -> -3", e.code == -3, e.code)
 
-    print("== listsinceblock (restart-safe poller) ==")
+
+@section("listsinceblock (restart-safe poller)", ZCASH)
+def s_listsinceblock(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     lsb = rpc.call("listsinceblock")
     ck("has transactions list", isinstance(lsb.get("transactions"), list))
     ck("has removed list", isinstance(lsb.get("removed"), list))
@@ -770,7 +1003,13 @@ def main() -> int:
     except JSONRPCException as e:
         ck("malformed block -> code -5", e.code == -5, e.code)
 
-    print("== error handling (JSONRPCException with Bitcoin Core codes) ==")
+
+@section("error handling (JSONRPCException with Bitcoin Core codes)", *BOTH)
+def s_errors(ctx):
+    rpc, ck, addr, args = ctx.rpc, ctx.ck, ctx.addr, ctx.args
+    if ctx.coin == BITCOIN:
+        s_errors_bitcoin(ctx)
+        return
     try:
         rpc.call("gettransaction", "00" * 32)
         ck("gettransaction unknown raises", False)
@@ -1207,7 +1446,132 @@ def main() -> int:
     except JSONRPCException as e:
         ck("bad auth -> 401", e.code == 401, e.code)
 
-    print("== wallet encryption state ==")
+
+def s_errors_bitcoin(ctx):
+    """The Bitcoin engine's error contract. Every send below is rejected while its arguments
+    are parsed - before coin selection, signing, or broadcast - so nothing can move."""
+    rpc, ck, addr, args = ctx.rpc, ctx.ck, ctx.addr, ctx.args
+    try:
+        rpc.call("gettransaction", "00" * 32)
+        ck("gettransaction unknown raises", False)
+    except JSONRPCException as e:
+        ck("gettransaction unknown -> code -5", e.code == -5, e.code)
+    try:
+        rpc.call("no_such_method_xyz")
+        ck("unknown method raises", False)
+    except JSONRPCException as e:
+        ck("unknown method -> code -32601", e.code == -32601, e.code)
+    try:
+        rpc.call("listtransactions", "*", -1)
+        ck("negative count raises", False)
+    except JSONRPCException as e:
+        ck("negative count -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("listtransactions", "*", "ten")
+        ck("non-numeric count raises", False)
+    except JSONRPCException as e:
+        ck("non-numeric count -> code -3", e.code == -3, e.code)
+    try:
+        rpc.call("listtransactions", "mylabel")
+        ck("listtransactions label raises", False)
+    except JSONRPCException as e:
+        ck("listtransactions label -> code -8 (stateless)", e.code == -8, e.code)
+    try:
+        # Zero amounts are rejected before any send logic, like Bitcoin Core.
+        rpc.call("sendtoaddress", addr, 0)
+        ck("zero amount raises", False)
+    except JSONRPCException as e:
+        ck("zero amount -> code -3", e.code == -3, e.code)
+    try:
+        # A missing amount is Bitcoin Core's help error (-1).
+        rpc.call("sendtoaddress", addr)
+        ck("sendtoaddress no amount raises", False)
+    except JSONRPCException as e:
+        ck("sendtoaddress no amount -> code -1", e.code == -1, e.code)
+    try:
+        # An address that does not parse for this network is -5, before any send logic.
+        rpc.call("sendtoaddress", "not-an-address", "0.1")
+        ck("sendtoaddress bad address raises", False)
+    except JSONRPCException as e:
+        ck("sendtoaddress bad address -> code -5", e.code == -5, e.code)
+    try:
+        # fee_rate (param 9) below the 1 sat/vB relay floor is refused up front: no node would
+        # relay it, and a light-client broadcast would still record it at 0-conf.
+        rpc.call("sendtoaddress", addr, "0.1", "", "", False, False, None, "", False, 0.5)
+        ck("sendtoaddress sub-floor fee_rate raises", False)
+    except JSONRPCException as e:
+        ck("sendtoaddress sub-floor fee_rate -> code -8", e.code == -8, e.code)
+    try:
+        # conf_target (param 6) cannot be honored: the wallet estimates at a fixed target.
+        rpc.call("sendtoaddress", addr, "0.1", "", "", False, False, 3)
+        ck("sendtoaddress conf_target raises", False)
+    except JSONRPCException as e:
+        ck("sendtoaddress conf_target -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("sendtoaddress", addr, "0.1", "", "", "yes")
+        ck("sendtoaddress non-boolean subtractfeefromamount raises", False)
+    except JSONRPCException as e:
+        ck("sendtoaddress non-boolean subtractfeefromamount -> code -3", e.code == -3, e.code)
+    try:
+        rpc.call("sendmany", "", {addr: 0})
+        ck("sendmany zero amount raises", False)
+    except JSONRPCException as e:
+        ck("sendmany zero amount -> code -3", e.code == -3, e.code)
+    try:
+        rpc.call("sendmany", "", {"not-an-address": "0.1"})
+        ck("sendmany bad address raises", False)
+    except JSONRPCException as e:
+        ck("sendmany bad address -> code -5", e.code == -5, e.code)
+    try:
+        rpc.call("sendrawtransaction", "00ff")
+        ck("sendrawtransaction undecodable raises", False)
+    except JSONRPCException as e:
+        ck("sendrawtransaction undecodable -> code -22", e.code == -22, e.code)
+    # Everything the engine does not serve is method-not-found, whatever the dialect: Zcash's
+    # chain reads and fee stubs, the passphrase pair, and the z_* extensions alike.
+    for m, params in (
+        ("getblockchaininfo", []),
+        ("getblockhash", [0]),
+        ("estimatesmartfee", [2]),
+        ("settxfee", [0.0001]),
+        ("walletpassphrase", ["x", 60]),
+        ("walletlock", []),
+        ("getrawtransaction", ["00" * 32]),
+        ("z_sendmany", [addr, []]),
+        ("z_getaddressforaccount", [0]),
+    ):
+        try:
+            rpc.call(m, *params)
+            ck(f"{m} raises on a Bitcoin wallet", False)
+        except JSONRPCException as e:
+            ck(f"{m} -> method not found (-32601) on a Bitcoin wallet", e.code == -32601, e.code)
+    # Arity: like Bitcoin Core, a call with more positional arguments than the method accepts is
+    # rejected (-1, the help error) rather than silently ignoring the trailing junk.
+    try:
+        rpc.call("getblockcount", 1)
+        ck("getblockcount extra arg raises", False)
+    except JSONRPCException as e:
+        ck("getblockcount extra arg -> code -1", e.code == -1, e.code)
+    try:
+        rpc.call("validateaddress", addr, "extra")
+        ck("validateaddress extra arg raises", False)
+    except JSONRPCException as e:
+        ck("validateaddress extra arg -> code -1", e.code == -1, e.code)
+    try:
+        rpc.call("listdescriptors", False, "extra")
+        ck("listdescriptors extra arg raises", False)
+    except JSONRPCException as e:
+        ck("listdescriptors extra arg -> code -1", e.code == -1, e.code)
+    try:
+        AuthServiceProxy(args.url, args.user, "wrong-password").call("getblockcount")
+        ck("bad auth raises", False)
+    except JSONRPCException as e:
+        ck("bad auth -> 401", e.code == 401, e.code)
+
+
+@section("wallet encryption state", ZCASH)
+def s_encryption(ctx):
+    rpc, ck, addr, args, wi = ctx.rpc, ctx.ck, ctx.addr, ctx.args, ctx.wi
     # Adapts to the wallet under test: an encrypted wallet reports unlocked_until and verifies
     # passphrases (-14 on a wrong one); an unencrypted wallet rejects the passphrase RPCs with
     # -15, exactly like running bitcoind with an unencrypted wallet.
@@ -1256,12 +1620,45 @@ def main() -> int:
     except JSONRPCException as e:
         ck("walletpassphrase negative timeout -> -8", e.code == -8, e.code)
 
-    print("== batch ==")
+
+@section("batch", *BOTH)
+def s_batch(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
     out = rpc.batch([("getblockcount", []), ("no_such", [])])
     ck("batch returns array", isinstance(out, list) and len(out) == 2)
     ck("batch[0] ok, [1] error", out[0]["error"] is None and out[1]["error"]["code"] == -32601)
 
-    print(f"\nCONFORMANCE: {passed} passed, {failed} failed")
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--coin", choices=(ZCASH, BITCOIN), default=ZCASH,
+                    help="the engine the wallet under test runs on (selects the sections)")
+    ap.add_argument("--url", default="http://127.0.0.1:18232/")
+    ap.add_argument("--user", default="u")
+    ap.add_argument("--password", default="p")
+    ap.add_argument("--passphrase", default="",
+                    help="wallet passphrase (enables the encrypted-wallet state-machine checks)")
+    args = ap.parse_args()
+    rpc = AuthServiceProxy(args.url, args.user, args.password)
+
+    passed = failed = 0
+
+    def ck(name, cond, detail=""):
+        nonlocal passed, failed
+        if cond:
+            passed += 1
+            print(f"  PASS {name} {detail}")
+        else:
+            failed += 1
+            print(f"  FAIL {name} {detail}")
+
+    ctx = Ctx(rpc, ck, args)
+    for title, coins, run in SECTIONS:
+        if args.coin in coins:
+            print(f"== {title} ==")
+            run(ctx)
+
+    print(f"\nCONFORMANCE ({args.coin}): {passed} passed, {failed} failed")
     return 1 if failed else 0
 
 

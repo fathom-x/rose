@@ -1406,7 +1406,8 @@ impl BtcActor {
                     RpcError::invalid_address_or_key(format!("Invalid Bitcoin address: {addr}"))
                 })?;
             if *sats == 0 {
-                return Err(RpcError::invalid_parameter("Invalid amount for send"));
+                // Core rejects a zero amount with -3 "Invalid amount", as the Zcash send does.
+                return Err(RpcError::type_error("Invalid amount"));
             }
             parsed.push((address, Amount::from_sat(*sats)));
         }

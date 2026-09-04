@@ -978,7 +978,7 @@ fn height_param(req: &RpcRequest, i: usize, name: &str) -> Result<Option<u32>, R
 
 /// Parse `listtransactions`/`z_listtransactions`'s `count` and `from` positional args with
 /// Bitcoin Core's strictness: a negative value is `-8`, a non-integer is `-3`.
-fn count_from_params(
+pub(crate) fn count_from_params(
     req: &RpcRequest,
     count_i: usize,
     from_i: usize,

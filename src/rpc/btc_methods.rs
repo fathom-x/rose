@@ -25,7 +25,17 @@ use crate::btc::actor::{
 };
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
+use crate::rpc::wallet_methods::{check_balance_dummy, count_from_params, depth_param};
 use crate::server::jsonrpc::RpcRequest;
+
+/// A non-negative depth argument (`minconf`, `maxconf`) with the Zcash handlers' error
+/// contract, so both engines answer a Core client identically: a non-number is `-3`, a
+/// negative number `-8`, `null`/absent the default.
+fn depth(v: Option<&Value>, name: &str, default: u64) -> Result<u64, RpcError> {
+    let n = depth_param(v, name, i64::try_from(default).unwrap_or(i64::MAX))?;
+    u64::try_from(n)
+        .map_err(|_| RpcError::invalid_parameter(format!("{name} must be a non-negative integer")))
+}
 
 /// The methods this module serves, in dispatch order - the data the lockstep test compares
 /// against `METHOD_COINS`. Test-only: the live routing is [`dispatch`]'s match, and this
@@ -107,20 +117,10 @@ async fn getnewaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Val
 }
 
 async fn getbalance(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
-    // Bitcoin Core's first parameter is the legacy dummy account ("*" or omitted).
-    if let Some(dummy) = opt_str(req, 0) {
-        if !dummy.is_empty() && dummy != "*" {
-            return Err(RpcError::invalid_parameter(
-                "dummy first argument must be \"*\" or omitted (accounts are not supported)",
-            ));
-        }
-    }
-    let minconf = match req.param(1) {
-        None | Some(Value::Null) => 0,
-        Some(v) => v
-            .as_u64()
-            .ok_or_else(|| RpcError::invalid_parameter("minconf must be a non-negative integer"))?,
-    };
+    // Bitcoin Core's first parameter is the legacy dummy account ("*" or omitted); the shared
+    // check answers Core's -32 for anything else, exactly as the Zcash handler does.
+    check_balance_dummy(req.param(0))?;
+    let minconf = depth(req.param(1), "minconf", 0)?;
     // Core's getbalance is TRUSTED funds only: confirmed outputs plus the wallet's own
     // unconfirmed change - never an unconfirmed receive from a foreign sender, even at
     // minconf 0 (that value lives in getunconfirmedbalance / getbalances.untrusted_pending).
@@ -159,6 +159,8 @@ async fn getunconfirmedbalance(handle: &BtcWalletHandle) -> Result<Value, RpcErr
 async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
     let b = handle.balance().await?;
     let status = handle.status();
+    // Core's txcount: every wallet transaction, visible history entry or not.
+    let txcount = handle.list_transactions().await?.len();
     Ok(json!({
         "walletname": handle.name,
         "walletversion": 169900,
@@ -166,6 +168,7 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         "balance": zats_to_value(b.confirmed + b.trusted_pending),
         "unconfirmed_balance": zats_to_value(b.untrusted_pending),
         "immature_balance": zats_to_value(b.immature),
+        "txcount": txcount,
         "keypoolsize": 1,
         "keypoolsize_hd_internal": 0,
         "paytxfee": zats_to_value(0),
@@ -202,14 +205,6 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
 /// unconfirmed receive is hidden until asked for with `listunspent 0` (exactly Core), and
 /// `safe` is confirmed-or-own-change.
 async fn listunspent(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
-    let depth = |v: Option<&Value>, name: &str, default: u64| -> Result<u64, RpcError> {
-        match v {
-            None | Some(Value::Null) => Ok(default),
-            Some(v) => v.as_u64().ok_or_else(|| {
-                RpcError::invalid_parameter(format!("{name} must be a non-negative integer"))
-            }),
-        }
-    };
     let minconf = depth(req.param(0), "minconf", 1)?;
     let maxconf = depth(req.param(1), "maxconf", 9_999_999)?;
     let filter: Option<std::collections::BTreeSet<String>> = match req.param(2) {
@@ -308,10 +303,17 @@ fn tx_entry_json(e: &BtcTxRecord, d: &BtcTxDetail) -> Value {
     obj["txid"] = json!(e.txid);
     obj["time"] = json!(e.time);
     obj["timereceived"] = json!(e.time);
+    obj["walletconflicts"] = json!([]);
     obj["bip125-replaceable"] = json!(bip125_replaceable(e));
+    // Core's WalletTxToJSON: a mined transaction carries its block fields, an unmined one
+    // carries `trusted` instead - true only when the wallet funded it (the same trust rule
+    // `listunspent` applies: a foreign 0-conf receive is untrusted).
     if let (Some(hash), Some(height)) = (&e.blockhash, e.height) {
         obj["blockhash"] = json!(hash);
         obj["blockheight"] = json!(height);
+        obj["blocktime"] = json!(e.time);
+    } else {
+        obj["trusted"] = json!(e.fee_sat.is_some());
     }
     obj
 }
@@ -326,20 +328,8 @@ async fn listtransactions(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<
             ));
         }
     }
-    let count = match req.param(1) {
-        None | Some(Value::Null) => 10,
-        Some(v) => v
-            .as_u64()
-            .ok_or_else(|| RpcError::invalid_parameter("count must be a non-negative integer"))?
-            as usize,
-    };
-    let skip = match req.param(2) {
-        None | Some(Value::Null) => 0,
-        Some(v) => v
-            .as_u64()
-            .ok_or_else(|| RpcError::invalid_parameter("skip must be a non-negative integer"))?
-            as usize,
-    };
+    // Shared with the Zcash handler: a negative count/skip is -8, a non-number -3.
+    let (count, skip) = count_from_params(req, 1, 2)?;
     let records = handle.list_transactions().await?;
     // Flatten to per-output entries first (a change-only transaction contributes none);
     // Core's pagination then applies to the entries: skip from the newest end, return up
@@ -376,6 +366,7 @@ async fn gettransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Va
         "time": entry.time,
         "timereceived": entry.time,
         "bip125-replaceable": bip125_replaceable(&entry),
+        "walletconflicts": [],
         "details": details,
         "hex": entry.hex,
     });
@@ -383,6 +374,7 @@ async fn gettransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Va
         obj["fee"] = signed_zats_to_value(-i64::try_from(fee).unwrap_or(i64::MAX));
     }
     if let (Some(hash), Some(height)) = (&entry.blockhash, entry.height) {
+        obj["blocktime"] = json!(entry.time);
         obj["blockhash"] = json!(hash);
         obj["blockheight"] = json!(height);
     }
@@ -404,12 +396,7 @@ async fn listreceivedbyaddress(
     handle: &BtcWalletHandle,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let minconf = match req.param(0) {
-        None | Some(Value::Null) => 1,
-        Some(v) => v
-            .as_u64()
-            .ok_or_else(|| RpcError::invalid_parameter("minconf must be a non-negative integer"))?,
-    };
+    let minconf = depth(req.param(0), "minconf", 1)?;
     let flag = |v: Option<&Value>, name: &str| -> Result<bool, RpcError> {
         match v {
             None | Some(Value::Null) => Ok(false),

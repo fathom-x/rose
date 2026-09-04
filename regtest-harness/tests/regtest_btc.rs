@@ -711,4 +711,45 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .await
         .expect_err("rebroadcast of a confirmed tx must be rejected");
     assert_eq!(code, -27, "node's own rejection code passes through: {msg}");
+
+    // ---- conformance.py, Bitcoin mode, against the live funded wallet ----
+    // The same python-bitcoinrpc-style client the Zcash suites run: Decimal amounts, Core
+    // error codes, arity, batching, over every method the engine serves. Its send checks
+    // all reject at argument parsing, so it moves no funds; the sends above are the live
+    // coverage of the send path.
+    run_conformance(zecd.rpc_port);
+}
+
+/// Run `scripts/conformance.py --coin bitcoin` against the regtest daemon, exactly as
+/// `regtest_funded.rs::run_conformance` does for a Zcash wallet. Skips with a notice when
+/// `python3` is unavailable so a local run without it does not fail confusingly.
+fn run_conformance(rpc_port: u16) {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("harness lives inside the zecd repo")
+        .join("scripts/conformance.py");
+    let out = std::process::Command::new("python3")
+        .arg(&script)
+        .args([
+            "--coin",
+            "bitcoin",
+            "--url",
+            &format!("http://127.0.0.1:{rpc_port}/"),
+            "--user",
+            "zec",
+            "--password",
+            "secret",
+        ])
+        .output();
+    match out {
+        Err(e) => eprintln!("SKIP conformance.py: python3 unavailable ({e})"),
+        Ok(out) => {
+            println!("{}", String::from_utf8_lossy(&out.stdout));
+            assert!(
+                out.status.success(),
+                "conformance.py reported failures:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 }

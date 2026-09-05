@@ -1606,6 +1606,14 @@ pub struct RescanArgs {
     /// Skip the interactive confirmation prompt (for non-interactive/automated recovery).
     #[arg(long)]
     pub yes: bool,
+
+    /// Change the recorded wallet birthday before the rebuild, so the rescan starts there
+    /// instead of at the birthday `init` recorded: a block height, or a UTC date as
+    /// YYYY-MM-DD, resolved exactly as `init --birthday` resolves it (against the upstream's
+    /// block times, or offline on a kyoto wallet). Earlier only scans more; later than the
+    /// wallet's first transaction silently drops that history from the rebuilt wallet.
+    #[arg(long, value_name = "HEIGHT|YYYY-MM-DD", value_parser = crate::init::Birthday::parse)]
+    pub birthday: Option<crate::init::Birthday>,
 }
 
 impl AppConfig {

@@ -276,11 +276,12 @@ Everything here is refused with a clear error rather than silently ignored or ha
   connection state is on `getwalletinfo` as the zecd extension `upstream_connected`
   (false once a hung or unreachable upstream is noticed - the bitcoind client's
   per-request deadline is `chain::RPC_DEADLINE`, 15s - true again after a reconnect).
-- **`rescan` / `derive-address`** refuse bitcoin wallets (each names why and what to do
-  instead); a bitcoin equivalent of offline address derivation and the wipe-and-rescan
-  flow is future work (deleting the wallet database by hand already rebuilds it from the
-  seed or the pinned xpub on the next start, which the watch-only regtest exercises).
-  `export-ufvk` refuses too, pointing at `export-xpub`.
+- **`derive-address`** refuses bitcoin wallets (naming what to do instead); a bitcoin
+  equivalent of offline address derivation is future work. `export-ufvk` refuses too,
+  pointing at `export-xpub`. (`rescan` covers bitcoin wallets since 2026-09-05: it deletes
+  the BDK database and the kyoto cache, the next spawn rebuilds from the seed or the pinned
+  xpub, and `--birthday` moves the recorded birthday first; a passphrase-encrypted bitcoin
+  wallet is refused, since nothing could decrypt its seed to rebuild.)
 
 Deliberate posture, not a gap: the fee fallback (1 sat/vB on test networks, hard refusal on
 mainnet when the upstream has no answer) mirrors bitcoind's own `fallbackfee` defaults. On

@@ -254,6 +254,25 @@ impl WalletStore {
         write_keys_atomic(keys_path, &encoding, false)
     }
 
+    /// Rewrite the recorded birthday - the height, plus the date kept for a deferred
+    /// resolution (or `None` to clear one) - leaving every other field as it is. This is
+    /// `zecd rescan --birthday`'s write: the file's birthday is where the next rebuild
+    /// starts, so it is the one record that has to change for a rescan from elsewhere.
+    pub fn set_birthday(
+        keys_path: &Path,
+        birthday: BlockHeight,
+        birthday_time: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let mut text = String::new();
+        std::fs::File::open(keys_path)
+            .map_err(|e| anyhow!("opening {}: {e}", keys_path.display()))?
+            .read_to_string(&mut text)?;
+        let mut encoding: StoreEncoding = toml::from_str(&text)?;
+        encoding.birthday = Some(u32::from(birthday));
+        encoding.birthday_time = birthday_time;
+        write_keys_atomic(keys_path, &encoding, false)
+    }
+
     pub fn read(keys_path: &Path) -> anyhow::Result<WalletStore> {
         let path = keys_path;
         let mut text = String::new();
@@ -610,5 +629,33 @@ mod tests {
         let before = std::fs::read_to_string(&kp).unwrap();
         WalletStore::pin_ufvk(&kp, UFVK).unwrap();
         assert_eq!(std::fs::read_to_string(&kp).unwrap(), before);
+    }
+
+    /// `set_birthday` rewrites the height and the kept date and nothing else: the viewing-key
+    /// pin (a UFVK here; a seed or an xpub elsewhere) and the network survive, and a cleared
+    /// date is dropped from the file rather than written as a null.
+    #[test]
+    fn set_birthday_rewrites_only_the_birthday() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp = keys_path(dir.path());
+        WalletStore::init_view_only(&kp, BlockHeight::from_u32(100), ZNetwork::Main, "uviewTEST")
+            .unwrap();
+        WalletStore::set_birthday(&kp, BlockHeight::from_u32(43), Some(1_800_000_000)).unwrap();
+        let st = WalletStore::read(&kp).unwrap();
+        assert_eq!(
+            (u32::from(st.birthday), st.birthday_time),
+            (43, Some(1_800_000_000))
+        );
+        assert_eq!(st.network, ZNetwork::Main);
+        assert_eq!(st.pinned_ufvk(), Some("uviewTEST"));
+        assert!(!st.has_seed());
+        WalletStore::set_birthday(&kp, BlockHeight::from_u32(42), None).unwrap();
+        let st = WalletStore::read(&kp).unwrap();
+        assert_eq!(u32::from(st.birthday), 42);
+        assert_eq!(st.birthday_time, None);
+        assert_eq!(st.pinned_ufvk(), Some("uviewTEST"));
+        assert!(!std::fs::read_to_string(&kp)
+            .unwrap()
+            .contains("birthday_time"));
     }
 }

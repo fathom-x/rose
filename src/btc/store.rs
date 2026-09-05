@@ -19,8 +19,15 @@ use rusqlite::Connection;
 
 /// The BDK wallet database inside a wallet's engine directory.
 pub fn wallet_db_path(engine_dir: &Path) -> PathBuf {
-    engine_dir.join("wallet.sqlite")
+    engine_dir.join(ENGINE_ARTIFACTS[0])
 }
+
+/// Everything the engine writes into its directory: the wallet database and its WAL
+/// sidecars (a `-wal` holds committed-but-uncheckpointed writes, so the three go together).
+/// `zecd rescan` deletes exactly this list; the kyoto header/filter cache lives in a sibling
+/// directory (`config::btc_kyoto_dir`) and is deleted alongside. `keys.toml` sits at the
+/// wallet root, above both.
+pub const ENGINE_ARTIFACTS: [&str; 3] = ["wallet.sqlite", "wallet.sqlite-wal", "wallet.sqlite-shm"];
 
 /// A [`WalletPersister`] backed by one SQLite table of serde-encoded changesets.
 pub struct Persister {

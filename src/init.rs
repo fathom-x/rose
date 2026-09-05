@@ -305,6 +305,41 @@ fn height_for_time(
     Ok(search.answer())
 }
 
+/// Dial the configured Zcash upstream as `init` does - the global `[backend] server` with
+/// its credentials, cleartext policy, TLS and capability override applied - and read its
+/// chain tip. One connection, shared by every init-time need for the chain (the tip a fresh
+/// birthday anchors on, the tree state, a date search) and by `rescan --birthday <date>`.
+async fn connect_zcash_upstream(
+    config: &AppConfig,
+    network: ZNetwork,
+) -> anyhow::Result<(crate::chain::AnySource, u32)> {
+    let mut server = backend::resolve(&config.backend.server, network)?;
+    backend::apply_zebra_auth(&mut server, &config.zebra.auth());
+    backend::apply_cleartext_policy(
+        &mut server,
+        crate::chain::zebra::CleartextPolicy {
+            rfc1918_is_local: config.backend.rfc1918_is_local,
+            allow_remote_cleartext: config.backend.allow_remote_cleartext,
+        },
+    );
+    backend::apply_tls(&mut server, config.backend.tls_options());
+    backend::apply_transparent_capability_override(
+        &mut server,
+        config.backend.assume_transparent_in_compact_blocks,
+    );
+    let mut client = server
+        .connect_timeout(Duration::from_secs(config.backend.connect_timeout_secs))
+        .await
+        .with_context(|| format!("connecting to {}", server.describe()))?;
+    let chain_tip: u32 = client
+        .latest_block()
+        .await?
+        .height
+        .try_into()
+        .map_err(|_| anyhow!("chain tip height does not fit into u32"))?;
+    Ok((client, chain_tip))
+}
+
 /// [`HeightSearch`] driven against the Zcash upstream: the block time at each probed
 /// height comes from the tree state, one unary call both backends serve.
 async fn zcash_height_for_date(
@@ -725,31 +760,7 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     };
 
     // init is a one-shot interactive command that dials the configured upstream once.
-    let mut server = backend::resolve(&config.backend.server, network)?;
-    backend::apply_zebra_auth(&mut server, &config.zebra.auth());
-    backend::apply_cleartext_policy(
-        &mut server,
-        crate::chain::zebra::CleartextPolicy {
-            rfc1918_is_local: config.backend.rfc1918_is_local,
-            allow_remote_cleartext: config.backend.allow_remote_cleartext,
-        },
-    );
-    backend::apply_tls(&mut server, config.backend.tls_options());
-    backend::apply_transparent_capability_override(
-        &mut server,
-        config.backend.assume_transparent_in_compact_blocks,
-    );
-    let mut client = server
-        .connect_timeout(Duration::from_secs(config.backend.connect_timeout_secs))
-        .await
-        .with_context(|| format!("connecting to {}", server.describe()))?;
-
-    let chain_tip: u32 = client
-        .latest_block()
-        .await?
-        .height
-        .try_into()
-        .map_err(|_| anyhow!("chain tip height does not fit into u32"))?;
+    let (mut client, chain_tip) = connect_zcash_upstream(config, network).await?;
 
     let (mnemonic, recover_until) = if ufvk.is_some() {
         // A watch-only wallet has no mnemonic; the imported key may have history, so treat
@@ -1567,12 +1578,23 @@ pub fn export_xpub_string(config: &AppConfig, wallet: &str) -> anyhow::Result<St
 /// `PutBlocksCommitmentTree`/shardtree-conflict sync error that repeats at the same block range
 /// across restarts and version upgrades (the daemon's sync-error log points here when it
 /// detects that pattern). Deletes the wallet's *database* files while **keeping** `keys.toml`
-/// (seed, network, birthday, UFVK pin), so the next daemon start takes the existing
-/// empty-data-directory bootstrap path: it recreates the account from the seed and rescans the
-/// chain from the wallet birthday, re-deriving all funds and history. This is safe by zecd's
-/// statelessness invariant - everything in the database is rebuildable from seed + chain.
+/// (seed, network, birthday, UFVK/xpub pin), so the next daemon start takes the existing
+/// empty-data-directory bootstrap path: it recreates the account from the seed (or the pinned
+/// viewing key) and rescans the chain from the wallet birthday, re-deriving all funds and
+/// history. This is safe by zecd's statelessness invariant - everything in the database is
+/// rebuildable from seed + chain. Both engines: a Zcash wallet loses librustzcash's databases
+/// and block cache ([`rescan_wallet`]), a Bitcoin wallet its BDK database and kyoto cache
+/// ([`rescan_bitcoin_wallet`]).
+///
+/// `--birthday` **moves the birthday** the rebuild starts from - the only way to change it
+/// after `init`, since a synced wallet resumes from its own checkpoint and never reads the
+/// recorded birthday again. It is resolved before anything is deleted, exactly as `init`
+/// resolves the same flag (a height verbatim; a date against the upstream's block times, or
+/// offline on a kyoto wallet), so an unreachable upstream is a clean refusal, and written to
+/// `keys.toml` only once the database is gone - the birthday and the database that embodies
+/// it never disagree on disk.
 #[cfg(feature = "cli")]
-pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
+pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
     // Same single-instance guard as `init`: refuses while the daemon (or another writer) owns
     // the datadir, so the database can't be deleted out from under a live wallet. Taken here
     // rather than inside `rescan_wallet` (which is why it is passed `None` below) because the
@@ -1583,40 +1605,75 @@ pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
     crate::migrate::migrate(config)?;
 
     let entry = resolve_wallet_entry(config, &args.wallet);
-    #[cfg(feature = "bitcoin")]
-    if entry.coin == crate::coin::Coin::Bitcoin {
-        anyhow::bail!(
-            "wallet '{}' is a Bitcoin wallet; `zecd rescan` is not supported for the BDK \
-             engine yet (delete {} to rebuild from seed on next start)",
+    let confirm = |st: &WalletStore| -> anyhow::Result<bool> {
+        if args.yes {
+            return Ok(true);
+        }
+        eprintln!(
+            "This deletes the wallet database for '{}' at {} (keys.toml and the seed are \
+             kept).\nOn the next start zecd rebuilds the account from keys.toml and rescans \
+             from the wallet birthday ({}), which re-derives all funds and history but can \
+             take a while.\nType 'yes' to continue:",
             args.wallet,
-            crate::btc::store::wallet_db_path(&entry.engine_dir()).display()
+            entry.dir.display(),
+            u32::from(st.birthday)
         );
-    }
-    let removed = rescan_wallet(
-        entry.zcash_network(),
-        &args.wallet,
-        // The lock (and the migration under it) are this wrapper's, taken above.
-        None,
-        &entry.keys_path(),
-        &entry.engine_dir(),
-        |st| {
-            if args.yes {
-                return Ok(true);
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim() == "yes")
+    };
+
+    #[cfg(feature = "bitcoin")]
+    let (removed, new_birthday) = if entry.coin == crate::coin::Coin::Bitcoin {
+        let new_birthday = match args.birthday {
+            Some(birthday) => {
+                Some(resolve_rescan_birthday_bitcoin(config, &entry, birthday).await?)
             }
-            eprintln!(
-                "This deletes the wallet database for '{}' at {} (keys.toml and the seed are \
-                 kept).\nOn the next start zecd rebuilds the account from the seed and rescans \
-                 from the wallet birthday ({}), which re-derives all funds and history but can \
-                 take a while.\nType 'yes' to continue:",
-                args.wallet,
-                entry.dir.display(),
-                u32::from(st.birthday)
-            );
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line)?;
-            Ok(line.trim() == "yes")
-        },
-    )?;
+            None => None,
+        };
+        let removed = rescan_bitcoin_wallet(
+            config.network,
+            &args.wallet,
+            // The lock (and the migration under it) are this wrapper's, taken above.
+            None,
+            &entry.keys_path(),
+            &entry.engine_dir(),
+            &crate::config::btc_kyoto_dir(&entry.dir),
+            confirm,
+        )?;
+        (removed, new_birthday)
+    } else {
+        let new_birthday = match args.birthday {
+            Some(birthday) => Some(resolve_rescan_birthday_zcash(config, &entry, birthday).await?),
+            None => None,
+        };
+        let removed = rescan_wallet(
+            entry.zcash_network(),
+            &args.wallet,
+            None,
+            &entry.keys_path(),
+            &entry.engine_dir(),
+            confirm,
+        )?;
+        (removed, new_birthday)
+    };
+    #[cfg(not(feature = "bitcoin"))]
+    let (removed, new_birthday) = {
+        let new_birthday = match args.birthday {
+            Some(birthday) => Some(resolve_rescan_birthday_zcash(config, &entry, birthday).await?),
+            None => None,
+        };
+        let removed = rescan_wallet(
+            entry.zcash_network(),
+            &args.wallet,
+            // The lock (and the migration under it) are this wrapper's, taken above.
+            None,
+            &entry.keys_path(),
+            &entry.engine_dir(),
+            confirm,
+        )?;
+        (removed, new_birthday)
+    };
 
     if removed.is_empty() {
         eprintln!(
@@ -1632,6 +1689,10 @@ pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
             removed.join(", ")
         );
     }
+    if let Some((height, time)) = new_birthday {
+        WalletStore::set_birthday(&entry.keys_path(), BlockHeight::from(height), time)?;
+        eprintln!("Wallet '{}' birthday set to {height}.", args.wallet);
+    }
     let st = WalletStore::read(&entry.keys_path())?;
     eprintln!(
         "Start zecd and it will rebuild the account from keys.toml and rescan from birthday {} \
@@ -1645,6 +1706,60 @@ pub fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()> {
         }
     );
     Ok(())
+}
+
+/// Resolve `rescan --birthday` for a Zcash wallet to the `(height, date)` pair `keys.toml`
+/// records: a height verbatim, a date by the same upstream block-time search `init` runs
+/// (dialing the configured backend once; refused on regtest, whose timestamps mean nothing).
+/// A Zcash wallet never keeps the date - the search answers exactly.
+#[cfg(feature = "cli")]
+async fn resolve_rescan_birthday_zcash(
+    config: &AppConfig,
+    entry: &crate::config::WalletEntry,
+    birthday: Birthday,
+) -> anyhow::Result<(u32, Option<u64>)> {
+    let network = entry.zcash_network();
+    match birthday {
+        Birthday::Height(height) => Ok((height, None)),
+        Birthday::Date(date) => {
+            if network.is_regtest() {
+                bail!(
+                    "--birthday takes a date only on public networks: regtest block \
+                     timestamps are not meaningful. Pass --birthday <height> instead."
+                );
+            }
+            let (mut client, chain_tip) = connect_zcash_upstream(config, network).await?;
+            let height = zcash_height_for_date(&mut client, chain_tip, date).await?;
+            tracing::info!(
+                "resolved the --birthday date to height {height} (~1 day before the \
+                 date's midnight UTC, so the wallet cannot miss funds)"
+            );
+            Ok((height, None))
+        }
+    }
+}
+
+/// Resolve `rescan --birthday` for a Bitcoin wallet to the `(height, date)` pair `keys.toml`
+/// records, through the same paths `init` uses ([`resolve_bitcoin_date_birthday`] for a date:
+/// the bitcoind header search, or the shipped per-day table and scan floors on kyoto - which
+/// is where the date is kept for the first sync to refine). The anchor those paths may also
+/// produce is dropped: it lives in the database being deleted, and the next first scan
+/// re-derives one from the recorded birthday (`btc::kyoto::recovery_floor` consults the same
+/// table) - the anchor is a cache, the birthday is the record.
+#[cfg(all(feature = "cli", feature = "bitcoin"))]
+async fn resolve_rescan_birthday_bitcoin(
+    config: &AppConfig,
+    entry: &crate::config::WalletEntry,
+    birthday: Birthday,
+) -> anyhow::Result<(u32, Option<u64>)> {
+    match birthday {
+        Birthday::Height(height) => Ok((height, None)),
+        Birthday::Date(date) => {
+            let resolved =
+                resolve_bitcoin_date_birthday(config, entry, entry.bitcoin_network(), date).await?;
+            Ok((resolved.height, resolved.time))
+        }
+    }
 }
 
 /// The checks + deletion behind [`rescan`] - the library core, also unit-testable without an
@@ -1724,9 +1839,85 @@ pub fn rescan_wallet(
     // librustzcash owns" cannot mean one thing to the migration and another to a rescan.
     // `keys.toml` sits at the wallet root, above this directory (and may be outside it
     // entirely via `keys_file`), so neither it nor the datadir-level `identity.txt` is touched.
+    remove_artifacts(engine_dir, &crate::migrate::ENGINE_ARTIFACTS)
+}
+
+/// The Bitcoin-engine counterpart of [`rescan_wallet`]: the same checks, then the BDK
+/// database ([`crate::btc::store::ENGINE_ARTIFACTS`] in `engine_dir`) and the kyoto
+/// header/filter cache (`kyoto_dir`, a sibling of the engine directory - pure cache the light
+/// client rebuilds from its peers) are deleted, `keys.toml` kept. The next daemon start
+/// recreates the database from the seed or the pinned xpub (`btc::actor::spawn` builds a
+/// missing database from whichever key material it has) and scans from the recorded
+/// birthday, exactly as it does for a database deleted by hand.
+///
+/// Rebuildable: a seed wallet under the identity-file custody model, and a watch-only wallet
+/// (`keys.toml` pins the account xpub). Refused: a **passphrase-encrypted** Bitcoin wallet -
+/// the daemon has no `walletpassphrase` for the BDK engine yet, so it could never decrypt the
+/// seed to rebuild from and would start with an empty database it cannot fill; deleting it
+/// would turn a wallet that at least reads its history into one that cannot start. `network`
+/// is the daemon's environment (`keys.toml` is coin-agnostic and records that).
+#[cfg(feature = "bitcoin")]
+pub fn rescan_bitcoin_wallet(
+    network: ZNetwork,
+    wallet: &str,
+    datadir: Option<&Path>,
+    keys_path: &Path,
+    engine_dir: &Path,
+    kyoto_dir: &Path,
+    confirm: impl FnOnce(&WalletStore) -> anyhow::Result<bool>,
+) -> anyhow::Result<Vec<String>> {
+    let _datadir_lock = datadir.map(crate::lock::lock_datadir).transpose()?;
+    if !WalletStore::exists(keys_path) {
+        return Err(anyhow!(
+            "wallet '{}' is not initialized ({} missing); there is no database to rebuild - \
+             run `zecd init` to create a wallet",
+            wallet,
+            keys_path.display()
+        ));
+    }
+    let st = WalletStore::read(keys_path)?;
+    ensure_store_matches(&st, wallet, network)?;
+    if st.is_encrypted() {
+        return Err(anyhow!(
+            "wallet '{}' is a passphrase-encrypted Bitcoin wallet: the daemon cannot decrypt \
+             its seed to rebuild the database (there is no `walletpassphrase` for Bitcoin \
+             wallets yet), so a rescan would leave it unable to start. Recreate it with \
+             `zecd init --wallet {} --restore` (and no --encrypt) or as a watch-only \
+             `init --xpub` wallet instead.",
+            wallet,
+            wallet
+        ));
+    }
+    if !st.has_seed() && st.pinned_xpub().is_none() {
+        return Err(anyhow!(
+            "wallet '{}' holds neither a seed nor a pinned account xpub in {}, so nothing on \
+             disk can rebuild its database. Delete the wallet directory and recreate it with \
+             `zecd init --wallet {} --xpub <key> --birthday <height>` (export the key from the \
+             spending wallet with `zecd export-xpub`) instead.",
+            wallet,
+            keys_path.display(),
+            wallet
+        ));
+    }
+    if !confirm(&st)? {
+        return Err(anyhow!("rescan aborted (expected 'yes')"));
+    }
+    let mut removed = remove_artifacts(engine_dir, &crate::btc::store::ENGINE_ARTIFACTS)?;
+    match std::fs::remove_dir_all(kyoto_dir) {
+        Ok(()) => removed.push("kyoto/".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("removing {}: {e}", kyoto_dir.display())),
+    }
+    Ok(removed)
+}
+
+/// Delete the named files and directories under `dir`, reporting the ones that existed (a
+/// directory with a trailing `/`). A missing artifact is not an error, which is what makes a
+/// rescan idempotent and retryable.
+fn remove_artifacts(dir: &Path, artifacts: &[&str]) -> anyhow::Result<Vec<String>> {
     let mut removed = Vec::new();
-    for artifact in crate::migrate::ENGINE_ARTIFACTS {
-        let path = engine_dir.join(artifact);
+    for artifact in artifacts {
+        let path = dir.join(artifact);
         let result = if path.is_dir() {
             std::fs::remove_dir_all(&path).map(|()| format!("{artifact}/"))
         } else {
@@ -3102,5 +3293,293 @@ mod tests {
         ensure_identity(&path).await.expect("create identity");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "age identity must be private (0600)");
+    }
+
+    /// The Bitcoin engine's rescan: the BDK database (with its WAL sidecars) and the kyoto
+    /// cache are deleted, `keys.toml` and its xpub pin survive, and a second run is a no-op -
+    /// on a watch-only wallet, the shape the mainnet dashboard runs.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn rescan_bitcoin_wallet_wipes_the_database_and_kyoto_cache() {
+        use crate::coin::BitcoinNetwork;
+        let net = network::regtest();
+        let dir = tempfile::tempdir().unwrap();
+        let keys_path = crate::wallet::store::keys_path(dir.path());
+        let xpub = crate::btc::keys::AccountKeys::from_seed(
+            &crate::btc::keys::tests::bip84_seed(),
+            BitcoinNetwork::Regtest,
+        )
+        .unwrap()
+        .export();
+        WalletStore::init_bitcoin_view_only(&keys_path, BlockHeight::from_u32(5), None, net, &xpub)
+            .unwrap();
+        let engine = crate::config::engine_dir(dir.path(), crate::coin::Coin::Bitcoin);
+        let kyoto = crate::config::btc_kyoto_dir(dir.path());
+        drop(crate::btc::store::Persister::open(&engine).unwrap());
+        std::fs::create_dir_all(&kyoto).unwrap();
+        std::fs::write(kyoto.join("headers.db"), b"x").unwrap();
+        assert!(crate::btc::store::wallet_db_path(&engine).exists());
+
+        let removed = rescan_bitcoin_wallet(
+            net,
+            "btc",
+            Some(dir.path()),
+            &keys_path,
+            &engine,
+            &kyoto,
+            |st| {
+                assert_eq!(u32::from(st.birthday), 5);
+                Ok(true)
+            },
+        )
+        .expect("rescan a watch-only bitcoin wallet");
+        assert!(
+            removed.contains(&"wallet.sqlite".to_string()),
+            "{removed:?}"
+        );
+        assert!(removed.contains(&"kyoto/".to_string()), "{removed:?}");
+        assert!(!crate::btc::store::wallet_db_path(&engine).exists());
+        assert!(!kyoto.exists());
+        assert!(WalletStore::exists(&keys_path), "keys.toml survives");
+        assert_eq!(
+            WalletStore::read(&keys_path).unwrap().pinned_xpub(),
+            Some(xpub.as_str())
+        );
+        let removed = rescan_bitcoin_wallet(
+            net,
+            "btc",
+            Some(dir.path()),
+            &keys_path,
+            &engine,
+            &kyoto,
+            |_| Ok(true),
+        )
+        .expect("re-running is not an error");
+        assert!(removed.is_empty(), "{removed:?}");
+    }
+
+    /// Refusals on the Bitcoin side: a passphrase-encrypted wallet (nothing could decrypt the
+    /// seed to rebuild from), a `keys.toml` with neither seed nor xpub, an uninitialized
+    /// wallet, a declined confirmation - and none of them deletes anything.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn rescan_bitcoin_wallet_refuses_encrypted_keyless_and_declined() {
+        use crate::btc::store::{wallet_db_path, Persister};
+        use crate::config::{btc_kyoto_dir, engine_dir};
+        use crate::wallet::store::keys_path;
+        let net = network::regtest();
+
+        let enc = tempfile::tempdir().unwrap();
+        let enc_keys = keys_path(enc.path());
+        let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+        WalletStore::init_with_passphrase_unpinned(
+            &enc_keys,
+            Passphrase::from("test-pass".to_string()),
+            &mnemonic,
+            BlockHeight::from_u32(1),
+            None,
+            net,
+        )
+        .unwrap();
+        let engine = engine_dir(enc.path(), crate::coin::Coin::Bitcoin);
+        drop(Persister::open(&engine).unwrap());
+        let err = rescan_bitcoin_wallet(
+            net,
+            "btc",
+            Some(enc.path()),
+            &enc_keys,
+            &engine,
+            &btc_kyoto_dir(enc.path()),
+            |_| Ok(true),
+        )
+        .expect_err("a passphrase-encrypted bitcoin wallet cannot be rebuilt");
+        assert!(err.to_string().contains("passphrase-encrypted"), "{err}");
+        assert!(
+            wallet_db_path(&engine).exists(),
+            "refusal must not delete anything"
+        );
+
+        let bare = tempfile::tempdir().unwrap();
+        let bare_keys = keys_path(bare.path());
+        std::fs::create_dir_all(bare_keys.parent().unwrap()).unwrap();
+        std::fs::write(
+            &bare_keys,
+            format!("network = \"{}\"\nbirthday = 1\n", net.name()),
+        )
+        .unwrap();
+        let err = rescan_bitcoin_wallet(
+            net,
+            "btc",
+            Some(bare.path()),
+            &bare_keys,
+            &engine_dir(bare.path(), crate::coin::Coin::Bitcoin),
+            &btc_kyoto_dir(bare.path()),
+            |_| Ok(true),
+        )
+        .expect_err("no seed and no xpub");
+        assert!(err.to_string().contains("neither a seed nor"), "{err}");
+        assert!(err.to_string().contains("--xpub"), "{err}");
+
+        let empty = tempfile::tempdir().unwrap();
+        let err = rescan_bitcoin_wallet(
+            net,
+            "btc",
+            Some(empty.path()),
+            &keys_path(empty.path()),
+            &engine_dir(empty.path(), crate::coin::Coin::Bitcoin),
+            &btc_kyoto_dir(empty.path()),
+            |_| Ok(true),
+        )
+        .expect_err("uninitialized");
+        assert!(err.to_string().contains("not initialized"), "{err}");
+
+        let xpub = crate::btc::keys::AccountKeys::from_seed(
+            &crate::btc::keys::tests::bip84_seed(),
+            crate::coin::BitcoinNetwork::Regtest,
+        )
+        .unwrap()
+        .export();
+        let declined = tempfile::tempdir().unwrap();
+        let declined_keys = keys_path(declined.path());
+        WalletStore::init_bitcoin_view_only(
+            &declined_keys,
+            BlockHeight::from_u32(1),
+            None,
+            net,
+            &xpub,
+        )
+        .unwrap();
+        let engine = engine_dir(declined.path(), crate::coin::Coin::Bitcoin);
+        drop(Persister::open(&engine).unwrap());
+        let err = rescan_bitcoin_wallet(
+            net,
+            "btc",
+            Some(declined.path()),
+            &declined_keys,
+            &engine,
+            &btc_kyoto_dir(declined.path()),
+            |_| Ok(false),
+        )
+        .expect_err("declined");
+        assert!(err.to_string().contains("aborted"), "{err}");
+        assert!(wallet_db_path(&engine).exists());
+    }
+
+    /// `rescan --birthday` through the command, Bitcoin side: a height rewrites `keys.toml`
+    /// offline (the bitcoind server is unreachable on purpose) once the database is gone,
+    /// a rescan without the flag leaves the record alone, and a date on a kyoto wallet
+    /// resolves offline exactly as `init` would - recording the date for the first sync.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rescan_birthday_rewrites_the_bitcoin_wallets_record() {
+        use crate::btc::store::wallet_db_path;
+        use crate::coin::BitcoinNetwork;
+        let xpub = crate::btc::keys::AccountKeys::from_seed(
+            &crate::btc::keys::tests::bip84_seed(),
+            BitcoinNetwork::Testnet3,
+        )
+        .unwrap()
+        .export();
+        let args = |birthday| RescanArgs {
+            wallet: "btc".to_string(),
+            yes: true,
+            birthday,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), "bitcoind://127.0.0.1:1", "");
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Xpub(xpub.clone()),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Height(12_345)),
+            },
+        )
+        .await
+        .unwrap();
+        let engine = config.wallets["btc"].engine_dir();
+        assert!(wallet_db_path(&engine).exists());
+        rescan(&config, &args(Some(Birthday::Height(7))))
+            .await
+            .unwrap();
+        assert!(!wallet_db_path(&engine).exists(), "database deleted");
+        let st = WalletStore::read(&outcome.keys_path).unwrap();
+        assert_eq!(u32::from(st.birthday), 7);
+        assert_eq!(st.birthday_time, None);
+        assert_eq!(st.pinned_xpub(), Some(xpub.as_str()), "the pin survives");
+        rescan(&config, &args(None)).await.unwrap();
+        assert_eq!(
+            u32::from(WalletStore::read(&outcome.keys_path).unwrap().birthday),
+            7,
+            "no --birthday, no change"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), "kyoto", "");
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Xpub(xpub),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Height(12_345)),
+            },
+        )
+        .await
+        .unwrap();
+        // Well after the testnet3 floor's own date, so the floor height serves offline.
+        let recent = 1_787_000_000;
+        rescan(&config, &args(Some(Birthday::Date(recent))))
+            .await
+            .unwrap();
+        let st = WalletStore::read(&outcome.keys_path).unwrap();
+        assert_eq!(
+            Some(u32::from(st.birthday)),
+            crate::btc::kyoto::birthday_height_for_date(BitcoinNetwork::Testnet3, recent)
+        );
+        assert_eq!(
+            st.birthday_time,
+            Some(recent),
+            "kept for the first sync to refine"
+        );
+    }
+
+    /// `rescan --birthday <height>` through the command, Zcash side: offline, the database
+    /// goes and the record moves; the encrypted seed is untouched.
+    #[cfg(feature = "cli")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rescan_birthday_rewrites_the_zcash_wallets_record() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_dir = dir.path().join("default");
+        make_spending_wallet(&wallet_dir);
+        let cli = crate::config::Cli::parse_from([
+            "zecd",
+            "--datadir",
+            dir.path().to_str().unwrap(),
+            "--regtest",
+        ]);
+        let config = AppConfig::resolve(&cli).unwrap();
+        let keys_path = crate::wallet::store::keys_path(&wallet_dir);
+        assert!(open::data_db_path(&engine_of(&wallet_dir)).exists());
+        rescan(
+            &config,
+            &RescanArgs {
+                wallet: "default".to_string(),
+                yes: true,
+                birthday: Some(Birthday::Height(3)),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!open::data_db_path(&engine_of(&wallet_dir)).exists());
+        let st = WalletStore::read(&keys_path).unwrap();
+        assert_eq!(u32::from(st.birthday), 3);
+        assert!(
+            st.has_seed() && st.is_encrypted(),
+            "the seed record is untouched"
+        );
     }
 }

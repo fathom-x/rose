@@ -476,7 +476,8 @@ pub enum InitKey {
     /// A watch-only wallet from this encoded Unified Full Viewing Key.
     WatchOnly(String),
     /// A watch-only **Bitcoin** wallet from this account xpub (the
-    /// `[fingerprint/84'/coin'/0']xpub` form `export-xpub` prints). Refused by a Zcash
+    /// `[fingerprint/84'/coin'/0']xpub` form `export-xpub` prints, or a bare `xpub` taken
+    /// as the BIP 84 first account - see `AccountKeys::from_xpub`). Refused by a Zcash
     /// wallet, exactly as [`InitKey::WatchOnly`] is by a Bitcoin one: the two viewing-key
     /// encodings are coin-specific, and a wallet's coin is its configuration's.
     Xpub(String),

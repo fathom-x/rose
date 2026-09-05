@@ -47,8 +47,9 @@ pub struct WalletStore {
     /// diverting deposits to a foreign account. `None` only for a `keys.toml` written before
     /// this field existed; the daemon backfills it trust-on-first-use.
     pinned_ufvk: Option<String>,
-    /// A watch-only **Bitcoin** wallet's imported account key (`init --xpub`, the
-    /// `[fingerprint/84'/coin'/0']xpub` form `export-xpub` prints). The Bitcoin analog of
+    /// A watch-only **Bitcoin** wallet's imported account key (`init --xpub`, pinned in the
+    /// `[fingerprint/84'/coin'/0']xpub` form `export-xpub` prints - a bare xpub import is
+    /// re-encoded with the assumed origin and fingerprint `00000000`). The Bitcoin analog of
     /// the UFVK pin: it is the only key material such a wallet has, so it is what the
     /// daemon verifies the BDK database's descriptors against at every start (a seed wallet
     /// verifies against the seed instead and pins nothing here), and what a deleted

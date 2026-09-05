@@ -1460,11 +1460,13 @@ pub struct InitArgs {
     #[arg(long, value_name = "UFVK", conflicts_with_all = ["restore", "encrypt"])]
     pub ufvk: Option<String>,
 
-    /// Create a watch-only **Bitcoin** wallet from this account xpub instead of a mnemonic
-    /// (export it from the spending wallet with `export-xpub`; the form is
-    /// `[fingerprint/84'/coin'/0']xpub...`). The wallet sees balances, history, and
-    /// addresses, but holds no spending material - spend RPCs are disabled. Only a
-    /// `coin = "bitcoin"` wallet accepts it; a Zcash wallet takes `--ufvk`.
+    /// Create a watch-only **Bitcoin** wallet from this account xpub instead of a mnemonic:
+    /// either the `[fingerprint/84'/coin'/0']xpub...` form `export-xpub` prints, or a bare
+    /// `xpub...` (taken to be the BIP 84 first account, `m/84'/coin'/0'`, which is the only
+    /// derivation the engine supports; its export then carries fingerprint `00000000`). The
+    /// wallet sees balances, history, and addresses, but holds no spending material - spend
+    /// RPCs are disabled. Only a `coin = "bitcoin"` wallet accepts it; a Zcash wallet takes
+    /// `--ufvk`.
     #[arg(long, value_name = "XPUB", conflicts_with_all = ["restore", "encrypt", "ufvk"])]
     pub xpub: Option<String>,
 

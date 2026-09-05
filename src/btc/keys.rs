@@ -72,15 +72,20 @@ impl AccountKeys {
         })
     }
 
-    /// Parse an exported account key (the [`AccountKeys::export`] form,
-    /// `[fingerprint/84'/coin'/0']xpub...`) for a watch-only wallet on `net`.
+    /// Parse an account key for a watch-only wallet on `net`: either the
+    /// [`AccountKeys::export`] form (`[fingerprint/84'/coin'/0']xpub...`) or a bare
+    /// `xpub...`/`tpub...`.
     ///
-    /// Strict on purpose: the engine is BIP 84 only (`getaddressinfo` reports
+    /// Strict where it matters: the engine is BIP 84 only (`getaddressinfo` reports
     /// `m/84'/coin'/0'/...` paths, and issuance is bech32), so the key must be the account
-    /// node at exactly that path, its own network kind must match the wallet's, and the key
-    /// origin (fingerprint + path) must be present - it is what `export-xpub` writes, what
-    /// the descriptors carry, and what the spending twin's seed-derived descriptors are
-    /// compared against. A bare xpub, a wrong depth, or a trailing `/0/*` is refused
+    /// node at exactly that path (depth 3) and its own network kind must match the wallet's.
+    /// When the key origin is present it is checked against that path - it is what
+    /// `export-xpub` writes, what the descriptors carry, and what the spending twin's
+    /// seed-derived descriptors are compared against. A **bare** key carries no origin, so
+    /// it is taken to be the BIP 84 first account it is required to be (a wallet built from
+    /// it derives the same addresses either way - the origin never enters derivation) and
+    /// tagged with the all-zero fingerprint, which is what its `export-xpub` then prints. A
+    /// wrong depth, a wrong network, a non-BIP-84 origin, or a trailing `/0/*` is refused
     /// naming the expected form rather than silently building a wallet whose addresses no
     /// paired seed can spend.
     pub fn from_xpub(encoded: &str, net: BitcoinNetwork) -> anyhow::Result<AccountKeys> {
@@ -92,7 +97,8 @@ impl AccountKeys {
         let DescriptorPublicKey::XPub(xkey) = key else {
             anyhow::bail!(
                 "invalid account xpub: expected an extended public key of the form \
-                 [fingerprint/84'/coin'/0']xpub... (as `zecd export-xpub` prints)"
+                 [fingerprint/84'/coin'/0']xpub... (as `zecd export-xpub` prints) or a \
+                 bare xpub..."
             );
         };
         if !xkey.derivation_path.is_empty() || xkey.wildcard != Wildcard::None {
@@ -101,13 +107,13 @@ impl AccountKeys {
                  derivation suffix such as /0/* (the wallet derives both keychains from it)"
             );
         }
-        let Some((fingerprint, origin_path)) = xkey.origin else {
-            anyhow::bail!(
-                "invalid account xpub: the key origin is missing - expected \
-                 [fingerprint/84'/coin'/0']xpub..., the form `zecd export-xpub` prints (the \
-                 master fingerprint is what ties the watch-only wallet to its spending twin)"
-            );
-        };
+        let expected_path = bip84_account_path(net);
+        // A bare key states no origin; it is the BIP 84 first account or it is refused
+        // below (depth), so assume that path. The fingerprint is a descriptor tag only, and
+        // an unknown master has none: zero it, the conventional "unknown origin" value.
+        let (fingerprint, origin_path) = xkey
+            .origin
+            .unwrap_or_else(|| (Fingerprint::default(), expected_path.clone()));
         let expected_kind = NetworkKind::from(network);
         if xkey.xkey.network != expected_kind {
             anyhow::bail!(
@@ -124,7 +130,6 @@ impl AccountKeys {
                 network
             );
         }
-        let expected_path = bip84_account_path(net);
         if origin_path != expected_path {
             anyhow::bail!(
                 "invalid account xpub: the key origin path is {origin_path}, but this \
@@ -364,19 +369,18 @@ pub(crate) mod tests {
         };
         // Garbage.
         refuse("not a key", BitcoinNetwork::Main, "invalid account xpub");
-        // A bare xpub without its origin.
-        refuse(
-            &main.account_xpub.to_string(),
-            BitcoinNetwork::Main,
-            "key origin is missing",
-        );
-        // A trailing keychain path / wildcard.
+        // A trailing keychain path / wildcard, with and without an origin.
         refuse(
             &format!("{}/0/*", main.export()),
             BitcoinNetwork::Main,
             "without a derivation suffix",
         );
-        // The wrong network kind for the wallet.
+        refuse(
+            &format!("{}/0/*", main.account_xpub),
+            BitcoinNetwork::Main,
+            "without a derivation suffix",
+        );
+        // The wrong network kind for the wallet, with and without an origin.
         refuse(
             &main.export(),
             BitcoinNetwork::Regtest,
@@ -384,6 +388,16 @@ pub(crate) mod tests {
         );
         refuse(
             &test.export(),
+            BitcoinNetwork::Main,
+            "encoded for a test network",
+        );
+        refuse(
+            &main.account_xpub.to_string(),
+            BitcoinNetwork::Regtest,
+            "encoded for mainnet",
+        );
+        refuse(
+            &test.account_xpub.to_string(),
             BitcoinNetwork::Main,
             "encoded for a test network",
         );
@@ -398,7 +412,7 @@ pub(crate) mod tests {
             BitcoinNetwork::Main,
             "BIP 84 accounts at 84'/0'/0' only",
         );
-        // A master key (depth 0) claiming the account origin.
+        // A master key (depth 0) claiming the account origin, and the same key bare.
         let secp = Secp256k1::new();
         let master = Xpriv::new_master(Network::Bitcoin, bip84_seed().expose_secret()).unwrap();
         refuse(
@@ -406,6 +420,53 @@ pub(crate) mod tests {
             BitcoinNetwork::Main,
             "not an account-level key",
         );
+        refuse(
+            &Xpub::from_priv(&secp, &master).to_string(),
+            BitcoinNetwork::Main,
+            "not an account-level key",
+        );
+    }
+
+    /// A bare account xpub (no key origin - what most wallets show as "the xpub") is
+    /// accepted as the BIP 84 first account, derives exactly the addresses the origin-tagged
+    /// form does, and re-exports with the all-zero fingerprint in place of the master's.
+    #[test]
+    fn bare_xpub_imports_as_the_bip84_account() {
+        for net in [BitcoinNetwork::Main, BitcoinNetwork::Testnet4] {
+            let keys = AccountKeys::from_seed(&bip84_seed(), net).unwrap();
+            let bare = keys.account_xpub.to_string();
+            assert!(!bare.starts_with('['), "{bare}");
+            let imported = AccountKeys::from_xpub(&bare, net).unwrap();
+            assert_eq!(imported.account_xpub, keys.account_xpub);
+            assert_eq!(imported.network, network(net));
+            assert_eq!(imported.fingerprint, Fingerprint::default());
+            let coin = if net == BitcoinNetwork::Main { 0 } else { 1 };
+            assert_eq!(
+                imported.export(),
+                format!("[00000000/84'/{coin}'/0']{bare}"),
+                "the pinned form names the assumed origin"
+            );
+            // The pin round-trips, and both wallets derive the same first addresses.
+            let repinned = AccountKeys::from_xpub(&imported.export(), net).unwrap();
+            assert_eq!(repinned.fingerprint, Fingerprint::default());
+            assert_eq!(repinned.account_xpub, keys.account_xpub);
+            let build = |k: &AccountKeys| {
+                bdk_wallet::Wallet::create(
+                    k.descriptor(KeychainKind::External),
+                    k.descriptor(KeychainKind::Internal),
+                )
+                .network(k.network)
+                .create_wallet_no_persist()
+                .unwrap()
+            };
+            let (mut from_seed, mut from_bare) = (build(&keys), build(&imported));
+            for keychain in [KeychainKind::External, KeychainKind::Internal] {
+                assert_eq!(
+                    from_seed.reveal_next_address(keychain).to_string(),
+                    from_bare.reveal_next_address(keychain).to_string()
+                );
+            }
+        }
     }
 
     #[test]

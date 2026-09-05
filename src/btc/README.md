@@ -17,7 +17,8 @@ wallets** pair with a spender through the account xpub: `zecd export-xpub` print
 its key origin, `zecd init --xpub` builds a seedless wallet from it (any number beside the
 one spender), `keys.toml` pins it, and the wallet syncs, reports and refuses to spend
 exactly as a UFVK watch-only Zcash wallet does. Import is BIP 84 first-account keys only,
-the one derivation the engine has.
+the one derivation the engine has; a bare xpub (no key origin, as most wallets show it) is
+accepted as that account and pinned with the all-zero fingerprint.
 
 ## The two backends are not equivalent
 

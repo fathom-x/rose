@@ -15,7 +15,9 @@
 #     (docker-compose.btc-mainnet.yml) precisely so nothing has to be published past loopback.
 #   * Watch-only is an option for the UI: `zecd export-xpub --wallet btc` here, then
 #     `init --xpub <key>` on the box that runs the dashboard, and that box holds no seed at
-#     all. The UI detects a watch-only wallet, says so, and disables its send form.
+#     all. A bare BIP 84 account xpub from any other wallet works too (add `--birthday`
+#     for its history). The UI detects a watch-only wallet, says so, and disables its send
+#     form.
 #
 # Needs a zecd built with the `bitcoin` feature (a default build refuses this file). Probe:
 #   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-mainnet.toml config check

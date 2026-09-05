@@ -143,7 +143,7 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 
 /// Days since 1970-01-01 for a civil date (Howard Hinnant's `days_from_civil` algorithm),
 /// so date parsing needs no calendar dependency.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -919,11 +919,12 @@ struct BitcoinBirthday {
 ///    capture that block's hash as the wallet's scan anchor; an unreachable node is a
 ///    clean refusal naming `--birthday <height>` as the offline escape hatch, like the
 ///    fresh-wallet dial.
-///  * kyoto stays offline, as everywhere in `init`: a date at or after the shipped scan
-///    floor's own date maps to the floor height, an earlier date falls back to the BIP 84
-///    history floor - and the date itself is recorded, so the first sync refines it to the
-///    true height (and hash) against the light client's own headers and every later first
-///    scan starts there.
+///  * kyoto stays offline, as everywhere in `init`: a mainnet date the shipped per-day
+///    table covers (`btc::birthdays`) resolves and anchors exactly like the bitcoind
+///    search; otherwise a date at or after the shipped scan floor's own date maps to the
+///    floor height, an earlier date falls back to the BIP 84 history floor - and the date
+///    itself is recorded, so the first sync refines it to the true height (and hash)
+///    against the light client's own headers and every later first scan starts there.
 ///
 /// Regtest is refused like the Zcash side: its block timestamps mean nothing.
 #[cfg(feature = "bitcoin")]
@@ -980,11 +981,50 @@ async fn resolve_bitcoin_date_birthday(
 }
 
 /// The offline (kyoto) half of [`resolve_bitcoin_date_birthday`], shared with the
-/// fresh-wallet default (no `--birthday` = today): record the shipped scan floor when the
-/// date safely postdates it, else the BIP 84 history floor, and keep the date itself so
-/// the first sync's anchor resolution can refine the record to the true height.
+/// fresh-wallet default (no `--birthday` = today): resolve and anchor the date from the
+/// shipped per-day table when it covers the date (mainnet), record the table's newest
+/// entry as the floor for a date past it; otherwise record the shipped scan floor when the
+/// date safely postdates it, else the BIP 84 history floor - keeping the date itself in
+/// every floor case so the first sync's anchor resolution can refine the record to the
+/// true height.
 #[cfg(feature = "bitcoin")]
 fn kyoto_date_birthday(btc_network: crate::coin::BitcoinNetwork, date: u64) -> BitcoinBirthday {
+    // The shipped per-day table answers exactly (a day low, like the bitcoind search) for
+    // any mainnet date it covers, anchor included - so the first scan starts at the
+    // birthday and nothing is left for the first sync to refine. A date past the table's
+    // end gets its newest entry as the recorded floor instead, with the date kept so the
+    // first sync resolves the true height above it (`btc::kyoto::recovery_floor` starts
+    // there on its own; recording an anchor would freeze the start at the table's age).
+    match crate::btc::birthdays::anchor_for_date(btc_network, date) {
+        Some(entry) if entry.exact => {
+            let height = entry.height;
+            tracing::info!(
+                "resolved the --birthday date offline to height {height} (the first block \
+                 of the previous UTC day, from the shipped per-day table) and anchored the \
+                 first scan there"
+            );
+            return BitcoinBirthday {
+                height,
+                time: None,
+                anchor: Some((height, entry.hash.to_string())),
+            };
+        }
+        Some(entry) => {
+            let height = entry.height;
+            tracing::info!(
+                "the birthday date is newer than this build's shipped per-day table; \
+                 recorded its newest entry (height {height}) as the floor, and the first \
+                 sync resolves the date to its true height against the light client's own \
+                 headers and anchors there from then on"
+            );
+            return BitcoinBirthday {
+                height,
+                time: Some(date),
+                anchor: None,
+            };
+        }
+        None => {}
+    }
     let height = match crate::btc::kyoto::birthday_height_for_date(btc_network, date) {
         Some(height) => {
             tracing::info!(
@@ -997,11 +1037,10 @@ fn kyoto_date_birthday(btc_network: crate::coin::BitcoinNetwork, date: u64) -> B
         None => {
             let height = bip84_history_floor(btc_network);
             warn!(
-                "the birthday date predates this build's shipped scan floor, so the \
-                 offline record falls back to the BIP 84 history floor (height {height}) - \
-                 a full history scan on the first sync, refined to the date's true height \
-                 once the light client's headers cover it. Pass --birthday <height> for a \
-                 faster first sync."
+                "the birthday date predates this build's shipped scan floor and per-day \
+                 table, so the offline record falls back to the BIP 84 history floor \
+                 (height {height}) - a full history scan on the first sync, refined to the \
+                 date's true height once the light client's headers cover it."
             );
             height
         }
@@ -1123,11 +1162,16 @@ async fn init_bitcoin_wallet(
     // Resolve the birthday before anything is written, so a failed dial is a clean refusal
     // (the same before-any-write doctrine as the Zcash path, which likewise dials its
     // upstream once at init). Four cases:
-    //  * --birthday height: honored verbatim; the init stays fully offline.
+    //  * --birthday height: honored verbatim; the init stays fully offline. On mainnet
+    //    the shipped per-day table (`btc::birthdays`) supplies a scan anchor at the last
+    //    day entry at or below it, so a kyoto first scan starts within a day of blocks of
+    //    the birthday instead of at SegWit activation (past the table's end, its newest
+    //    entry is the first scan's floor and the first sync anchors at the height).
     //  * --birthday date: resolved to a height erring low
     //    (`resolve_bitcoin_date_birthday`) - exactly via a bitcoind upstream's headers
-    //    (capturing the block hash as the scan anchor), offline via the shipped scan floor
-    //    on kyoto (recording the date, so the first sync refines it).
+    //    (capturing the block hash as the scan anchor), offline via the per-day table or
+    //    else the shipped scan floor on kyoto (recording the date, so the first sync
+    //    refines it).
     //  * restore, or an imported xpub: the key may hold history from any point in its
     //    past, so scan everything it could possibly own - from SegWit activation, the first
     //    block a BIP 84 (bech32) output can exist in. Warned, like the Zcash restore
@@ -1141,7 +1185,12 @@ async fn init_bitcoin_wallet(
         Some(Birthday::Height(height)) => BitcoinBirthday {
             height,
             time: None,
-            anchor: None,
+            // A height the table covers is anchored within a day of blocks below it;
+            // past the table's end the newest entry serves as the first scan's floor
+            // (`btc::kyoto::recovery_floor`) and the first sync anchors at the height.
+            anchor: crate::btc::birthdays::anchor_for_height(btc_network, height)
+                .filter(|entry| entry.exact)
+                .map(|entry| (entry.height, entry.hash.to_string())),
         },
         Some(Birthday::Date(date)) => {
             resolve_bitcoin_date_birthday(config, &entry, btc_network, date).await?

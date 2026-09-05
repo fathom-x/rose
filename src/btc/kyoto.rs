@@ -155,12 +155,12 @@ const FEE_BLOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// and the fallback for wallets that predate the anchor, not as the common scan start.
 /// The blocks are deeply buried (the mainnet one had 4389 confirmations when recorded),
 /// so no reorg can orphan them.
-struct ScanFloor {
-    height: u32,
-    hash: &'static str,
+pub(crate) struct ScanFloor {
+    pub(crate) height: u32,
+    pub(crate) hash: &'static str,
     /// The block's own header time: what [`birthday_height_for_date`] resolves a date
     /// against.
-    time: u64,
+    pub(crate) time: u64,
 }
 
 /// Mainnet: block 960000, mined 2026-07-28.
@@ -187,13 +187,15 @@ const BTC_KYOTO_SCAN_FLOOR_TESTNET4: ScanFloor = ScanFloor {
 };
 
 /// The offline resolution of a date birthday for a kyoto wallet (`init` will not start a
-/// P2P node to read the chain): a date at or after the network's shipped scan floor - with
-/// a day of slack over the floor block's own header time - maps to the floor height, the
-/// height an anchor-less first scan starts at for any birthday at or above it
-/// ([`recovery_floor`]). The date itself is recorded alongside
-/// (`WalletStore::birthday_time`), and the first sync refines it to the true height via
-/// [`resolve_birthday_anchor`]. An earlier date (or regtest, which ships no floor) has no
-/// offline reference; the caller falls back to the BIP 84 history floor.
+/// P2P node to read the chain) when the shipped per-day table
+/// ([`super::birthdays::anchor_for_date`], mainnet only, consulted first) does not cover
+/// the date: a date at or after the network's shipped scan floor - with a day of slack
+/// over the floor block's own header time - maps to the floor height, the height an
+/// anchor-less first scan starts at for any birthday at or above it ([`recovery_floor`]).
+/// The date itself is recorded alongside (`WalletStore::birthday_time`), and the first
+/// sync refines it to the true height via [`resolve_birthday_anchor`]. An earlier date
+/// (or regtest, which ships no floor) has no offline reference; the caller falls back to
+/// the BIP 84 history floor.
 pub(crate) fn birthday_height_for_date(network: BitcoinNetwork, date: u64) -> Option<u32> {
     let floor = scan_floor(network)?;
     (date >= floor.time + 24 * 60 * 60).then_some(floor.height)
@@ -201,7 +203,7 @@ pub(crate) fn birthday_height_for_date(network: BitcoinNetwork, date: u64) -> Op
 
 /// The network's shipped floor. Regtest has none: its chains are built per run and stay
 /// tiny, so a fresh wallet's scan from genesis is already short.
-fn scan_floor(network: BitcoinNetwork) -> Option<&'static ScanFloor> {
+pub(crate) fn scan_floor(network: BitcoinNetwork) -> Option<&'static ScanFloor> {
     match network {
         BitcoinNetwork::Main => Some(&BTC_KYOTO_SCAN_FLOOR),
         BitcoinNetwork::Testnet3 => Some(&BTC_KYOTO_SCAN_FLOOR_TESTNET3),
@@ -880,26 +882,36 @@ impl KyotoConn {
 ///    history may sit anywhere after the first block a BIP 84 output could exist in.
 ///  * test networks, birthday below the floor: genesis (`segwit_activation` is a mainnet
 ///    block). Regtest ships no floor at all - its chains are built per run and stay tiny.
+///  * on top of those, the shipped per-day table ([`super::birthdays`], mainnet only): the
+///    last day entry at or below the birthday, when it is higher than the floor above.
+///    That is within a day of blocks of any birthday the table covers, and the table's
+///    newest entry for a birthday past its end - so the mainnet shipped floor is in
+///    practice the fallback for a birthday between the two, and the aging cost of the
+///    fixed floor is bounded by how old the build is rather than how old the floor is.
 ///
-/// The `birthday >= height` comparison is the correctness gate, and it is per-wallet: the
-/// shipped floor is used only for wallets whose birthday proves they cannot have funds below
-/// it. Scanning from too early is only slow; this function is what makes "too late"
-/// unreachable no matter what value the constants hold.
+/// The `birthday >= height` comparison is the correctness gate, and it is per-wallet: a
+/// floor is used only for wallets whose birthday proves they cannot have funds below it.
+/// Scanning from too early is only slow; this function is what makes "too late"
+/// unreachable no matter what value the constants (or the table) hold.
 fn recovery_floor(network: BitcoinNetwork, birthday: u32) -> HashCheckpoint {
-    let Some(floor) = scan_floor(network) else {
-        return HashCheckpoint::from_genesis(crate::btc::keys::network(network));
+    let shipped = match scan_floor(network) {
+        None => HashCheckpoint::from_genesis(crate::btc::keys::network(network)),
+        Some(floor) if birthday >= floor.height => {
+            let hash = floor
+                .hash
+                .parse::<BlockHash>()
+                .expect("scan floors are literal block hashes; covered by a unit test");
+            HashCheckpoint::new(floor.height, hash)
+        }
+        Some(_) if network == BitcoinNetwork::Main => HashCheckpoint::segwit_activation(),
+        Some(_) => HashCheckpoint::from_genesis(crate::btc::keys::network(network)),
     };
-    if birthday >= floor.height {
-        let hash = floor
-            .hash
-            .parse::<BlockHash>()
-            .expect("scan floors are literal block hashes; covered by a unit test");
-        return HashCheckpoint::new(floor.height, hash);
+    match super::birthdays::anchor_for_height(network, birthday) {
+        Some(entry) if entry.height > shipped.height => {
+            HashCheckpoint::new(entry.height, entry.hash)
+        }
+        _ => shipped,
     }
-    if network == BitcoinNetwork::Main {
-        return HashCheckpoint::segwit_activation();
-    }
-    HashCheckpoint::from_genesis(crate::btc::keys::network(network))
 }
 
 /// Broadcast a transaction over the P2P layer.
@@ -1123,28 +1135,55 @@ mod tests {
     #[test]
     fn a_generated_wallets_birthday_skips_to_the_release_floor() {
         // The whole point: a wallet created after the floor need not scan the chain's
-        // whole filter history - on any public network.
-        for network in [
-            BitcoinNetwork::Main,
-            BitcoinNetwork::Testnet3,
-            BitcoinNetwork::Testnet4,
-        ] {
+        // whole filter history - on any public network. The testnets have only their
+        // shipped floor; mainnet's per-day table places the start within a day of
+        // blocks below the birthday, or at the table's newest entry past its end.
+        for network in [BitcoinNetwork::Testnet3, BitcoinNetwork::Testnet4] {
             let floor_height = scan_floor(network).unwrap().height;
             for birthday in [floor_height, floor_height + 1, floor_height + 4_300] {
                 let cp = recovery_floor(network, birthday);
                 assert_eq!(cp.height, floor_height, "{network:?} birthday {birthday}");
             }
         }
+        let floor_height = BTC_KYOTO_SCAN_FLOOR.height;
+        let newest = super::super::birthdays::anchor_for_height(BitcoinNetwork::Main, u32::MAX)
+            .unwrap()
+            .height;
+        assert!(
+            newest > floor_height,
+            "the table postdates the shipped floor"
+        );
+        for birthday in [floor_height, floor_height + 1, floor_height + 4_300] {
+            let cp = recovery_floor(BitcoinNetwork::Main, birthday);
+            assert!(
+                floor_height <= cp.height && cp.height <= birthday && birthday - cp.height < 300,
+                "birthday {birthday}: start {}",
+                cp.height
+            );
+        }
+        for birthday in [newest, newest + 1, newest + 100_000, u32::MAX] {
+            let cp = recovery_floor(BitcoinNetwork::Main, birthday);
+            assert_eq!(cp.height, newest, "birthday {birthday}");
+        }
     }
 
     #[test]
     fn an_older_birthday_falls_back_to_segwit_activation() {
         // A restore may hold history from before the floor, so the floor must not apply.
+        // On mainnet the per-day table takes over from SegWit activation the day after it.
         let floor_height = BTC_KYOTO_SCAN_FLOOR.height;
         let segwit = HashCheckpoint::segwit_activation();
-        for birthday in [0, 481_824, floor_height - 1] {
+        for birthday in [0, 481_824, 481_914] {
             let cp = recovery_floor(BitcoinNetwork::Main, birthday);
             assert_eq!(cp.height, segwit.height, "birthday {birthday}");
+        }
+        for birthday in [481_915, 600_000, floor_height - 1] {
+            let cp = recovery_floor(BitcoinNetwork::Main, birthday);
+            assert!(
+                segwit.height < cp.height && cp.height <= birthday && birthday - cp.height < 300,
+                "birthday {birthday}: start {}",
+                cp.height
+            );
         }
         // The test networks have no shipped SegWit checkpoint (`segwit_activation` is a
         // mainnet block), so a pre-floor restore starts at genesis there.

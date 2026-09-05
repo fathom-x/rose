@@ -19,6 +19,7 @@
 //! backend's spend path needs, since a filter client has no `estimatesmartfee`.
 
 pub mod actor;
+pub mod birthdays;
 pub mod chain;
 pub mod fees;
 pub mod keys;

@@ -31,8 +31,10 @@
 # freshly generated kyoto wallet's birthday defaults to today (funds cannot predate the
 # wallet) and the first sync resolves it against the node's headers - from the shipped scan
 # floor that is a few thousand filters, minutes. Pass `--birthday <height|YYYY-MM-DD>` only
-# to restore a seed with history, which is the slow case (a restore with no birthday scans
-# from SegWit activation).
+# to restore a seed (or watch an xpub) with history: on mainnet a date or height since
+# SegWit activation resolves offline from the shipped per-day table to a (height, hash)
+# anchor, so the first scan starts within a day of blocks of the birthday. A restore with no
+# birthday scans from SegWit activation, the slow case.
 #
 # What kyoto gives up versus the bitcoind backend (filters cover blocks only, no mempool):
 #   - NO 0-conf receives: an incoming payment is invisible until it confirms.

@@ -136,10 +136,10 @@
     <div class="tablewrap">
       <table>
         <thead><tr><th>time</th><th style="text-align:right">debit</th>
-                   <th style="text-align:right">credit</th><th style="text-align:right">fee</th>
+                   <th style="text-align:right">credit</th>
                    <th>conf</th><th>address</th><th>txid</th>
                    <th style="text-align:right">net</th></tr></thead>
-        <tbody id="txs"><tr><td colspan="8" style="color:var(--dim)">&ndash;</td></tr></tbody>
+        <tbody id="txs"><tr><td colspan="7" style="color:var(--dim)">&ndash;</td></tr></tbody>
         <!-- Totals over the wallet's whole history, not just the rows shown above. -->
         <tfoot id="txtotals"></tfoot>
       </table>
@@ -291,11 +291,10 @@ async function refresh() {
     $("chaintext").textContent = `wallet height ${height} · ${short(hash, 16)}${upstream}`;
 
     // A fee belongs to the transaction as a whole (the surplus of its inputs over its
-    // outputs, claimed by the block's coinbase), not to any recipient row - Core merely
-    // repeats the transaction's `fee` on every send entry it fans out to. So each funded
-    // transaction gets one synthetic `fee` row of its own, placed just before its send
-    // rows in history order (below them once the list is shown newest first), with the
-    // coinbase named as the counterparty; recipient rows carry no fee.
+    // outputs), not to any recipient row - Core merely repeats the transaction's `fee` on
+    // every send entry it fans out to. So each funded transaction gets one synthetic row
+    // of its own, a debit labelled "transaction fee", placed just before its send rows in
+    // history order (below them once the list is shown newest first).
     const entries = [];
     const feeRowFor = new Set();
     for (const tx of txs) {
@@ -303,20 +302,17 @@ async function refresh() {
       if (tx.fee !== undefined && sats < 0 && !feeRowFor.has(tx.txid)) {
         feeRowFor.add(tx.txid);
         const fee = -toSats(tx.fee);
-        const payee = tx.blockheight ? `coinbase, block ${tx.blockheight}` : "coinbase (unmined)";
-        entries.push({ tx: { ...tx, category: "fee", address: payee }, debit: 0, credit: 0,
-                       fee, net: -fee, synthetic: true });
+        entries.push({ tx: { ...tx, address: "transaction fee" }, debit: fee, credit: 0,
+                       net: -fee, synthetic: true });
       }
-      entries.push({ tx, debit: sats < 0 ? -sats : 0, credit: sats >= 0 ? sats : 0, fee: 0,
-                     net: sats });
+      entries.push({ tx, debit: sats < 0 ? -sats : 0, credit: sats >= 0 ? sats : 0, net: sats });
     }
-    const rows = entries.slice(-25).reverse().map(({ tx, debit, credit, fee, net, synthetic }) => {
+    const rows = entries.slice(-25).reverse().map(({ tx, debit, credit, net, synthetic }) => {
       const when = tx.time ? new Date(tx.time * 1000).toLocaleString() : "";
       return `<tr>
         <td>${when}</td>
         <td class="amt neg" style="text-align:right">${debit ? fmtSats(debit) : ""}</td>
         <td class="amt pos" style="text-align:right">${credit ? fmtSats(credit) : ""}</td>
-        <td class="amt neg" style="text-align:right">${fee ? fmtSats(fee) : ""}</td>
         <td>${tx.confirmations ?? 0}</td>
         <td title="${tx.address || ""}">${synthetic ? tx.address : short(tx.address, 18) + copyBtn(tx.address)}</td>
         <td class="txid" title="${tx.txid}">${short(tx.txid)}${copyBtn(tx.txid)}</td>
@@ -324,20 +320,19 @@ async function refresh() {
       </tr>`;
     });
     $("txs").innerHTML = rows.length ? rows.join("")
-      : `<tr><td colspan="8" style="color:var(--dim)">no transactions yet</td></tr>`;
-    // Footer: each column summed over the whole history (Core reports a send's amount
-    // without its fee, so debits and fees are separate columns); net = credits - debits -
-    // fees, which is what the wallet's balance should equal once everything confirms.
+      : `<tr><td colspan="7" style="color:var(--dim)">no transactions yet</td></tr>`;
+    // Footer: each column summed over the whole history (fees are debits, on their own
+    // rows); net = credits - debits, which is what the wallet's balance should equal once
+    // everything confirms.
     const sum = key => entries.reduce((acc, e) => acc + e[key], 0);
-    const outSats = sum("debit"), inSats = sum("credit"), feeSats = sum("fee");
-    const net = inSats - outSats - feeSats;
+    const outSats = sum("debit"), inSats = sum("credit");
+    const net = inSats - outSats;
     $("txtotals").innerHTML = txs.length ? `<tr>
-        <td>total over ${new Set(txs.map(t => t.txid)).size} transactions, ${entries.length} rows</td>
-        <td class="amt neg" style="text-align:right" title="sum of debits">${fmtSats(outSats)}</td>
+        <td>Total</td>
+        <td class="amt neg" style="text-align:right" title="sum of debits, fees included">${fmtSats(outSats)}</td>
         <td class="amt pos" style="text-align:right" title="sum of credits">${fmtSats(inSats)}</td>
-        <td class="amt neg" style="text-align:right" title="sum of fees">${fmtSats(feeSats)}</td>
         <td colspan="3"></td>
-        <td class="amt ${net < 0 ? "neg" : "pos"}" style="text-align:right" title="credits - debits - fees">${fmtSats(net)}</td>
+        <td class="amt ${net < 0 ? "neg" : "pos"}" style="text-align:right" title="credits - debits">${fmtSats(net)}</td>
       </tr>` : "";
     renderAddresses(received, descriptors, unspent);
   } catch (e) {

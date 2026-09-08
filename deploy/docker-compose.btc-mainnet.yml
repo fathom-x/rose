@@ -136,7 +136,7 @@ services:
     # surface - to 127.0.0.1, and on the host network the container reaches it at exactly
     # that address, read from the mounted config. So unlike the testnet stacks there is no
     # --rpc-url, no host.docker.internal, and no `--rpcbind` past loopback on the daemon:
-    # spend authority never leaves 127.0.0.1. The UI itself binds 127.0.0.1:8080 on the
+    # spend authority never leaves 127.0.0.1. The UI itself binds 127.0.0.1:8081 on the
     # host (no `ports:` - there is nothing to publish on the host network); put a reverse
     # proxy with TLS and auth in front for remote access. Linux only (host networking),
     # which this node's host is.
@@ -156,10 +156,19 @@ services:
       - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:?set ZECD_RPC_PASSWORD in deploy/.env}
     volumes:
       - ./zecd.btc-mainnet.toml:/config/zecd.btc-mainnet.toml:ro
+      # The source, over the image's copy of it, so an edit is live without a rebuild:
+      # index.html on the next page load, serve.py via --reload below (the container's
+      # PID 1 re-execs itself). The image still carries a copy, so dropping this line and
+      # the flag gives the shipped build - do that for a deployment that must not track
+      # the checkout.
+      - ../scripts/zecd-gui:/app:ro
     command:
       - --conf=/config/zecd.btc-mainnet.toml
+      - --reload
       - --bind=127.0.0.1
-      - --port=8080
+      # 8081, not 8080: the testnet4 stack's GUI publishes 127.0.0.1:8080 on the same
+      # host, and on the host network there is no port mapping to separate the two.
+      - --port=8081
       # Point this at a WATCH-ONLY wallet (init --xpub from the spender's export-xpub) to
       # run the dashboard on a box with no seed; the page detects it and disables sending.
 

@@ -54,8 +54,14 @@
   .tab { background: transparent; color: var(--dim); border: none; border-bottom: 2px solid transparent;
          padding: .4rem .8rem; font-size: .95rem; cursor: pointer; border-radius: 0; }
   .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  /* The account key as two columns: what it is (label, fingerprint, path) beside the key
+     itself, which wraps in its own column rather than under the origin. One column again on
+     a narrow screen. */
+  #xpub-block { display: grid; grid-template-columns: max-content minmax(0, 1fr);
+                gap: .25rem 1.5rem; align-items: start; margin-bottom: .75rem; }
+  @media (max-width: 640px) { #xpub-block { grid-template-columns: 1fr; } }
   #xpub { font-family: ui-monospace, monospace; font-size: .8rem; word-break: break-all;
-          margin-bottom: .75rem; }
+          align-self: end; }
   #xpub-origin { color: var(--dim); font-family: ui-monospace, monospace; font-size: .8rem;
                  min-height: 1.2em; }
   tfoot td.amt { font-weight: 600; }
@@ -148,9 +154,13 @@
   <div id="pane-addrs" class="pane" hidden>
     <!-- The account xpub, from listdescriptors: the receiving descriptor's key with its
          origin. Public material only; zecd refuses the private form. -->
-    <label style="margin-top:0">account xpub</label>
-    <div id="xpub-origin" title="key origin: master key fingerprint / BIP 84 derivation path"></div>
-    <div id="xpub" style="color:var(--dim)">&ndash;</div>
+    <div id="xpub-block">
+      <div>
+        <label style="margin-top:0">account xpub</label>
+        <div id="xpub-origin" title="key origin: master key fingerprint / BIP 84 derivation path"></div>
+      </div>
+      <div id="xpub" style="color:var(--dim)">&ndash;</div>
+    </div>
     <div class="tablewrap">
       <table>
         <thead><tr><th>index</th><th>address</th><th style="text-align:right">balance</th>
@@ -227,14 +237,21 @@ function renderAddresses(received, descriptors, unspent) {
     ? descriptors.descriptors.find(d => !d.internal) : null;
   if (ext) {
     // desc = wpkh([<fingerprint>/84'/c'/0']<xpub>/0/*)#checksum: the bracketed key origin
-    // goes beside the label, the key itself on its own line.
+    // goes under the label in the first column, the key itself in the second.
     const m = /\[([^\]]+)\]([A-Za-z0-9]+)/.exec(ext.desc);
     $("xpub").style.color = "";
     // Origin is "<fingerprint>/<path>": the master key fingerprint (identifies the seed the
     // key came from) and the hardened BIP 84 path down to this account.
     const [fp, ...path] = (m ? m[1] : "").split("/");
+    // All zeros is not a fingerprint: it is what zecd records for a bare xpub import
+    // (init --xpub without the [fingerprint/path] origin), since the master key's
+    // fingerprint cannot be recovered from an account key. Say so rather than show a
+    // value that looks real.
+    const fpText = fp === "00000000"
+      ? `<span title="the xpub was imported bare, without its key origin; the master key fingerprint is not recoverable from an account key">undefined</span>`
+      : fp;
     $("xpub-origin").innerHTML = m
-      ? `fingerprint: ${fp}<br>path: m/${path.join("/")}`
+      ? `fingerprint: ${fpText}<br>path: m/${path.join("/")}`
       : "";
     $("xpub").innerHTML = m
       ? `${m[2]}${copyBtn(m[2])}`
@@ -288,7 +305,15 @@ async function refresh() {
     // upstream_connected is zecd's per-wallet signal for the chain source; false means a
     // hung or unreachable node has been noticed and the heights shown are the last known.
     const upstream = info.upstream_connected === false ? " · upstream disconnected" : "";
-    $("chaintext").textContent = `wallet height ${height} · ${short(hash, 16)}${upstream}`;
+    // The tip hash by its tail: a mainnet hash opens with ~19 zeros of proof of work, so a
+    // leading prefix shows nothing distinguishing. The full hash rides on the tooltip.
+    // The tail sits in its own span carrying the full hash as a tooltip, with the shared
+    // copy button beside it (the document-level click handler covers it). Height, hash and
+    // the fixed suffix are all safe to inline; the hash is validated hex.
+    const tail = /^[0-9a-f]{64}$/.test(hash || "")
+      ? `<span title="${hash}">...${hash.slice(-12)}</span>${copyBtn(hash)}`
+      : "";
+    $("chaintext").innerHTML = `wallet height ${Number(height)} · ${tail}${upstream}`;
 
     // A fee belongs to the transaction as a whole (the surplus of its inputs over its
     // outputs), not to any recipient row - Core merely repeats the transaction's `fee` on

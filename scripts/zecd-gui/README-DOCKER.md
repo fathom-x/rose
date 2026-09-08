@@ -59,8 +59,9 @@ Then open http://127.0.0.1:8080/
 mainnet config binds zecd's RPC to `127.0.0.1:8232`, and on the host network the container
 reaches that address as-is, so there is no `--rpc-url`, no `host.docker.internal`, and no
 `--rpcbind` past loopback on the daemon: the spend surface never leaves loopback. The UI
-binds `127.0.0.1:8080` on the host; front it with a reverse proxy for TLS and auth if it must
-be reachable remotely. Linux only.
+binds `127.0.0.1:8081` on the host (8081 so it can run beside the testnet4 stack's GUI on
+8080; on the host network there is no port mapping to separate them); front it with a
+reverse proxy for TLS and auth if it must be reachable remotely. Linux only.
 
 ```bash
 cp deploy/.env.mainnet.example deploy/.env && $EDITOR deploy/.env    # one variable
@@ -142,7 +143,14 @@ Whatever the topology, the rule is the same: the config supplies the credentials
 
 ## Development
 
-To rebuild after editing `serve.py` or `index.html`:
+**Both compose stacks mount this directory over the image's `/app` and pass `--reload`**, so
+an edit is live without a rebuild: `index.html` is read from disk on every request (reload
+the page), and a change to `serve.py` makes the server re-exec itself in place (the
+container's PID 1 survives, so compose sees no restart; the log says `reload: serve.py
+changed; restarting`). The image still carries its own copy of both files, so a deployment
+that must not track the checkout drops the mount and the flag and gets the shipped build.
+
+A rebuild is only needed when the `Dockerfile` itself changes:
 
 ```bash
 docker build -t zecd-gui .

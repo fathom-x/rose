@@ -38,12 +38,49 @@ import math
 import os
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from decimal import Decimal
 from pathlib import Path
 
 UI_DIR = Path(__file__).resolve().parent
+
+# How often --reload polls the server's own source files for a change (mtime). Polling
+# rather than inotify because it needs no dependency and works across a Docker bind mount
+# from any host filesystem, and a one-second delay on a code edit costs nothing.
+RELOAD_POLL_SECS = 1.0
+
+
+def watch_and_reexec(paths, interval=RELOAD_POLL_SECS):
+    """Re-exec this process when any of `paths` changes on disk (--reload).
+
+    The page itself needs nothing: index.html is read from disk on every request, so an
+    edit is live on the next refresh. This is for the server: a change to serve.py
+    replaces the whole process with a fresh one running the new code, via execv, so the
+    PID (and so the container) stays the same and a compose restart policy never sees a
+    stop. The listening socket does not survive the exec (Python sockets are
+    non-inheritable) and the new process rebinds the port; SO_REUSEADDR keeps that from
+    failing on the lingering TIME_WAIT connections.
+    """
+    def stamp():
+        return tuple(p.stat().st_mtime_ns if p.exists() else None for p in paths)
+
+    def run():
+        last = stamp()
+        while True:
+            time.sleep(interval)
+            try:
+                now = stamp()
+            except OSError:
+                continue
+            if now != last:
+                changed = [p.name for p, a, b in zip(paths, last, now) if a != b]
+                print(f"reload: {', '.join(changed)} changed; restarting", flush=True)
+                os.execv(sys.executable, [sys.executable, *sys.argv])
+
+    threading.Thread(target=run, name="reload", daemon=True).start()
 
 
 def read_config(conf_path):
@@ -313,6 +350,12 @@ def main():
         default="http://127.0.0.1:48332",
         help="bitcoind JSON-RPC for the fee estimate (default testnet4 48332; uses [bitcoind] creds)",
     )
+    ap.add_argument(
+        "--reload",
+        action="store_true",
+        help="development: re-exec this server when its source changes (index.html is "
+             "always read per request); pair with a bind mount of the source directory",
+    )
     args = ap.parse_args()
 
     sys.stdout.reconfigure(line_buffering=True)  # banner shows when piped to a service log
@@ -367,6 +410,9 @@ def main():
     }).encode()
 
     server = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
+    if args.reload:
+        watch_and_reexec(sorted(UI_DIR.glob("*.py")))
+        print(f"reload: watching {UI_DIR} (index.html is read per request; a .py change re-execs)")
     print(f"UI:   http://{args.bind}:{args.port}/")
     print(f"zecd: {Handler.upstream_url}  (credentials from {args.conf})")
     if backend == "kyoto":

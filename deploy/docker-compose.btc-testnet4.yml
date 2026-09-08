@@ -138,6 +138,9 @@ services:
       # Both testnet4 configs, so one service covers either backend (see the env vars below).
       - ./zecd.btc-testnet4.toml:/config/zecd.btc-testnet4.toml:ro
       - ./zecd.btc-testnet4-kyoto.toml:/config/zecd.btc-testnet4-kyoto.toml:ro
+      # The source, over the image's copy, so an edit is live without a rebuild (index.html
+      # on the next page load, serve.py via --reload; see the mainnet file).
+      - ../scripts/zecd-gui:/app:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -149,6 +152,7 @@ services:
       #     docker compose -f deploy/docker-compose.btc-testnet4.yml up -d zecd-gui
       # The port must match the chosen config's [rpc] port - only the host part is overridden.
       - --conf=/config/${ZECD_GUI_CONF:-zecd.btc-testnet4.toml}
+      - --reload
       - --bind=0.0.0.0
       - --port=8080
       - --rpc-url=http://host.docker.internal:${ZECD_GUI_RPC_PORT:-48232}

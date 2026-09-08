@@ -15,17 +15,37 @@
 //! (`crate::backoff`), reconnect WARNs once per outage then drops to DEBUG, per the logging
 //! conventions.
 //!
+//! A **rebroadcast pass** ([`BtcActor::rebroadcast_pass`]) follows every sync pass that
+//! reaches a tip the wallet has not rebroadcast at yet - so once per new block, and once
+//! after every reconnect, never on a timer. It resubmits every unconfirmed wallet transaction,
+//! sends and receives alike, as Bitcoin Core's wallet does (a transaction the network dropped
+//! stays unconfirmed in the wallet - a send with its inputs still spent - and nothing else
+//! would bring the network back in line: a reorg makes an anti-fee-sniping locktime non-final
+//! and Core drops the transaction rather than hold it), skipping the ones bitcoind's mempool
+//! already holds and classifying its verdicts
+//! ([`classify_rejection`]); over kyoto it re-announces detached, since a peer that already
+//! has the transaction never asks for it and the wait must not hold the actor.
+//!
+//! A kyoto broadcast that no peer requests within the light client's timeout is **recorded
+//! anyway** and the send returns its txid ([`Relay::Queued`]): the light client holds the
+//! transaction queued and will relay it to the next peer, so dropping the record would leave
+//! the wallet's view behind the world's - a retry could then double-spend the same inputs,
+//! which is unrecoverable, where a recorded send that never relays merely holds its inputs
+//! until `abandontransaction` releases them (recoverable). That is Bitcoin Core's order of
+//! operations too: commit to the wallet, then relay.
+//!
 //! The spend path derives its signers from the seed **per send** (a throwaway in-memory
 //! signing wallet over the private BIP 84 descriptors - `keys::signing_wallet`), so no
 //! spending material ever lands on disk; the persisted wallet holds public descriptors only.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bdk_bitcoind_rpc::Emitter;
-use bdk_wallet::bitcoin::{Address, Amount, FeeRate, OutPoint, Psbt, Transaction, Txid};
+use bdk_wallet::bitcoin::{Address, Amount, BlockHash, FeeRate, OutPoint, Psbt, Transaction, Txid};
 use bdk_wallet::{KeychainKind, PersistedWallet, SignOptions, Wallet};
 use secrecy::SecretVec;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -229,6 +249,10 @@ enum BtcCommand {
         hex: String,
         reply: oneshot::Sender<Result<String, RpcError>>,
     },
+    AbandonTransaction {
+        txid: Txid,
+        reply: oneshot::Sender<Result<(), RpcError>>,
+    },
     ListTransactions {
         reply: oneshot::Sender<Result<Vec<BtcTxRecord>, RpcError>>,
     },
@@ -327,6 +351,14 @@ impl BtcWalletHandle {
     /// Broadcast a caller-built raw transaction (`sendrawtransaction`). Returns the txid.
     pub async fn broadcast(&self, hex: String) -> Result<String, RpcError> {
         self.dispatch(|reply| BtcCommand::Broadcast { hex, reply })
+            .await
+    }
+
+    /// Mark an unconfirmed wallet transaction (and its unconfirmed descendants) abandoned
+    /// (`abandontransaction`): its inputs are released for the next send. See
+    /// `BtcActor::do_abandon` for the eligibility rules.
+    pub async fn abandon_transaction(&self, txid: Txid) -> Result<(), RpcError> {
+        self.dispatch(|reply| BtcCommand::AbandonTransaction { txid, reply })
             .await
     }
 
@@ -547,6 +579,9 @@ pub fn spawn(
         next_attempt: Instant::now(),
         reconnect_warned: false,
         header_sync_failures: 0,
+        rebroadcast_tip: None,
+        node_mempool: None,
+        rebroadcast_rejections: HashMap::new(),
         sync_interval,
         status_tx,
         cmd_rx,
@@ -615,6 +650,18 @@ struct BtcActor {
     /// client cannot reorg onto from 7 blocks back is retried from further down the
     /// wallet's own chain rather than from the same stale tip forever.
     header_sync_failures: u32,
+    /// The wallet tip the last rebroadcast pass ran at; `None` until the first pass after a
+    /// (re)connect. A pass runs when a sync pass reaches a tip that differs, which makes
+    /// the cadence one attempt per new block plus one per reconnect.
+    rebroadcast_tip: Option<BlockHash>,
+    /// What the upstream's mempool held at the last pass that reached tip: `Some` over
+    /// bitcoind (the emitter's mempool pass fetches the whole set), `None` over kyoto, which
+    /// has no mempool view. The three-way answer the rebroadcast pass filters on - a
+    /// transaction known to be held is skipped, an unknown one is resubmitted.
+    node_mempool: Option<HashSet<Txid>>,
+    /// The last rejection each unconfirmed send drew from bitcoind, for WARN-once logging
+    /// (a repeat of the same verdict drops to DEBUG). Pruned to the current candidate set.
+    rebroadcast_rejections: HashMap<Txid, String>,
     sync_interval: Duration,
     status_tx: watch::Sender<BtcSyncStatus>,
     cmd_rx: mpsc::Receiver<BtcCommand>,
@@ -676,6 +723,15 @@ impl BtcActor {
             } else {
                 false
             };
+            // At a tip the wallet has not rebroadcast at: resubmit what the network may
+            // have dropped. `at_tip` only survives a successful pass (an error drops the
+            // connection and clears it), and the hash comparison makes a quiet tip free.
+            if self.at_tip
+                && self.conn.is_some()
+                && self.rebroadcast_tip != Some(self.wallet.latest_checkpoint().hash())
+            {
+                self.rebroadcast_pass().await;
+            }
             if worked {
                 continue;
             }
@@ -747,6 +803,15 @@ impl BtcActor {
                             let event = emitter
                                 .mempool()
                                 .map_err(|e| anyhow::anyhow!("mempool: {e}"))?;
+                            // The pass fetched the node's whole mempool: keep its txid set,
+                            // so the rebroadcast pass skips what the node already holds.
+                            self.node_mempool = Some(
+                                event
+                                    .update
+                                    .iter()
+                                    .map(|(tx, _)| tx.compute_txid())
+                                    .collect(),
+                            );
                             self.wallet.apply_unconfirmed_txs(event.update);
                             self.wallet.apply_evicted_txs(event.evicted);
                             return Ok(applied);
@@ -764,6 +829,8 @@ impl BtcActor {
                 Ok(Some(update)) => {
                     reached_tip = true;
                     self.header_sync_failures = 0;
+                    // No mempool view on this backend: the rebroadcast pass cannot filter.
+                    self.node_mempool = None;
                     self.wallet
                         .apply_update(update)
                         .map_err(|e| anyhow::anyhow!("apply kyoto update: {e}"))
@@ -908,6 +975,9 @@ impl BtcActor {
             Ok(conn) => {
                 self.conn = Some(conn);
                 self.at_tip = false;
+                // A fresh connection rebroadcasts once at its first tip, whatever the hash.
+                self.rebroadcast_tip = None;
+                self.node_mempool = None;
                 self.backoff.reset();
                 self.reconnect_warned = false;
                 self.status_tx
@@ -933,9 +1003,168 @@ impl BtcActor {
     fn drop_conn(&mut self) {
         self.conn = None;
         self.at_tip = false;
+        self.rebroadcast_tip = None;
+        self.node_mempool = None;
         self.next_attempt = Instant::now() + self.backoff.next_delay();
         self.status_tx
             .send_replace(status_of(&self.wallet, BtcConnState::Down));
+    }
+
+    /// Resubmit the wallet's unconfirmed transactions to the upstream. See the module doc for
+    /// when it runs; this is what it does.
+    ///
+    /// The candidate set is every canonical unconfirmed wallet transaction (the wallet's
+    /// own sends and payments it received, exactly Bitcoin Core's
+    /// `ResubmitWalletTransactions`) minus what the upstream's mempool is known to hold
+    /// ([`Self::node_mempool`]).
+    /// Received payments are included on purpose: a signed transaction that was broadcast is
+    /// public data anyone may relay, the sender has no veto short of double-spending it (in
+    /// which case the resubmission is rejected), and a recipient whose sender's wallet never
+    /// rebroadcasts would otherwise wait on them forever. Parents go before children, so an
+    /// own chain of unconfirmed sends is accepted in order rather than the child failing on
+    /// a missing input the next line would have supplied.
+    ///
+    /// Over bitcoind each verdict is classified ([`classify_rejection`]): an accepted
+    /// resubmission and an already-mined one need nothing more; a confirmed conflict (the
+    /// inputs are gone from the UTXO set, and no input waits on an unconfirmed wallet
+    /// parent) is terminal, so the transaction is marked **evicted** - a send's inputs free
+    /// up, a receive stops counting toward the unconfirmed balance, and neither lingers as
+    /// a transaction that can never confirm (an eviction is not final in BDK's model: a
+    /// later block or mempool sighting re-canonicalizes it); everything else, `non-final`
+    /// (the reorg case: the locktime height arrives on its own) and fee policy (mempool
+    /// minimums move) included, simply retries at the next tip. A transport failure drops
+    /// the connection like any other. Over kyoto there are no verdicts at all, so each
+    /// transaction is re-announced on a detached task: a peer that already holds it never
+    /// asks, the wait is bounded by the light client's broadcast timeout, and neither may
+    /// hold the actor.
+    async fn rebroadcast_pass(&mut self) {
+        let tip = self.wallet.latest_checkpoint();
+        self.rebroadcast_tip = Some(tip.hash());
+        let candidates = self.rebroadcast_candidates();
+        let live: HashSet<Txid> = candidates.iter().map(|c| c.txid).collect();
+        self.rebroadcast_rejections
+            .retain(|txid, _| live.contains(txid));
+        if candidates.is_empty() {
+            return;
+        }
+        debug!(
+            candidates = candidates.len(),
+            height = tip.height(),
+            "rebroadcasting unconfirmed transactions"
+        );
+        let mut evicted = Vec::new();
+        for candidate in candidates {
+            let RebroadcastCandidate {
+                tx,
+                txid,
+                waits_on_parent,
+            } = candidate;
+            match self.conn.as_ref() {
+                Some(Conn::Bitcoind { rpc, .. }) => {
+                    let outcome = tokio::task::block_in_place(|| rpc.broadcast_blocking(&tx));
+                    match outcome {
+                        Ok(_) => {
+                            self.rebroadcast_rejections.remove(&txid);
+                            info!(%txid, height = tip.height(), "re-broadcast an unconfirmed transaction");
+                        }
+                        Err(BroadcastError::Rejected { code, message }) => {
+                            match classify_rejection(code, &message, waits_on_parent) {
+                                RebroadcastVerdict::AlreadyInChain => {
+                                    debug!(%txid, "rebroadcast: already in the chain (the block is on its way)");
+                                }
+                                RebroadcastVerdict::ConfirmedConflict => {
+                                    warn!(
+                                        %txid,
+                                        "rebroadcast: the inputs were spent by a confirmed \
+                                         conflict ({code}: {message}); marking the transaction \
+                                         evicted"
+                                    );
+                                    evicted.push((txid, unix_now()));
+                                }
+                                RebroadcastVerdict::Retry => {
+                                    let verdict = format!("{code}: {message}");
+                                    // `non-final` is the expected reorg shape and clears by
+                                    // itself; anything else WARNs once, then repeats at DEBUG.
+                                    let repeat =
+                                        self.rebroadcast_rejections.get(&txid) == Some(&verdict);
+                                    if repeat || message.contains("non-final") {
+                                        debug!(%txid, "rebroadcast rejected, retrying at the next tip ({verdict})");
+                                    } else {
+                                        warn!(%txid, "rebroadcast rejected, retrying at the next tip ({verdict})");
+                                    }
+                                    self.rebroadcast_rejections.insert(txid, verdict);
+                                }
+                            }
+                        }
+                        Err(BroadcastError::Transport(e)) => {
+                            warn!("rebroadcast transport error (reconnecting with backoff): {e:#}");
+                            self.drop_conn();
+                            return;
+                        }
+                    }
+                }
+                Some(Conn::Kyoto(kyoto)) => {
+                    let requester = kyoto.requester();
+                    let span = tracing::Span::current();
+                    tokio::spawn(
+                        async move {
+                            match crate::btc::kyoto::announce(requester, &tx).await {
+                                Ok(true) => info!(%txid, "re-broadcast an unconfirmed transaction (a peer requested it)"),
+                                Ok(false) => debug!(%txid, "re-announced an unconfirmed transaction; no peer asked for it"),
+                                Err(e) => warn!(%txid, "re-announcing an unconfirmed transaction failed: {e:#}"),
+                            }
+                        }
+                        .instrument(span),
+                    );
+                }
+                None => return,
+            }
+        }
+        if !evicted.is_empty() {
+            self.wallet.apply_evicted_txs(evicted);
+            self.persist("rebroadcast eviction");
+            let state = if self.at_tip {
+                BtcConnState::Ready
+            } else {
+                BtcConnState::Syncing
+            };
+            self.status_tx.send_replace(status_of(&self.wallet, state));
+        }
+    }
+
+    /// The rebroadcast pass's input, parents first. See [`Self::rebroadcast_pass`].
+    fn rebroadcast_candidates(&self) -> Vec<RebroadcastCandidate> {
+        let unconfirmed: HashMap<Txid, Arc<Transaction>> = self
+            .wallet
+            .transactions()
+            .filter(|wtx| !wtx.chain_position.is_confirmed())
+            .map(|wtx| (wtx.tx_node.txid, wtx.tx_node.tx.clone()))
+            .collect();
+        let candidates = unconfirmed
+            .iter()
+            .filter(|(txid, _)| {
+                !self
+                    .node_mempool
+                    .as_ref()
+                    .is_some_and(|mempool| mempool.contains(*txid))
+            })
+            .map(|(txid, tx)| {
+                // A dependency is an input whose funding transaction the wallet itself
+                // holds unconfirmed (an own chain of sends). A parent the wallet does not
+                // know - every input of a received payment - is not one: the wallet cannot
+                // resubmit it, so the node's verdict on the inputs is final for now.
+                let waits_on_parent = tx
+                    .input
+                    .iter()
+                    .any(|input| unconfirmed.contains_key(&input.previous_output.txid));
+                RebroadcastCandidate {
+                    tx: tx.clone(),
+                    txid: *txid,
+                    waits_on_parent,
+                }
+            })
+            .collect();
+        order_parents_first(candidates)
     }
 
     fn persist(&mut self, what: &str) {
@@ -1047,6 +1276,9 @@ impl BtcActor {
             BtcCommand::Broadcast { hex, reply } => {
                 let result = self.do_broadcast(hex).await;
                 let _ = reply.send(result);
+            }
+            BtcCommand::AbandonTransaction { txid, reply } => {
+                let _ = reply.send(self.do_abandon(txid));
             }
             BtcCommand::ListTransactions { reply } => {
                 let _ = reply.send(Ok(self.tx_entries()));
@@ -1287,14 +1519,17 @@ impl BtcActor {
     }
 
     /// Broadcast in whichever dialect is connected: bitcoind's `sendrawtransaction`, or a
-    /// kyoto submission to the P2P peers. Failures come back as [`BroadcastError`]:
+    /// kyoto announcement to the P2P peers. Failures come back as [`BroadcastError`]:
     /// bitcoind classifies rejection vs transport itself, and every kyoto failure is
     /// transport-shaped - a rejection there surfaces asynchronously in the log stream, so
-    /// this call failing only ever means "no verdict" (see [`crate::btc::kyoto::broadcast`]).
-    async fn upstream_broadcast(&mut self, tx: &Transaction) -> Result<Txid, BroadcastError> {
+    /// this call failing only ever means "no verdict" (see [`crate::btc::kyoto::announce`]).
+    /// A kyoto announcement no peer answers within the timeout is not a failure but
+    /// [`Relay::Queued`]: the light client holds the transaction and relays it later.
+    async fn upstream_broadcast(&mut self, tx: &Transaction) -> Result<Relay, BroadcastError> {
         let requester = match self.conn.as_ref() {
             Some(Conn::Bitcoind { rpc, .. }) => {
-                return tokio::task::block_in_place(|| rpc.broadcast_blocking(tx));
+                return tokio::task::block_in_place(|| rpc.broadcast_blocking(tx))
+                    .map(|_| Relay::Relayed);
             }
             Some(Conn::Kyoto(kyoto)) => kyoto.requester(),
             None => {
@@ -1303,9 +1538,25 @@ impl BtcActor {
                 )))
             }
         };
-        crate::btc::kyoto::broadcast(requester, tx)
-            .await
-            .map_err(BroadcastError::Transport)
+        match crate::btc::kyoto::announce(requester, tx).await {
+            Ok(true) => Ok(Relay::Relayed),
+            Ok(false) => Ok(Relay::Queued),
+            Err(e) => Err(BroadcastError::Transport(e)),
+        }
+    }
+
+    /// Record a transaction the upstream only *queued* (a kyoto announcement no peer
+    /// answered) exactly as a relayed one, and say so: the inputs lock now, the rebroadcast
+    /// pass re-announces it at every new tip, and `abandontransaction` is the way out if it
+    /// never relays.
+    fn note_queued(&self, txid: Txid) {
+        warn!(
+            %txid,
+            "no peer requested the transaction within the broadcast timeout; recorded at \
+             0-conf anyway (its inputs are locked and it is re-announced at each new tip, \
+             the light client also holding it for the next peer) - check peer connectivity, \
+             and `abandontransaction` releases the inputs if it never relays"
+        );
     }
 
     /// Map a broadcast failure onto the RPC vocabulary. A rejection passes the node's own
@@ -1443,12 +1694,14 @@ impl BtcActor {
         let tx = psbt
             .extract_tx()
             .map_err(|e| RpcError::misc(format!("extract transaction: {e:?}")))?;
-        let txid = match self.upstream_broadcast(&tx).await {
-            Ok(txid) => txid,
+        let txid = tx.compute_txid();
+        match self.upstream_broadcast(&tx).await {
+            Ok(Relay::Relayed) => {}
+            Ok(Relay::Queued) => self.note_queued(txid),
             Err(e) => return Err(self.broadcast_failure(e)),
-        };
+        }
         // Record our own send immediately (0-conf), which also locks its inputs against
-        // reuse by the next send's coin selection.
+        // reuse by the next send's coin selection - a queued one too (module doc).
         self.wallet
             .apply_unconfirmed_txs(vec![(Arc::new(tx), unix_now())]);
         self.persist("send");
@@ -1563,10 +1816,12 @@ impl BtcActor {
                     format!("TX decode failed: {e}"),
                 )
             })?;
-        let txid = match self.upstream_broadcast(&tx).await {
-            Ok(txid) => txid,
+        let txid = tx.compute_txid();
+        match self.upstream_broadcast(&tx).await {
+            Ok(Relay::Relayed) => {}
+            Ok(Relay::Queued) => self.note_queued(txid),
             Err(e) => return Err(self.broadcast_failure(e)),
-        };
+        }
         // If the transaction touches this wallet, record it at 0-conf (the apply filters
         // relevance itself, so a foreign transaction is a no-op).
         self.wallet
@@ -1574,6 +1829,181 @@ impl BtcActor {
         self.persist("broadcast");
         Ok(txid.to_string())
     }
+
+    /// `abandontransaction`: mark an unconfirmed wallet transaction and its unconfirmed
+    /// descendants abandoned, releasing their inputs for the next send. Core's eligibility
+    /// rules: the transaction must be the wallet's (`-5` "Invalid or non-wallet transaction
+    /// id"), unconfirmed, and not in the mempool (`-5` "Transaction not eligible for
+    /// abandonment"). The mempool half is only checkable where the upstream has a mempool
+    /// view - over bitcoind, [`Self::node_mempool`] from the last pass at tip; over kyoto
+    /// there is none, so the caller is trusted. Over kyoto the abandonment also **restarts
+    /// the light client**: `bip157`'s in-memory broadcast queue holds the signed bytes and
+    /// re-announces them to every peer that completes a handshake, with no API to forget
+    /// one, so leaving the node up would have the operator's own client keep pushing a
+    /// transaction the operator just abandoned - worse than Core, whose node at least stops
+    /// relaying. Dropping the node discards the queue; the redial is a deliberate restart
+    /// (no backoff, from the wallet's own checkpoint), not an outage. What remains is
+    /// Core's own caveat: a peer that already received the bytes may still relay them. BDK
+    /// represents "abandoned" as an eviction (`apply_evicted_txs`), which is not final: if
+    /// the transaction confirms after all, the block re-canonicalizes it.
+    fn do_abandon(&mut self, txid: Txid) -> Result<(), RpcError> {
+        let Some(wtx) = self.wallet.get_tx(txid) else {
+            return Err(RpcError::invalid_address_or_key(
+                "Invalid or non-wallet transaction id",
+            ));
+        };
+        if wtx.chain_position.is_confirmed() {
+            return Err(RpcError::invalid_address_or_key(
+                "Transaction not eligible for abandonment",
+            ));
+        }
+        if self
+            .node_mempool
+            .as_ref()
+            .is_some_and(|mempool| mempool.contains(&txid))
+        {
+            return Err(RpcError::invalid_address_or_key(
+                "Transaction not eligible for abandonment",
+            ));
+        }
+        // The transaction plus every unconfirmed wallet transaction that spends from the
+        // set, to a fixed point: a child cannot stand once its parent is abandoned.
+        let unconfirmed: Vec<(Txid, Arc<Transaction>)> = self
+            .wallet
+            .transactions()
+            .filter(|wtx| !wtx.chain_position.is_confirmed())
+            .map(|wtx| (wtx.tx_node.txid, wtx.tx_node.tx.clone()))
+            .collect();
+        let mut abandoned: HashSet<Txid> = HashSet::from([txid]);
+        loop {
+            let before = abandoned.len();
+            for (child, tx) in &unconfirmed {
+                if !abandoned.contains(child)
+                    && tx
+                        .input
+                        .iter()
+                        .any(|input| abandoned.contains(&input.previous_output.txid))
+                {
+                    abandoned.insert(*child);
+                }
+            }
+            if abandoned.len() == before {
+                break;
+            }
+        }
+        let now = unix_now();
+        for id in &abandoned {
+            self.rebroadcast_rejections.remove(id);
+        }
+        self.wallet
+            .apply_evicted_txs(abandoned.iter().map(|id| (*id, now)));
+        self.persist("abandontransaction");
+        info!(
+            target: "zecd::audit",
+            %txid,
+            descendants = abandoned.len() - 1,
+            "abandoned an unconfirmed transaction; its inputs are released"
+        );
+        if matches!(self.conn, Some(Conn::Kyoto(_))) {
+            // The light client's broadcast queue still holds the transaction; the only way
+            // to make it forget is a new node. A deliberate restart, like the birthday
+            // anchor's: no backoff, the next pass redials at once.
+            self.conn = None;
+            self.at_tip = false;
+            self.rebroadcast_tip = None;
+            self.node_mempool = None;
+            self.status_tx
+                .send_replace(status_of(&self.wallet, BtcConnState::Syncing));
+            info!(
+                %txid,
+                "restarting the light client so its broadcast queue forgets the abandoned \
+                 transaction; a peer that already received it may still relay it"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What an upstream broadcast achieved, when it did not fail outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relay {
+    /// The node accepted it (bitcoind), or a peer requested the bytes (kyoto).
+    Relayed,
+    /// Kyoto only: no peer asked within the timeout; the light client holds the
+    /// transaction queued and announces it to every peer that connects from now on. The
+    /// send records it and returns the txid all the same - see the module doc.
+    Queued,
+}
+
+/// One unconfirmed wallet transaction the rebroadcast pass will resubmit.
+struct RebroadcastCandidate {
+    tx: Arc<Transaction>,
+    txid: Txid,
+    /// Some input's funding transaction is itself an unconfirmed wallet transaction, so a
+    /// missing-inputs verdict means "parent first", not "conflict".
+    waits_on_parent: bool,
+}
+
+/// What a bitcoind rejection of a resubmitted send means for the wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebroadcastVerdict {
+    /// Core's `-27`: mined already; the block reaches the wallet on its own.
+    AlreadyInChain,
+    /// The inputs are gone from the UTXO set and no input waits on an unconfirmed wallet
+    /// parent, so something else spent them and confirmed. Terminal: the transaction can
+    /// never confirm as things stand.
+    ConfirmedConflict,
+    /// Anything else - `non-final` after a reorg, a fee-policy floor, a missing input whose
+    /// parent is an own unconfirmed send - clears with time or a parent, so try again next
+    /// tip.
+    Retry,
+}
+
+/// Bitcoin Core's `sendrawtransaction` error codes (`rpc/protocol.h`).
+const RPC_VERIFY_ERROR: i32 = -25;
+const RPC_VERIFY_ALREADY_IN_CHAIN: i32 = -27;
+
+/// Classify a bitcoind rejection of a resubmitted transaction. Pure, so the rules are
+/// testable without a node: `-27` is [`RebroadcastVerdict::AlreadyInChain`]; `-25` with
+/// Core's missing-inputs text (`Missing inputs` from `sendrawtransaction`,
+/// `bad-txns-inputs-missingorspent` from mempool acceptance) is a
+/// [`RebroadcastVerdict::ConfirmedConflict`] **unless** the transaction waits on an own
+/// unconfirmed parent, where the same text just means "parent first"; everything else, the
+/// `-26` policy family included, is [`RebroadcastVerdict::Retry`].
+fn classify_rejection(code: i32, message: &str, waits_on_parent: bool) -> RebroadcastVerdict {
+    let lower = message.to_ascii_lowercase();
+    let missing_inputs = lower.contains("missing inputs") || lower.contains("missingorspent");
+    match code {
+        RPC_VERIFY_ALREADY_IN_CHAIN => RebroadcastVerdict::AlreadyInChain,
+        RPC_VERIFY_ERROR if missing_inputs && !waits_on_parent => {
+            RebroadcastVerdict::ConfirmedConflict
+        }
+        _ => RebroadcastVerdict::Retry,
+    }
+}
+
+/// Order candidates so that no transaction precedes one it spends from (a stable
+/// topological sort over the candidate set; transactions outside the set are not
+/// constraints). A cycle is impossible for valid transactions, but the loop still
+/// terminates on one by appending whatever is left.
+fn order_parents_first(mut pending: Vec<RebroadcastCandidate>) -> Vec<RebroadcastCandidate> {
+    let mut ordered = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let unresolved: HashSet<Txid> = pending.iter().map(|c| c.txid).collect();
+        let (ready, blocked): (Vec<_>, Vec<_>) = pending.into_iter().partition(|c| {
+            !c.tx
+                .input
+                .iter()
+                .any(|input| unresolved.contains(&input.previous_output.txid))
+        });
+        if ready.is_empty() {
+            ordered.extend(blocked);
+            break;
+        }
+        ordered.extend(ready);
+        pending = blocked;
+    }
+    ordered
 }
 
 /// Divide `fee_sat` across the `subtract` recipients and return the reduced amounts -
@@ -1893,5 +2323,98 @@ mod tests {
             .await
             .expect("actor exits on shutdown")
             .unwrap();
+    }
+
+    #[test]
+    fn classify_rejection_reads_core_verdicts() {
+        use RebroadcastVerdict::*;
+        assert_eq!(
+            classify_rejection(-27, "Transaction already in block chain", false),
+            AlreadyInChain
+        );
+        // Missing inputs with no own unconfirmed parent: a conflict confirmed. This is also
+        // the shape for a received payment (its parents are foreign, never wallet txs).
+        assert_eq!(
+            classify_rejection(-25, "Missing inputs", false),
+            ConfirmedConflict
+        );
+        assert_eq!(
+            classify_rejection(-25, "bad-txns-inputs-missingorspent", false),
+            ConfirmedConflict
+        );
+        // The same text while waiting on an own unconfirmed parent is a dependency.
+        assert_eq!(classify_rejection(-25, "Missing inputs", true), Retry);
+        // The reorg shape and the policy family both retry.
+        assert_eq!(classify_rejection(-26, "non-final", false), Retry);
+        assert_eq!(
+            classify_rejection(-26, "min relay fee not met", false),
+            Retry
+        );
+        assert_eq!(
+            classify_rejection(-26, "txn-mempool-conflict", false),
+            Retry
+        );
+        // An unfamiliar -25 is not read as a conflict.
+        assert_eq!(
+            classify_rejection(-25, "mandatory-script-verify-flag-failed", false),
+            Retry
+        );
+    }
+
+    #[test]
+    fn order_parents_first_puts_a_spent_from_transaction_ahead_of_its_spender() {
+        use bdk_wallet::bitcoin::{
+            absolute, transaction, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness,
+        };
+        fn tx(inputs: &[OutPoint]) -> Arc<Transaction> {
+            Arc::new(Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: inputs
+                    .iter()
+                    .map(|&previous_output| TxIn {
+                        previous_output,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                        witness: Witness::new(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            })
+        }
+        fn candidate(tx: Arc<Transaction>) -> RebroadcastCandidate {
+            RebroadcastCandidate {
+                txid: tx.compute_txid(),
+                tx,
+                waits_on_parent: false,
+            }
+        }
+        let external = OutPoint::new(Txid::from_str(&"11".repeat(32)).unwrap(), 0);
+        let parent = tx(&[external]);
+        let child = tx(&[OutPoint::new(parent.compute_txid(), 0)]);
+        let grandchild = tx(&[OutPoint::new(child.compute_txid(), 0)]);
+        let unrelated = tx(&[OutPoint::new(Txid::from_str(&"22".repeat(32)).unwrap(), 1)]);
+        // Fed children-first, they come out parents-first; the unrelated one keeps its
+        // relative position among the ready set.
+        let ordered = order_parents_first(vec![
+            candidate(grandchild.clone()),
+            candidate(child.clone()),
+            candidate(unrelated.clone()),
+            candidate(parent.clone()),
+        ]);
+        let ids: Vec<Txid> = ordered.iter().map(|c| c.txid).collect();
+        assert_eq!(
+            ids,
+            vec![
+                unrelated.compute_txid(),
+                parent.compute_txid(),
+                child.compute_txid(),
+                grandchild.compute_txid(),
+            ]
+        );
+        assert!(order_parents_first(Vec::new()).is_empty());
     }
 }

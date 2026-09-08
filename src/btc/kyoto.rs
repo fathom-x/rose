@@ -76,7 +76,7 @@ use anyhow::{anyhow, bail, Context as _};
 use bdk_kyoto::bip157::{AddrV2, ServiceFlags};
 use bdk_kyoto::builder::{Builder, BuilderExt as _};
 use bdk_kyoto::{HashCheckpoint, Requester, ScanType, TrustedPeer, Update, Warning};
-use bdk_wallet::bitcoin::{BlockHash, FeeRate, Transaction, Txid};
+use bdk_wallet::bitcoin::{BlockHash, FeeRate, Transaction};
 use bdk_wallet::chain::CheckPoint;
 use bdk_wallet::Wallet;
 use tokio::sync::{mpsc, oneshot};
@@ -447,10 +447,18 @@ impl KyotoEndpoint {
 
     /// Start the light client for `wallet` and return the live connection.
     ///
-    /// Async, unlike the bitcoind dial: `LightClient::start` spawns the node onto the current
-    /// `tokio` runtime, and the bridge task is spawned here too. Returns as soon as the node
-    /// is running - peer discovery and header sync proceed in the background, so a caller
-    /// gets a connection before the first `Update` is available.
+    /// The node, its bridge and log drains, and the anchor resolver all run on a **runtime
+    /// of their own**, owned by the returned [`KyotoConn`], so dropping the connection
+    /// tears down every task the light client spawned - its per-peer tasks included.
+    /// `bip157`'s `shutdown()` alone does not: it only returns from the node loop, and each
+    /// peer task it had spawned keeps its socket and its `Arc` of the shared broadcast
+    /// queue, answering `None => continue` when the node's channel to it closes. That
+    /// leaked peer would go on serving `getdata` for a transaction the wallet had since
+    /// abandoned (seen live: a stopped peer, resumed after the abandonment, fetched the
+    /// transaction from the dead node's peer task), and would spin on the closed channel
+    /// until the remote hung up. Returns as soon as the node is running - peer discovery
+    /// and header sync proceed in the background, so a caller gets a connection before the
+    /// first `Update` is available.
     ///
     /// `resync` is the escalating restart depth from [`resync_depth`] - `None` on a healthy
     /// (re)dial, `Some` after repeated header-sync failures (see the module doc).
@@ -498,6 +506,17 @@ impl KyotoEndpoint {
             .map_err(|e| anyhow!("build the kyoto light client: {e}"))
             .with_context(|| format!("connect to {}", self.describe()))?;
 
+        // Everything the light client spawns goes onto this runtime (`LightClient::start`
+        // and the tasks below all use `tokio::spawn`, which targets the entered context),
+        // so `KyotoConn`'s drop can end the lot. Two workers: the node loop plus a peer or
+        // a block download at a time is all it ever runs concurrently.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("zecd-kyoto")
+            .enable_all()
+            .build()
+            .context("start the kyoto light client's runtime")?;
+        let entered = runtime.enter();
         let (client, logging, mut updates) = client.subscribe();
         let client = client.start();
         let requester = client.requester();
@@ -574,6 +593,8 @@ impl KyotoEndpoint {
             (rx, task)
         });
 
+        drop(entered);
+
         info!(
             upstream = %self.describe(),
             scan = ?scan_type,
@@ -585,6 +606,7 @@ impl KyotoEndpoint {
             bridge,
             logs,
             anchor,
+            runtime: Some(runtime),
         })
     }
 
@@ -798,13 +820,17 @@ async fn resolve_birthday_anchor(
 }
 
 /// A live kyoto connection: the channel the bridge task feeds, plus the requester used for
-/// broadcast and the fee signals. Dropping it aborts every owned task, which shuts the
-/// node down.
+/// broadcast and the fee signals. Dropping it shuts the node down and then shuts down the
+/// runtime every light-client task lives on, so nothing of the connection survives it (see
+/// [`KyotoEndpoint::connect`] for why the runtime exists).
 pub struct KyotoConn {
     updates: mpsc::Receiver<Result<Update, KyotoFailure>>,
     requester: Requester,
     bridge: JoinHandle<()>,
     logs: JoinHandle<()>,
+    /// The light client's own runtime. `Option` only so `Drop` can take it: shutting a
+    /// runtime down consumes it.
+    runtime: Option<tokio::runtime::Runtime>,
     /// The birthday-anchor resolution, when this connect launched one (see
     /// [`resolve_birthday_anchor`]): the channel its result arrives on plus the task
     /// itself, taken on delivery and aborted with the connection otherwise.
@@ -914,31 +940,24 @@ fn recovery_floor(network: BitcoinNetwork, birthday: u32) -> HashCheckpoint {
     }
 }
 
-/// Broadcast a transaction over the P2P layer.
-///
-/// Unlike bitcoind's `sendrawtransaction`, acceptance here is a peer relaying it, not a node
-/// validating it against its own mempool policy - so a rejection surfaces asynchronously as a
-/// `Warning` in the log stream rather than as an error from this call. The returned txid is
-/// the transaction's own, not a node's acknowledgement.
-///
-/// Bounded by [`BROADCAST_TIMEOUT`]: the future underneath resolves on a peer's `getdata`,
-/// so with no connected peer it would otherwise never resolve. A timeout is reported as an
-/// error, which leaves the caller *not* recording the transaction - while kyoto keeps it
-/// queued for the next peer, so it may still go out later.
-pub async fn broadcast(requester: Requester, tx: &Transaction) -> anyhow::Result<Txid> {
-    tokio::time::timeout(BROADCAST_TIMEOUT, requester.submit_package(tx.clone()))
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "no peer requested the transaction within {}s, so it is not known to have \
-                 been relayed; it stays queued for the next peer that connects, but the \
-                 wallet has not recorded it. Check peer connectivity and, if it does not \
-                 appear once the node has peers, send again",
-                BROADCAST_TIMEOUT.as_secs()
-            )
-        })?
-        .map_err(|e| anyhow!("broadcast over the kyoto p2p layer: {e}"))?;
-    Ok(tx.compute_txid())
+/// Announce a transaction to the peers and report whether one asked for it within
+/// Announce a transaction to the peers and report whether one asked for it within
+/// [`BROADCAST_TIMEOUT`]: `Ok(true)` when a peer's `getdata` arrived (the bytes went out),
+/// `Ok(false)` when none did. Unlike bitcoind's `sendrawtransaction`, acceptance here is a
+/// peer relaying the transaction, not a node validating it against its mempool policy - a
+/// rejection surfaces asynchronously as a `Warning` in the log stream, never from this
+/// call. `Ok(false)` is not a failure in itself: a peer that already holds the transaction
+/// never requests it again (the rebroadcast pass reads it as "nothing to do"), and with no
+/// responsive peer the light client keeps the transaction queued and re-announces it to
+/// every peer that completes a handshake from here on - which is why the send path records
+/// the transaction on `Ok(false)` rather than dropping it (see `actor::Relay::Queued`). An
+/// `Err` is the node itself having stopped: nothing was queued.
+pub async fn announce(requester: Requester, tx: &Transaction) -> anyhow::Result<bool> {
+    match tokio::time::timeout(BROADCAST_TIMEOUT, requester.submit_package(tx.clone())).await {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(e)) => Err(anyhow!("broadcast over the kyoto p2p layer: {e}")),
+        Err(_) => Ok(false),
+    }
 }
 
 /// The node's current tip height.
@@ -1051,11 +1070,14 @@ fn bias_for_market_lag(rate: FeeRate) -> FeeRate {
 
 impl Drop for KyotoConn {
     fn drop(&mut self) {
-        // Order matters. `shutdown()` is what actually stops the node task `start()` spawned
-        // onto the runtime - aborting the bridge and log tasks does not, since neither owns
-        // it. Without this the node outlives its connection: a reconnect would stack a second
-        // node on the same data directory, and the header store would never be flushed,
-        // leaving every restart to re-download the whole header chain.
+        // Order matters. `shutdown()` asks the node loop to return, which is the polite half;
+        // it does not reach the per-peer tasks the node spawned (see `connect`). Shutting the
+        // runtime down is what ends those - every task on it is cancelled, so each peer's
+        // socket closes and the shared broadcast queue dies with the last `Arc`. Without both
+        // a reconnect would stack a second node on the same data directory beside the leaked
+        // peers of the first. `shutdown_background` because this runs inside the actor's own
+        // runtime, where a blocking shutdown is not allowed; nothing waits on the node's exit,
+        // since `bip157` 0.6 persists nothing it would need to flush.
         if let Err(e) = self.requester.shutdown() {
             debug!("kyoto node was already stopped at shutdown: {e}");
         }
@@ -1063,6 +1085,9 @@ impl Drop for KyotoConn {
         self.logs.abort();
         if let Some((_, task)) = &self.anchor {
             task.abort();
+        }
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
         }
     }
 }

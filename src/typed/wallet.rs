@@ -720,6 +720,14 @@ impl Client<'_> {
         self.call_typed("listdescriptors", params).await
     }
 
+    /// `abandontransaction <txid>`: release an unconfirmed transaction's inputs (Bitcoin
+    /// wallets); `-5` unless the transaction is the wallet's, unconfirmed and out of the
+    /// mempool.
+    pub async fn abandon_transaction(&self, txid: &str) -> Result<(), ClientError> {
+        self.call_typed("abandontransaction", vec![json!(txid)])
+            .await
+    }
+
     /// `listwallets`: the loaded wallet names.
     pub async fn list_wallets(&self) -> Result<Vec<String>, ClientError> {
         self.call_typed("listwallets", vec![]).await

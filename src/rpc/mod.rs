@@ -52,6 +52,7 @@ pub const ALL_METHODS: &[&str] = &[
     // Raw transactions
     "getrawtransaction",
     "sendrawtransaction",
+    "abandontransaction",
     // Wallet - reads
     "getbalance",
     "getbalances",
@@ -134,6 +135,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     // Raw transactions
     ("getrawtransaction", 3),
     ("sendrawtransaction", 2),
+    ("abandontransaction", 1),
     // Wallet - reads
     ("getbalance", 4),
     ("getbalances", 0),
@@ -195,8 +197,10 @@ enum MethodCoins {
 /// Four tiers. `All` marks the wallet-independent shell (control methods and the registry
 /// list), which no engine is involved in serving. The nine `z_*` methods are Zcash-only by
 /// nature (shielded sends, the shielding/merge sweeps, the async-operation trio, zcashd's
-/// account address derivation). `BITCOIN_ONLY` holds the Core methods that only make sense
-/// for a descriptor wallet (`listdescriptors`). Everything else is the shared Bitcoin-Core
+/// account address derivation). `BITCOIN_ONLY` holds the Core methods only the BDK engine
+/// serves (`listdescriptors`, a descriptor-wallet method; `abandontransaction`, whose
+/// release-the-inputs semantics the Zcash engine has no counterpart for - a shielded send
+/// expires on its own). Everything else is the shared Bitcoin-Core
 /// dialect *in shape*, but each method is listed for a coin only once that coin's engine
 /// actually serves it - a method the engine cannot serve yet must read as method-not-found,
 /// not reach a Zcash-typed handler. The BDK engine's surface grows by moving entries from
@@ -249,6 +253,7 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("settxfee", MethodCoins::Only(ZCASH_ONLY)),
     // Raw transactions
     ("sendrawtransaction", MethodCoins::Only(ZCASH_AND_BITCOIN)),
+    ("abandontransaction", MethodCoins::Only(BITCOIN_ONLY)),
     ("getrawtransaction", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - reads
     ("getbalance", MethodCoins::Only(ZCASH_AND_BITCOIN)),
@@ -475,6 +480,7 @@ async fn dispatch_zecd(
         // has already answered -32601, so this arm is never reached. It exists so the
         // dispatch table and `ALL_METHODS` stay in lockstep (the test scans these arms).
         "listdescriptors" => Err(RpcError::method_not_found(&req.method)),
+        "abandontransaction" => Err(RpcError::method_not_found(&req.method)),
 
         other => Err(RpcError::method_not_found(other)),
     }
@@ -566,7 +572,7 @@ mod tests {
         ];
         /// Core methods with no Zcash meaning at all: the only entries allowed to leave
         /// Zcash out of their coin set.
-        const BITCOIN_ONLY_METHODS: &[&str] = &["listdescriptors"];
+        const BITCOIN_ONLY_METHODS: &[&str] = &["listdescriptors", "abandontransaction"];
         for (method, coins) in super::METHOD_COINS {
             if method.starts_with("z_") {
                 assert_eq!(

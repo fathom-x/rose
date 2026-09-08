@@ -17,11 +17,15 @@
 //! Over kyoto the sync side is a non-blocking poll of the light client's channel, so the
 //! command loop cannot park on the peer at all; the P2P connection simply stalls with the
 //! peer and resumes with it. The kyoto leg therefore holds the wallet to contracts 1 and
-//! 3 only, and additionally pins what the send error text promises: a *send* attempted
-//! during the hang fails within the broadcast timeout instead of wedging the actor (the
-//! one kyoto path that does await the peer), records nothing, and - because the light
-//! client keeps it queued - still relays once the peer resumes, at which point the wallet
-//! learns of it from the chain like any foreign spend of its output.
+//! 3 only, and additionally pins the broadcast-timeout contract: a *send* attempted during
+//! the hang returns within the broadcast timeout instead of wedging the actor (the one
+//! kyoto path that does await the peer), and because the light client keeps it queued the
+//! send is **recorded** and returns its txid - the inputs lock, so a retry cannot
+//! double-spend them - while `abandontransaction` is the release valve. The leg also pins
+//! that the valve is complete on the wallet's side: abandoning restarts the light client,
+//! whose broadcast queue would otherwise have served the transaction to the peer the moment
+//! it resumed, so after the resume the transaction never reaches the node and the released
+//! input is spent by the post-recovery send.
 //!
 //! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
@@ -76,6 +80,8 @@ async fn hang_flow(backend: BtcBackend) {
         .expect("getwalletinfo");
     assert_eq!(wi["upstream_connected"], json!(true), "{wi}");
     let miner = node.new_address().await;
+
+    let mut queued_txid: Option<String> = None;
 
     // Hang - don't kill - the node.
     node.pause();
@@ -141,10 +147,13 @@ async fn hang_flow(backend: BtcBackend) {
         }
         BtcBackend::Kyoto => {
             // The one kyoto path that awaits the peer: a broadcast resolves on the peer's
-            // `getdata`, which a stopped peer never sends. It must fail within the
-            // broadcast timeout (30s), releasing the actor, rather than wedge it.
+            // `getdata`, which a stopped peer never sends. It must return within the
+            // broadcast timeout (30s), releasing the actor, rather than wedge it - and it
+            // returns a txid, not an error: the light client keeps the transaction queued
+            // for the next peer, so the wallet records it (Core's commit-then-relay order)
+            // rather than let a retry double-spend inputs the network may yet see spent.
             let t1 = Instant::now();
-            let (code, msg) = tokio::time::timeout(
+            let txid = tokio::time::timeout(
                 DETECT_TIMEOUT,
                 zecd.call(
                     "sendtoaddress",
@@ -153,9 +162,9 @@ async fn hang_flow(backend: BtcBackend) {
             )
             .await
             .expect("a kyoto send during the hang must time out, not wedge the actor")
-            .expect_err("no peer answers the broadcast");
+            .expect("a broadcast no peer answered is recorded and returns its txid");
             eprintln!(
-                "[{}] send during the hang failed in {:?}: {code} {msg}",
+                "[{}] send during the hang returned in {:?}: {txid}",
                 backend.label(),
                 t1.elapsed()
             );
@@ -163,48 +172,110 @@ async fn hang_flow(backend: BtcBackend) {
                 t1.elapsed() < Duration::from_secs(60),
                 "bounded by the broadcast timeout"
             );
-            // And the failed broadcast recorded nothing: the inputs are not locked behind
-            // a transaction that never left.
+            // (No node RPC here: the node is stopped, and a call would park the test on it.
+            // That the stopped peer never received the transaction is what step 3 shows,
+            // when it relays after the resume.)
+            // Recorded at 0-conf: the 1.0 input is spent and the change is the wallet's
+            // own trusted unconfirmed output, so the trusted balance is 0.9 less the fee.
             let balance = zecd
                 .call("getbalance", json!([]))
                 .await
-                .expect("getbalance after the failed send");
+                .expect("getbalance after the queued send")
+                .as_f64()
+                .unwrap();
+            assert!(
+                balance < 1.0 && balance > 0.89,
+                "{balance}: the queued send locks its input and returns its change"
+            );
+            let tx = zecd
+                .call("gettransaction", json!([txid]))
+                .await
+                .expect("the queued send is a wallet transaction");
+            assert_eq!(tx["confirmations"], json!(0), "{tx}");
+            // A retry that would need the locked input is refused, not double-spent. An
+            // explicit fee rate, like the first send's: fee estimation would otherwise ask
+            // the stopped peer for a block, and the light client drops a peer that does not
+            // answer a request, which turns the relay after the resume into a reconnect.
+            let (code, msg) = zecd
+                .call(
+                    "sendtoaddress",
+                    json!([miner, 0.95, null, null, false, null, null, null, null, 2]),
+                )
+                .await
+                .expect_err("the locked input is not available to a second send");
+            assert_eq!(code, -6, "{msg}");
+            // The release valve: abandoning it frees the input at once, drops it from the
+            // wallet's canonical history, and restarts the light client so its broadcast
+            // queue (which still holds the signed bytes, with the `inv` already sitting in
+            // the stopped peer's socket) forgets it too.
+            zecd.call("abandontransaction", json!([txid]))
+                .await
+                .expect("abandontransaction on a queued, unrelayed send");
+            let balance = zecd
+                .call("getbalance", json!([]))
+                .await
+                .expect("getbalance after the abandonment");
             assert_eq!(
                 balance.as_f64(),
                 Some(1.0),
-                "no 0-conf record of a send that never relayed"
+                "the abandoned send's input is spendable again"
             );
+            let (code, msg) = zecd
+                .call("gettransaction", json!([txid]))
+                .await
+                .expect_err("an abandoned transaction leaves the canonical set");
+            assert_eq!(code, -5, "{msg}");
+            queued_txid = Some(txid.as_str().unwrap().to_string());
         }
     }
 
     // 3. Recovery is automatic: resume the node, mine, and the wallet follows.
     node.resume();
-    let mut expected_balance = 1.0;
-    if backend == BtcBackend::Kyoto {
-        // The timed-out broadcast was queued, not dropped: once the peer answers again it
-        // requests and accepts the transaction. The wallet then meets it on chain as a
-        // spend of its own output (the 0.1 gone, the change back on the internal
-        // keychain) - exactly the "may still relay" the error text warns about, and why
-        // the post-recovery send below has to come after it rather than double-spend it.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while node.mempool().await.is_empty() {
+    let expected_balance = 1.0;
+    if queued_txid.is_some() {
+        // The abandonment restarted the light client, so the old node - whose queue held
+        // the transaction and whose `inv` the stopped peer is about to read - is gone, and
+        // the new one has nothing to serve when the `getdata` comes. Wait for the wallet to
+        // be back on the resumed peer before mining, so the window in which the old node
+        // would have relayed has actually passed.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let wi = zecd
+                .call("getwalletinfo", json!([]))
+                .await
+                .expect("getwalletinfo after the abandonment");
+            if wi["upstream_connected"] == json!(true) {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
-                "the queued kyoto broadcast never relayed after the peer resumed"
+                "the restarted light client never reconnected to the resumed peer: {wi}"
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         eprintln!(
-            "[{}] the queued broadcast relayed {:?} after the resume",
+            "[{}] the restarted light client reconnected {:?} after the resume",
             backend.label(),
             t0.elapsed()
         );
-        expected_balance = 0.9;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mempool = node.mempool().await;
+        assert!(
+            mempool.is_empty(),
+            "the abandoned transaction must not reach the node: {mempool:?}"
+        );
     }
     node.mine(3).await;
     zecd.wait_height(105).await;
     zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
+    if let Some(queued) = &queued_txid {
+        let (code, msg) = zecd
+            .call("gettransaction", json!([queued]))
+            .await
+            .expect_err("the abandoned transaction stays abandoned");
+        assert_eq!(code, -5, "{msg}");
+    }
     let wi = zecd
         .call("getwalletinfo", json!([]))
         .await

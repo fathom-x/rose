@@ -289,6 +289,23 @@ impl BitcoinD {
             .map(|t| t.as_str().unwrap().to_string())
             .collect()
     }
+
+    /// Until the node's mempool holds `txid` - how a test observes the wallet's own
+    /// rebroadcast landing, since the wallet reports nothing about a resubmission itself.
+    pub async fn wait_mempool_contains(&self, txid: &str) {
+        let deadline = Instant::now() + SYNC_TIMEOUT;
+        loop {
+            let mempool = self.mempool().await;
+            if mempool.iter().any(|t| t == txid) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {txid} to reach the node's mempool; it holds {mempool:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
 }
 
 /// Which chain source the zecd under test dials.

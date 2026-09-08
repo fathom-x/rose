@@ -748,11 +748,12 @@ def s_labels_removed(ctx):
     if ctx.coin == ZCASH:
         # Descriptor-wallet methods exist for the BDK engine only; a Zcash wallet cannot serve
         # them, and a method a wallet cannot serve is indistinguishable from one that does not exist.
-        try:
-            rpc.call("listdescriptors")
-            ck("listdescriptors raises on a Zcash wallet", False)
-        except JSONRPCException as e:
-            ck("listdescriptors -> method not found (-32601) on a Zcash wallet", e.code == -32601, e.code)
+        for m, params in (("listdescriptors", []), ("abandontransaction", ["00" * 32])):
+            try:
+                rpc.call(m, *params)
+                ck(f"{m} raises on a Zcash wallet", False)
+            except JSONRPCException as e:
+                ck(f"{m} -> method not found (-32601) on a Zcash wallet", e.code == -32601, e.code)
     # A non-empty label argument to getnewaddress is rejected (-8); the address itself is fine.
     try:
         rpc.call("getnewaddress", "mylabel")
@@ -799,6 +800,46 @@ def s_listdescriptors(ctx):
         ck("listdescriptors non-boolean raises", False)
     except JSONRPCException as e:
         ck("listdescriptors non-boolean -> code -3", e.code == -3, e.code)
+
+
+@section("abandontransaction", BITCOIN)
+def s_abandontransaction(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
+    # Core's eligibility matrix, without abandoning anything: a confirmed transaction is
+    # "not eligible", an unknown txid is "non-wallet", a malformed one fails parsing (-8)
+    # in ParseHashV's two shapes, a missing one is -1. The live abandonment of a genuinely
+    # stuck transaction is regtest_btc_hang.rs's kyoto leg.
+    confirmed = [t for t in rpc.call("listtransactions", "*", 50) if t["confirmations"] > 0]
+    if confirmed:
+        try:
+            rpc.call("abandontransaction", confirmed[0]["txid"])
+            ck("abandontransaction on a confirmed tx raises", False)
+        except JSONRPCException as e:
+            ck("abandontransaction confirmed -> code -5", e.code == -5, e.code)
+            ck("abandontransaction confirmed -> not eligible",
+               "not eligible" in str(e), str(e))
+    try:
+        rpc.call("abandontransaction", "00" * 32)
+        ck("abandontransaction unknown txid raises", False)
+    except JSONRPCException as e:
+        ck("abandontransaction unknown -> code -5", e.code == -5, e.code)
+        ck("abandontransaction unknown -> non-wallet", "non-wallet" in str(e), str(e))
+    try:
+        rpc.call("abandontransaction", "abc")
+        ck("abandontransaction short txid raises", False)
+    except JSONRPCException as e:
+        ck("abandontransaction short txid -> code -8", e.code == -8, e.code)
+        ck("abandontransaction short txid names the length", "length 64" in str(e), str(e))
+    try:
+        rpc.call("abandontransaction", "zz" * 32)
+        ck("abandontransaction non-hex txid raises", False)
+    except JSONRPCException as e:
+        ck("abandontransaction non-hex txid -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("abandontransaction")
+        ck("abandontransaction without txid raises", False)
+    except JSONRPCException as e:
+        ck("abandontransaction without txid -> code -1", e.code == -1, e.code)
 
 
 @section("wallets", *BOTH)
@@ -1618,6 +1659,12 @@ def s_errors_bitcoin(ctx):
         ck("listdescriptors extra arg raises", False)
     except JSONRPCException as e:
         ck("listdescriptors extra arg -> code -1", e.code == -1, e.code)
+    if ctx.coin == BITCOIN:
+        try:
+            rpc.call("abandontransaction", "00" * 32, "extra")
+            ck("abandontransaction extra arg raises", False)
+        except JSONRPCException as e:
+            ck("abandontransaction extra arg -> code -1", e.code == -1, e.code)
     try:
         AuthServiceProxy(args.url, args.user, "wrong-password").call("getblockcount")
         ck("bad auth raises", False)

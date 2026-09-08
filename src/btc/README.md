@@ -30,6 +30,7 @@ bitcoind backend has. The differences are behavioral, not cosmetic:
 | Credentials | rpcauth/cookie, cleartext-locality gated | none - nothing secret on the wire |
 | 0-conf receives | yes (mempool pass at tip) | **no** - filters are block-derived (an opt-in feed is designed below, not built) |
 | Eviction reporting | yes | **no** |
+| Rebroadcast of unconfirmed transactions | at each new tip, skipping what the node's mempool holds, verdicts classified (see below) | at each new tip, blind - every unconfirmed transaction re-announced, no verdicts |
 | Fee estimation | `estimatesmartfee` | the `[fees]` oracle chain (mempool.space, then Esplora), falling back to a relay floor + block median |
 | Birthday at `init` | dials once for the tip | **defaults to today**, offline; `--birthday` overrides |
 | Fresh-wallet scan start | the birthday | the recorded birthday anchor, else a shipped checkpoint at/below the birthday (see below) |
@@ -175,6 +176,72 @@ an unconfirmed, explicitly-signaling transaction); `gettransaction`'s top-level 
 the sum of the details, so a self-payment nets to zero and change never distorts it. Still
 omitted, matching the Zcash side: `walletconflicts` and `abandoned`.
 
+## Rebroadcast of unconfirmed transactions
+
+A transaction the wallet holds can drop out of the network's view while the wallet's own
+state stays right. The shape that happens on its own is a reorg: BDK's `TxBuilder` sets
+`nLockTime` to the tip height on every send (anti-fee-sniping, as Core's wallet does), so a
+send built at tip 102 and mined at 103 is non-final if the chain reorgs back to 101 - and
+Core does not hold non-final transactions across a reorg, `removeForReorg` drops them from
+the mempool. The receive that shared the orphaned block goes straight back into the
+mempool; the wallet's send vanishes from the node, while the wallet keeps it unconfirmed
+with its inputs still spent. Until something resubmits it, the funds are in limbo.
+
+The actor's `rebroadcast_pass` is that something. It runs after every sync pass that reaches
+a tip the wallet has not rebroadcast at yet - once per new block and once per reconnect,
+never on a timer (a peer keeps a rejected txid in its recent-rejects filter until the next
+block, so a faster cadence would only spin) - and resubmits every canonical unconfirmed
+wallet transaction, parents first. **Received payments included**, as Bitcoin Core's
+`ResubmitWalletTransactions` does: a signed transaction that was broadcast is public data
+anyone may relay, the sender has no veto short of double-spending it (which makes the
+resubmission fail), and a recipient whose sender's wallet never rebroadcasts would
+otherwise wait on them indefinitely. This is a deliberate divergence from the Zcash
+rebroadcast loop, which retransmits only transactions spending the wallet's own notes.
+
+The two backends differ here as they do elsewhere:
+
+- **bitcoind** knows its mempool, so the pass skips anything the node already holds (the
+  emitter's mempool pass fetches the whole set) and classifies each verdict. `-27` already
+  in chain: nothing to do, the block is on its way. `-25` missing inputs, when no input
+  waits on an **own unconfirmed parent**: a conflict spent the inputs and confirmed, the
+  transaction can never confirm as things stand, so it is marked evicted - a send's inputs
+  are freed, a dead receive stops counting toward the unconfirmed balance (BDK evictions
+  are not final: a later block or mempool sighting re-canonicalizes the transaction). The
+  same text on a child of an own unconfirmed send is a dependency, not a conflict, and just
+  waits for the parent. Everything else retries at the next tip: `non-final` (the reorg case, which
+  clears by itself when the locktime height arrives) quietly, any other policy rejection
+  with one WARN then DEBUG on repeats.
+- **kyoto** has no mempool and no verdicts (peers stopped sending `reject` with BIP 61's
+  removal), so every unconfirmed send is re-announced at each new tip on a detached task:
+  a peer that already holds the transaction never asks for it, and the light client's
+  broadcast timeout must not hold the actor. The pass reads the mempool question three
+  ways - known held, known absent, unknown - so a kyoto mempool view (below) narrows the
+  candidate set without the pass changing shape. Unconfirmed receives are rare there in
+  the first place (no mempool means a payment is first seen in a block), so the set is
+  own sends plus whatever a reorg unconfirmed. Note that a light client follows work,
+  not an operator's `invalidateblock`: it reorgs only once the replacement chain outgrows
+  the old one, so its resubmission comes later than bitcoind's after the same reorg
+  (`regtest_btc_reorg.rs` pins both timings).
+
+The pass also covers a kyoto broadcast no peer answered in time, because the send records
+it (see the broadcast-timeout paragraph below), and `abandontransaction` is the release
+valve for a recorded transaction that never relays: Core's shape and codes, applied to the
+transaction and its unconfirmed descendants as an eviction, which frees their inputs for
+the next send. Core refuses to abandon a transaction that is in the mempool; over bitcoind
+the last pass's mempool set enforces that, over kyoto nothing can, so the operator is
+trusted. Over kyoto the abandonment also **restarts the light client**: `bip157`'s
+in-memory broadcast queue holds the signed bytes and re-announces them to every peer that
+completes a handshake, with no API to forget one, so the operator's own client would
+otherwise keep pushing the transaction it was just told to drop. A new node has an empty
+queue; the redial is immediate and resumes from the wallet's checkpoint. For that to hold,
+each kyoto node runs on a `tokio` runtime the connection owns and shuts down with it -
+`bip157`'s own `shutdown()` only returns from the node loop, and the per-peer tasks it
+spawned would otherwise keep their sockets and their handle on the broadcast queue, serving
+the abandoned transaction to the next `getdata` (seen live before the runtime teardown). What remains is
+the risk Core documents for its own `abandontransaction`: a peer that already received the
+bytes may relay them, and if the transaction confirms after all the block re-canonicalizes
+it (an eviction is not final).
+
 ## Send pricing and fee subtraction (Core's optional send parameters)
 
 `sendtoaddress`/`sendmany` honor Core's optional fee parameters, at Core's positions (which
@@ -215,8 +282,9 @@ Everything here is refused with a clear error rather than silently ignored or ha
   not see those funds. Additional descriptor templates are the fix, once wanted.
 - **Fee bumping (`bumpfee`/RBF) and CPFP.** Sends already *signal* BIP 125 (BDK's
   `TxBuilder` default sequence, surfaced as `bip125-replaceable`), but nothing can act on
-  the signal: `bumpfee` and `abandontransaction` answer method-not-found, and the send RPCs
-  have no coin control, so a high-fee child cannot be aimed at a stuck transaction's output
+  the signal: `bumpfee` answers method-not-found (`abandontransaction` exists, but it releases
+  the inputs rather than rescuing the payment), and the send RPCs have no coin control, so
+  a high-fee child cannot be aimed at a stuck transaction's output
   - and an incoming 0-conf output is `untrusted_pending`, which selection excludes, so CPFP
   on a receive has no route at all. The interim escape hatch is building and signing the
   replacement externally and broadcasting it via `sendrawtransaction` (the bitcoind
@@ -339,11 +407,15 @@ Two kyoto requests on the send path carry timeouts of their own, because the und
 would wedge every other command for that wallet, and the shutdown flush with them:
 
 - **Broadcast (30s).** `submit_package` resolves only when a peer sends a `getdata` for the
-  announced txid; with no connected peer, nothing resolves it. On timeout the send returns
-  an error and the wallet does **not** record the transaction at 0-conf, so its inputs stay
-  unlocked - but kyoto keeps it queued for the next peer that connects, so a send that
-  timed out may still relay. If it does, the wallet learns of it when it confirms and a
-  filter matches. Re-sending before then can double-spend the same inputs into a second
-  transaction.
+  announced txid; with no connected peer, nothing resolves it. On timeout the send is
+  **recorded at 0-conf anyway and returns its txid**, with a WARN: kyoto keeps the
+  transaction queued and announces it to every peer that connects from then on, and the
+  actor's rebroadcast pass re-announces it at each new tip, so it may well still relay -
+  and a wallet that had dropped it could then double-spend the same inputs on a retry,
+  which is the unrecoverable outcome. Recording it makes the failure mode the recoverable
+  one instead: the inputs stay locked until the transaction confirms or the operator
+  releases them with `abandontransaction`. That is Core's order of operations (commit,
+  then relay). The `-4` "not recorded" error is reserved for a transport failure - the
+  light client itself having stopped, so nothing was queued.
 - **Tip block for the fee average (10s).** Falls back to the peers' relay floor alone, which
   is the same degradation path an outright fetch error takes.

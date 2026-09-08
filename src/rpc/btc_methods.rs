@@ -17,6 +17,10 @@
 //! (`listdescriptors`, Core's shape, the xpub included), and sends (`sendtoaddress`/`sendmany`/`sendrawtransaction`) - built, signed with
 //! seed-derived signers, and broadcast through the wallet's bitcoind upstream.
 
+use bdk_wallet::bitcoin::Txid;
+
+use std::str::FromStr as _;
+
 use serde_json::{json, Value};
 
 use crate::amount::{signed_zats_to_value, value_to_sat_per_kvb, value_to_zats, zats_to_value};
@@ -59,6 +63,7 @@ pub(crate) const BITCOIN_METHODS: &[&str] = &[
     "sendtoaddress",
     "sendmany",
     "sendrawtransaction",
+    "abandontransaction",
 ];
 
 /// Route one request for a Bitcoin wallet. `None` = not a method this engine serves
@@ -86,6 +91,7 @@ pub(crate) async fn dispatch(
         "sendtoaddress" => sendtoaddress(handle, req).await,
         "sendmany" => sendmany(handle, req).await,
         "sendrawtransaction" => sendrawtransaction(handle, req).await,
+        "abandontransaction" => abandontransaction(handle, req).await,
         _ => return None,
     })
 }
@@ -642,6 +648,26 @@ async fn sendrawtransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Resul
     let hex = req.require_str(0, "sendrawtransaction requires a hex string")?;
     let txid = handle.broadcast(hex.to_string()).await?;
     Ok(Value::String(txid))
+}
+
+/// `abandontransaction "txid"` - Core's shape and codes: `null` on success; a malformed txid
+/// is `-8` (Core's `ParseHashV` messages), an unknown one `-5` "Invalid or non-wallet
+/// transaction id", a confirmed or mempool-held one `-5` "Transaction not eligible for
+/// abandonment". The wallet-side rules, and the kyoto caveat (no mempool view to check
+/// against), are on `btc::actor::BtcActor::do_abandon`.
+async fn abandontransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    let txid = req.require_str(0, "txid is required")?;
+    if txid.len() != 64 {
+        return Err(RpcError::invalid_parameter(format!(
+            "txid must be of length 64 (not {}, for '{txid}')",
+            txid.len()
+        )));
+    }
+    let txid = Txid::from_str(txid).map_err(|_| {
+        RpcError::invalid_parameter(format!("txid must be hexadecimal string (not '{txid}')"))
+    })?;
+    handle.abandon_transaction(txid).await?;
+    Ok(Value::Null)
 }
 
 async fn getaddressinfo(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {

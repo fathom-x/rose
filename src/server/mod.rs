@@ -319,12 +319,14 @@ mod tests {
                 tls_ca_file: None,
                 tls_pins: Vec::new(),
                 assume_transparent_in_compact_blocks: false,
+                proxy: None,
             },
             zebra: Default::default(),
             #[cfg(feature = "bitcoin")]
             bitcoind: Default::default(),
             #[cfg(feature = "bitcoin")]
             fees: Default::default(),
+            fleet: Default::default(),
             rpc: rpc.clone(),
             keys: KeysConfig {
                 age_identity: None,
@@ -362,6 +364,7 @@ mod tests {
                 work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
                 active: crate::state::ActiveCommands::default(),
                 operations: Arc::new(crate::operations::OperationRegistry::new()),
+                fleet: None,
             },
         }
     }
@@ -556,7 +559,7 @@ mod tests {
         use crate::network::ZNetwork;
         use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
 
-        let mut reg = WalletRegistry::new("default".into());
+        let reg = WalletRegistry::new("default".into());
         reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
             "default",
             ZNetwork::Test,
@@ -614,7 +617,7 @@ mod tests {
         use crate::wallet::{CoinWallet, WalletHandle};
 
         let (handle, tx) = WalletHandle::for_test_publishing("default", ZNetwork::Test, status);
-        let mut reg = WalletRegistry::new("default".into());
+        let reg = WalletRegistry::new("default".into());
         reg.insert(CoinWallet::Zcash(handle));
         let mut state = test_state();
         state.app.registry = Arc::new(reg);
@@ -810,7 +813,7 @@ mod tests {
         use crate::network::ZNetwork;
         use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
 
-        let mut reg = WalletRegistry::new("default".into());
+        let reg = WalletRegistry::new("default".into());
         reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
             "default",
             ZNetwork::Test,
@@ -905,7 +908,7 @@ mod tests {
         use crate::network::ZNetwork;
         use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
 
-        let mut reg = WalletRegistry::new("default".into());
+        let reg = WalletRegistry::new("default".into());
         reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
             "default",
             ZNetwork::Test,
@@ -951,7 +954,7 @@ mod tests {
         use crate::network::ZNetwork;
         use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
 
-        let mut reg = WalletRegistry::new("default".into());
+        let reg = WalletRegistry::new("default".into());
         for name in ["default", "w2"] {
             reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
                 name,

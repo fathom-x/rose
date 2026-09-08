@@ -148,6 +148,71 @@ pub struct AppConfig {
     pub pools: PoolsConfig,
     pub health: HealthConfig,
     pub log: LogConfig,
+    /// `[fleet]` - monitoring many watch-only wallets in this one daemon.
+    pub fleet: FleetConfig,
+}
+
+/// Where the fleet's wallet manifests live, relative to the datadir.
+pub const DEFAULT_FLEET_MANIFEST_DIR: &str = "wallets.d";
+/// Where the fleet's shard databases live, relative to the datadir.
+pub const DEFAULT_FLEET_DIR: &str = "fleet";
+/// Accounts per shard database.
+///
+/// Sharding buys nothing in trial-decryption cost - that is the sum over viewing keys however
+/// they are grouped - so this is not a throughput knob. It bounds *blast radius*: onboarding a
+/// wallet rewinds its shard's database to the new account's birthday, one SQLite writer
+/// serializes per shard, `get_wallet_summary` is O(accounts in the database), and a halted shard
+/// stops one group of wallets rather than the fleet.
+pub const DEFAULT_FLEET_SHARD_SIZE: usize = 128;
+/// How far below a shard's earliest birthday an arriving wallet may be and still join it, rather
+/// than starting a shard of its own.
+///
+/// Importing an account rewinds its database to that account's birthday, so a wallet arriving far
+/// below a caught-up shard's floor would drag every wallet in it back through a rescan. Alone in a
+/// fresh shard it re-scans only against its own key, over blocks the daemon is fetching anyway.
+pub const DEFAULT_FLEET_COHORT_DEPTH: u32 = 10_000;
+
+/// `[fleet]` - monitoring many watch-only wallets in one daemon.
+///
+/// **Experimental, and off unless [`FleetConfig::enabled`] says otherwise.** The manifest
+/// format, the `[fleet]` keys and the four wallet-management RPCs carry no compatibility
+/// guarantee while the feature is experimental: they may change in a patch release. Two known
+/// limitations are the reason: shard placement groups wallets by arrival rather than by
+/// birthday, so a wide spread of birthdays makes a recent wallet wait behind the oldest member
+/// of its shard; and there is no path to remove a wallet from a shard once it is imported.
+///
+/// The fleet is **additive**: disabled (the default) none of this runs, and `[wallets.<name>]`
+/// entries keep behaving exactly as they always have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetConfig {
+    /// Run the fleet at all (`[fleet] enabled`, default `false`).
+    ///
+    /// Off means the manifest directory is never read, no shard is opened, and the wallet
+    /// management RPCs (`createwallet`, `loadwallet`, `unloadwallet`) refuse with a message
+    /// naming this key. It is a deliberate opt-in rather than "on when manifests exist": the
+    /// feature is experimental, so an operator should have said so, and a stray file in the
+    /// datadir should not enrol a daemon into it.
+    pub enabled: bool,
+    /// Directory of per-wallet manifests, one small TOML each (absolute after resolution).
+    pub manifest_dir: PathBuf,
+    /// Directory holding the shard databases (absolute after resolution).
+    pub dir: PathBuf,
+    /// Accounts per shard - see [`DEFAULT_FLEET_SHARD_SIZE`].
+    pub shard_size: usize,
+    /// Cohort depth for placement - see [`DEFAULT_FLEET_COHORT_DEPTH`].
+    pub cohort_depth: u32,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        FleetConfig {
+            enabled: false,
+            manifest_dir: PathBuf::from(DEFAULT_FLEET_MANIFEST_DIR),
+            dir: PathBuf::from(DEFAULT_FLEET_DIR),
+            shard_size: DEFAULT_FLEET_SHARD_SIZE,
+            cohort_depth: DEFAULT_FLEET_COHORT_DEPTH,
+        }
+    }
 }
 
 /// `[pools]` - the wallet's shielded pool configuration: which pools are enabled and which
@@ -496,6 +561,7 @@ impl WalletBackendOverride {
             reconnect_max_secs: global.reconnect_max_secs,
             rfc1918_is_local: global.rfc1918_is_local,
             allow_remote_cleartext: global.allow_remote_cleartext,
+            proxy: global.proxy.clone(),
         }
     }
 }
@@ -562,6 +628,16 @@ pub struct BackendConfig {
     ///
     /// Ignored by `zebra://` endpoints, which always cover transparent data.
     pub assume_transparent_in_compact_blocks: bool,
+    /// Route every outbound connection through this SOCKS5 proxy (`socks5://host:port`), e.g.
+    /// `socks5://127.0.0.1:9050` for Tor. `None` (the default) dials directly.
+    ///
+    /// Daemon policy, not a per-endpoint setting: it covers both upstream kinds - the zebrad
+    /// JSON-RPC client and the lightwalletd gRPC channel - so a configured proxy carries *all*
+    /// of zecd's network traffic. The destination is resolved by the proxy rather than locally
+    /// (so `.onion` upstreams work and no DNS leaks), and lightwalletd TLS is layered over the
+    /// proxied stream unchanged, keeping certificate verification pinned to the destination
+    /// hostname. SOCKS username/password authentication is not supported.
+    pub proxy: Option<crate::socks::SocksProxy>,
 }
 
 impl BackendConfig {
@@ -799,6 +875,17 @@ pub struct SpendConfig {
     /// Confirmations before third-party outputs are spendable. Must be at least
     /// `trusted_confirmations`. Default 10.
     pub untrusted_confirmations: u32,
+    /// Mark transactions this wallet authors as **trusted** at store time
+    /// (`actor::mark_own_tx_trusted`), so their outputs - including the payment half of a
+    /// self-send - are spendable at `trusted_confirmations` instead of
+    /// `untrusted_confirmations` (Bitcoin Core's own-transaction trust model). **On by
+    /// default.** Set `trust_own_transactions = false` to keep zecd from persisting the marker
+    /// at all: every output is then classified purely from data a from-seed restore re-derives
+    /// (key scope + chain), so an authoring instance and a restore of the same seed report
+    /// byte-identical classifications at every confirmation depth - the strictest reading of
+    /// the statelessness invariant, at the cost of self-send payments waiting the untrusted
+    /// depth. Governs new sends only; markers already written remain until a rescan.
+    pub trust_own_transactions: bool,
     /// What sends are allowed to reveal on-chain. Default `AllowRevealedRecipients`.
     pub privacy: SendPrivacy,
     /// Cap on the number of Orchard actions (`max(orchard inputs, orchard outputs)`) a single
@@ -843,6 +930,7 @@ impl Default for SpendConfig {
         Self {
             trusted_confirmations: 3,
             untrusted_confirmations: 10,
+            trust_own_transactions: true,
             privacy: SendPrivacy::AllowRevealedRecipients,
             orchard_action_limit: DEFAULT_ORCHARD_ACTION_LIMIT,
             cache_proving_key: true,
@@ -1042,6 +1130,17 @@ struct ConfigFile {
     pools: Option<PoolsFile>,
     health: Option<HealthFile>,
     log: Option<LogFile>,
+    fleet: Option<FleetFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetFile {
+    enabled: Option<bool>,
+    manifest_dir: Option<PathBuf>,
+    dir: Option<PathBuf>,
+    shard_size: Option<usize>,
+    cohort_depth: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1130,6 +1229,9 @@ struct BackendFile {
     /// Assert that the upstream lightwalletd serves transparent data in compact blocks - see
     /// [`BackendConfig::assume_transparent_in_compact_blocks`].
     assume_transparent_in_compact_blocks: Option<bool>,
+    /// Route all upstream traffic through a SOCKS5 proxy (`socks5://host:port`) - see
+    /// [`BackendConfig::proxy`].
+    proxy: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1209,6 +1311,7 @@ struct SyncFile {
 struct SpendFile {
     trusted_confirmations: Option<u32>,
     untrusted_confirmations: Option<u32>,
+    trust_own_transactions: Option<bool>,
     privacy_policy: Option<String>,
     orchard_action_limit: Option<usize>,
     cache_proving_key: Option<bool>,
@@ -1274,6 +1377,8 @@ pub struct ConfigOverrides {
     pub rpc_auth: Vec<String>,
     /// Chain upstream token (`zebra`, `zebra://host:port`, `zecrocks`, `https://...`, ...).
     pub server: Option<String>,
+    /// SOCKS5 proxy carrying every outbound connection (`socks5://host:port`).
+    pub proxy: Option<String>,
     /// age identity file used to decrypt the wallet seed for sending.
     pub age_identity: Option<PathBuf>,
     /// Path to the default wallet's `keys.toml`, independent of the datadir.
@@ -1295,6 +1400,7 @@ impl From<&Cli> for ConfigOverrides {
             rpc_password: cli.rpc_password.clone(),
             rpc_auth: cli.rpc_auth.clone(),
             server: cli.server.clone(),
+            proxy: cli.proxy.clone(),
             age_identity: cli.age_identity.clone(),
             keys_file: cli.keys_file.clone(),
         }
@@ -1362,6 +1468,11 @@ pub struct Cli {
     /// Chain upstream: `zebra` (local zebrad, the default) or `zebra://host:port`.
     #[arg(long, global = true, value_name = "SERVER")]
     pub server: Option<String>,
+
+    /// Route every outbound connection through a SOCKS5 proxy, e.g. `socks5://127.0.0.1:9050`
+    /// for Tor. Covers both upstream kinds; the proxy resolves the destination.
+    #[arg(long, global = true, value_name = "SOCKS5_URL")]
+    pub proxy: Option<String>,
 
     /// age identity file used to decrypt the wallet seed for sending.
     #[arg(long, global = true, value_name = "FILE", env = "ZECD_AGE_IDENTITY")]
@@ -1922,6 +2033,7 @@ impl AppConfig {
             tls_ca_file: None,
             tls_pinned_sha256: None,
             assume_transparent_in_compact_blocks: None,
+            proxy: None,
         });
         let server = select_server_token(cli.server.clone(), backend_file.server);
         let reconnect_base_secs = backend_file.reconnect_base_secs.unwrap_or(1).max(1);
@@ -1966,6 +2078,15 @@ impl AppConfig {
             assume_transparent_in_compact_blocks: backend_file
                 .assume_transparent_in_compact_blocks
                 .unwrap_or(false),
+            // Parsed now, like the CA file above: a malformed proxy token must fail startup
+            // rather than let the daemon dial directly under a config that says otherwise -
+            // the whole point of the knob is that nothing bypasses it.
+            proxy: match cli.proxy.clone().or(backend_file.proxy) {
+                Some(token) => {
+                    Some(crate::socks::SocksProxy::parse(&token).context("[backend] proxy")?)
+                }
+                None => None,
+            },
         };
         validate_backend_tls(&backend)?;
         // Same contradiction checks for every wallet that overrides the endpoint, against its
@@ -2149,6 +2270,7 @@ impl AppConfig {
         let spend = SpendConfig {
             trusted_confirmations: spend_file.trusted_confirmations.unwrap_or(3),
             untrusted_confirmations: spend_file.untrusted_confirmations.unwrap_or(10),
+            trust_own_transactions: spend_file.trust_own_transactions.unwrap_or(true),
             privacy: spend_file
                 .privacy_policy
                 .as_deref()
@@ -2200,6 +2322,33 @@ impl AppConfig {
             max_scan_lag: health_file.max_scan_lag.unwrap_or(4),
         };
 
+        let fleet_file = file.fleet.unwrap_or(FleetFile {
+            enabled: None,
+            manifest_dir: None,
+            dir: None,
+            shard_size: None,
+            cohort_depth: None,
+        });
+        let fleet = FleetConfig {
+            enabled: fleet_file.enabled.unwrap_or(false),
+            manifest_dir: fleet_file
+                .manifest_dir
+                .map(|p| datadir.join(p))
+                .unwrap_or_else(|| datadir.join(DEFAULT_FLEET_MANIFEST_DIR)),
+            dir: fleet_file
+                .dir
+                .map(|p| datadir.join(p))
+                .unwrap_or_else(|| datadir.join(DEFAULT_FLEET_DIR)),
+            shard_size: fleet_file.shard_size.unwrap_or(DEFAULT_FLEET_SHARD_SIZE),
+            cohort_depth: fleet_file
+                .cohort_depth
+                .unwrap_or(DEFAULT_FLEET_COHORT_DEPTH),
+        };
+        // A shard is a scan domain: zero accounts per shard would mean no wallet is ever placed.
+        if fleet.shard_size == 0 {
+            anyhow::bail!("[fleet] shard_size must be at least 1");
+        }
+
         let log_file = file.log.unwrap_or(LogFile {
             level: None,
             format: None,
@@ -2241,6 +2390,7 @@ impl AppConfig {
             pools,
             health,
             log,
+            fleet,
         })
     }
 }
@@ -2905,6 +3055,39 @@ mod tests {
     }
 
     #[test]
+    fn trust_own_transactions_defaults_on_and_parses() {
+        // Absent -> on: wallet-authored transactions are marked trusted at store time.
+        assert!(SpendConfig::default().trust_own_transactions);
+        // The full-statelessness opt-out round-trips: with it off, zecd persists no trust
+        // marker, so an authoring instance and a from-seed restore classify identically.
+        let f: SpendFile = toml::from_str("trust_own_transactions = false").unwrap();
+        assert_eq!(f.trust_own_transactions, Some(false));
+        let f: SpendFile = toml::from_str("trust_own_transactions = true").unwrap();
+        assert_eq!(f.trust_own_transactions, Some(true));
+    }
+
+    #[test]
+    fn fleet_defaults_off_and_parses() {
+        // Absent -> off. The fleet is experimental and opt-in: a daemon that never mentions
+        // [fleet] must not read the manifest directory or accept a runtime `createwallet`,
+        // and a stray file in the datadir must not enrol it.
+        assert!(!FleetConfig::default().enabled);
+        // An omitted [fleet] table resolves to the same thing as an empty one.
+        let f: FleetFile = toml::from_str("").unwrap();
+        assert_eq!(f.enabled, None);
+        let f: FleetFile = toml::from_str("enabled = true").unwrap();
+        assert_eq!(f.enabled, Some(true));
+        let f: FleetFile = toml::from_str("enabled = false").unwrap();
+        assert_eq!(f.enabled, Some(false));
+        // The other keys are inert but still parse, so a config can be written before the
+        // feature is switched on.
+        let f: FleetFile = toml::from_str("shard_size = 64\ncohort_depth = 500").unwrap();
+        assert_eq!(f.enabled, None);
+        assert_eq!(f.shard_size, Some(64));
+        assert_eq!(f.cohort_depth, Some(500));
+    }
+
+    #[test]
     fn privacy_policy_parses_known_values_only() {
         assert_eq!(
             SendPrivacy::parse("FullPrivacy").unwrap(),
@@ -3000,6 +3183,73 @@ mod tests {
     }
 
     #[test]
+    fn backend_file_parses_the_proxy_key() {
+        let f: BackendFile = toml::from_str("server = \"zecrocks\"").unwrap();
+        assert_eq!(f.proxy, None);
+        let f: BackendFile = toml::from_str("proxy = \"socks5://127.0.0.1:9050\"").unwrap();
+        assert_eq!(f.proxy.as_deref(), Some("socks5://127.0.0.1:9050"));
+    }
+
+    /// The library entry point carries the proxy the same way the binary's flag does, and it
+    /// reaches the `Server` a `NodeBuilder` would dial - so an embedded node is proxied on the
+    /// same terms as the daemon.
+    #[test]
+    fn a_library_consumers_override_reaches_the_resolved_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::resolve_overrides(&ConfigOverrides {
+            conf: Some(conf),
+            proxy: Some("socks5://127.0.0.1:9050".into()),
+            ..Default::default()
+        })
+        .expect("resolve with a proxy override");
+        assert_eq!(
+            config.backend.proxy,
+            Some(crate::socks::SocksProxy::parse("socks5://127.0.0.1:9050").unwrap())
+        );
+        // `resolve_configured` is what the daemon dials through; `resolve_for_wallet` is what
+        // `node.rs` calls per wallet. Both must carry it.
+        assert!(crate::backend::resolve_configured(&config)
+            .unwrap()
+            .describe()
+            .contains("via socks5://127.0.0.1:9050"));
+        for entry in config.wallets.values() {
+            assert!(crate::backend::resolve_for_wallet(&config, entry)
+                .unwrap()
+                .describe()
+                .contains("via socks5://127.0.0.1:9050"));
+        }
+    }
+
+    #[test]
+    fn the_proxy_is_daemon_policy_and_never_per_wallet() {
+        // A wallet may override its endpoint and TLS, but not how the daemon reaches the
+        // network: one proxy decision for the whole process.
+        let mut global = backend_cfg();
+        global.proxy = Some(crate::socks::SocksProxy::parse("socks5://127.0.0.1:9050").unwrap());
+        let override_with_own_server = WalletBackendOverride {
+            server: Some("zecrocks".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            override_with_own_server.effective(&global).proxy,
+            global.proxy,
+            "a wallet override must inherit the daemon's proxy"
+        );
+        // And there is no per-wallet key to set one with.
+        assert!(toml::from_str::<WalletFile>("proxy = \"socks5://127.0.0.1:9050\"").is_err());
+    }
+
+    #[test]
     fn backend_file_parses_transparent_capability_override() {
         // Absent by default - asserting a capability the server does not advertise has to be a
         // deliberate act, since guessing wrong loses transparent receives silently.
@@ -3048,6 +3298,7 @@ mod tests {
             tls_ca_file: None,
             tls_pins: Vec::new(),
             assume_transparent_in_compact_blocks: false,
+            proxy: None,
         }
     }
 

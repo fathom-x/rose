@@ -746,7 +746,7 @@ mod tests {
             shutdown: tokio::sync::watch::channel(false).1,
         })
         .unwrap();
-        let mut registry = WalletRegistry::new("btc".to_string());
+        let registry = WalletRegistry::new("btc".to_string());
         registry.insert(CoinWallet::Bitcoin(handle));
         let state = AppState {
             config: Arc::new(config),
@@ -757,6 +757,7 @@ mod tests {
             work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
+            fleet: None,
         };
         let call = |method: &str, params: Vec<Value>| {
             let req = RpcRequest::positional(method.to_string(), params);

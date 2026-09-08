@@ -75,6 +75,19 @@ dir = "./data/default"
 server = "zebra"
 # Per-attempt dial timeout (seconds) so a hung/black-holed endpoint can't stall sync.
 connect_timeout_secs = 10
+# Route EVERY outbound connection through a SOCKS5 proxy - most usefully Tor. Off by default.
+# It covers both upstream kinds (the zebra:// JSON-RPC client and the lightwalletd gRPC
+# channel), so nothing zecd dials bypasses it.
+#
+# The proxy resolves the destination, not zecd, so no DNS leaves this host and a .onion
+# upstream works. lightwalletd TLS is layered over the proxied connection unchanged, with
+# certificate verification still pinned to the destination hostname - the proxy carries
+# ciphertext it cannot read. SOCKS username/password authentication is not supported; use a
+# proxy that restricts access by source address (a loopback listener is the usual answer).
+#
+# Note that with a proxy set, a loopback `server` names the PROXY's loopback rather than this
+# machine's - `zecd config check` warns about that combination.
+# proxy = "socks5://127.0.0.1:9050"
 # Reconnect backoff (seconds): start at base, double up to max, with full jitter.
 reconnect_base_secs = 1
 reconnect_max_secs = 60
@@ -375,10 +388,20 @@ rebroadcast_secs = 60
 # must be before it is spendable. Anchors getbalance/getbalances/getwalletinfo and spend
 # proposals; getbalance's explicit minconf argument overrides it per call. Lowering these
 # trades reorg/double-spend safety for latency.
-# Confirmations before the wallet's *own* outputs (change) are spendable.
+# Confirmations before the wallet's *own* outputs are spendable: change, and every output of
+# a transaction this wallet authored (zecd marks its own sends trusted at store time, so a
+# self-send's payment output waits this depth, not the untrusted one - Bitcoin Core's
+# own-transaction trust model).
 trusted_confirmations = 3
 # Confirmations before third-party payments are spendable (must be >= trusted_confirmations).
 untrusted_confirmations = 10
+# Mark transactions this wallet authors as trusted at store time (what makes a self-send's
+# payment output wait trusted_confirmations above rather than untrusted_confirmations). Set
+# false to keep zecd from persisting the trust marker at all: classification then derives only
+# from data a from-seed restore re-derives, so an authoring instance and a restore of the same
+# seed report identical balances at every confirmation depth (the strictest statelessness
+# posture) - at the cost of the wallet's own self-send payments waiting the untrusted depth.
+trust_own_transactions = true
 # What sends may reveal on-chain (zcashd/Zallet's privacy-policy opt-in, zcash/zcash#6240). A
 # five-rung ladder from most to least private; unlike zcashd's policy lattice it is linear, so
 # each rung also permits everything the rungs above it forbid:
@@ -464,3 +487,62 @@ port = 9233
 readiness = "synced"
 # Only consulted in "synced" and "scanned" modes:
 max_scan_lag = 4
+
+# ---------------------------------------------------------------------------
+# [fleet] - EXPERIMENTAL. Monitoring many watch-only wallets in one daemon.
+# ---------------------------------------------------------------------------
+# Off by default, and almost nobody needs it: this exists for an operator running a
+# service that watches viewing keys on other people's behalf. A conventional
+# deployment - one wallet, or a handful of [wallets.<name>] entries - should leave
+# this alone and is completely unaffected by it.
+#
+# What it does: a view wallet normally costs a full stack of its own (a database, an
+# actor, a scan pass, note-commitment trees). At tens or thousands of wallets that
+# duplication is what stops zecd scaling. A fleet puts many viewing keys behind ONE
+# scan domain - a "shard" - so a block is fetched once and trial-decrypted once
+# against every key in the shard. Spending is untouched: one conventional wallet, its
+# own database, its own actor.
+#
+# EXPERIMENTAL means what it says. While the fleet carries this label, the manifest
+# format, the [fleet] keys below, and the createwallet/loadwallet/unloadwallet/
+# listwalletdir RPCs may all change in a PATCH release, with no migration. Two known
+# limitations you should read before enabling it:
+#
+#   * Placement groups wallets by ARRIVAL, not by birthday. A shard's scan floor is
+#     its oldest member's birthday, so a wallet born at today's tip that lands in a
+#     shard holding a 2018 wallet waits for that shard to scan from 2018. If your
+#     wallets arrive with a wide spread of birthdays, expect placement to be well
+#     short of optimal.
+#   * There is NO way to remove a wallet once imported. `unloadwallet` stops serving
+#     it but deletes nothing - the manifest stays, the account stays, and the shard
+#     keeps scanning its key. Removing it means deleting and rebuilding the shard.
+#
+# Backup note: with a fleet enabled, `manifest_dir` below holds viewing keys that
+# exist NOWHERE ELSE in zecd, and it is written at runtime by `createwallet`. It is
+# key material, not a cache, and the "the whole data directory is disposable" rule in
+# docs/OPERATIONS.md does NOT cover it. Back it up like keys.toml.
+#
+# [fleet]
+# Run the fleet at all. Off means the manifest directory is never read, no shard is
+# opened, and createwallet/loadwallet/unloadwallet refuse.
+# enabled = false
+#
+# Directory of per-wallet manifests, one small TOML each, relative to the datadir.
+# Each file is `<name>.toml` holding `ufvk = "uview1..."` and `birthday = <height>`;
+# the file stem is the wallet name, served at /wallet/<name>. Drop a file in and
+# restart, or use `createwallet` to add one without a restart.
+# manifest_dir = "wallets.d"
+#
+# Directory holding the shard databases, relative to the datadir. Derived data: this
+# one IS a cache, rebuildable from the manifests plus the chain.
+# dir = "fleet"
+#
+# Accounts per shard. A shard is one scan domain, so this trades scan sharing against
+# blast radius: importing a wallet rewinds its whole shard to that wallet's birthday,
+# so a bigger shard shares more work but is dragged backwards by more arrivals.
+# shard_size = 128
+#
+# How far below a shard's oldest birthday an arriving wallet may be before it starts
+# a new shard instead of joining. See the placement limitation above - this bounds
+# how far one arrival can drag a shard back, but it does not bound the total spread.
+# cohort_depth = 10000

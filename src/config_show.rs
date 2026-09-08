@@ -77,6 +77,12 @@ pub fn render(config: &AppConfig) -> String {
             &format!("UNRESOLVED: {e}"),
         ),
     }
+    // Rendered only when set, like tls_ca_file: an absent proxy has no key to write back.
+    // `SocksProxy`'s Display is the canonical token, so this re-parses to the same value -
+    // which `render_is_idempotent_through_a_resolve` depends on.
+    if let Some(proxy) = &b.proxy {
+        kv(&mut s, "proxy", str_val(&proxy.to_string()));
+    }
     kv(&mut s, "connect_timeout_secs", b.connect_timeout_secs);
     kv(&mut s, "reconnect_base_secs", b.reconnect_base_secs);
     kv(&mut s, "reconnect_max_secs", b.reconnect_max_secs);
@@ -265,6 +271,11 @@ pub fn render(config: &AppConfig) -> String {
         "untrusted_confirmations",
         config.spend.untrusted_confirmations,
     );
+    kv(
+        &mut s,
+        "trust_own_transactions",
+        config.spend.trust_own_transactions,
+    );
     // The `Debug` spelling is the config spelling (`SendPrivacy::parse` accepts exactly these),
     // so the rendered value round-trips.
     kv(
@@ -299,6 +310,17 @@ pub fn render(config: &AppConfig) -> String {
         str_val(config.health.readiness.as_str()),
     );
     kv(&mut s, "max_scan_lag", config.health.max_scan_lag);
+
+    table(&mut s, "fleet");
+    // First, because every other key here is inert without it.
+    kv(&mut s, "enabled", config.fleet.enabled);
+    // Rendered as absolute paths, as resolved: the config accepts either, and an operator
+    // reading "which directory is this daemon actually watching for wallet manifests" wants the
+    // answer, not the datadir-relative form they may have written.
+    kv(&mut s, "manifest_dir", path_val(&config.fleet.manifest_dir));
+    kv(&mut s, "dir", path_val(&config.fleet.dir));
+    kv(&mut s, "shard_size", config.fleet.shard_size);
+    kv(&mut s, "cohort_depth", config.fleet.cohort_depth);
 
     table(&mut s, "log");
     kv(&mut s, "level", str_val(&config.log.level));

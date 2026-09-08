@@ -40,6 +40,233 @@ pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(state.registry.names()))
 }
 
+/// `listwalletdir` - the wallets available on disk, whether or not they are loaded.
+///
+/// Bitcoin Core's shape (`{"wallets": [{"name": ...}, ...]}`). For zecd this is the fleet's
+/// manifest directory: the wallets an operator has provisioned, which is what they reconcile
+/// against when a name is missing from `listwallets`. Configured `[wallets.<name>]` entries are
+/// listed too - they are equally "on disk available", and omitting them would make the two RPCs
+/// disagree for reasons that have nothing to do with the fleet.
+///
+/// zecd extension: a `warnings` array naming any manifest that could not be read. Those wallets
+/// are skipped at startup rather than taking the daemon down, so this is where an operator sees
+/// that a file they wrote is not being served - without it, a skipped wallet is indistinguishable
+/// from one that was never provisioned. Absent when there are none, so the Core-shaped response
+/// is unchanged for a healthy fleet.
+pub(crate) fn listwalletdir(state: &AppState) -> Result<Value, RpcError> {
+    let mut names: Vec<String> = state.config.wallets.keys().cloned().collect();
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(fleet) = &state.fleet {
+        match crate::fleet::load_manifests(fleet.manifest_dir()) {
+            Ok((members, skipped)) => {
+                names.extend(members.into_iter().map(|m| m.name));
+                warnings.extend(
+                    skipped
+                        .into_iter()
+                        .map(|s| format!("{}: {}", s.path.display(), s.reason)),
+                );
+            }
+            // A manifest directory the daemon cannot read is an operator-visible problem, but it
+            // must not make listing the rest fail - that is exactly when this RPC is being used.
+            Err(e) => {
+                tracing::warn!("listwalletdir: reading the fleet manifests: {e:#}");
+                warnings.push(format!("{}: {e:#}", fleet.manifest_dir().display()));
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    let wallets: Vec<Value> = names
+        .into_iter()
+        .map(|name| json!({ "name": name }))
+        .collect();
+    let mut out = json!({ "wallets": wallets });
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
+}
+
+/// `createwallet "wallet_name" ( disable_private_keys blank passphrase avoid_reuse descriptors
+/// load_on_startup external_signer )` - onboard a **view wallet** into the fleet, without
+/// restarting the daemon.
+///
+/// zecd's divergence from Bitcoin Core is forced by what a Zcash wallet is: Core creates a wallet
+/// that generates its own keys, while a monitored Zcash wallet is defined by a viewing key it is
+/// given. So this RPC requires `ufvk` and `birthday` (in the options object, param 8), and every
+/// Core flag that would ask for a *spending* wallet is refused rather than ignored - zecd loads at
+/// most one wallet with spending keys, and it is not created over the network. `disable_private_keys`
+/// is accepted only as `true`, which is what a fleet wallet is.
+///
+/// The birthday is required for the same reason it is in a manifest: defaulting it would silently
+/// choose between a full-chain rescan and a tip-only scan that misses the wallet's funds.
+///
+/// Returns Core's `{"name": ..., "warning": ...}`.
+pub(crate) async fn createwallet(state: &AppState, params: &[Value]) -> Result<Value, RpcError> {
+    let name = params
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_parameter("createwallet requires a wallet name"))?
+        .to_string();
+
+    // Core's positional flags. Only the ones that describe a watch-only wallet are honoured; the
+    // rest are refused, because silently ignoring a request for a spending wallet would hand back
+    // a wallet that cannot do what the caller asked for.
+    if let Some(v) = params.get(1) {
+        if v.as_bool() == Some(false) {
+            return Err(RpcError::invalid_parameter(
+                "createwallet on zecd creates a watch-only wallet from a viewing key, so \
+                 disable_private_keys must be true (or omitted). zecd loads at most one wallet \
+                 with spending keys, created offline with `zecd init`.",
+            ));
+        }
+    }
+    for (index, flag) in [(3usize, "passphrase"), (7, "external_signer")] {
+        if params.get(index).is_some_and(|v| !v.is_null()) {
+            return Err(RpcError::invalid_parameter(format!(
+                "createwallet does not support {flag}: a fleet wallet holds no spending material"
+            )));
+        }
+    }
+
+    let options = params.get(8).cloned().unwrap_or(Value::Null);
+    let ufvk = options
+        .get("ufvk")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            RpcError::invalid_parameter(
+                "createwallet requires a \"ufvk\" in its options object (param 8): a monitored \
+                 Zcash wallet is defined by the viewing key it is given",
+            )
+        })?
+        .to_string();
+    let birthday = options
+        .get("birthday")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            RpcError::invalid_parameter(
+                "createwallet requires a \"birthday\" height in its options object (param 8): \
+                 defaulting it would either rescan the whole chain or miss the wallet's funds",
+            )
+        })?;
+    let birthday = u32::try_from(birthday)
+        .map_err(|_| RpcError::invalid_parameter("birthday is not a block height"))?;
+
+    let fleet = state.fleet.as_ref().ok_or_else(|| {
+        RpcError::wallet(
+            "no fleet on this node, so view wallets cannot be onboarded. Set [fleet] \
+             enabled = true and restart. The fleet is experimental: its manifest format, \
+             [fleet] keys and wallet-management RPCs may change in a patch release. (An \
+             embedded host may also have been built without a fleet manager.)"
+                .to_string(),
+        )
+    })?;
+    let member = crate::wallet::shard::ShardMember {
+        name: name.clone(),
+        ufvk,
+        birthday: zcash_protocol::consensus::BlockHeight::from_u32(birthday),
+    };
+    fleet
+        .onboard(&state.registry, member, true)
+        .await
+        .map_err(onboard_error)?;
+    Ok(json!({
+        "name": name,
+        // The wallet is served immediately but has not scanned yet, which a caller reading a zero
+        // balance a moment later needs to know.
+        "warning": "the wallet is loaded; its balance and history are empty until the shard \
+                    scans from its birthday",
+    }))
+}
+
+/// `unloadwallet ( "wallet_name" load_on_startup )` - stop serving a wallet.
+///
+/// As in Bitcoin Core, this does not delete anything: the wallet's manifest and its account stay
+/// where they are, so a restart (or `loadwallet`) serves it again. Its shard also keeps scanning
+/// for it - the account is still in that database, and removing it would rewind the shard and
+/// re-scan every other wallet in it, which is a far larger action than "stop answering for this
+/// name".
+pub(crate) fn unloadwallet(
+    state: &AppState,
+    params: &[Value],
+    routed: Option<&str>,
+) -> Result<Value, RpcError> {
+    // Core takes the name positionally *or* from the /wallet/<name> route.
+    let name = params
+        .first()
+        .and_then(|v| v.as_str())
+        .or(routed)
+        .ok_or_else(|| RpcError::invalid_parameter("unloadwallet requires a wallet name"))?;
+    // Only fleet wallets are unloadable: `loadwallet` restores from the fleet manifests, so
+    // unloading a configured `[wallets.<name>]` entry (the spending wallet included) would be
+    // irreversible until a restart - and `listwalletdir` would keep calling it loadable.
+    if state.config.wallets.contains_key(name) {
+        return Err(RpcError::wallet(format!(
+            "wallet '{name}' is a configured [wallets.{name}] entry, which stays loaded for the \
+             daemon's lifetime; only fleet wallets can be unloaded (to retire it, remove the \
+             config entry and restart)"
+        )));
+    }
+    if !state.registry.remove(name) {
+        return Err(RpcError::wallet_not_found(format!(
+            "Requested wallet does not exist or is not loaded: {name}"
+        )));
+    }
+    Ok(json!({ "name": name, "warning": "" }))
+}
+
+/// `loadwallet "filename" ( load_on_startup )` - serve a wallet that is provisioned but not
+/// loaded: one added to the manifest directory while the daemon ran, or one `unloadwallet`
+/// dropped.
+pub(crate) async fn loadwallet(state: &AppState, params: &[Value]) -> Result<Value, RpcError> {
+    let name = params
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_parameter("loadwallet requires a wallet name"))?
+        .to_string();
+    let fleet = state.fleet.as_ref().ok_or_else(|| {
+        RpcError::wallet(
+            "no fleet on this node, so wallets cannot be loaded at runtime. Set [fleet] \
+             enabled = true and restart. The fleet is experimental: its manifest format, \
+             [fleet] keys and wallet-management RPCs may change in a patch release. (An \
+             embedded host may also have been built without a fleet manager.)"
+                .to_string(),
+        )
+    })?;
+    let (members, _skipped) = crate::fleet::load_manifests(fleet.manifest_dir())
+        .map_err(|e| RpcError::wallet(format!("reading the fleet manifests: {e:#}")))?;
+    // A skipped manifest is not found here, so an unreadable file for this very name surfaces as
+    // "no wallet '<name>'" - correct as far as it goes, and `listwalletdir`'s warnings say why.
+    let member = members
+        .into_iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| {
+            RpcError::wallet_not_found(format!(
+                "no wallet '{name}' in the fleet manifest directory ({}); see listwalletdir",
+                fleet.manifest_dir().display()
+            ))
+        })?;
+    // The manifest is already on disk, so this is a load, not a create.
+    fleet
+        .onboard(&state.registry, member, false)
+        .await
+        .map_err(onboard_error)?;
+    Ok(json!({ "name": name, "warning": "" }))
+}
+
+/// Map an onboarding refusal onto Bitcoin Core's error dialect.
+fn onboard_error(e: crate::fleet::OnboardError) -> RpcError {
+    use crate::fleet::OnboardError;
+    match e {
+        // Core's `RPC_WALLET_ALREADY_EXISTS` case.
+        OnboardError::NameTaken(_) => RpcError::wallet(e.to_string()),
+        OnboardError::BadName(_) | OnboardError::BadKey(_) => {
+            RpcError::invalid_parameter(e.to_string())
+        }
+        OnboardError::Failed(_) => RpcError::wallet(e.to_string()),
+    }
+}
+
 /// `getnewaddress [label] [address_type]` - a fresh diversified unified address for the wallet's
 /// account (new diversifier, not a new derivation path).
 ///
@@ -374,7 +601,12 @@ pub(crate) fn getbalance(
     check_balance_dummy(req.param(0))?;
     let handle = state.registry.get(wallet)?;
     let policy = minconf_policy(req.param(1), handle.confirmations)?;
-    let info = read::balance(handle.network, &handle.engine_dir, policy)?;
+    let info = read::balance(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        policy,
+    )?;
     Ok(zats_to_value(info.total_spendable))
 }
 
@@ -385,7 +617,12 @@ pub(crate) fn getunconfirmedbalance(
     wallet: Option<&str>,
 ) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
-    let info = read::balance(handle.network, &handle.engine_dir, handle.confirmations)?;
+    let info = read::balance(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        handle.confirmations,
+    )?;
     Ok(zats_to_value(info.pending))
 }
 
@@ -401,7 +638,12 @@ pub(crate) fn getunconfirmedbalance(
 /// the wallet exactly as Bitcoin Core clients expect.
 pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
-    let info = read::balance(handle.network, &handle.engine_dir, handle.confirmations)?;
+    let info = read::balance(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        handle.confirmations,
+    )?;
     let mut obj = json!({
         "mine": {
             "trusted": zats_to_value(info.total_spendable),
@@ -424,8 +666,13 @@ pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Valu
 /// `unlocked_until` appears only for passphrase-encrypted wallets, like Bitcoin Core.
 pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Value, RpcError> {
     let handle = state.registry.get(wallet)?;
-    let info = read::balance(handle.network, &handle.engine_dir, handle.confirmations)?;
-    let txcount = read::tx_count(&handle.engine_dir).unwrap_or(0);
+    let info = read::balance(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        handle.confirmations,
+    )?;
+    let txcount = read::tx_count(&handle.engine_dir, handle.account_scope()).unwrap_or(0);
     let st = handle.status();
     // `scanning` stays truthy while a transaction-enhancement backlog drains, not just during the
     // block scan: the wallet has reached the tip but is still backfilling memos/full tx data, so it
@@ -569,17 +816,34 @@ pub(crate) fn getaddressinfo(
     // this wallet issued. `None` (foreign or single-receiver) omits the field. This is informational
     // here; the consuming RPCs (getreceivedbyaddress/z_sendmany) reject the spliced case outright.
     let receivers_consistent = if v.is_valid {
-        read::classify_unified_receivers(handle.network, &handle.engine_dir, addr).consistent_flag()
+        read::classify_unified_receivers(
+            handle.network,
+            &handle.engine_dir,
+            handle.account_scope(),
+            addr,
+        )
+        .consistent_flag()
     } else {
         None
     };
-    let ismine = v.is_valid && read::is_mine(handle.network, &handle.engine_dir, addr);
+    let ismine = v.is_valid
+        && read::is_mine(
+            handle.network,
+            &handle.engine_dir,
+            handle.account_scope(),
+            addr,
+        );
     // For a transparent address the wallet derived, surface where it sits in the BIP 44 chain.
     // `getnewaddress "" "transparent"` returns a bare string (Bitcoin Core's contract) and zecd
     // keeps no off-chain issuance log, so this is how a caller learns which index it was handed -
     // and how an operator reconciles an issued range against `z_getaddressforaccount`.
     let derivation = if ismine {
-        read::transparent_derivation(handle.network, &handle.engine_dir, addr)
+        read::transparent_derivation(
+            handle.network,
+            &handle.engine_dir,
+            handle.account_scope(),
+            addr,
+        )
     } else {
         None
     };
@@ -885,6 +1149,7 @@ struct HistoryPage {
 /// slice output exactly.
 fn paginate_history(
     wallet_dir: &std::path::Path,
+    scope: read::AccountScope,
     page: HistoryPage,
     expand: impl Fn(&read::TxRecord) -> Vec<Value>,
 ) -> Result<Vec<Value>, RpcError> {
@@ -908,7 +1173,7 @@ fn paginate_history(
             limit: Some(limit),
             newest_first: true,
         };
-        let txs = read::query_transactions(wallet_dir, &query)?;
+        let txs = read::query_transactions(wallet_dir, scope, &query)?;
         let full_page = txs.len() as u32 >= limit;
         let entries = window_history_from_txs(&txs, from, count, &expand);
         // The window is fully covered when either we produced exactly the requested count, or
@@ -1027,7 +1292,7 @@ pub(crate) fn listtransactions(
         count,
         ..HistoryPage::default()
     };
-    let entries = paginate_history(&handle.engine_dir, page, |tx| {
+    let entries = paginate_history(&handle.engine_dir, handle.account_scope(), page, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
         tx_entries(&network, tx, confirmations, time, label_filter.as_deref())
@@ -1180,7 +1445,7 @@ pub(crate) fn z_listtransactions(
         start_height,
         end_height,
     };
-    let entries = paginate_history(&handle.engine_dir, page, |tx| {
+    let entries = paginate_history(&handle.engine_dir, handle.account_scope(), page, |tx| {
         let confirmations = tx_confirmations(&st, tx);
         let time = tx_time(tx, first_seen.get(&tx.txid_hex).copied());
         z_tx_entries(&network, tx, confirmations, time)
@@ -1267,18 +1532,26 @@ pub(crate) fn getreceivedbyaddress(
             "Invalid Zcash address: {addr}"
         )));
     }
-    if let read::UaReceivers::Inconsistent(why) =
-        read::classify_unified_receivers(handle.network, &handle.engine_dir, addr)
-    {
+    if let read::UaReceivers::Inconsistent(why) = read::classify_unified_receivers(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        addr,
+    ) {
         return Err(RpcError::invalid_address_or_key(why));
     }
-    if !read::is_mine(handle.network, &handle.engine_dir, addr) {
+    if !read::is_mine(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        addr,
+    ) {
         return Err(RpcError::wallet("Address not found in wallet"));
     }
     let st = handle.status();
     // Push the single-address filter into SQL (sublinear) rather than scanning the whole
     // history; the aggregation then sees only this address's outputs.
-    let txs = read::received_tx_records(&handle.engine_dir, Some(addr))?;
+    let txs = read::received_tx_records(&handle.engine_dir, handle.account_scope(), Some(addr))?;
     let total = received_by_address(&txs, &st, minconf, include_immature_coinbase)
         .remove(addr)
         .map(|(amt, _, _)| amt)
@@ -1308,14 +1581,22 @@ pub(crate) fn listreceivedbyaddress(
     let include_immature_coinbase = req.param(4).and_then(|v| v.as_bool()).unwrap_or(false);
     let handle = state.registry.get(wallet)?;
     let st = handle.status();
-    let txs = read::received_tx_records(&handle.engine_dir, address_filter.as_deref())?;
+    let txs = read::received_tx_records(
+        &handle.engine_dir,
+        handle.account_scope(),
+        address_filter.as_deref(),
+    )?;
     let mut received = received_by_address(&txs, &st, minconf, include_immature_coinbase);
 
     // The address universe: everything that received (already restricted by the pushed-down
     // filter), plus (with include_empty) every address the wallet has ever generated.
     let mut addrs: BTreeSet<String> = received.keys().cloned().collect();
     if include_empty {
-        addrs.extend(read::all_addresses(handle.network, &handle.engine_dir));
+        addrs.extend(read::all_addresses(
+            handle.network,
+            &handle.engine_dir,
+            handle.account_scope(),
+        ));
     }
 
     let mut out = Vec::new();
@@ -1395,7 +1676,7 @@ pub(crate) fn listsinceblock(
         limit: None,
         newest_first: false,
     };
-    let txs = read::query_transactions(&handle.engine_dir, &query)?;
+    let txs = read::query_transactions(&handle.engine_dir, handle.account_scope(), &query)?;
     let network = handle.network;
     let first_seen = handle.first_seen();
     let mut transactions: Vec<Value> = Vec::new();
@@ -1442,8 +1723,13 @@ pub(crate) async fn gettransaction(
     let txid = req.require_str(0, "gettransaction requires a txid")?;
     let handle = state.registry.get(wallet)?.clone();
     let st = handle.status();
-    let rec = read::get_transaction(handle.network, &handle.engine_dir, txid)?
-        .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
+    let rec = read::get_transaction(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        txid,
+    )?
+    .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
 
     let details = gettransaction_details(&handle.network, &rec);
     let hex_str = gettransaction_hex(&handle, &rec).await;
@@ -1644,7 +1930,7 @@ pub(crate) fn listunspent(
         Some(_) => return Err(RpcError::type_error("include_unsafe must be a boolean")),
     };
     let st = handle.status();
-    let notes = read::list_unspent(handle.network, &handle.engine_dir)?;
+    let notes = read::list_unspent(handle.network, &handle.engine_dir, handle.account_scope())?;
     Ok(Value::Array(unspent_json(
         &notes,
         &st,
@@ -1967,12 +2253,20 @@ pub(crate) fn z_sendmany(
                 "Invalid from address: should be a taddr, zaddr, or unified address",
             ));
         };
-        if let read::UaReceivers::Inconsistent(why) =
-            read::classify_unified_receivers(handle.network, &handle.engine_dir, fromaddress)
-        {
+        if let read::UaReceivers::Inconsistent(why) = read::classify_unified_receivers(
+            handle.network,
+            &handle.engine_dir,
+            handle.account_scope(),
+            fromaddress,
+        ) {
             return Err(RpcError::invalid_address_or_key(why));
         }
-        if !read::is_mine(handle.network, &handle.engine_dir, fromaddress) {
+        if !read::is_mine(
+            handle.network,
+            &handle.engine_dir,
+            handle.account_scope(),
+            fromaddress,
+        ) {
             return Err(RpcError::invalid_address_or_key(
                 "Invalid from address, no payment source found for address.",
             ));
@@ -2384,12 +2678,20 @@ pub(crate) async fn z_mergetoaddress(
                         "Invalid from address: should be a taddr, zaddr, or unified address",
                     ));
                 };
-                if let read::UaReceivers::Inconsistent(why) =
-                    read::classify_unified_receivers(handle.network, &handle.engine_dir, addr)
-                {
+                if let read::UaReceivers::Inconsistent(why) = read::classify_unified_receivers(
+                    handle.network,
+                    &handle.engine_dir,
+                    handle.account_scope(),
+                    addr,
+                ) {
                     return Err(RpcError::invalid_address_or_key(why));
                 }
-                if !read::is_mine(handle.network, &handle.engine_dir, addr) {
+                if !read::is_mine(
+                    handle.network,
+                    &handle.engine_dir,
+                    handle.account_scope(),
+                    addr,
+                ) {
                     return Err(RpcError::invalid_address_or_key(
                         "Invalid from address, no payment source found for address.",
                     ));

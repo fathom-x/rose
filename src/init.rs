@@ -327,6 +327,10 @@ async fn connect_zcash_upstream(
         &mut server,
         config.backend.assume_transparent_in_compact_blocks,
     );
+    // `init` (and `rescan --birthday <date>`) dial the upstream themselves, so they must
+    // honour the proxy too: without this the very first connection a new wallet makes
+    // would go out direct, exposing the operator's address before the daemon ever runs.
+    backend::apply_proxy(&mut server, config.backend.proxy.clone());
     let mut client = server
         .connect_timeout(Duration::from_secs(config.backend.connect_timeout_secs))
         .await

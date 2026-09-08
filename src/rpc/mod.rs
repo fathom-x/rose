@@ -67,6 +67,11 @@ pub const ALL_METHODS: &[&str] = &[
     "listreceivedbyaddress",
     "listdescriptors",
     "listwallets",
+    "listwalletdir",
+    // Wallet - management (fleet onboarding)
+    "createwallet",
+    "loadwallet",
+    "unloadwallet",
     // Wallet - writes / async
     "getnewaddress",
     "sendtoaddress",
@@ -144,6 +149,14 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("listreceivedbyaddress", 5),
     ("listdescriptors", 1),
     ("listwallets", 0),
+    ("listwalletdir", 0),
+    // Wallet - management (fleet onboarding). `createwallet` keeps Bitcoin Core's eight
+    // positional parameters so a Core-shaped client's call is accepted (and its
+    // spending-wallet flags explicitly refused); zecd's own arguments ride in the options
+    // object at param 8.
+    ("createwallet", 9),
+    ("loadwallet", 2),
+    ("unloadwallet", 2),
     // Wallet - writes / async
     ("getnewaddress", 2),
     ("sendtoaddress", 12),
@@ -246,6 +259,7 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ),
     ("getwalletinfo", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("listwallets", MethodCoins::All),
+    ("listwalletdir", MethodCoins::All),
     ("listtransactions", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("listsinceblock", MethodCoins::Only(ZCASH_ONLY)),
     ("gettransaction", MethodCoins::Only(ZCASH_AND_BITCOIN)),
@@ -258,6 +272,11 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("listdescriptors", MethodCoins::Only(BITCOIN_ONLY)),
     ("getaddressinfo", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("z_listtransactions", MethodCoins::Only(ZCASH_ONLY)),
+    // Wallet - management (fleet onboarding). Bitcoin-dialect method names, so `All`: what is
+    // engine-specific is the format of `createwallet`'s `ufvk` option, not the method itself.
+    ("createwallet", MethodCoins::All),
+    ("loadwallet", MethodCoins::All),
+    ("unloadwallet", MethodCoins::All),
     // Wallet - writes
     ("getnewaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("sendtoaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
@@ -369,7 +388,7 @@ async fn dispatch_zecd(
     // has already 404'd everything the engine does not serve.
     #[cfg(feature = "bitcoin")]
     if let Ok(crate::wallet::CoinWallet::Bitcoin(handle)) = state.registry.get_coin(wallet) {
-        if let Some(result) = btc_methods::dispatch(handle, req).await {
+        if let Some(result) = btc_methods::dispatch(&handle, req).await {
             return result;
         }
     }
@@ -424,6 +443,12 @@ async fn dispatch_zecd(
         "getreceivedbyaddress" => wallet_methods::getreceivedbyaddress(state, wallet, req),
         "listreceivedbyaddress" => wallet_methods::listreceivedbyaddress(state, wallet, req),
         "listwallets" => wallet_methods::listwallets(state),
+        "listwalletdir" => wallet_methods::listwalletdir(state),
+
+        // Wallet - management (fleet onboarding)
+        "createwallet" => wallet_methods::createwallet(state, &req.params).await,
+        "loadwallet" => wallet_methods::loadwallet(state, &req.params).await,
+        "unloadwallet" => wallet_methods::unloadwallet(state, &req.params, wallet),
 
         // Wallet - writes / async
         "getnewaddress" => wallet_methods::getnewaddress(state, wallet, req).await,
@@ -525,6 +550,8 @@ mod tests {
     #[test]
     fn method_coin_tiers_hold() {
         use crate::coin::Coin;
+        // The registry operations (`listwalletdir`, `createwallet`, `loadwallet`,
+        // `unloadwallet`) act on the set of wallets, not on one, so they sit in the shell too.
         const WALLET_INDEPENDENT: &[&str] = &[
             "stop",
             "uptime",
@@ -532,6 +559,10 @@ mod tests {
             "getrpcinfo",
             "ping",
             "listwallets",
+            "listwalletdir",
+            "createwallet",
+            "loadwallet",
+            "unloadwallet",
         ];
         /// Core methods with no Zcash meaning at all: the only entries allowed to leave
         /// Zcash out of their coin set.

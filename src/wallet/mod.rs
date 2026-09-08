@@ -6,12 +6,13 @@ pub mod binding;
 pub mod keys;
 pub mod open;
 pub mod read;
+pub mod shard;
 pub mod store;
 
 #[cfg(test)]
 mod regtest_tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -136,6 +137,19 @@ pub struct SyncStatus {
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
     pub encrypted: bool,
+    /// Which account each wallet this actor serves resolves to, keyed by wallet name.
+    ///
+    /// A database can hold several accounts - that is how a fleet shard scans many view wallets
+    /// in one pass - so every read that reports a wallet's own money, history or addresses must
+    /// be scoped to its account ([`read::AccountScope`]). A conventional actor publishes a single
+    /// entry for its own wallet; a shard publishes one per member.
+    ///
+    /// A wallet is absent from the map until its account exists: an empty data directory whose
+    /// account has not been rebuilt from `keys.toml` (an encrypted wallet awaiting its first
+    /// `walletpassphrase`), or a shard member whose viewing key has not been imported yet.
+    /// Publishing it rather than fixing it at spawn is what lets the scope start reporting an
+    /// account the moment one of those completes.
+    pub accounts: Arc<BTreeMap<String, AccountUuid>>,
     /// True for a watch-only wallet (imported UFVK; no spending material anywhere). Drives
     /// `getwalletinfo.private_keys_enabled` - the wallet-level signal, as in Bitcoin Core's
     /// descriptor wallets (per-address `iswatchonly` is deprecated there and stays false).
@@ -331,6 +345,10 @@ pub struct MergePlan {
 /// Commands sent from RPC handlers to the per-wallet actor (the sole DB writer).
 pub enum WalletCommand {
     GetNewAddress {
+        /// Which account to derive for. A fleet shard's database holds one account per view
+        /// wallet it hosts, so the command names the one the request came in on; `None` means
+        /// the actor's own single account, which is every conventional wallet.
+        account: Option<AccountUuid>,
         /// The kind of address to derive (per-call override resolved against wallet config).
         request: ReceiverRequest,
         reply: oneshot::Sender<Result<String, RpcError>>,
@@ -342,9 +360,19 @@ pub enum WalletCommand {
     /// transparent receiver, or `Default` for the wallet's configured default. Returns the
     /// encoded address, the index used, and the receivers actually derived.
     GetAddressForAccount {
+        /// As [`WalletCommand::GetNewAddress::account`].
+        account: Option<AccountUuid>,
         request: ReceiverRequest,
         diversifier_index: Option<DiversifierIndex>,
         reply: oneshot::Sender<Result<DerivedAddress, RpcError>>,
+    },
+    /// Add a view wallet to a running **fleet shard**. The member is queued for import, which
+    /// happens on the shard's next connected sync pass (an account's birthday is anchored on the
+    /// tree state below it, so it needs an upstream). This is what lets `createwallet` onboard a
+    /// wallet without restarting the daemon.
+    AddShardMember {
+        member: shard::ShardMember,
+        reply: oneshot::Sender<Result<(), RpcError>>,
     },
     Send {
         request: TransactionRequest,
@@ -493,6 +521,24 @@ impl WalletHandle {
         Coin::Zcash
     }
 
+    /// Which account in this wallet's database its reads apply to.
+    ///
+    /// [`read::AccountScope::Any`] until the account exists (a pending bootstrap), which is also
+    /// exactly the pre-fleet behaviour - and identical to naming the account whenever the
+    /// database holds only one, which is every non-fleet wallet.
+    pub fn account_scope(&self) -> read::AccountScope {
+        match self.account() {
+            Some(account) => read::AccountScope::Only(account),
+            None => read::AccountScope::Any,
+        }
+    }
+
+    /// This wallet's account, as published by its actor. `None` until the account exists (a
+    /// pending bootstrap, or a shard member awaiting import).
+    pub fn account(&self) -> Option<AccountUuid> {
+        self.status_rx.borrow().accounts.get(&self.name).copied()
+    }
+
     /// A private receiver on the actor's published [`SyncStatus`], for RPC handlers that must
     /// *wait* for the wallet's view of the chain to move rather than poll it (the `waitfor*`
     /// blockchain RPCs). The clone inherits this handle's seen-version, which is the channel's
@@ -588,7 +634,33 @@ impl WalletHandle {
     }
 
     pub async fn get_new_address(&self, request: ReceiverRequest) -> Result<String, RpcError> {
-        self.dispatch(|reply| WalletCommand::GetNewAddress { request, reply })
+        let account = self.account();
+        self.dispatch(|reply| WalletCommand::GetNewAddress {
+            account,
+            request,
+            reply,
+        })
+        .await
+    }
+
+    /// A sibling handle for another wallet served by the same actor.
+    ///
+    /// A shard's handles differ only in their name: they share the actor's command channel and
+    /// its published status, and each finds its own account by looking itself up by name in that
+    /// status. So minting one for a newly onboarded member is a rename, and the member is
+    /// servable the instant the actor accepts it - before its account exists, exactly as a wallet
+    /// loaded at boot is servable before it has caught up.
+    pub fn sibling(&self, name: String) -> WalletHandle {
+        WalletHandle {
+            name,
+            ..self.clone()
+        }
+    }
+
+    /// Queue a view wallet for import into this handle's shard. See
+    /// [`WalletCommand::AddShardMember`].
+    pub async fn add_shard_member(&self, member: shard::ShardMember) -> Result<(), RpcError> {
+        self.dispatch(|reply| WalletCommand::AddShardMember { member, reply })
             .await
     }
 
@@ -601,7 +673,9 @@ impl WalletHandle {
         request: ReceiverRequest,
         diversifier_index: Option<DiversifierIndex>,
     ) -> Result<DerivedAddress, RpcError> {
+        let account = self.account();
         self.dispatch(|reply| WalletCommand::GetAddressForAccount {
+            account,
             request,
             diversifier_index,
             reply,
@@ -758,6 +832,9 @@ impl WalletHandle {
 /// The tag keeps the registry's storage independent of the handle type, so the librustzcash
 /// half of the tree stays confined to `wallet/` instead of appearing in the registry's own
 /// signatures. Built the way `chain::AnySource` is: an enum, not a trait object.
+///
+/// `Clone` because the registry hands back clones rather than borrows - see [`WalletRegistry`].
+#[derive(Clone)]
 pub enum CoinWallet {
     /// A Zcash wallet, served by the librustzcash-backed actor.
     Zcash(WalletHandle),
@@ -787,25 +864,48 @@ impl CoinWallet {
 }
 
 /// The set of loaded wallets, addressable by name with a configured default.
+/// The wallets this daemon serves, addressable as `/wallet/<name>`.
+///
+/// Behind an `RwLock` because the set changes at runtime: a fleet wallet can be onboarded with
+/// `createwallet` or dropped with `unloadwallet` without restarting the daemon, which is the
+/// difference between operating a fleet and editing a config file for every arrival.
+///
+/// [`WalletRegistry::get`] hands back a **clone** of the handle rather than a borrow, so no caller
+/// holds the lock across its work. A handle is a name, some configuration, and cheap clones of the
+/// actor's channels, so this costs a handful of small allocations per RPC - nothing beside the
+/// round trip it serves, and it keeps every one of the forty-odd call sites written exactly as it
+/// was when the registry was immutable.
 pub struct WalletRegistry {
-    wallets: HashMap<String, CoinWallet>,
+    wallets: std::sync::RwLock<HashMap<String, CoinWallet>>,
     default: String,
 }
 
 impl WalletRegistry {
     pub fn new(default: String) -> Self {
         WalletRegistry {
-            wallets: HashMap::new(),
+            wallets: std::sync::RwLock::new(HashMap::new()),
             default,
         }
     }
 
-    pub fn insert(&mut self, wallet: CoinWallet) {
-        self.wallets.insert(wallet.name().to_string(), wallet);
+    /// Add (or replace) a wallet. Taking `&self` is what lets a wallet be onboarded while the
+    /// daemon runs; startup uses the same call.
+    pub fn insert(&self, wallet: CoinWallet) {
+        self.write().insert(wallet.name().to_string(), wallet);
+    }
+
+    /// Stop serving `name`, returning whether it was loaded. The wallet's data is untouched -
+    /// this only removes it from the RPC surface, so `loadwallet` can bring it back.
+    pub fn remove(&self, name: &str) -> bool {
+        self.write().remove(name).is_some()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.read().contains_key(name)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.wallets.is_empty()
+        self.read().is_empty()
     }
 
     /// Look up a wallet by name, or the default when `name` is `None`.
@@ -815,7 +915,10 @@ impl WalletRegistry {
     /// chokepoint, where an accessor returning an `Option` would conflate "no such wallet"
     /// with "a wallet that exists but is not the kind you asked for" - and the `-18` contract
     /// depends on telling those apart.
-    pub fn get(&self, name: Option<&str>) -> Result<&WalletHandle, RpcError> {
+    ///
+    /// A **clone**, not a borrow: the registry changes at runtime (`createwallet`), so no
+    /// caller may hold the lock across its work. See [`WalletRegistry`].
+    pub fn get(&self, name: Option<&str>) -> Result<WalletHandle, RpcError> {
         match self.get_coin(name)? {
             CoinWallet::Zcash(handle) => Ok(handle),
             // Unreachable through dispatch: every method whose handler resolves a Zcash handle
@@ -831,12 +934,13 @@ impl WalletRegistry {
     }
 
     /// Look up a Bitcoin wallet by name - [`WalletRegistry::get`]'s counterpart on the other
-    /// side of the coin gate, for the handlers that serve Bitcoin wallets.
+    /// side of the coin gate, for the handlers that serve Bitcoin wallets. A clone, for the
+    /// same reason as `get`: the registry changes at runtime, so no caller holds its lock.
     #[cfg(feature = "bitcoin")]
     pub fn get_bitcoin(
         &self,
         name: Option<&str>,
-    ) -> Result<&crate::btc::actor::BtcWalletHandle, RpcError> {
+    ) -> Result<crate::btc::actor::BtcWalletHandle, RpcError> {
         match self.get_coin(name)? {
             CoinWallet::Bitcoin(handle) => Ok(handle),
             wallet @ CoinWallet::Zcash(_) => Err(RpcError::misc(format!(
@@ -849,9 +953,9 @@ impl WalletRegistry {
     /// Look up a wallet without resolving its engine - what the dispatch-time coin gate needs,
     /// since it must decide whether a method serves this wallet's coin before any handler runs.
     /// Same `-18` contract as [`WalletRegistry::get`].
-    pub fn get_coin(&self, name: Option<&str>) -> Result<&CoinWallet, RpcError> {
+    pub fn get_coin(&self, name: Option<&str>) -> Result<CoinWallet, RpcError> {
         let name = name.unwrap_or(&self.default);
-        self.wallets.get(name).ok_or_else(|| {
+        self.read().get(name).cloned().ok_or_else(|| {
             RpcError::wallet_not_found(format!(
                 "Requested wallet does not exist or is not loaded: {name}"
             ))
@@ -859,9 +963,20 @@ impl WalletRegistry {
     }
 
     pub fn names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.wallets.keys().cloned().collect();
+        let mut v: Vec<String> = self.read().keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// The lock guards a plain map and every critical section is a single map operation, so a
+    /// poisoned lock cannot leave a half-updated registry; recover rather than take the daemon
+    /// down with it.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, CoinWallet>> {
+        self.wallets.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, CoinWallet>> {
+        self.wallets.write().unwrap_or_else(|e| e.into_inner())
     }
 }
 

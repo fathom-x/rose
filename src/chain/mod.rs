@@ -10,6 +10,7 @@
 //! mempool-driven 0-conf flow - is backend-agnostic. [`AnySource`] is the enum the actor
 //! stores; a future backend (e.g. an embedded Zaino service) is one more variant + impl.
 
+pub mod hub;
 pub mod lwd;
 pub mod zebra;
 
@@ -316,7 +317,7 @@ pub trait ChainSource: Send {
     /// `getaddresstxids`, which accepts a batch of addresses in one call). Legacy-server compact
     /// blocks omit transparent inputs/outputs, so this is how the wallet discovers *mined*
     /// transparent receives and spends in order to enhance (fetch+store) them. Each address is
-    /// the bare encoding (`t1…`/`tm…`). Ordering is not guaranteed, and entries may repeat
+    /// the bare encoding (`t1...`/`tm...`). Ordering is not guaranteed, and entries may repeat
     /// across addresses (callers de-dupe / store idempotently). See [`TxEvidence`] for why the
     /// item is an enum rather than a bare txid.
     fn transparent_tx_evidence(
@@ -349,6 +350,7 @@ pub trait ChainSource: Send {
 // instances (one per actor / one per scan batch / one per subscription), never in collections,
 // so boxing the larger variant would add indirection for no memory win.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum AnySource {
     Zebra(zebra::ZebraSource),
     Lwd(lwd::LwdSource),
@@ -477,6 +479,9 @@ impl CompactBlockStream {
 pub enum MempoolStream {
     Zebra(zebra::ZebraMempoolStream),
     Lwd(lwd::LwdMempoolStream),
+    /// One consumer's view of [`hub::ChainHub`]'s single shared subscription. The hub pumps a
+    /// `Zebra`/`Lwd` stream and fans it out, so many wallets cost one upstream subscription.
+    Hub(hub::HubMempoolStream),
 }
 
 impl MempoolStream {
@@ -486,8 +491,32 @@ impl MempoolStream {
             // lightwalletd's `GetMempoolStream` natively closes on each new block - the same
             // end-of-stream contract the zebra poller synthesizes.
             MempoolStream::Lwd(s) => s.message().await,
+            // The fan-out relays that same close to every subscriber.
+            MempoolStream::Hub(s) => s.message().await,
         }
     }
+}
+
+/// Whether `e` is h2's own load-shed GOAWAY: the *client* library tearing down a healthy
+/// connection because too many small DATA frames sat momentarily unpolled
+/// (`ENHANCE_YOUR_CALM` with debug data `too_many_data_frames`; see the eager-drain comment
+/// on [`lwd::LwdSource`]'s `compact_block_range`). It is not a server failure and not a
+/// network failure: the connection is gone, but nothing the wallet already wrote is lost and
+/// tonic's channel reconnects transparently on the next call, so a range download can resume
+/// from where it stopped ([`crate::sync::engine`] does exactly that).
+///
+/// The reason survives only in the **`Debug`** rendering of a source deep in the chain (tonic
+/// `Status` -> `hyper::Error` -> `h2::Error`), and anyhow's own `Debug` walks sources with
+/// `Display`, so neither `{e}` nor `{e:?}` alone is enough - hence the explicit walk. Keep
+/// the match this narrow: a plain transport failure or an upstream refusal must surface to
+/// the caller rather than be retried in a loop that can never succeed.
+pub fn is_h2_load_shed(e: &anyhow::Error) -> bool {
+    fn names_the_load_shed(text: &str) -> bool {
+        text.contains("too_many_data_frames") || text.contains("ENHANCE_YOUR_CALM")
+    }
+    names_the_load_shed(&format!("{e:?}"))
+        || e.chain()
+            .any(|cause| names_the_load_shed(&format!("{cause:?}")))
 }
 
 /// Aborts a detached backend task when its owning stream is dropped (e.g. the actor
@@ -605,5 +634,84 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(got[0].active, "imminent activation is active severity");
         assert_eq!(got[0].name, "NU-Future", "the map entry's name is kept");
+    }
+
+    /// h2's load-shed reason survives only in the **`Debug`** rendering of a source deep in
+    /// the error chain (tonic `Status` -> `hyper::Error` -> `h2::Error`), while anyhow's own
+    /// `Debug` walks sources with `Display`. Pin that: the retry in `sync::engine` exists
+    /// only because this classifier can see through to it.
+    #[test]
+    fn h2_load_shed_is_recognized_from_a_source_debug_rendering() {
+        // A source whose `Display` says nothing useful and whose `Debug` carries the reason,
+        // exactly as `hyper::Error`/`h2::Error` do.
+        #[derive(Debug)]
+        enum H2Kind {
+            #[allow(dead_code)]
+            GoAway(&'static str, H2Reason, Initiator),
+        }
+        #[derive(Debug)]
+        enum H2Reason {
+            #[allow(dead_code)]
+            EnhanceYourCalm,
+        }
+        #[derive(Debug)]
+        enum Initiator {
+            #[allow(dead_code)]
+            Library,
+        }
+        struct HyperLike(H2Kind);
+        impl std::fmt::Debug for HyperLike {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                // h2 spells the reason `ENHANCE_YOUR_CALM` in its own Debug output.
+                write!(
+                    f,
+                    "hyper::Error(Body, Error {{ kind: GoAway(b\"too_many_data_frames\", \
+                     ENHANCE_YOUR_CALM, Library) }}) {:?}",
+                    self.0
+                )
+            }
+        }
+        impl std::fmt::Display for HyperLike {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                // The Display chain alone never names the reason - that is the whole point.
+                f.write_str("error reading a body from connection")
+            }
+        }
+        impl std::error::Error for HyperLike {}
+
+        let shed = anyhow::Error::new(HyperLike(H2Kind::GoAway(
+            "too_many_data_frames",
+            H2Reason::EnhanceYourCalm,
+            Initiator::Library,
+        )))
+        .context("status: ResourceExhausted, message: \"h2 protocol error\"");
+        assert!(
+            !format!("{shed:#}").contains("too_many_data_frames"),
+            "fixture must not leak the reason into the Display chain, or it proves nothing"
+        );
+        assert!(is_h2_load_shed(&shed));
+
+        // The flat rendering some layers do produce is matched too.
+        assert!(is_h2_load_shed(&anyhow::anyhow!(
+            "status: ResourceExhausted, source: Some(GoAway(b\"too_many_data_frames\", \
+             ENHANCE_YOUR_CALM, Library))"
+        )));
+    }
+
+    /// The retry loop must never swallow an error that reconnecting cannot fix: those have to
+    /// surface so the actor can classify and report them.
+    #[test]
+    fn ordinary_failures_are_not_mistaken_for_a_load_shed() {
+        for other in [
+            "transport error",
+            "connection error detected: unexpected internal error encountered",
+            "tree state height mismatch: requested 100, got 99",
+            "status: Unavailable, message: \"error trying to connect: dns error\"",
+        ] {
+            assert!(
+                !is_h2_load_shed(&anyhow::anyhow!("{other}")),
+                "must not be retried as a load shed: {other}"
+            );
+        }
     }
 }

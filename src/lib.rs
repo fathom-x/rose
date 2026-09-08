@@ -176,6 +176,7 @@ pub mod daemon;
 pub mod derive_address;
 pub mod error;
 pub mod example_config;
+pub mod fleet;
 pub mod hardening;
 #[cfg(feature = "server")]
 pub mod health;
@@ -190,6 +191,7 @@ pub mod pools;
 pub mod progress;
 pub mod rpc;
 pub mod server;
+pub mod socks;
 pub mod state;
 pub mod sync;
 pub mod typed;

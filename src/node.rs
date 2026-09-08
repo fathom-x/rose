@@ -16,13 +16,17 @@
 //! A multi-thread tokio runtime is required: the scan and proving paths use
 //! `tokio::task::block_in_place`, which panics on a current-thread runtime.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info, warn};
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
+use anyhow::Context as _;
+
 use crate::backend;
+use crate::chain;
 use crate::config::{self, AppConfig};
 use crate::error::RpcError;
 use crate::state::AppState;
@@ -123,7 +127,7 @@ impl PreparedNode {
         // carries a receiver and can stop its sync loop between batches.
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-        let mut registry = WalletRegistry::new(config.default_wallet.clone());
+        let registry = WalletRegistry::new(config.default_wallet.clone());
         let mut actor_tasks = Vec::new();
         // Build the Orchard proving keys once (they're wallet-independent) and share them across
         // every actor, so each send reuses the cached key instead of rebuilding it per transaction.
@@ -171,6 +175,21 @@ impl PreparedNode {
         } else {
             None
         };
+        // The upstream connections this daemon holds, keyed by endpoint - see the hub comment in
+        // the wallet loop below. A wallet joins an existing hub when its resolved endpoint matches
+        // one already dialed, so the common single-backend deployment holds exactly one.
+        let mut hubs: HashMap<String, Arc<chain::hub::ChainHub>> = HashMap::new();
+
+        // Validated at config load; re-derive once rather than carrying a second copy. Shared
+        // by the configured wallets and the fleet's shards.
+        let confirmations_policy = match config.spend.confirmations_policy() {
+            Ok(policy) => policy,
+            Err(e) => {
+                stop_actors(&shutdown_tx, actor_tasks).await;
+                return Err(e);
+            }
+        };
+
         // zecd permits at most one wallet with spending keys per coin; watch-only (UFVK)
         // wallets may be loaded without limit. Record each opened wallet's coin and watch-only
         // flag so the invariant can be enforced once every wallet has been spawned (the flag
@@ -239,6 +258,18 @@ impl PreparedNode {
                     return Err(e);
                 }
             };
+            // One shared upstream per distinct endpoint (`chain::hub`). Wallets used to dial
+            // individually, so a daemon's upstream load - connections, chain-tip polls and, worst,
+            // the 2s mempool poll - scaled with the wallet count rather than with the chain.
+            // Wallets resolve their own endpoint (a `[wallets.<name>]` may override the global
+            // `[backend]`), so the hubs are keyed by that endpoint: every wallet agreeing on the
+            // dial shares one connection, and a wallet pointed somewhere else gets its own.
+            let hub = Arc::clone(hubs.entry(server.connection_key()).or_insert_with(|| {
+                chain::hub::ChainHub::new(
+                    server.clone(),
+                    Duration::from_secs(config.backend.connect_timeout_secs),
+                )
+            }));
             // Transparent *receives* now ride the block scan on both backends, so a large address
             // set no longer means per-block polling. What stays per-address is spend detection:
             // librustzcash emits one `TransactionsInvolvingAddress` request per funded address, and
@@ -263,14 +294,6 @@ impl PreparedNode {
                     entry.transparent_gap_limit,
                 );
             }
-            // Validated at config load; re-derive here rather than carrying a second copy.
-            let confirmations_policy = match config.spend.confirmations_policy() {
-                Ok(policy) => policy,
-                Err(e) => {
-                    stop_actors(&shutdown_tx, actor_tasks).await;
-                    return Err(e);
-                }
-            };
             let actor_cfg = ActorConfig {
                 name: name.clone(),
                 // The wallet's own chain rather than the daemon-global network: the actor is
@@ -279,10 +302,9 @@ impl PreparedNode {
                 network: entry.zcash_network(),
                 engine_dir: entry.engine_dir(),
                 keys_path: keys_path.clone(),
-                server,
+                hub: Arc::clone(&hub),
                 sync_interval: Duration::from_secs(config.sync.interval_secs),
                 rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
-                connect_timeout: Duration::from_secs(config.backend.connect_timeout_secs),
                 reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
                 reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
                 age_identity: config.keys.age_identity.clone(),
@@ -294,6 +316,7 @@ impl PreparedNode {
                 min_split_output_value: config.spend.min_split_output_value,
                 orchard_keys: orchard_keys.clone(),
                 pipeline_proving: config.spend.pipeline_proving,
+                trust_own_transactions: config.spend.trust_own_transactions,
                 enabled_pools: entry.pools.clone(),
                 default_receivers: entry.default_receivers.clone(),
                 transparent_enabled: entry.transparent_enabled,
@@ -303,6 +326,9 @@ impl PreparedNode {
                 transparent_allow_beyond_recovery_window: entry
                     .transparent_allow_beyond_recovery_window,
                 transparent_gap_warn_threshold: entry.transparent_gap_warn_threshold,
+                // Configured wallets are conventional single-wallet actors; the fleet's shard
+                // actors are spawned separately below.
+                shard_members: Vec::new(),
                 shutdown: shutdown_tx.subscribe(),
             };
             match actor::spawn(actor_cfg).await {
@@ -329,6 +355,46 @@ impl PreparedNode {
                 Err(e) => error!("failed to start wallet '{}': {e}", name),
             }
         }
+
+        // Fleet shards come from manifests rather than `[wallets.<name>]`, so they carry no
+        // per-wallet `[backend]` override and ride the daemon's global endpoint - sharing a hub
+        // with any configured wallet that resolves to the same place. Constructing it is free
+        // when there is no fleet: a hub does not dial until something acquires a source.
+        let fleet_hub = {
+            let server = match backend::resolve_configured(&config) {
+                Ok(server) => server,
+                Err(e) => {
+                    stop_actors(&shutdown_tx, actor_tasks).await;
+                    return Err(e);
+                }
+            };
+            Arc::clone(hubs.entry(server.connection_key()).or_insert_with(|| {
+                chain::hub::ChainHub::new(
+                    server.clone(),
+                    Duration::from_secs(config.backend.connect_timeout_secs),
+                )
+            }))
+        };
+
+        // The fleet: many watch-only wallets scanned in a handful of shards rather than one
+        // actor apiece. Additive - with no manifests present this does nothing, and the
+        // `[wallets.<name>]` actors above are untouched.
+        let fleet = match spawn_fleet(
+            &config,
+            &fleet_hub,
+            confirmations_policy,
+            &shutdown_tx,
+            &registry,
+            &mut actor_tasks,
+        )
+        .await
+        {
+            Ok(fleet) => fleet,
+            Err(e) => {
+                stop_actors(&shutdown_tx, actor_tasks).await;
+                return Err(e);
+            }
+        };
 
         if registry.is_empty() {
             anyhow::bail!(
@@ -358,6 +424,7 @@ impl PreparedNode {
             work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
+            fleet: fleet.clone(),
         };
 
         Ok(Node {
@@ -366,6 +433,179 @@ impl PreparedNode {
             _datadir_lock: Some(self.datadir_lock),
         })
     }
+}
+
+/// Spawn the fleet: one shard actor per group of manifested view wallets, each serving all of
+/// its members from a single scan. Returns how many wallets were registered.
+///
+/// The shape is deliberately the same as the configured-wallet loop above - resolve, spawn,
+/// register - with two differences that are the whole point of a shard: one `spawn_shard` call
+/// produces *many* handles, and the wallets it serves come from the manifest directory rather
+/// than from the config file, so onboarding does not mean editing config.
+///
+/// Additive: with no manifests present this returns 0 without touching anything.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_fleet(
+    config: &AppConfig,
+    hub: &Arc<chain::hub::ChainHub>,
+    confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    registry: &WalletRegistry,
+    actor_tasks: &mut Vec<(String, tokio::task::JoinHandle<()>)>,
+) -> anyhow::Result<Option<Arc<crate::fleet::FleetManager>>> {
+    // Experimental and opt-in: with `[fleet] enabled` false (the default) the manifest
+    // directory is never read, no shard is opened, and `state.fleet` stays `None`, which is
+    // what makes the wallet-management RPCs refuse. Checked before the directory read so a
+    // stray file in the datadir cannot enrol a daemon that never asked for a fleet.
+    if !config.fleet.enabled {
+        return Ok(None);
+    }
+    let (members, skipped) = crate::fleet::load_manifests(&config.fleet.manifest_dir)?;
+    for skip in &skipped {
+        warn!(
+            "fleet manifest {} is not being served: {}",
+            skip.path.display(),
+            skip.reason
+        );
+    }
+    // Past the gate, no manifests is an *empty* fleet, not an absent one: the manager is still
+    // built (it is only data - nothing dials or spawns until a wallet exists) so `createwallet`
+    // can onboard the first fleet wallet at runtime. Returning `None` for an empty directory
+    // would leave the RPC that exists to avoid config-file-and-restart onboarding unable to
+    // bootstrap on exactly the daemons that have not bootstrapped yet. `None` means "this
+    // operator did not ask for a fleet", which is the check above, and nothing else.
+    // A fleet wallet name must not collide with a configured one: both are addressed as
+    // `/wallet/<name>`, and a collision would silently route one of them to the other's actor.
+    for member in &members {
+        if config.wallets.contains_key(&member.name) {
+            anyhow::bail!(
+                "fleet wallet '{}' collides with the configured [wallets.{}] entry: both would \
+                 be served at /wallet/{}. Rename one of them.",
+                member.name,
+                member.name,
+                member.name
+            );
+        }
+    }
+
+    // Where each already-imported wallet lives, read back from the shard databases themselves -
+    // there is no placement file to fall out of step with reality. Opening each shard read-only
+    // also tells us how full it is, which is what placement needs.
+    let shard_dirs = crate::fleet::existing_shard_dirs(&config.fleet.dir);
+    let mut placed = std::collections::BTreeMap::new();
+    let mut existing = Vec::with_capacity(shard_dirs.len());
+    for (index, dir) in shard_dirs.iter().enumerate() {
+        let state = crate::fleet::inspect_shard(config.network, dir, index, &mut placed)
+            .with_context(|| format!("inspecting shard {}", dir.display()))?;
+        existing.push(state);
+    }
+
+    let layout = crate::fleet::plan(members, &placed, &existing, &config.fleet);
+    let total = layout.members();
+    // The manager keeps the pieces a shard actor is built from, so `createwallet` can place a
+    // wallet into a running shard - or open a new one - without a restart.
+    let manager = Arc::new(crate::fleet::FleetManager::new(
+        config.fleet.clone(),
+        crate::fleet::ShardTemplate {
+            network: config.network,
+            hub: Arc::clone(hub),
+            sync_interval: Duration::from_secs(config.sync.interval_secs),
+            rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
+            reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
+            reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
+            confirmations_policy,
+            orchard_action_limit: config.spend.orchard_action_limit,
+            target_note_count: config.spend.target_note_count,
+            min_split_output_value: config.spend.min_split_output_value,
+            enabled_pools: config.pools.enabled.clone(),
+            default_receivers: config.pools.default_receivers.clone(),
+            shutdown: shutdown_tx.clone(),
+        },
+    ));
+    for (dir, members) in layout.shards {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating shard directory {}", dir.display()))?;
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("shard")
+            .to_string();
+        let actor_cfg = ActorConfig {
+            name: name.clone(),
+            network: config.network,
+            engine_dir: dir.clone(),
+            // A shard has no keys.toml: its wallets are watch-only accounts imported from the
+            // manifest's viewing keys, so there is no seed, passphrase or bootstrap involved.
+            keys_path: dir.join("keys.toml"),
+            hub: Arc::clone(hub),
+            sync_interval: Duration::from_secs(config.sync.interval_secs),
+            rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
+            reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
+            reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
+            age_identity: None,
+            auto_unlock: false,
+            bootstrap: false,
+            confirmations_policy,
+            orchard_action_limit: config.spend.orchard_action_limit,
+            // Carried for completeness: a shard member never spends, so the change-splitting
+            // knobs are never consulted. Taking the configured values rather than defaults keeps
+            // a shard actor's config identical to a wallet actor's on every field it shares.
+            target_note_count: config.spend.target_note_count,
+            min_split_output_value: config.spend.min_split_output_value,
+            // Shard members never spend, so the proving keys are dead weight here.
+            orchard_keys: None,
+            pipeline_proving: false,
+            // Never consulted either: the trust marker is written at send-store time.
+            trust_own_transactions: false,
+            enabled_pools: config.pools.enabled.clone(),
+            default_receivers: config.pools.default_receivers.clone(),
+            // Shielded-only: the transparent matcher keeps per-account gap windows, pre-exposure
+            // progress and recovery horizons, and generalizing those to K accounts is its own
+            // piece of work.
+            transparent_enabled: false,
+            transparent_default: false,
+            transparent_gap_limit: config.pools.transparent_gap_limit,
+            transparent_initial_scan: 0,
+            transparent_allow_beyond_recovery_window: true,
+            transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
+            shard_members: members,
+            shutdown: shutdown_tx.subscribe(),
+        };
+        let member_names: Vec<String> = actor_cfg
+            .shard_members
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
+        let lowest_birthday = actor_cfg
+            .shard_members
+            .iter()
+            .map(|m| u32::from(m.birthday))
+            .min();
+        let (handles, task) = actor::spawn_shard(actor_cfg)
+            .await
+            .with_context(|| format!("starting fleet shard '{name}'"))?;
+        // Any of this shard's handles serves as the prototype for a member onboarded into it
+        // later: they differ only by name.
+        if let Some(prototype) = handles.first().cloned() {
+            manager.register_shard(dir.clone(), prototype, member_names, lowest_birthday);
+        }
+        for handle in handles {
+            registry.insert(CoinWallet::Zcash(handle));
+        }
+        actor_tasks.push((name, task));
+    }
+    if total > 0 {
+        info!(
+            "fleet: {total} view wallet(s) across {} shard(s)",
+            shard_count(&manager)
+        );
+    }
+    Ok(Some(manager))
+}
+
+/// How many shards the manager currently tracks (for the startup line).
+fn shard_count(manager: &crate::fleet::FleetManager) -> usize {
+    manager.shards()
 }
 
 /// Signal shutdown and wait for the given actor tasks, so no task is still writing the wallet
@@ -594,8 +834,16 @@ impl Node {
     /// than the tasks being killed mid-write at runtime teardown. Consumes the node; the
     /// datadir lock is released on return.
     pub async fn shutdown(self) {
+        // Shard actors started *after* boot (a `createwallet` that opened a new shard) are owned
+        // by the fleet manager, not by this list. They must be awaited too, or the process could
+        // exit with one of them mid-write - the exact thing awaiting the boot-time actors exists
+        // to prevent.
+        let mut tasks = self.actor_tasks;
+        if let Some(fleet) = &self.state.fleet {
+            tasks.extend(fleet.take_tasks());
+        }
         // The send inside covers the case where the embedder never called `trigger_shutdown`.
-        stop_actors(&self.state.shutdown_tx, self.actor_tasks).await;
+        stop_actors(&self.state.shutdown_tx, tasks).await;
     }
 
     /// The shared state, for the binary's HTTP layers (`server::run`, `health::run`).
@@ -646,6 +894,7 @@ pub(crate) mod testutil {
             work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
+            fleet: None,
         })
     }
 
@@ -688,12 +937,14 @@ pub(crate) mod testutil {
                 tls_ca_file: None,
                 tls_pins: Vec::new(),
                 assume_transparent_in_compact_blocks: false,
+                proxy: None,
             },
             zebra: Default::default(),
             #[cfg(feature = "bitcoin")]
             bitcoind: Default::default(),
             #[cfg(feature = "bitcoin")]
             fees: Default::default(),
+            fleet: Default::default(),
             rpc,
             keys: KeysConfig {
                 age_identity: None,

@@ -1,7 +1,7 @@
 //! The per-wallet actor: the single owner/writer of the `WalletDb`, running the sync loop
 //! and serving writer commands (address generation, sends, lock/unlock) from RPC handlers.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -54,11 +54,10 @@ use zcash_transparent::builder::TransparentSigningSet;
 use zip32::DiversifierIndex;
 use zip321::TransactionRequest;
 
-use crate::backend::Server;
 use crate::backoff::Backoff;
 use crate::chain::{
-    AnySource, BroadcastOutcome, ChainSource, MempoolStream, ServerInfo, TxEvidence,
-    UnsupportedUpgrade,
+    hub::{ChainHub, HubSource},
+    BroadcastOutcome, ChainSource, MempoolStream, ServerInfo, TxEvidence, UnsupportedUpgrade,
 };
 use crate::config::SendPrivacy;
 use crate::error::{codes, ErrorDetails, InsufficientFunds, RpcError};
@@ -69,6 +68,7 @@ use crate::wallet::binding;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
+use crate::wallet::shard;
 use crate::wallet::{
     make_handle, store, ConnState, DerivedAddress, FirstSeen, MergePlan, MergeSource, MergeWork,
     RawTx, ReceiverRequest, SendSource, SharedSeed, SyncStatus, WalletCommand, WalletHandle,
@@ -616,13 +616,13 @@ pub struct ActorConfig {
     pub engine_dir: PathBuf,
     /// Path to this wallet's `keys.toml` (may live outside `engine_dir`, e.g. a mounted Secret).
     pub keys_path: PathBuf,
-    /// The upstream zebrad endpoint.
-    pub server: Server,
+    /// The shared upstream ([`ChainHub`]): one connection, one mempool subscription and one
+    /// chain-tip poll serve every wallet in the daemon, so adding a wallet adds no upstream load
+    /// beyond its own scan. Actors never dial directly.
+    pub hub: Arc<ChainHub>,
     pub sync_interval: Duration,
     /// Minimum spacing between unmined-tx rebroadcast passes.
     pub rebroadcast_interval: Duration,
-    /// Per-attempt dial timeout.
-    pub connect_timeout: Duration,
     /// Reconnect backoff base/max delays.
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
@@ -652,6 +652,10 @@ pub struct ActorConfig {
     /// Run the proving step off the actor so a long send doesn't freeze sync (`[spend]
     /// pipeline_proving`). Only engages on the cached-Orchard PCZT path; off by default.
     pub pipeline_proving: bool,
+    /// Mark wallet-authored transactions trusted at store time (`[spend]
+    /// trust_own_transactions`, default on) - see [`mark_own_tx_trusted`]. Off = persist no
+    /// trust marker, so a restore classifies identically to the authoring instance.
+    pub trust_own_transactions: bool,
     /// Shielded pools this wallet receives into and spends from (change pool selection).
     pub enabled_pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses.
@@ -673,6 +677,10 @@ pub struct ActorConfig {
     /// Warn when fewer than this many in-window transparent address slots remain. Only used when
     /// `transparent_enabled`.
     pub transparent_gap_warn_threshold: u32,
+    /// The view wallets this actor hosts as a **fleet shard**: many watch-only accounts in one
+    /// database, scanned once for all of them (see [`crate::wallet::shard`]). Empty for a
+    /// conventional single-wallet actor, which is every wallet configured the pre-fleet way.
+    pub shard_members: Vec<shard::ShardMember>,
     /// Flips to `true` on Ctrl-C/`stop`; the actor exits its loop (between sync batches)
     /// so the `WalletDb` is dropped cleanly before the process ends.
     pub shutdown: watch::Receiver<bool>,
@@ -684,9 +692,8 @@ struct WalletActor {
     engine_dir: PathBuf,
     /// Path to this wallet's `keys.toml` (may live outside `engine_dir`).
     keys_path: PathBuf,
-    /// The upstream zebrad endpoint.
-    server: Server,
-    connect_timeout: Duration,
+    /// The shared upstream connection every wallet in this daemon uses.
+    hub: Arc<ChainHub>,
     backoff: Backoff,
     /// When the next reconnect attempt is allowed (a backoff deadline, not a fixed tick), so
     /// commands interrupting the idle wait don't advance the backoff.
@@ -771,12 +778,23 @@ struct WalletActor {
     /// first `walletpassphrase`).
     account_id: Option<AccountUuid>,
     account_index: Option<zip32::AccountId>,
+    /// Whether this actor is a fleet shard (many watch-only accounts, no seed, no "the"
+    /// account). Recorded explicitly rather than inferred from the member maps, which can both
+    /// be transiently consulted while empty.
+    is_shard: bool,
+    /// A fleet shard's members, keyed by wallet name, for the accounts already imported. Empty
+    /// for a conventional actor (which publishes `account_id` under its own name instead).
+    /// Published on [`SyncStatus`], which is how each member's `WalletHandle` finds its account.
+    shard_accounts: Arc<BTreeMap<String, AccountUuid>>,
+    /// Shard members whose account does not exist yet. Importing one needs the tree state at its
+    /// birthday, so it waits for a connected sync pass - the same shape as `pending_bootstrap`.
+    shard_pending: Vec<shard::ShardMember>,
     /// When `Some`, the account must be (re)created from `keys.toml` at this birthday height once
     /// the seed is available and an upstream is connected. `None` once an account exists.
     pending_bootstrap: Option<(BlockHeight, BootstrapKey)>,
     db_data: WriteDb,
     db_cache: FsBlockDb,
-    client: Option<AnySource>,
+    client: Option<HubSource>,
     /// Whether the current connection has emitted its "connected ... chain tip N" log line.
     /// Set once per connection (on the first successful tip refresh, when the tip is known)
     /// and reset on disconnect, so connect/disconnect are logged as matched transitions
@@ -792,13 +810,18 @@ struct WalletActor {
     mempool: Option<MempoolStream>,
     /// Shared (`Arc`) so the proving step can be moved onto a blocking thread when
     /// `pipeline_proving` is on (`LocalTxProver` is built once and is read-only during proving).
-    prover: Arc<LocalTxProver>,
+    /// The Sapling prover, for a wallet that can spend. `None` on a watch-only wallet (including
+    /// every fleet shard), which refuses spending before any send path could reach it.
+    prover: Option<Arc<LocalTxProver>>,
     /// Cached Orchard keys for the PCZT send path (`None` = legacy fused path). Built in the
     /// background; a send awaits it. See [`ProvingKeys`].
     orchard_keys: Option<Arc<ProvingKeys>>,
     /// `[spend] pipeline_proving`: run a send's prove+sign off the actor so it doesn't freeze
     /// sync. Only engages on the cached-Orchard PCZT path (see [`Self::pipeline_eligible`]).
     pipeline_proving: bool,
+    /// `[spend] trust_own_transactions`: mark wallet-authored transactions trusted at store
+    /// time (see [`mark_own_tx_trusted`]). Off = the full-statelessness posture.
+    trust_own_transactions: bool,
     /// Whether a pipelined send's proof is currently running on a blocking thread. While `true`,
     /// new sends queue (in [`Self::send_queue`]) rather than starting - sends stay serialized.
     send_in_flight: bool,
@@ -892,13 +915,34 @@ pub async fn spawn(
 ) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
     use tracing::Instrument as _;
     let span = tracing::info_span!("wallet", name = %cfg.name);
+    let (mut handles, task) = spawn_inner(cfg).instrument(span).await?;
+    // A conventional actor serves exactly one wallet; `spawn_shard` is the many-wallet entry.
+    let handle = handles
+        .pop()
+        .ok_or_else(|| anyhow!("a conventional wallet actor must produce exactly one handle"))?;
+    Ok((handle, task))
+}
+
+/// Spawn a **fleet shard**: one actor over one database holding one watch-only account per
+/// member, scanned once for all of them. Returns a handle per member (in manifest order), each
+/// addressable at `/wallet/<name>` exactly like a conventional wallet.
+///
+/// See [`crate::wallet::shard`] for why the fleet is organized this way.
+pub async fn spawn_shard(
+    cfg: ActorConfig,
+) -> anyhow::Result<(Vec<WalletHandle>, tokio::task::JoinHandle<()>)> {
+    use tracing::Instrument as _;
+    let span = tracing::info_span!("shard", name = %cfg.name);
     spawn_inner(cfg).instrument(span).await
 }
 
 async fn spawn_inner(
     cfg: ActorConfig,
-) -> anyhow::Result<(WalletHandle, tokio::task::JoinHandle<()>)> {
-    if !store::WalletStore::exists(&cfg.keys_path) {
+) -> anyhow::Result<(Vec<WalletHandle>, tokio::task::JoinHandle<()>)> {
+    // A shard carries its wallets in its manifest members rather than in a `keys.toml`: they are
+    // watch-only, so there is no seed, no encryption and no bootstrap to rebuild from.
+    let is_shard = !cfg.shard_members.is_empty();
+    if !is_shard && !store::WalletStore::exists(&cfg.keys_path) {
         return Err(anyhow!(
             "wallet '{}' is not initialized ({} missing); run `zecd init --wallet {}`",
             cfg.name,
@@ -955,14 +999,47 @@ async fn spawn_inner(
         }
     }
     let db_cache = open::open_fsblockdb(&cfg.engine_dir)?;
-    let st = store::WalletStore::read(&cfg.keys_path)?;
+    // A shard has no `keys.toml`; stand in the values its wallets imply (watch-only, never
+    // encrypted, birthday at the earliest member's so the scan covers all of them).
+    let st = if is_shard {
+        store::WalletStore::view_only_placeholder(
+            cfg.network,
+            cfg.shard_members
+                .iter()
+                .map(|m| m.birthday)
+                .min()
+                .expect("a shard has at least one member"),
+        )
+    } else {
+        store::WalletStore::read(&cfg.keys_path)?
+    };
     let encrypted = st.is_encrypted();
+
+    // Match the shard's members against the accounts its database already holds. Adopted members
+    // are serviceable immediately; the rest are imported once the actor is connected (importing
+    // needs the tree state at the member's birthday), exactly like the bootstrap path.
+    let (shard_accounts, shard_pending) = if is_shard {
+        let reconciled = shard::reconcile_accounts(cfg.network, &db_data, &cfg.shard_members)?;
+        info!(
+            adopted = reconciled.adopted.len(),
+            pending = reconciled.pending.len(),
+            "shard accounts reconciled against the manifest"
+        );
+        (reconciled.adopted, reconciled.pending)
+    } else {
+        (BTreeMap::new(), Vec::new())
+    };
 
     // Resolve the account. A normal data directory already has one. An *empty* data directory
     // (keys.toml present, but data.sqlite carries no account) is the bootstrap case: when
     // enabled, rebuild the account from keys.toml once the seed is available - immediately for an
     // identity/auto-unlock wallet, at the first `walletpassphrase` for an encrypted one.
-    let (account_id, account_index, watch_only, pending_bootstrap) =
+    let (account_id, account_index, watch_only, pending_bootstrap) = if is_shard {
+        // Every account belongs to a member, so there is no "the" account; `shard_accounts` is
+        // the routing table. Watch-only by construction: shard members are imported viewing
+        // keys, which is what disables every spending RPC for them.
+        (None, None, true, None)
+    } else {
         match try_select_account(&db_data)? {
             Some((id, index, wo)) => (Some(id), index, wo, None),
             None => {
@@ -1030,7 +1107,8 @@ async fn spawn_inner(
                 );
                 (None, None, watch_only, Some((st.birthday, bootstrap_key)))
             }
-        };
+        }
+    };
 
     // The selected account's UFVK (its canonical encoded form), for the binding checks below:
     // the database account must match keys.toml's pin, and an unlocked seed must derive it.
@@ -1146,23 +1224,43 @@ async fn spawn_inner(
 
     // The local prover bundles Sapling parameters; build it once (off the async threads). Shared
     // via `Arc` so the proving step can be handed to a blocking thread under `pipeline_proving`.
-    let prover = Arc::new(
-        tokio::task::spawn_blocking(LocalTxProver::bundled)
-            .await
-            .map_err(|e| anyhow!("failed to build prover: {e}"))?,
-    );
+    // The bundled Sapling proving parameters are tens of megabytes, and only a wallet that can
+    // *spend* ever touches them. A watch-only wallet - every fleet shard member, and every
+    // `init --ufvk` import - refuses spending outright, so building one per actor would be pure
+    // resident memory: at a few dozen shards that is gigabytes of parameters no send will use.
+    let prover = if watch_only {
+        None
+    } else {
+        Some(Arc::new(
+            tokio::task::spawn_blocking(LocalTxProver::bundled)
+                .await
+                .map_err(|e| anyhow!("failed to build prover: {e}"))?,
+        ))
+    };
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     // Loopback for pipelined-send completions. Bounded by `MAX_QUEUED_SENDS` since at most that
     // many sends can be outstanding (one in flight + the queue), and only one is ever proving.
     let (send_done_tx, send_done_rx) = mpsc::channel(MAX_QUEUED_SENDS + 1);
-    // Seed the status channel with the wallet's static facts (encryption mode, watch-only)
-    // so an RPC racing the actor's first `update_status` - which only runs after the initial
-    // connect attempt - never reports a default-shaped wallet (e.g. `private_keys_enabled:
-    // true` for a watch-only wallet, or a missing `unlocked_until` for an encrypted one).
+    // Seed the status channel with the wallet's static facts (encryption mode, watch-only, and
+    // the account map) so an RPC racing the actor's first `update_status` - which only runs after
+    // the initial connect attempt - never reports a default-shaped wallet (e.g.
+    // `private_keys_enabled: true` for a watch-only wallet, or a missing `unlocked_until` for an
+    // encrypted one). The account map matters most: it is what every read scopes on, so a wallet
+    // whose account is already known must not read as account-less for the first connect's worth
+    // of requests.
+    let seeded_accounts = if is_shard {
+        shard_accounts.clone()
+    } else {
+        match account_id {
+            Some(account) => BTreeMap::from([(cfg.name.clone(), account)]),
+            None => BTreeMap::new(),
+        }
+    };
     let (status_tx, status_rx) = watch::channel(SyncStatus {
         encrypted,
         watch_only,
+        accounts: Arc::new(seeded_accounts),
         birthday: Some(birthday),
         unlocked_until: encrypted.then_some(0),
         ..SyncStatus::default()
@@ -1186,8 +1284,7 @@ async fn spawn_inner(
         network: cfg.network,
         engine_dir: cfg.engine_dir.clone(),
         keys_path: cfg.keys_path.clone(),
-        server: cfg.server,
-        connect_timeout: cfg.connect_timeout,
+        hub: cfg.hub,
         backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
         reconnect_at: Instant::now(),
         sync_interval: cfg.sync_interval,
@@ -1215,6 +1312,9 @@ async fn spawn_inner(
         first_seen: first_seen.clone(),
         account_id,
         account_index,
+        is_shard,
+        shard_accounts: Arc::new(shard_accounts),
+        shard_pending,
         pending_bootstrap,
         db_data,
         db_cache,
@@ -1223,6 +1323,7 @@ async fn spawn_inner(
         prover,
         orchard_keys: cfg.orchard_keys,
         pipeline_proving: cfg.pipeline_proving,
+        trust_own_transactions: cfg.trust_own_transactions,
         send_in_flight: false,
         send_queue: VecDeque::new(),
         send_done_tx,
@@ -1256,24 +1357,35 @@ async fn spawn_inner(
         tokio::spawn(actor.run().instrument(tracing::Span::current()))
     };
 
-    Ok((
-        make_handle(
-            cfg.name,
-            cfg.engine_dir,
-            cfg.network,
-            cfg.confirmations_policy,
-            cfg.enabled_pools,
-            cfg.default_receivers,
-            cfg.transparent_enabled,
-            cfg.transparent_default,
-            cfg.transparent_gap_limit,
-            first_seen,
-            handle_seed,
-            cmd_tx,
-            status_rx,
-        ),
-        task,
-    ))
+    // A shard produces one handle per member: they share the command channel and the published
+    // status - one actor, one scan - and are told apart by name, which is the key the actor's
+    // published account map is keyed on.
+    let names: Vec<String> = if is_shard {
+        cfg.shard_members.iter().map(|m| m.name.clone()).collect()
+    } else {
+        vec![cfg.name]
+    };
+    let handles = names
+        .into_iter()
+        .map(|name| {
+            make_handle(
+                name,
+                cfg.engine_dir.clone(),
+                cfg.network,
+                cfg.confirmations_policy,
+                cfg.enabled_pools.clone(),
+                cfg.default_receivers.clone(),
+                cfg.transparent_enabled,
+                cfg.transparent_default,
+                cfg.transparent_gap_limit,
+                first_seen.clone(),
+                handle_seed.clone(),
+                cmd_tx.clone(),
+                status_rx.clone(),
+            )
+        })
+        .collect();
+    Ok((handles, task))
 }
 
 /// Fetch the upstream's current tip and record it as the wallet DB's chain tip, returning the
@@ -1457,6 +1569,7 @@ fn build_signed_transparent_tx(
     change: Option<(TransparentAddress, Zatoshis)>,
     fee_amount: Zatoshis,
     prover: &LocalTxProver,
+    trust_own: bool,
 ) -> Result<(TxId, Vec<u8>), RpcError> {
     use rand::rngs::OsRng;
 
@@ -1572,6 +1685,7 @@ fn build_signed_transparent_tx(
     );
     db.store_transactions_to_be_sent(std::slice::from_ref(&sent))
         .map_err(RpcError::database_internal)?;
+    mark_own_tx_trusted(db, txid, trust_own);
 
     Ok((txid, raw))
 }
@@ -2021,7 +2135,7 @@ impl WalletActor {
                             self.enhance_progress = None;
                         } else {
                             // Caught up: give any unmined wallet txs another shot at the mempool,
-                            // pull the full data (memos, …) for transactions seen only as compact
+                            // pull the full data (memos, ...) for transactions seen only as compact
                             // blocks, and (re)subscribe to incoming mempool txs for 0-conf visibility.
                             // (Transparent receives are discovered by the block scan itself - see
                             // `sync_step` - and at 0-conf by the mempool path below, on every
@@ -2211,6 +2325,49 @@ impl WalletActor {
         }
     }
 
+    /// The wallet-name -> account map this actor publishes on its [`SyncStatus`], which is how
+    /// each `WalletHandle` finds the account its reads and address derivations must be scoped to.
+    ///
+    /// A conventional actor publishes one entry, for its own wallet, and only once its account
+    /// exists (a pending bootstrap creates it later). A shard publishes one per member it has
+    /// imported, growing as the remaining imports complete.
+    fn published_accounts(&self) -> Arc<BTreeMap<String, AccountUuid>> {
+        if !self.shard_accounts.is_empty() {
+            return Arc::clone(&self.shard_accounts);
+        }
+        Arc::new(match self.account_id {
+            Some(account) => BTreeMap::from([(self.name.clone(), account)]),
+            None => BTreeMap::new(),
+        })
+    }
+
+    /// The Sapling prover, or the watch-only refusal.
+    ///
+    /// Every send path already rejects a watch-only wallet before reaching a proof, so this is a
+    /// backstop that keeps the "watch-only actors hold no proving parameters" decision safe: a
+    /// path that ever did reach here without one fails the call rather than the daemon.
+    fn require_prover(&self) -> Result<&Arc<LocalTxProver>, RpcError> {
+        self.prover.as_ref().ok_or_else(private_keys_disabled)
+    }
+
+    /// Whether this actor's database holds anything to scan for yet.
+    ///
+    /// A conventional wallet has its one account, unless a bootstrap has still to create it; a
+    /// shard has one per member it has imported. Either way, with none there is no key to
+    /// trial-decrypt against, so the scan has nothing to do.
+    fn has_account(&self) -> bool {
+        self.account_id.is_some() || !self.shard_accounts.is_empty()
+    }
+
+    /// Which account this actor's own reads apply to. `Any` only while no account exists yet
+    /// (a pending bootstrap), where there is nothing in the database to scope to anyway.
+    fn scope(&self) -> super::read::AccountScope {
+        match self.account_id {
+            Some(account) => super::read::AccountScope::Only(account),
+            None => super::read::AccountScope::Any,
+        }
+    }
+
     /// Run one writer command, catching any panic so a single bad command can't silently take
     /// the whole actor - and thus every wallet *write* - down until process restart (reads
     /// bypass the actor and would keep working, masking the outage). The one *expected* panic
@@ -2297,7 +2454,10 @@ impl WalletActor {
         self.client = None;
         self.reconnect_at = reconnect_after_backoff(Instant::now(), &mut self.backoff);
         if std::mem::take(&mut self.connected_logged) {
-            warn!("disconnected from {}: {reason}", self.server.describe());
+            warn!(
+                "disconnected from {}: {reason}",
+                self.hub.server().describe()
+            );
         }
     }
 
@@ -2370,9 +2530,11 @@ impl WalletActor {
         // Any open mempool stream belongs to the channel being replaced; drop it so it can't
         // pin the old connection alive. It is reopened on the next caught-up sync pass.
         self.mempool = None;
-        let describe = self.server.describe();
+        let describe = self.hub.server().describe();
         info!("connecting to {}", describe);
-        let client = self.server.connect_timeout(self.connect_timeout).await?;
+        // The hub dials only if the shared connection is down; when many wallets react to one
+        // outage together, the first through re-dials and the rest attach to its result.
+        let client = self.hub.acquire().await?;
         self.client = Some(client);
         let client = self.client.as_mut().expect("just set");
         // A reachable-but-unhealthy upstream can still fail here; treat that as a failed connect.
@@ -3142,6 +3304,8 @@ impl WalletActor {
     }
 
     async fn refresh_tip(&mut self) -> anyhow::Result<()> {
+        // Read before taking the client's mutable borrow, which lasts to the end of the fetch.
+        let has_account = self.has_account();
         let client = self
             .client
             .as_mut()
@@ -3160,7 +3324,7 @@ impl WalletActor {
         // floor. So defer it: `maybe_bootstrap_account` calls `update_chain_tip` itself right
         // after creating the account (birthday now set -> the scan floors at the birthday). We
         // still record the tip height/hash below so the bootstrap can run.
-        let (tip, hash) = if self.account_id.is_some() {
+        let (tip, hash) = if has_account {
             fetch_and_store_chain_tip(client, &mut self.db_data).await?
         } else {
             fetch_chain_tip(client).await?
@@ -3176,7 +3340,7 @@ impl WalletActor {
         if !self.connected_logged {
             self.connected_logged = true;
             info!(
-                server = %self.server.describe(),
+                server = %self.hub.server().describe(),
                 tip = u32::from(tip),
                 "connected to the upstream"
             );
@@ -3202,16 +3366,25 @@ impl WalletActor {
         // Rebuild the account from keys.toml if the data directory was empty. Until that
         // succeeds there is nothing to scan, so don't run a batch.
         self.maybe_bootstrap_account().await;
-        let Some(account_id) = self.account_id else {
+        // Import any shard member whose account does not exist yet (the fleet's counterpart of
+        // the bootstrap above: both need the tree state at a birthday, so both wait for a
+        // connected pass). Members already imported keep scanning meanwhile.
+        self.import_pending_shard_members().await;
+        if !self.has_account() {
             return Ok(false);
-        };
+        }
 
         // Transparent receive discovery rides on the block scan: the wallet's exposed transparent
         // addresses are matched against each scanned block's outputs (see `engine::sync_one_batch`).
         // Pre-expose the initial-scan window and (re)build the address set *before* the scan so
         // the historic range is matched against the full address set - including a from-seed
         // restore, where a high funded index is found only if `transparent_initial_scan` exposed it.
+        // A shard is shielded-only (refused at config time otherwise), so `account_id` here is
+        // always the conventional wallet's own account.
         if self.transparent_enabled {
+            let Some(account_id) = self.account_id else {
+                return Ok(false);
+            };
             if !self.transparent_preexposed {
                 // Derive the initial-scan window a chunk at a time. The window must be fully exposed before
                 // the scan (so historical blocks are matched against every address), but a deep
@@ -3403,6 +3576,132 @@ impl WalletActor {
     ) -> Option<zcash_transparent::keys::ExternalIvk> {
         let account = self.db_data.get_account(account_id).ok()??;
         account.uivk().transparent().clone()
+    }
+
+    /// Accept a view wallet into this shard, for import on the next connected pass.
+    ///
+    /// Refused for a conventional wallet: its account comes from its own `keys.toml`, and there
+    /// is nowhere for a foreign viewing key to go. Refused for a name the shard already serves,
+    /// which would otherwise queue a second account under it.
+    fn add_shard_member(&mut self, member: shard::ShardMember) -> Result<(), RpcError> {
+        if self.shard_accounts.is_empty() && self.shard_pending.is_empty() {
+            return Err(RpcError::wallet(
+                "this wallet is not a fleet shard; view wallets are onboarded into the fleet"
+                    .to_string(),
+            ));
+        }
+        if self.shard_accounts.contains_key(&member.name)
+            || self.shard_pending.iter().any(|m| m.name == member.name)
+        {
+            return Err(RpcError::wallet(format!(
+                "wallet '{}' is already in this shard",
+                member.name
+            )));
+        }
+        info!(wallet = %member.name, "queued a view wallet for import into this shard");
+        self.shard_pending.push(member);
+        Ok(())
+    }
+
+    /// Import each shard member that has no account yet, one per pass.
+    ///
+    /// This is the fleet's counterpart of [`Self::maybe_bootstrap_account`], and it waits for the
+    /// same reason: an account's birthday is derived from the tree state just below its birthday
+    /// height, which only a connected upstream can serve. Members already imported keep being
+    /// scanned meanwhile, so onboarding never stalls the wallets already running.
+    ///
+    /// One per pass on purpose. `import_account_ufvk` rewinds the whole database to the new
+    /// account's birthday and requeues everything above it, so importing a batch in one go would
+    /// hold the actor - and every wallet in the shard - through N rewinds back to back. Between
+    /// passes the actor drains queued commands and publishes the growing account map, so each
+    /// newly imported wallet starts serving as soon as it exists.
+    ///
+    /// Best-effort throughout: a failed import is retried on the next pass. The one exception is
+    /// a member the database refuses outright, which is dropped with an error rather than retried
+    /// forever (it would fail identically every pass).
+    async fn import_pending_shard_members(&mut self) {
+        if self.shard_pending.is_empty() {
+            return;
+        }
+        let Some(tip) = self.tip_height else {
+            return;
+        };
+        if self.client.is_none() {
+            return;
+        }
+        let member = self.shard_pending[0].clone();
+        // The tree state just before the birthday, exactly as `zecd init` and the bootstrap
+        // fetch it. Height 0 has no tree state; clamp to >= 1.
+        let prior = u32::from(member.birthday).saturating_sub(1).max(1);
+        let treestate = {
+            let client = self.client.as_mut().expect("checked above");
+            match tokio::time::timeout(
+                UNARY_RPC_TIMEOUT,
+                client.tree_state(BlockHeight::from_u32(prior)),
+            )
+            .await
+            {
+                Ok(Ok(ts)) => ts,
+                Ok(Err(e)) => {
+                    warn!(
+                        wallet = %member.name,
+                        "shard import: fetching the birthday tree state failed: {e}"
+                    );
+                    self.client = None;
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        wallet = %member.name,
+                        "shard import: birthday tree-state fetch timed out"
+                    );
+                    self.client = None;
+                    return;
+                }
+            }
+        };
+        let birthday =
+            match AccountBirthday::from_treestate(treestate, Some(BlockHeight::from_u32(tip))) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(
+                        wallet = %member.name,
+                        "shard import: could not derive an account birthday from the tree state \
+                         at {prior}: {e}. Dropping this wallet from the shard - fix its manifest \
+                         birthday and restart."
+                    );
+                    self.shard_pending.remove(0);
+                    return;
+                }
+            };
+        match shard::import_member(&mut self.db_data, &member, &birthday) {
+            Ok(account) => {
+                info!(
+                    wallet = %member.name,
+                    birthday = u32::from(member.birthday),
+                    "imported a view wallet into this shard"
+                );
+                let mut accounts = (*self.shard_accounts).clone();
+                accounts.insert(member.name.clone(), account);
+                self.shard_accounts = Arc::new(accounts);
+                self.shard_pending.remove(0);
+                // The new account's birthday requeues the scan below it; record the tip so the
+                // queue is derived with the account (and its birthday) present, as the bootstrap
+                // does after creating its account.
+                if let Err(e) = self.db_data.update_chain_tip(BlockHeight::from_u32(tip)) {
+                    warn!("shard import: update_chain_tip after the import failed: {e}");
+                }
+                self.update_status();
+            }
+            Err(e) => {
+                error!(
+                    wallet = %member.name,
+                    "shard import failed: {e}. Dropping this wallet from the shard - it would \
+                     fail identically on every retry. Fix its manifest entry and restart."
+                );
+                self.shard_pending.remove(0);
+            }
+        }
     }
 
     /// Rebuild the wallet account from `keys.toml` on an empty data directory (the bootstrap
@@ -3689,7 +3988,7 @@ impl WalletActor {
         });
         let status = SyncStatus {
             connected: self.client.is_some(),
-            server: Some(self.server.describe()),
+            server: Some(self.hub.server().describe()),
             conn_state,
             chain_tip: self.tip_height,
             fully_scanned,
@@ -3700,6 +3999,7 @@ impl WalletActor {
             pending_enhancements,
             enhanced_through,
             encrypted: self.encrypted,
+            accounts: self.published_accounts(),
             watch_only: self.watch_only,
             unlocked_until,
             transparent_frontier: self.transparent_frontier,
@@ -3770,16 +4070,25 @@ impl WalletActor {
     /// Returns `true` if the actor should stop.
     async fn handle_command(&mut self, cmd: WalletCommand) -> bool {
         match cmd {
-            WalletCommand::GetNewAddress { request, reply } => {
-                let res = self.get_new_address(request);
+            WalletCommand::GetNewAddress {
+                account,
+                request,
+                reply,
+            } => {
+                let res = self.get_new_address(account, request);
                 let _ = reply.send(res);
             }
             WalletCommand::GetAddressForAccount {
+                account,
                 request,
                 diversifier_index,
                 reply,
             } => {
-                let res = self.get_address_for_account(request, diversifier_index);
+                let res = self.get_address_for_account(account, request, diversifier_index);
+                let _ = reply.send(res);
+            }
+            WalletCommand::AddShardMember { member, reply } => {
+                let res = self.add_shard_member(member);
                 let _ = reply.send(res);
             }
             WalletCommand::Send {
@@ -3891,21 +4200,39 @@ impl WalletActor {
         }
     }
 
-    /// The wallet's account id, or [`account_not_ready`] while a bootstrap is still pending.
-    fn require_account(&self) -> Result<AccountUuid, RpcError> {
-        self.account_id.ok_or_else(account_not_ready)
+    /// The account a command applies to, or [`account_not_ready`] when there is none.
+    ///
+    /// `requested` is the account the command named - a fleet shard's database holds one per view
+    /// wallet it hosts, so address derivation has to say which. `None` means the actor's own
+    /// single account, which is every conventional wallet; it is also `None` while a bootstrap is
+    /// still pending, which is what the error reports.
+    fn require_account(&self, requested: Option<AccountUuid>) -> Result<AccountUuid, RpcError> {
+        requested.or(self.account_id).ok_or_else(|| {
+            if self.is_shard {
+                // A shard has no "the" account by design - its members are watch-only imports -
+                // so an operation that needs one (every spend path) gets Core's watch-only
+                // refusal, not the conventional actor's transient bootstrap/unlock message.
+                private_keys_disabled()
+            } else {
+                account_not_ready()
+            }
+        })
     }
 
-    fn get_new_address(&mut self, request: ReceiverRequest) -> Result<String, RpcError> {
+    fn get_new_address(
+        &mut self,
+        account: Option<AccountUuid>,
+        request: ReceiverRequest,
+    ) -> Result<String, RpcError> {
         // Resolve the request against the wallet's configuration. `Default` becomes a bare
         // transparent address when the wallet defaults to transparent, else the configured
         // shielded `default_receivers`. The actor is the authority on the wallet's configuration,
         // so it re-validates an explicit shielded override and re-checks transparent enablement
         // (the RPC layer validates these too, before dispatch).
         let receivers = match request {
-            ReceiverRequest::Transparent => return Ok(self.new_transparent_address()?.0),
+            ReceiverRequest::Transparent => return Ok(self.new_transparent_address(account)?.0),
             ReceiverRequest::Default if self.transparent_default => {
-                return Ok(self.new_transparent_address()?.0)
+                return Ok(self.new_transparent_address(account)?.0)
             }
             ReceiverRequest::Default => self.default_receivers.clone(),
             ReceiverRequest::Shielded(set) => {
@@ -3919,7 +4246,7 @@ impl WalletActor {
                 set
             }
         };
-        let account_id = self.require_account()?;
+        let account_id = self.require_account(account)?;
         let request = receivers.to_unified_address_request();
         let (ua, _) = self
             .db_data
@@ -3936,7 +4263,7 @@ impl WalletActor {
         Ok(encoded)
     }
 
-    /// Derive and persist a fresh bare transparent (`t1…`/`tm…`) receiving address for the
+    /// Derive and persist a fresh bare transparent (`t1...`/`tm...`) receiving address for the
     /// account. ZIP-316 forbids a transparent-only Unified Address, so we derive a UA that
     /// requires both an Orchard and a transparent receiver (keys always derive all pools, so the
     /// Orchard receiver is always available), then extract and bare-encode the transparent
@@ -3947,11 +4274,14 @@ impl WalletActor {
     /// at. `getnewaddress` discards the index (Bitcoin Core's contract is a bare string), but
     /// `z_getaddressforaccount` reports it - the index is what an operator needs to reconcile an
     /// issued address against its derivation path.
-    fn new_transparent_address(&mut self) -> Result<(String, u32), RpcError> {
+    fn new_transparent_address(
+        &mut self,
+        account: Option<AccountUuid>,
+    ) -> Result<(String, u32), RpcError> {
         if !self.transparent_enabled {
             return Err(transparent_not_enabled());
         }
-        let account_id = self.require_account()?;
+        let account_id = self.require_account(account)?;
         // Handing out a transparent receiver may expose a new address (notably the beyond-gap
         // issuance path, which exposes an index outside the current gap window): mark the matcher's
         // address set stale so the next sync pass rebuilds it and the block-scan / mempool matcher
@@ -4194,15 +4524,16 @@ impl WalletActor {
     /// Returns the encoded address, the index used, and the receivers derived.
     fn get_address_for_account(
         &mut self,
+        account: Option<AccountUuid>,
         request: ReceiverRequest,
         diversifier_index: Option<DiversifierIndex>,
     ) -> Result<DerivedAddress, RpcError> {
         let receivers = match request {
             ReceiverRequest::Transparent => {
-                return self.transparent_address_for_account(diversifier_index)
+                return self.transparent_address_for_account(account, diversifier_index)
             }
             ReceiverRequest::Default if self.transparent_default => {
-                return self.transparent_address_for_account(diversifier_index)
+                return self.transparent_address_for_account(account, diversifier_index)
             }
             ReceiverRequest::Default => self.default_receivers.clone(),
             ReceiverRequest::Shielded(set) => {
@@ -4216,7 +4547,7 @@ impl WalletActor {
                 set
             }
         };
-        let account_id = self.require_account()?;
+        let account_id = self.require_account(account)?;
         let request = receivers.to_unified_address_request();
         let (ua, j) = match diversifier_index {
             None => self
@@ -4270,13 +4601,14 @@ impl WalletActor {
     /// two ranges do not collide in practice.
     fn transparent_address_for_account(
         &mut self,
+        account: Option<AccountUuid>,
         diversifier_index: Option<DiversifierIndex>,
     ) -> Result<DerivedAddress, RpcError> {
         if !self.transparent_enabled {
             return Err(transparent_not_enabled());
         }
         let (address, index) = match diversifier_index {
-            None => self.new_transparent_address()?,
+            None => self.new_transparent_address(account)?,
             Some(j) => {
                 let index = transparent_child_index(j).ok_or_else(|| {
                     RpcError::invalid_parameter(format!(
@@ -4287,7 +4619,7 @@ impl WalletActor {
                         1u32 << 31
                     ))
                 })?;
-                let account_id = self.require_account()?;
+                let account_id = self.require_account(None)?;
                 (self.expose_transparent_index(account_id, index)?, index)
             }
         };
@@ -4387,13 +4719,16 @@ impl WalletActor {
         policy: ConfirmationsPolicy,
         privacy: SendPrivacy,
     ) -> Result<(pczt::Pczt, SendShape, Duration), RpcError> {
-        let account_id = self.require_account()?;
+        let account_id = self.require_account(None)?;
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
         let orchard_action_limit = self.orchard_action_limit;
         let (target_note_count, min_split_output_value) =
             (self.target_note_count, self.min_split_output_value);
         let engine_dir = self.engine_dir.clone();
+        // Captured alongside `engine_dir`: the closures below hold `&mut self.db_data`,
+        // so `self` cannot be borrowed again to ask for the scope once they have started.
+        let scope = self.scope();
         let db = &mut self.db_data;
         tokio::task::block_in_place(move || -> Result<_, RpcError> {
             let start = Instant::now();
@@ -4429,7 +4764,9 @@ impl WalletActor {
                 // `None` builds at the transaction version implied by the target height.
                 None,
             )
-            .map_err(|e| enrich_insufficient_funds(db, &engine_dir, policy, classify_err(e)))?;
+            .map_err(|e| {
+                enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
+            })?;
             if privacy == SendPrivacy::FullPrivacy {
                 enforce_full_privacy(&proposal)?;
             }
@@ -4450,7 +4787,7 @@ impl WalletActor {
                 BundlePadding::DEFAULT,
             )
             .map_err(|e| {
-                enrich_insufficient_funds(db, &engine_dir, policy, classify_pczt_err(e))
+                enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_pczt_err(e))
             })?;
             Ok((pczt, shape, start.elapsed()))
         })
@@ -4469,7 +4806,7 @@ impl WalletActor {
         // Match the send path: if an encrypted wallet's unlock elapsed but proactive relock hasn't
         // fired yet, lock now so a signature can't slip through past the timeout.
         self.relock_if_expired();
-        let account_id = self.require_account()?;
+        let account_id = self.require_account(None)?;
         let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
 
         // The address must be a recorded transparent receiver of this account. librustzcash only
@@ -4546,7 +4883,7 @@ impl WalletActor {
         // range; normally a no-op because the sync loop keeps the wallet caught up.
         self.sync_to_tip_for_send().await;
 
-        let account_id = self.require_account()?;
+        let account_id = self.require_account(None)?;
         let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
         // Lock the shared seed only long enough to derive the spending key; the guard is released
         // before the (long) proving below, so a concurrent `walletlock` fast path can zeroize the
@@ -4613,7 +4950,8 @@ impl WalletActor {
             .expect("cached path")
             .get()
             .await?;
-        let prover = self.prover.clone();
+        let prover = self.require_prover()?.clone();
+        let trust_own = self.trust_own_transactions;
         let db = &mut self.db_data;
         let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -4621,7 +4959,7 @@ impl WalletActor {
                 let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed)?;
+                let txid = store_pczt(db, signed, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
@@ -4653,9 +4991,13 @@ impl WalletActor {
         let orchard_action_limit = self.orchard_action_limit;
         let (target_note_count, min_split_output_value) =
             (self.target_note_count, self.min_split_output_value);
-        let account_id = self.require_account()?;
-        let prover: &LocalTxProver = &self.prover;
+        let account_id = self.require_account(None)?;
+        let prover: &LocalTxProver = &self.require_prover()?.clone();
         let engine_dir = self.engine_dir.clone();
+        let trust_own = self.trust_own_transactions;
+        // Captured alongside `engine_dir`: the closures below hold `&mut self.db_data`,
+        // so `self` cannot be borrowed again to ask for the scope once they have started.
+        let scope = self.scope();
         let db = &mut self.db_data;
         let (txid, raw, shape, build, prove): (TxId, Vec<u8>, SendShape, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -4691,7 +5033,9 @@ impl WalletActor {
                     // `None` builds at the transaction version implied by the target height.
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, &engine_dir, policy, classify_err(e)))?;
+                .map_err(|e| {
+                    enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
+                })?;
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
@@ -4711,13 +5055,16 @@ impl WalletActor {
                     // height, matching the PCZT path.
                     None,
                 )
-                .map_err(|e| enrich_insufficient_funds(db, &engine_dir, policy, classify_err(e)))?;
+                .map_err(|e| {
+                    enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
+                })?;
                 if txids.len() > 1 {
                     return Err(RpcError::wallet(
                         "multi-transaction proposals are not supported",
                     ));
                 }
                 let txid = *txids.first();
+                mark_own_tx_trusted(db, txid, trust_own);
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, shape, build, p0.elapsed()))
             })?;
@@ -4831,7 +5178,13 @@ impl WalletActor {
             }
         };
 
-        let prover = self.prover.clone();
+        let prover = match self.require_prover() {
+            Ok(prover) => prover.clone(),
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
         // As on the inline path, this awaits the background keygen only on a young daemon's
         // first send. It happens before `send_in_flight` is set, so a keygen failure leaves the
         // pipeline free rather than wedged.
@@ -4923,12 +5276,13 @@ impl WalletActor {
         build: Duration,
         prove: Duration,
     ) -> Result<TxId, RpcError> {
+        let trust_own = self.trust_own_transactions;
         let db = &mut self.db_data;
         let _ = policy; // store rarely surfaces -6; kept for symmetry with the inline path.
         let (txid, raw, store): (TxId, Vec<u8>, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed)?;
+                let txid = store_pczt(db, signed, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
@@ -4987,8 +5341,12 @@ impl WalletActor {
         let policy = confirmations.unwrap_or(self.confirmations_policy);
         // `self.prover` is an `Arc<LocalTxProver>` (shared for the pipeline); the transaction
         // builder wants `&LocalTxProver`, so deref-coerce through the Arc.
-        let prover: &LocalTxProver = &self.prover;
+        let prover: &LocalTxProver = &self.require_prover()?.clone();
         let engine_dir = self.engine_dir.clone();
+        let trust_own = self.trust_own_transactions;
+        // Captured alongside `engine_dir`: the closures below hold `&mut self.db_data`,
+        // so `self` cannot be borrowed again to ask for the scope once they have started.
+        let scope = self.scope();
         let db = &mut self.db_data;
 
         let (txid, raw): (TxId, Vec<u8>) =
@@ -5040,9 +5398,12 @@ impl WalletActor {
                     // may hold mature coinbase UTXOs that `listunspent`/`getbalance` display as
                     // spendable, so a bare "0 spendable" here would contradict what the caller
                     // just read. Same query as `getbalances.mine.coinbase`.
-                    let coinbase =
-                        super::read::mature_coinbase_zats(&engine_dir, u32::from(target_height))
-                            .unwrap_or(0);
+                    let coinbase = super::read::mature_coinbase_zats(
+                        &engine_dir,
+                        scope,
+                        u32::from(target_height),
+                    )
+                    .unwrap_or(0);
                     return Err(RpcError::insufficient_funds(if coinbase > 0 {
                         format!(
                             "Insufficient funds: 0 spendable non-coinbase transparent UTXOs; {}",
@@ -5085,6 +5446,7 @@ impl WalletActor {
                         // expected to cover the shortfall, so name it.
                         let coinbase = super::read::mature_coinbase_zats(
                             &engine_dir,
+                            scope,
                             u32::from(target_height),
                         )
                         .unwrap_or(0);
@@ -5159,6 +5521,7 @@ impl WalletActor {
                     change_recipient,
                     fee_amount,
                     prover,
+                    trust_own,
                 )
             })?;
 
@@ -5203,7 +5566,7 @@ impl WalletActor {
         // expiry) must come from the real chain tip, not a lagging scanned height.
         self.sync_to_tip_for_send().await;
 
-        let account_id = self.require_account()?;
+        let account_id = self.require_account(None)?;
         let net = self.network;
         let db = &mut self.db_data;
 
@@ -5337,7 +5700,9 @@ impl WalletActor {
         let usk = seed_guard(&self.seed).derive_usk(self.network, account_index)?;
 
         let net = self.network;
-        let prover: &LocalTxProver = &self.prover;
+        let prover = self.require_prover()?.clone();
+        let prover: &LocalTxProver = &prover;
+        let trust_own = self.trust_own_transactions;
         let db = &mut self.db_data;
         let (txid, raw): (TxId, Vec<u8>) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
@@ -5369,6 +5734,7 @@ impl WalletActor {
                     ));
                 }
                 let txid = *txids.first();
+                mark_own_tx_trusted(db, txid, trust_own);
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw))
             })?;
@@ -5422,7 +5788,7 @@ impl WalletActor {
         // expiry) must come from the real chain tip, not a lagging scanned height.
         self.sync_to_tip_for_send().await;
 
-        let account_id = self.require_account()?;
+        let account_id = self.require_account(None)?;
         let net = self.network;
         let policy = self.confirmations_policy;
         let orchard_action_limit = self.orchard_action_limit;
@@ -5860,9 +6226,11 @@ impl WalletActor {
         let usk = seed_guard(&self.seed).derive_usk(self.network, account_index)?;
 
         let net = self.network;
+        let trust_own = self.trust_own_transactions;
         let (txid, raw): (TxId, Vec<u8>) = match work {
             MergeWork::UtxoProposal(proposal) => {
-                let prover: &LocalTxProver = &self.prover;
+                let prover = self.require_prover()?.clone();
+                let prover: &LocalTxProver = &prover;
                 let db = &mut self.db_data;
                 tokio::task::block_in_place(move || -> Result<_, RpcError> {
                     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
@@ -5882,12 +6250,14 @@ impl WalletActor {
                         ));
                     }
                     let txid = *txids.first();
+                    mark_own_tx_trusted(db, txid, trust_own);
                     let raw = read_raw_tx(db, txid)?;
                     Ok((txid, raw))
                 })?
             }
             MergeWork::NoteProposal(proposal) => {
-                let prover: &LocalTxProver = &self.prover;
+                let prover = self.require_prover()?.clone();
+                let prover: &LocalTxProver = &prover;
                 let db = &mut self.db_data;
                 tokio::task::block_in_place(move || -> Result<_, RpcError> {
                     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
@@ -5907,6 +6277,7 @@ impl WalletActor {
                         ));
                     }
                     let txid = *txids.first();
+                    mark_own_tx_trusted(db, txid, trust_own);
                     let raw = read_raw_tx(db, txid)?;
                     Ok((txid, raw))
                 })?
@@ -5917,8 +6288,9 @@ impl WalletActor {
                 amount,
                 fee,
             } => {
-                let account_id = self.require_account()?;
-                let prover: &LocalTxProver = &self.prover;
+                let account_id = self.require_account(None)?;
+                let prover = self.require_prover()?.clone();
+                let prover: &LocalTxProver = &prover;
                 let db = &mut self.db_data;
                 let (target_height, _anchor) = db
                     .get_target_and_anchor_heights(std::num::NonZeroU32::MIN)
@@ -5940,6 +6312,7 @@ impl WalletActor {
                         None,
                         fee,
                         prover,
+                        trust_own,
                     )
                 })?
             }
@@ -6337,7 +6710,7 @@ fn sanitize_upstream_msg(msg: &str) -> String {
     const MAX: usize = 200;
     let mut out: String = msg.chars().filter(|c| !c.is_control()).take(MAX).collect();
     if msg.chars().filter(|c| !c.is_control()).nth(MAX).is_some() {
-        out.push('…');
+        out.push_str("...");
     }
     out
 }
@@ -6438,7 +6811,7 @@ fn now_unix() -> i64 {
 }
 
 /// Whether any recipient in `request` forces a **Sapling output**: a shielded address carrying a
-/// Sapling receiver but *no* Orchard receiver (a bare `zs…`, or a UA whose only shielded receiver
+/// Sapling receiver but *no* Orchard receiver (a bare `zs...`, or a UA whose only shielded receiver
 /// is Sapling). This is the sole way a send on the Orchard-only cached PCZT path produces a PCZT
 /// with a non-empty Sapling bundle - spends are always Orchard and change goes to Orchard (Sapling
 /// isn't an enabled pool on that path, or `cached_pczt_path` is already false). The PCZT extractor
@@ -6626,11 +6999,51 @@ fn prove_sign_pczt(
 /// node (the compact scan materializes the notes but carries no memos, and enhancement skips a tx
 /// whose raw bytes the send pre-stored). zecd covered that by re-decrypting the just-stored
 /// transaction here; the pass is gone with the version that made it unnecessary.
-fn store_pczt(db: &mut WriteDb, pczt: pczt::Pczt) -> Result<TxId, RpcError> {
-    extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
+fn store_pczt(db: &mut WriteDb, pczt: pczt::Pczt, trust_own: bool) -> Result<TxId, RpcError> {
+    let txid = extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
         db, pczt, None, None,
     )
-    .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))
+    .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))?;
+    mark_own_tx_trusted(db, txid, trust_own);
+    Ok(txid)
+}
+
+/// Mark a transaction this wallet just authored as **trusted** (`WalletWrite::set_tx_trust`), so
+/// the ZIP-315 confirmations policy applies `[spend] trusted_confirmations` (default 3) to its
+/// outputs instead of `untrusted_confirmations` (default 10) - Bitcoin Core's own-transaction
+/// trust model. Without this, the payment half of a self-send (an *external*-scope output, unlike
+/// change, whose internal key scope is already trusted) sat in
+/// `getwalletinfo.unconfirmed_balance` until 10 confirmations even though the wallet built the
+/// transaction itself; `zcash_client_sqlite` 0.22.0 added the `trust_status` column and the
+/// `set_tx_trust` hook but nothing upstream calls it. Called at every send-store chokepoint
+/// (the PCZT extract path, the fused path, the transparent builder, `z_shieldcoinbase`, and
+/// `z_mergetoaddress`'s fused arms), right after the store and before broadcast.
+///
+/// Statelessness note: the marker persists in `data.sqlite`, but it is a cache of derivable
+/// data ("this wallet authored this transaction", recoverable in principle from seed + chain
+/// via OVK decryption), so it respects the no-unrebuildable-persistence invariant. A from-seed
+/// restore does not currently re-derive it, so a restored wallet classifies an old self-send's
+/// payment output as untrusted until `untrusted_confirmations` - strictly more conservative
+/// than the authoring instance for that window, never less safe, and moot once the output is
+/// 10 deep.
+///
+/// Best-effort by design: the transaction is already stored (and about to broadcast), so a
+/// failure here must not fail the send - the output just stays on the conservative untrusted
+/// depth, exactly as before this call existed.
+///
+/// `enabled` is `[spend] trust_own_transactions` (default on), threaded from the caller rather
+/// than read here so the free-function call sites (`store_pczt`,
+/// `build_signed_transparent_tx`) stay actor-state-free. With it off, zecd never writes the
+/// marker: classification then derives purely from data every from-seed restore re-derives, so
+/// an authoring instance and a restore report identically at every depth - the operator's
+/// full-statelessness opt-out, paid for in self-send payments waiting the untrusted depth.
+fn mark_own_tx_trusted(db: &mut WriteDb, txid: TxId, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    if let Err(e) = db.set_tx_trust(txid, true) {
+        warn!("failed to mark own transaction {txid} as trusted: {e}");
+    }
 }
 
 /// A send's size, for the latency log line. Proving cost scales with `orchard_actions`; a large,
@@ -6877,6 +7290,7 @@ fn classify_err(e: ProposalError) -> RpcError {
 fn enrich_insufficient_funds(
     db: &WriteDb,
     engine_dir: &Path,
+    scope: super::read::AccountScope,
     policy: ConfirmationsPolicy,
     err: RpcError,
 ) -> RpcError {
@@ -6910,7 +7324,7 @@ fn enrich_insufficient_funds(
     // caller can't diagnose. Same number as `getbalances.mine.coinbase` (both read
     // `mature_coinbase_zats`); best-effort - a failed lookup just leaves the hint off.
     let target_height = u32::from(summary.chain_tip_height()) + 1;
-    let coinbase = super::read::mature_coinbase_zats(engine_dir, target_height).unwrap_or(0);
+    let coinbase = super::read::mature_coinbase_zats(engine_dir, scope, target_height).unwrap_or(0);
     if incoming == 0 && change == 0 && coinbase == 0 {
         return err;
     }
@@ -8093,11 +8507,12 @@ mod tests {
         assert_eq!(sanitize_upstream_msg(real), real);
         // Control characters (log/terminal injection) are stripped.
         assert_eq!(sanitize_upstream_msg("a\r\nb\x1b[31mc"), "ab[31mc");
-        // Oversized messages are truncated with an ellipsis marker.
+        // Oversized messages are truncated with a trailing "..." marker. The cap bounds the
+        // upstream *content* at MAX; the marker is added on top of it, so the total is MAX + 3.
         let long = "x".repeat(500);
         let bounded = sanitize_upstream_msg(&long);
-        assert_eq!(bounded.chars().count(), 201);
-        assert!(bounded.ends_with('…'));
+        assert_eq!(bounded.chars().count(), 203);
+        assert!(bounded.ends_with("..."));
         // Exactly at the cap: no marker.
         let exact = "y".repeat(200);
         assert_eq!(sanitize_upstream_msg(&exact), exact);
@@ -8168,14 +8583,25 @@ mod tests {
 
         let other = RpcError::wallet("some other failure");
         assert_eq!(
-            super::enrich_insufficient_funds(&db, dir.path(), Default::default(), other.clone())
-                .message,
+            super::enrich_insufficient_funds(
+                &db,
+                dir.path(),
+                super::read::AccountScope::Any,
+                Default::default(),
+                other.clone()
+            )
+            .message,
             other.message
         );
 
         let bare = RpcError::insufficient_funds("Insufficient funds: 0 zatoshis spendable");
-        let out =
-            super::enrich_insufficient_funds(&db, dir.path(), Default::default(), bare.clone());
+        let out = super::enrich_insufficient_funds(
+            &db,
+            dir.path(),
+            super::read::AccountScope::Any,
+            Default::default(),
+            bare.clone(),
+        );
         assert_eq!(out.code, codes::RPC_WALLET_INSUFFICIENT_FUNDS);
         assert_eq!(
             out.message, bare.message,

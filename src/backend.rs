@@ -384,6 +384,10 @@ pub struct Server {
     /// (`[backend] assume_transparent_in_compact_blocks`), overriding the capability probe.
     /// Unused by `zebra://` endpoints, which always cover it.
     assume_transparent_in_compact_blocks: bool,
+    /// SOCKS5 proxy carrying this endpoint's traffic (`[backend] proxy`), or `None` to dial
+    /// directly. Applies to both endpoint kinds - it is daemon policy, not a lightwalletd
+    /// setting - and is layered *under* TLS, so certificate verification is unaffected.
+    proxy: Option<crate::socks::SocksProxy>,
 }
 
 impl Server {
@@ -397,11 +401,48 @@ impl Server {
             zebra_auth: ZebraAuth::default(),
             cleartext_policy: CleartextPolicy::default(),
             assume_transparent_in_compact_blocks: false,
+            proxy: None,
         }
     }
 
     pub fn kind(&self) -> ServerKind {
         self.kind
+    }
+
+    /// The destination host as configured. Read by `config check` to tell an operator when a
+    /// proxy is pointed at a destination the *proxy* would resolve to its own loopback.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// A stable identity for the *connection* this endpoint describes: two `Server`s with equal
+    /// keys can share one upstream connection, and two with different keys must not.
+    ///
+    /// This is what lets [`crate::chain::hub`] keep collapsing N wallets onto one connection now
+    /// that each wallet resolves its own endpoint. It covers TLS trust and credentials as well as
+    /// host and port, because sharing a connection across those would silently carry one wallet's
+    /// trust configuration - or its zebra credentials - onto another wallet's traffic. The key can
+    /// therefore contain a credential, so it is a map key and nothing else: never log it.
+    ///
+    /// The proxy belongs here for the same reason: it decides how the socket is opened at all, so
+    /// two endpoints that disagree about it must never share one. Today `[backend] proxy` is
+    /// daemon policy and every wallet resolves the same value, which makes the distinction
+    /// unreachable in practice - it is in the key so that stays true by construction rather than
+    /// by coincidence, and so making the knob per-wallet later cannot silently route one wallet's
+    /// traffic through another's proxy.
+    pub fn connection_key(&self) -> String {
+        format!(
+            "{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{:?}",
+            self.kind,
+            self.host,
+            self.port,
+            self.network,
+            self.tls,
+            self.zebra_auth,
+            self.cleartext_policy,
+            self.assume_transparent_in_compact_blocks,
+            self.proxy,
+        )
     }
 
     /// Whether the lightwalletd dial uses TLS: the forced setting when present, else the
@@ -423,16 +464,23 @@ impl Server {
     }
 
     pub fn describe(&self) -> String {
+        // The proxy suffix rides on both arms so every connect log, `config show` note and
+        // error message that names the endpoint also says how it is reached.
+        let via = match &self.proxy {
+            Some(proxy) => format!(" via {proxy}"),
+            None => String::new(),
+        };
         match self.kind {
             ServerKind::Lightwalletd => {
                 format!(
-                    "lightwalletd {}:{} (tls={})",
+                    "lightwalletd {}:{} (tls={}){}",
                     self.host,
                     self.port,
-                    self.use_tls()
+                    self.use_tls(),
+                    via
                 )
             }
-            ServerKind::ZebraRpc => format!("zebra-rpc {}:{}", self.host, self.port),
+            ServerKind::ZebraRpc => format!("zebra-rpc {}:{}{}", self.host, self.port, via),
         }
     }
 
@@ -458,6 +506,7 @@ impl Server {
                     &self.zebra_auth,
                     self.network,
                     self.cleartext_policy,
+                    self.proxy.as_ref(),
                 );
                 let source = tokio::time::timeout(timeout, connect).await.map_err(|_| {
                     anyhow!("connect to {} timed out after {timeout:?}", self.describe())
@@ -614,7 +663,21 @@ impl Server {
         } else {
             endpoint
         };
-        let channel = endpoint.connect().await?;
+        // TLS (configured above) is layered by tonic *over* whatever stream the connector
+        // yields, so every mode above behaves identically proxied - SNI and certificate
+        // verification stay pinned to the destination host, and the proxy sees only ciphertext.
+        // NB `tcp_keepalive` above configures tonic's own connector and so does not apply on
+        // this path; the HTTP/2 keepalives do, and they are the layer that actually detects a
+        // hung peer.
+        let channel = match &self.proxy {
+            Some(proxy) => {
+                tracing::info!(%proxy, "dialing lightwalletd through SOCKS5 proxy");
+                endpoint
+                    .connect_with_connector(crate::socks::SocksConnector::new(proxy.clone()))
+                    .await?
+            }
+            None => endpoint.connect().await?,
+        };
         LwdSource::connect(channel, self.assume_transparent_in_compact_blocks).await
     }
 
@@ -645,6 +708,7 @@ pub fn resolve_configured(config: &crate::config::AppConfig) -> anyhow::Result<S
         &mut server,
         config.backend.assume_transparent_in_compact_blocks,
     );
+    apply_proxy(&mut server, config.backend.proxy.clone());
     Ok(server)
 }
 
@@ -688,6 +752,7 @@ pub fn resolve_for_wallet(
         &mut server,
         backend.assume_transparent_in_compact_blocks,
     );
+    apply_proxy(&mut server, backend.proxy.clone());
     Ok(server)
 }
 
@@ -730,6 +795,14 @@ pub fn apply_transparent_capability_override(server: &mut Server, assume: bool) 
         return;
     }
     server.assume_transparent_in_compact_blocks = assume;
+}
+
+/// Apply the `[backend] proxy` setting: route this endpoint's traffic through a SOCKS5 proxy.
+///
+/// Unlike the TLS and capability mutators this applies to *both* endpoint kinds - the point of
+/// the knob is that nothing zecd dials bypasses the proxy.
+pub fn apply_proxy(server: &mut Server, proxy: Option<crate::socks::SocksProxy>) {
+    server.proxy = proxy;
 }
 
 /// Resolve the configured `server` token into a single upstream endpoint. See the module doc
@@ -801,6 +874,49 @@ pub fn resolve(server: &str, network: ZNetwork) -> anyhow::Result<Server> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lightwalletd dial must ride the SOCKS connector too, and must ask the proxy for the
+    /// destination by name.
+    ///
+    /// The dial is expected to *fail*: the fake proxy forwards to a listener that accepts and
+    /// immediately closes, so the TLS handshake dies. What is under test is that the CONNECT
+    /// happened at all - a direct dial to an unresolvable host could never have produced one.
+    #[tokio::test]
+    async fn a_configured_proxy_carries_the_lightwalletd_dial() {
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = dead.accept().await {
+                drop(sock);
+            }
+        });
+        let proxy = crate::socks::test_proxy::TestProxy::start(dead_addr).await;
+
+        let mut server = resolve("https://lwd.test.invalid:9067", ZNetwork::Main).unwrap();
+        apply_proxy(&mut server, Some(proxy.proxy()));
+        assert!(
+            server.connect().await.is_err(),
+            "the upstream closes immediately, so the dial cannot succeed"
+        );
+        assert_eq!(proxy.targets(), vec!["lwd.test.invalid:9067".to_string()]);
+    }
+
+    /// The proxy is named wherever the endpoint is, so connect logs and `config show` say how
+    /// the upstream is reached.
+    #[test]
+    fn describe_names_the_proxy_when_one_is_configured() {
+        let mut server = resolve("zebra://127.0.0.1:8232", ZNetwork::Main).unwrap();
+        assert!(!server.describe().contains("socks5"));
+        apply_proxy(
+            &mut server,
+            Some(crate::socks::SocksProxy::parse("socks5://127.0.0.1:9050").unwrap()),
+        );
+        assert!(
+            server.describe().contains("via socks5://127.0.0.1:9050"),
+            "describe() should name the proxy, got: {}",
+            server.describe()
+        );
+    }
 
     #[test]
     fn default_server_resolves_to_local_zebrad_per_network() {
@@ -1042,6 +1158,169 @@ mod tests {
         let mut s = resolve("http://127.0.0.1:9067", crate::network::regtest()).unwrap();
         apply_tls(&mut s, opts);
         assert!(!s.use_tls(), "http:// wins over tls = \"yes\"");
+    }
+
+    /// Two endpoints may share one upstream connection exactly when every setting that shapes
+    /// the dial agrees. [`Server::connection_key`] is what `node.rs` keys its hub map on, so
+    /// this test is what stands between a new dial-affecting field and two wallets silently
+    /// sharing a connection - which would mean one wallet's TLS trust, or its zebra
+    /// credentials, riding on another wallet's traffic.
+    ///
+    /// It matters because a wallet may override the global `[backend] server`: before that
+    /// existed the daemon had one upstream and the question could not arise.
+    #[test]
+    fn connection_key_separates_every_dial_affecting_field() {
+        let base = || {
+            Server::new(
+                Cow::Borrowed("example.test"),
+                1234,
+                ServerKind::Lightwalletd,
+                ZNetwork::Main,
+            )
+        };
+
+        // Compile-time guard: destructured exhaustively and without `..`, so adding a field to
+        // `Server` fails to compile here and forces a decision about whether the key covers it.
+        // The key is a `Debug` string, so nothing else would catch the omission.
+        let Server {
+            host: _,
+            port: _,
+            kind: _,
+            network: _,
+            tls: _,
+            zebra_auth: _,
+            cleartext_policy: _,
+            assume_transparent_in_compact_blocks: _,
+            proxy: _,
+        } = base();
+
+        // Identically configured endpoints share a connection - the whole point of the hub.
+        assert_eq!(base().connection_key(), base().connection_key());
+
+        let mut variants: Vec<(&str, Server)> = Vec::new();
+        let mut v = base();
+        v.host = Cow::Borrowed("other.test");
+        variants.push(("host", v));
+        let mut v = base();
+        v.port = 1235;
+        variants.push(("port", v));
+        let mut v = base();
+        v.kind = ServerKind::ZebraRpc;
+        variants.push(("kind", v));
+        let mut v = base();
+        v.network = ZNetwork::Test;
+        variants.push(("network", v));
+        let mut v = base();
+        v.tls.force_tls = Some(false);
+        variants.push(("tls.force_tls", v));
+        let mut v = base();
+        v.tls.roots = TlsRoots::Webpki;
+        variants.push(("tls.roots", v));
+        let mut v = base();
+        v.tls.insecure_skip_verify = true;
+        variants.push(("tls.insecure_skip_verify", v));
+        let mut v = base();
+        v.tls.ca_pem = Some(b"-----BEGIN CERTIFICATE-----".to_vec());
+        variants.push(("tls.ca_pem", v));
+        let mut v = base();
+        v.tls.pins = vec![CertFingerprint([7u8; 32])];
+        variants.push(("tls.pins", v));
+        let mut v = base();
+        v.zebra_auth.user = Some("u".into());
+        variants.push(("zebra_auth.user", v));
+        let mut v = base();
+        v.zebra_auth.password = Some("p".into());
+        variants.push(("zebra_auth.password", v));
+        let mut v = base();
+        v.zebra_auth.cookie = Some("/tmp/zebra.cookie".into());
+        variants.push(("zebra_auth.cookie", v));
+        let mut v = base();
+        v.cleartext_policy.rfc1918_is_local = !v.cleartext_policy.rfc1918_is_local;
+        variants.push(("cleartext_policy.rfc1918_is_local", v));
+        let mut v = base();
+        v.cleartext_policy.allow_remote_cleartext = !v.cleartext_policy.allow_remote_cleartext;
+        variants.push(("cleartext_policy.allow_remote_cleartext", v));
+        let mut v = base();
+        v.assume_transparent_in_compact_blocks = !v.assume_transparent_in_compact_blocks;
+        variants.push(("assume_transparent_in_compact_blocks", v));
+        let mut v = base();
+        apply_proxy(
+            &mut v,
+            Some(crate::socks::SocksProxy::parse("socks5://127.0.0.1:9050").unwrap()),
+        );
+        variants.push(("proxy", v));
+        let mut v = base();
+        apply_proxy(
+            &mut v,
+            Some(crate::socks::SocksProxy::parse("socks5://127.0.0.1:9150").unwrap()),
+        );
+        variants.push(("proxy (different port)", v));
+
+        let baseline = base().connection_key();
+        for (field, server) in &variants {
+            assert_ne!(
+                baseline,
+                server.connection_key(),
+                "changing {field} must not leave the endpoint sharing a connection with the \
+                 original - the hub map would hand both wallets the same upstream"
+            );
+        }
+        // And distinct from each other, so the key is not merely "something changed".
+        for (i, (fa, a)) in variants.iter().enumerate() {
+            for (fb, b) in &variants[i + 1..] {
+                assert_ne!(a.connection_key(), b.connection_key(), "{fa} vs {fb}");
+            }
+        }
+    }
+
+    /// The production seam: a wallet may point at its own upstream, and `node.rs` gives each
+    /// distinct endpoint its own hub. Driven through a real config so the test covers
+    /// `resolve_for_wallet` and the key together - the two halves that decide, for an actual
+    /// `zecd.toml`, which wallets share a connection.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn wallets_share_a_hub_exactly_when_their_resolved_endpoints_agree() {
+        use crate::config::Cli;
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            "[backend]\n\
+             server = \"zebra://127.0.0.1:18234\"\n\
+             [wallets.a]\n\
+             [wallets.b]\n\
+             [wallets.elsewhere]\n\
+             server = \"zebra://127.0.0.1:18999\"\n\
+             [wallets.light]\n\
+             server = \"https://testnet.zec.rocks:443\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["zecd", "--testnet", "--conf", conf.to_str().unwrap()]);
+        let cfg = crate::config::AppConfig::resolve(&cli).unwrap();
+
+        let key = |wallet: &str| {
+            resolve_for_wallet(&cfg, cfg.wallets.get(wallet).expect("wallet in config"))
+                .expect("the endpoint resolves")
+                .connection_key()
+        };
+
+        // Two wallets with no override ride the global `[backend]`, so they share one upstream.
+        // This is the case the hub exists for: N wallets, one connection.
+        assert_eq!(key("a"), key("b"));
+
+        // A wallet pointed at another zebra gets its own connection, even though everything
+        // else about it is identical - only the port differs.
+        assert_ne!(key("a"), key("elsewhere"));
+
+        // And one pointed at a lightwalletd differs in kind, host and TLS all at once.
+        assert_ne!(key("a"), key("light"));
+        assert_ne!(key("elsewhere"), key("light"));
+
+        // The fleet has no per-wallet override to apply - manifests carry no server - so its
+        // shards ride the globally-configured endpoint and join the no-override wallets' hub
+        // rather than opening a second connection to the same place.
+        assert_eq!(key("a"), resolve_configured(&cfg).unwrap().connection_key());
     }
 
     #[test]

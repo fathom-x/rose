@@ -25,8 +25,16 @@
           border-radius: 8px; padding: 1rem; }
   .card h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em;
              color: var(--dim); margin: 0 0 .75rem; }
+  /* A card's heading and its headline value share one line: the heading on the left, the
+     value (balance, the new-address button, the connection state) on the right. */
+  .head { display: flex; justify-content: space-between; align-items: center;
+          flex-wrap: wrap; gap: .5rem .75rem; margin-bottom: .75rem; }
+  .head h2 { margin: 0; }
+  .head .sub { margin: 0; }
   .bal { font-size: 1.5rem; }
   .bal small, .sub { color: var(--dim); font-size: .8rem; display: block; }
+  .head .bal { white-space: nowrap; }
+  .head .bal small { display: inline; }
   label { display: block; color: var(--dim); font-size: .8rem; margin-top: .6rem; }
   input[type=text], input[type=number] {
     width: 100%; background: var(--bg); color: var(--text);
@@ -87,17 +95,21 @@
 
 <div class="grid">
   <div class="card">
-    <h2>Balance</h2>
-    <div class="bal"><span id="trusted">&ndash;</span> <small><span class="unit">tBTC</span> spendable</small></div>
+    <div class="head">
+      <h2>Balance</h2>
+      <div class="bal" title="spendable (confirmed) balance"><span id="trusted">&ndash;</span> <small class="unit">tBTC</small></div>
+    </div>
     <span class="sub">unconfirmed: <span id="pending">&ndash;</span></span>
     <span class="sub">immature: <span id="immature">&ndash;</span></span>
   </div>
 
   <div class="card">
-    <h2>Receive</h2>
-    <div class="row" style="margin-top:0">
-      <button id="newaddr">new address</button>
-      <button id="copyaddr" class="ghost" hidden>copy</button>
+    <div class="head">
+      <h2>Receive</h2>
+      <div class="row" style="margin-top:0">
+        <button id="newaddr">new address</button>
+        <button id="copyaddr" class="ghost" hidden>copy</button>
+      </div>
     </div>
     <div id="addr"></div>
     <div class="msg" id="addrmsg"></div>
@@ -108,8 +120,10 @@
        height, the anchor a kyoto first scan actually started at when it differs, and the
        birthday's calendar date (zecd's getwalletinfo `birthday` extension). -->
   <div class="card" id="statuscard">
-    <h2>Status</h2>
-    <span class="sub"><span class="dot" id="conn"></span> <span id="chaintext">connecting...</span></span>
+    <div class="head">
+      <h2>Status</h2>
+      <span class="sub"><span class="dot" id="conn"></span> <span id="chaintext">connecting...</span></span>
+    </div>
     <span class="sub">block height: <span id="st-height">&ndash;</span></span>
     <span class="sub" id="st-hash"></span>
     <span class="sub">birthday height: <span id="st-birthday">&ndash;</span></span>

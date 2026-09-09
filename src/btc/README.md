@@ -341,7 +341,11 @@ Everything here is refused with a clear error rather than silently ignored or ha
   noted here because the kyoto/UI deployments are where it bites.
 - **Health/readiness integration** - `/healthz`/`/readyz`/`/status` speak Zcash-sync
   vocabulary and do not aggregate bitcoin wallets' sync state yet. Per wallet, the
-  connection state is on `getwalletinfo` as the zecd extension `upstream_connected`
+  connection state is on `getwalletinfo` as the zecd extension `upstream_connected`; the
+  wallet birthday and how it resolved (`birthday.height`, its `time` - the birthday
+  block's own time once the chain source answers, else the offline record - and the scan
+  `anchor` once recorded) is the extension beside it, and `listdescriptors.timestamp`
+  carries the same time as Core's rescan-from time
   (false once a hung or unreachable upstream is noticed - the bitcoind client's
   per-request deadline is `chain::RPC_DEADLINE`, 15s - true again after a reconnect).
 - **`derive-address`** refuses bitcoin wallets (naming what to do instead); a bitcoin

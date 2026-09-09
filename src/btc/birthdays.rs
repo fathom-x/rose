@@ -152,6 +152,20 @@ pub fn anchor_for_date(network: BitcoinNetwork, date: u64) -> Option<DayAnchor> 
     })
 }
 
+/// The UTC midnight (unix seconds) of the day the table places `height` in: the day of the
+/// last entry at or below it. At or before the block's own header time by construction (the
+/// entry is the first block of that day), so it serves as a conservative "created no later
+/// than" timestamp - what `listdescriptors` reports when no operator date was recorded.
+/// `None` below the table's first entry, and on the networks without a table.
+pub fn day_start_for_height(network: BitcoinNetwork, height: u32) -> Option<u64> {
+    let table = table(network)?;
+    let index = table
+        .days
+        .partition_point(|(h, _)| *h <= height)
+        .checked_sub(1)?;
+    Some((table.first_day + index as u64) * DAY_SECS)
+}
+
 /// Resolve a `--birthday` height offline: the last day entry at or below it - within a day
 /// of blocks of the birthday while the table covers it (exact), the table's last entry as
 /// a floor past its end. `None` below the table's first entry.
@@ -306,6 +320,34 @@ mod tests {
         let index = table.days.iter().position(|(h, _)| *h == height).unwrap();
         assert!(height <= 877_100 && 877_100 - height < 300, "{height}");
         assert!(table.days[index + 1].0 > 877_100);
+    }
+
+    /// A height maps to the midnight of its table day: the 2025-01-01 entry's height and
+    /// the last block of that day both give that midnight, the block before gives the day
+    /// before, and heights below the table (or any height on a table-less network) give
+    /// nothing.
+    #[test]
+    fn day_start_for_height_is_the_entrys_day() {
+        let table = table(BitcoinNetwork::Main).unwrap();
+        let (h, _) = table.day_of(midnight("2025-01-01")).unwrap();
+        let (next, _) = table.day_of(midnight("2025-01-02")).unwrap();
+        assert_eq!(
+            day_start_for_height(BitcoinNetwork::Main, h),
+            Some(midnight("2025-01-01"))
+        );
+        assert_eq!(
+            day_start_for_height(BitcoinNetwork::Main, next - 1),
+            Some(midnight("2025-01-01"))
+        );
+        assert_eq!(
+            day_start_for_height(BitcoinNetwork::Main, h - 1),
+            Some(midnight("2024-12-31"))
+        );
+        assert_eq!(day_start_for_height(BitcoinNetwork::Main, 481_824), None);
+        assert_eq!(
+            day_start_for_height(BitcoinNetwork::Testnet4, 150_000),
+            None
+        );
     }
 
     /// The parser refuses a truncated, mis-sized or non-monotonic table rather than

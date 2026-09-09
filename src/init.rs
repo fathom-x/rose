@@ -1015,8 +1015,8 @@ fn kyoto_date_birthday(btc_network: crate::coin::BitcoinNetwork, date: u64) -> B
             let height = entry.height;
             tracing::info!(
                 "resolved the --birthday date offline to height {height} (the first block \
-                 of the previous UTC day, from the shipped per-day table) and anchored the \
-                 first scan there"
+                 of the previous UTC day, from the shipped per-day table); the first scan \
+                 starts there"
             );
             return BitcoinBirthday {
                 height,
@@ -1609,18 +1609,50 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
     crate::migrate::migrate(config)?;
 
     let entry = resolve_wallet_entry(config, &args.wallet);
+    // Resolve a moved birthday first - before the prompt, and before anything is deleted:
+    // a failed upstream dial is then a clean refusal, and the prompt names the birthday the
+    // rebuild will actually start from rather than the one keys.toml still holds.
+    let new_birthday: Option<(u32, Option<u64>)> = match args.birthday {
+        None => None,
+        #[cfg(feature = "bitcoin")]
+        Some(birthday) if entry.coin == crate::coin::Coin::Bitcoin => {
+            Some(resolve_rescan_birthday_bitcoin(config, &entry, birthday).await?)
+        }
+        Some(birthday) => Some(resolve_rescan_birthday_zcash(config, &entry, birthday).await?),
+    };
     let confirm = |st: &WalletStore| -> anyhow::Result<bool> {
+        let recorded = u32::from(st.birthday);
+        let from = match new_birthday {
+            Some((height, _)) => format!("the new birthday {height} (moved from {recorded})"),
+            None => format!("the wallet birthday ({recorded})"),
+        };
+        // Moving the birthday *later* is the one direction that can lose funds: nothing
+        // below it is ever scanned again, so history between the two heights vanishes from
+        // the rebuilt wallet - silently, as a lower balance. Earlier only costs scan time.
+        let warning = match new_birthday {
+            Some((height, _)) if height > recorded => format!(
+                "\nWARNING: the new birthday is LATER than the recorded one. Any transaction \
+                 between heights {recorded} and {height} will be missing from the rebuilt \
+                 wallet, and its funds from the balance. Only do this if you are certain the \
+                 wallet received nothing before {height}."
+            ),
+            _ => String::new(),
+        };
+        // `--yes` skips the question, not the warning: the one-line loss notice still
+        // reaches the operator's terminal or log.
         if args.yes {
+            if !warning.is_empty() {
+                eprintln!("{}", warning.trim_start_matches('\n'));
+            }
             return Ok(true);
         }
         eprintln!(
             "This deletes the wallet database for '{}' at {} (keys.toml and the seed are \
              kept).\nOn the next start zecd rebuilds the account from keys.toml and rescans \
-             from the wallet birthday ({}), which re-derives all funds and history but can \
-             take a while.\nType 'yes' to continue:",
+             from {from}, which re-derives all funds and history but can take a while.{warning}\
+             \nType 'yes' to continue:",
             args.wallet,
             entry.dir.display(),
-            u32::from(st.birthday)
         );
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
@@ -1628,14 +1660,8 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
     };
 
     #[cfg(feature = "bitcoin")]
-    let (removed, new_birthday) = if entry.coin == crate::coin::Coin::Bitcoin {
-        let new_birthday = match args.birthday {
-            Some(birthday) => {
-                Some(resolve_rescan_birthday_bitcoin(config, &entry, birthday).await?)
-            }
-            None => None,
-        };
-        let removed = rescan_bitcoin_wallet(
+    let removed = if entry.coin == crate::coin::Coin::Bitcoin {
+        rescan_bitcoin_wallet(
             config.network,
             &args.wallet,
             // The lock (and the migration under it) are this wrapper's, taken above.
@@ -1644,40 +1670,27 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
             &entry.engine_dir(),
             &crate::config::btc_kyoto_dir(&entry.dir),
             confirm,
-        )?;
-        (removed, new_birthday)
+        )?
     } else {
-        let new_birthday = match args.birthday {
-            Some(birthday) => Some(resolve_rescan_birthday_zcash(config, &entry, birthday).await?),
-            None => None,
-        };
-        let removed = rescan_wallet(
+        rescan_wallet(
             entry.zcash_network(),
             &args.wallet,
             None,
             &entry.keys_path(),
             &entry.engine_dir(),
             confirm,
-        )?;
-        (removed, new_birthday)
+        )?
     };
     #[cfg(not(feature = "bitcoin"))]
-    let (removed, new_birthday) = {
-        let new_birthday = match args.birthday {
-            Some(birthday) => Some(resolve_rescan_birthday_zcash(config, &entry, birthday).await?),
-            None => None,
-        };
-        let removed = rescan_wallet(
-            entry.zcash_network(),
-            &args.wallet,
-            // The lock (and the migration under it) are this wrapper's, taken above.
-            None,
-            &entry.keys_path(),
-            &entry.engine_dir(),
-            confirm,
-        )?;
-        (removed, new_birthday)
-    };
+    let removed = rescan_wallet(
+        entry.zcash_network(),
+        &args.wallet,
+        // The lock (and the migration under it) are this wrapper's, taken above.
+        None,
+        &entry.keys_path(),
+        &entry.engine_dir(),
+        confirm,
+    )?;
 
     if removed.is_empty() {
         eprintln!(

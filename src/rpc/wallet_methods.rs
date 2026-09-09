@@ -721,6 +721,17 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
         // (see `SyncStatus::enhanced_through`), which a consumer must read as "hold the
         // cursor", never as "everything is enhanced".
         "enhanced_through": st.enhanced_through,
+        // zecd extension, the same object the Bitcoin handler reports: the recorded wallet
+        // birthday (where a rebuild scans from). A Zcash birthday is always recorded exactly
+        // (`init` resolves a date against the upstream before writing it) and the scan starts
+        // at it directly, so `time` and `anchor` are null here; on a Bitcoin wallet they carry
+        // the birthday's date (operator's or table-derived) and the kyoto light client's
+        // resolved checkpoint.
+        "birthday": {
+            "height": st.birthday,
+            "time": Value::Null,
+            "anchor": Value::Null,
+        },
         "descriptors": false
     });
     // Only present for passphrase-encrypted wallets (matches Bitcoin Core): the unix time the

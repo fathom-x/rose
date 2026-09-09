@@ -277,6 +277,23 @@ def s_getwalletinfo(ctx):
     # A seeded wallet can sign; only watch-only (init --ufvk / --xpub) wallets report False here.
     ck("private_keys_enabled is True", wi.get("private_keys_enabled") is True,
        repr(wi.get("private_keys_enabled")))
+    # zecd extension, same shape on both engines: the recorded birthday height, its date as a
+    # UTC midnight when known (the operator's, or the mainnet per-day table's) or None, and the
+    # resolved scan anchor {height, hash} or None (always None on Zcash and bitcoind wallets).
+    bd = wi.get("birthday")
+    ck("getwalletinfo has a birthday object", isinstance(bd, dict), repr(bd))
+    if isinstance(bd, dict):
+        ck("birthday.height is a height", isinstance(bd.get("height"), int) and bd["height"] >= 0, bd)
+        ck("birthday.time is unix seconds or None",
+           bd.get("time") is None or (isinstance(bd["time"], int) and bd["time"] > 0), bd)
+        anchor = bd.get("anchor")
+        ck("birthday.anchor is None or {height, hash}",
+           anchor is None or (isinstance(anchor, dict) and isinstance(anchor.get("height"), int)
+                              and isinstance(anchor.get("hash"), str) and len(anchor["hash"]) == 64),
+           anchor)
+        if ctx.coin == ZCASH:
+            ck("a Zcash birthday has no deferred date or anchor",
+               bd.get("time") is None and anchor is None, bd)
     scanning = wi.get("scanning")
     if ctx.coin == ZCASH:
         # The transparent observability block appears only when [pools] transparent is enabled; this

@@ -199,6 +199,25 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         // hung or unreachable upstream has been noticed - it flips false when the actor
         // drops the connection and back once a reconnect succeeds.
         "upstream_connected": status.conn_state != BtcConnState::Down,
+        // zecd extension: the wallet birthday and how it resolved - the same object the Zcash
+        // handler reports. `height` is the recorded birthday (`keys.toml`), where a rebuild
+        // scans from; `time` the birthday block's own time once the chain source has
+        // answered (bitcoind at connect, kyoto once its headers cover it), else the offline
+        // record - the operator's date when init kept one, else the shipped per-day table's
+        // day for the height - or null off-table; `anchor` the `(height, hash)` checkpoint a
+        // kyoto first scan
+        // actually started from once one is recorded (by init, or by the first sync's own
+        // resolution), else null - so an operator can see the anchor climb from the shipped
+        // floor to the true height on a fresh wallet, and a bitcoind-backed wallet, whose
+        // emitter starts from the birthday by height, shows null for good.
+        "birthday": {
+            "height": handle.birthday,
+            "time": status.birthday_block_time.or(handle.birthday_time),
+            "anchor": status
+                .birthday_anchor
+                .as_ref()
+                .map(|(height, hash)| json!({ "height": height, "hash": hash })),
+        },
         // zecd extension: which engine serves this wallet. The Zcash handler reports its own
         // extensions (pools, transparent) here; `coin` is the field a mixed-coin deployment
         // tells wallets apart by.
@@ -803,6 +822,12 @@ mod tests {
 
         let info = call("getwalletinfo", vec![]).await.unwrap();
         assert_eq!(info["coin"], json!("bitcoin"));
+        // The birthday object, in the shape both engines share: the recorded height, no
+        // kept date, and no anchor on a wallet that has never resolved one.
+        assert_eq!(
+            info["birthday"],
+            json!({ "height": 0, "time": null, "anchor": null })
+        );
         assert_eq!(info["private_keys_enabled"], json!(true));
         assert_eq!(info["scanning"], json!(false));
         // The wallet's own chain view: a fresh wallet sits at its genesis checkpoint, and

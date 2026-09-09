@@ -312,6 +312,11 @@ pub struct KyotoBirthday {
     pub time: Option<u64>,
     /// The persisted resolved anchor, once one exists.
     pub anchor: Option<(u32, BlockHash)>,
+    /// The birthday block's header time, once known. `None` asks the connect to resolve it
+    /// against the light client's headers ([`resolve_birthday_time`]) - display only, for
+    /// `getwalletinfo`'s `birthday.time` and `listdescriptors`' `timestamp`; nothing in the
+    /// scan depends on it.
+    pub block_time: Option<u64>,
 }
 
 /// A resolved birthday anchor: the height and hash a first scan can start from.
@@ -593,6 +598,20 @@ impl KyotoEndpoint {
             (rx, task)
         });
 
+        // The birthday block's time, for display, when the actor does not know it yet: the
+        // same channel-fed shape, dying with the connection, polled beside the anchor.
+        let birthday_time = birthday.block_time.is_none().then(|| {
+            let requester = requester.clone();
+            let (height, anchor) = (birthday.height, birthday.anchor);
+            let (tx, rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                if let Some(time) = resolve_birthday_time(requester, height, anchor).await {
+                    let _ = tx.send(time);
+                }
+            });
+            (rx, task)
+        });
+
         drop(entered);
 
         info!(
@@ -607,6 +626,7 @@ impl KyotoEndpoint {
             logs,
             anchor,
             runtime: Some(runtime),
+            birthday_time,
         })
     }
 
@@ -717,6 +737,40 @@ async fn header_at(
         .ok()
         .flatten()
         .map(|indexed| indexed.header)
+}
+
+/// The birthday block's header time, read off the running node once its headers cover the
+/// birthday: the display value behind `getwalletinfo`'s `birthday.time`. The header tree
+/// never holds its own anchor (see [`resolve_birthday_anchor`]), so a birthday that *is*
+/// the recorded anchor is fetched as a block by its hash instead - one download, once. A
+/// birthday the tree covers neither way (it sits at an anchor-less scan start) is given up
+/// on rather than polled forever; the caller's offline fallbacks stand. `None` also when
+/// the node stops (the next connect spawns a fresh task).
+async fn resolve_birthday_time(
+    requester: Requester,
+    birthday: u32,
+    anchor: Option<BirthdayAnchor>,
+) -> Option<u64> {
+    loop {
+        tokio::time::sleep(ANCHOR_POLL_INTERVAL).await;
+        let tip = match requester.chain_tip().await {
+            Ok(tip) => tip,
+            Err(_) => return None,
+        };
+        if tip.height < birthday {
+            continue;
+        }
+        if let Some(header) = header_at(&requester, birthday).await {
+            return Some(u64::from(header.time));
+        }
+        match anchor {
+            Some((height, hash)) if height == birthday => match requester.get_block(hash).await {
+                Ok(indexed) => return Some(u64::from(indexed.block.header.time)),
+                Err(_) => continue,
+            },
+            _ => return None,
+        }
+    }
 }
 
 /// Resolve the wallet's birthday to a `(height, hash)` anchor against the light client's
@@ -835,9 +889,29 @@ pub struct KyotoConn {
     /// [`resolve_birthday_anchor`]): the channel its result arrives on plus the task
     /// itself, taken on delivery and aborted with the connection otherwise.
     anchor: Option<(oneshot::Receiver<BirthdayAnchor>, JoinHandle<()>)>,
+    /// The birthday block-time resolution ([`resolve_birthday_time`]), when this connect
+    /// launched one - polled like the anchor's.
+    birthday_time: Option<(oneshot::Receiver<u64>, JoinHandle<()>)>,
 }
 
 impl KyotoConn {
+    /// The birthday block's header time, once the resolution task has it; `None` while it
+    /// is still waiting or once it has given up.
+    pub fn try_resolved_birthday_time(&mut self) -> Option<u64> {
+        let (rx, _task) = self.birthday_time.as_mut()?;
+        match rx.try_recv() {
+            Ok(time) => {
+                self.birthday_time.take();
+                Some(time)
+            }
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.birthday_time.take();
+                None
+            }
+        }
+    }
+
     /// The next completed sync, or `None` when the client has not reached tip since the last
     /// one. Never blocks - the awaiting happens in the bridge task.
     ///
@@ -1327,6 +1401,7 @@ mod tests {
             height,
             time: None,
             anchor: None,
+            block_time: None,
         }
     }
 

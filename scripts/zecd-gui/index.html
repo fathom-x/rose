@@ -18,7 +18,7 @@
   h1 { font-size: 1.1rem; margin: 0; color: var(--accent); }
   header { display: flex; justify-content: space-between; align-items: baseline;
            flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
-  #chaininfo { color: var(--dim); font-size: .85rem; }
+  #st-hash { padding-left: 1.25rem; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
           gap: 1rem; margin-bottom: 1rem; }
   .card { background: var(--panel); border: 1px solid var(--line);
@@ -73,10 +73,6 @@
                 font-size: .75rem; line-height: 1.3; font-weight: 400; }
   button.copy:hover { color: var(--accent); border-color: var(--accent); }
   button.copy.done { color: var(--good); border-color: var(--good); }
-  #watchonly { display: none; background: #3a2e00; border: 1px solid var(--accent);
-               border-radius: 8px; padding: .75rem 1rem; margin-bottom: 1rem; }
-  #watchonly b { color: var(--accent); }
-  body.watchonly #watchonly { display: block; }
   body.watchonly #sendcard { opacity: .55; }
 </style>
 </head>
@@ -86,14 +82,8 @@
     <h1>&#9679; zecd &middot; bitcoin wallet</h1>
     <div id="cfgbadge" class="sub" style="margin-top:.2rem">&ndash;</div>
   </div>
-  <div id="chaininfo"><span class="dot" id="conn"></span><span id="chaintext">connecting&hellip;</span></div>
 </header>
 
-<div id="watchonly" role="status">
-  <b>Watch-only wallet.</b> This wallet was built from an imported xpub and holds no
-  spending keys: balances, addresses and history are live, <b>sending is disabled here</b>.
-  Spend from the paired spending wallet.
-</div>
 
 <div class="grid">
   <div class="card">
@@ -111,6 +101,19 @@
     </div>
     <div id="addr"></div>
     <div class="msg" id="addrmsg"></div>
+  </div>
+
+  <!-- Where the wallet stands on the chain: its own synced height (what getblockcount
+       answers for this wallet), and the birthday its history starts from - the recorded
+       height, the anchor a kyoto first scan actually started at when it differs, and the
+       birthday's calendar date (zecd's getwalletinfo `birthday` extension). -->
+  <div class="card" id="statuscard">
+    <h2>Status</h2>
+    <span class="sub"><span class="dot" id="conn"></span> <span id="chaintext">connecting...</span></span>
+    <span class="sub">block height: <span id="st-height">&ndash;</span></span>
+    <span class="sub" id="st-hash"></span>
+    <span class="sub">birthday height: <span id="st-birthday">&ndash;</span></span>
+    <span class="sub">birthdate: <span id="st-birthdate">&ndash;</span></span>
   </div>
 
   <div class="card" id="sendcard" style="grid-column: 1 / -1">
@@ -304,16 +307,41 @@ async function refresh() {
     $("conn").className = "dot ok";
     // upstream_connected is zecd's per-wallet signal for the chain source; false means a
     // hung or unreachable node has been noticed and the heights shown are the last known.
-    const upstream = info.upstream_connected === false ? " · upstream disconnected" : "";
-    // The tip hash by its tail: a mainnet hash opens with ~19 zeros of proof of work, so a
-    // leading prefix shows nothing distinguishing. The full hash rides on the tooltip.
-    // The tail sits in its own span carrying the full hash as a tooltip, with the shared
-    // copy button beside it (the document-level click handler covers it). Height, hash and
-    // the fixed suffix are all safe to inline; the hash is validated hex.
-    const tail = /^[0-9a-f]{64}$/.test(hash || "")
+    $("chaintext").textContent =
+      info.upstream_connected === false ? "disconnected" : "connected";
+    // The Status card. The tip hash by its tail: a mainnet hash opens with ~19 zeros of
+    // proof of work, so a leading prefix shows nothing distinguishing; the full hash rides on
+    // the tooltip, with the shared copy button beside it (the document-level click handler
+    // covers it). Height, hash and the fixed suffix are all safe to inline; the hash is
+    // validated hex.
+    $("st-height").textContent = Number(height);
+    $("st-hash").innerHTML = /^[0-9a-f]{64}$/.test(hash || "")
       ? `<span title="${hash}">...${hash.slice(-12)}</span>${copyBtn(hash)}`
       : "";
-    $("chaintext").innerHTML = `wallet height ${Number(height)} · ${tail}${upstream}`;
+    // The wallet birthday (zecd's getwalletinfo extension): the recorded height, and - on
+    // kyoto - the anchor the first scan actually started from once resolved, which is the
+    // block that decides how much history this wallet can have seen. The date is the
+    // birthday's UTC day when zecd knows it (the operator's, or the shipped table's).
+    const b = info.birthday || {};
+    if (Number.isInteger(b.height)) {
+      const a = b.anchor;
+      const anchorNote = a && Number.isInteger(a.height) && a.height !== b.height
+        ? ` (anchor ${a.height})` : "";
+      const tip = a && /^[0-9a-f]{64}$/.test(a.hash || "")
+        ? `scan anchor ${a.height} ${a.hash}` : "no scan anchor recorded yet";
+      $("st-birthday").innerHTML = `<span title="${tip}">${b.height}${anchorNote}</span>`;
+      if (Number.isInteger(b.time)) {
+        const iso = new Date(b.time * 1000).toISOString();
+        $("st-birthdate").textContent = iso.slice(0, 10) + " (UTC)";
+        $("st-birthdate").title = iso.replace("T", " ").slice(0, 19) + " UTC";
+      } else {
+        $("st-birthdate").textContent = "unknown";
+        $("st-birthdate").title = "";
+      }
+    } else {
+      $("st-birthday").textContent = "\u2013";
+      $("st-birthdate").textContent = "\u2013";
+    }
 
     // A fee belongs to the transaction as a whole (the surplus of its inputs over its
     // outputs), not to any recipient row - Core merely repeats the transaction's `fee` on

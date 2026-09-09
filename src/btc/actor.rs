@@ -155,8 +155,11 @@ pub struct BtcDescriptor {
     /// The end of the range the wallet currently watches: `next_index` plus the keychain's
     /// lookahead - Core's `range[1]`, the keypool analogue.
     pub range_end: u32,
-    /// Core's `timestamp` (the descriptor's birth time): the wallet's recorded birthday time
-    /// when `init` was given a date, else 0.
+    /// Core's `timestamp` (the descriptor's birth time, the point a rescan starts from): the
+    /// birthday block's own time once the chain source has answered, else the operator's
+    /// recorded birthday date when `init` kept one, else the UTC midnight of the day the
+    /// shipped per-day table places the birthday height in (mainnet; at or before the
+    /// block's own time, so a rescan from it cannot miss the birthday block), else 0.
     pub timestamp: u64,
 }
 
@@ -223,6 +226,18 @@ pub struct BtcSyncStatus {
     pub synced_height: u32,
     /// The hash at `synced_height` (display order).
     pub synced_hash: String,
+    /// The resolved birthday anchor - the `(height, hash)` checkpoint a kyoto first scan
+    /// starts from - once one exists: recorded by `init`, or by the first sync's own
+    /// resolution against the light client's headers (which is why it rides the status
+    /// channel rather than the static handle: it can appear at runtime). `None` until then,
+    /// and always `None` for a bitcoind-backed wallet, whose emitter starts from the
+    /// birthday by height. Reported by `getwalletinfo` as `birthday.anchor`.
+    pub birthday_anchor: Option<(u32, String)>,
+    /// The birthday block's header time, once the chain source has answered: one
+    /// `getblockheader` at connect over bitcoind, the header (or the anchor block) off the
+    /// light client once its headers cover the birthday over kyoto. `None` until then.
+    /// `getwalletinfo` prefers it for `birthday.time` over the offline record.
+    pub birthday_block_time: Option<u64>,
 }
 
 enum BtcCommand {
@@ -296,6 +311,15 @@ pub struct BtcWalletHandle {
     /// from an imported account xpub, so `getwalletinfo` reports `private_keys_enabled`
     /// (and `listunspent` its `spendable`) from the same signal the Zcash side does.
     pub has_seed: bool,
+    /// The recorded birthday height (`keys.toml`): where a rebuild scans from, and on kyoto
+    /// what the recovery floor and anchor resolution are derived from.
+    pub birthday: u32,
+    /// The birthday as a date (unix seconds of a UTC midnight), when one is known: the
+    /// operator's `--birthday` date when `init` kept one for the first sync to refine (see
+    /// `WalletStore::birthday_time`), else the day the shipped per-day table places the
+    /// birthday height in (mainnet; at or before the block's own time). `None` off-table.
+    /// Display only - the actor's own resolution target stays the operator's date alone.
+    pub birthday_time: Option<u64>,
     cmd_tx: mpsc::Sender<BtcCommand>,
     status_rx: watch::Receiver<BtcSyncStatus>,
 }
@@ -560,7 +584,12 @@ pub fn spawn(
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
-    let (status_tx, status_rx) = watch::channel(status_of(&wallet, BtcConnState::Down));
+    let (status_tx, status_rx) = watch::channel(status_of(
+        &wallet,
+        BtcConnState::Down,
+        birthday_anchor.as_ref(),
+        None,
+    ));
     let span = info_span!("wallet", name = %name);
     let actor = BtcActor {
         wallet,
@@ -573,6 +602,7 @@ pub fn spawn(
         birthday,
         birthday_time,
         birthday_anchor,
+        birthday_block_time: None,
         conn: None,
         at_tip: false,
         backoff: Backoff::new(reconnect_base, reconnect_max),
@@ -593,6 +623,9 @@ pub fn spawn(
             name,
             network,
             has_seed,
+            birthday,
+            birthday_time: birthday_time
+                .or_else(|| crate::btc::birthdays::day_start_for_height(network, birthday)),
             cmd_tx,
             status_rx,
         },
@@ -638,6 +671,9 @@ struct BtcActor {
     /// loaded from the engine database at spawn, updated in place when the resolution task
     /// delivers one mid-sync.
     birthday_anchor: Option<(u32, bdk_wallet::bitcoin::BlockHash)>,
+    /// See [`BtcSyncStatus::birthday_block_time`]; resolved once per actor life, on the
+    /// first connection that can answer, and kept across reconnects.
+    birthday_block_time: Option<u64>,
     conn: Option<Conn>,
     /// Whether the last sync pass reached the upstream's tip (drives Ready vs Syncing).
     at_tip: bool,
@@ -668,12 +704,19 @@ struct BtcActor {
     shutdown: watch::Receiver<bool>,
 }
 
-fn status_of(wallet: &Wallet, conn_state: BtcConnState) -> BtcSyncStatus {
+fn status_of(
+    wallet: &Wallet,
+    conn_state: BtcConnState,
+    birthday_anchor: Option<&(u32, bdk_wallet::bitcoin::BlockHash)>,
+    birthday_block_time: Option<u64>,
+) -> BtcSyncStatus {
     let cp = wallet.latest_checkpoint();
     BtcSyncStatus {
         conn_state,
         synced_height: cp.height(),
         synced_hash: cp.hash().to_string(),
+        birthday_anchor: birthday_anchor.map(|(height, hash)| (*height, hash.to_string())),
+        birthday_block_time,
     }
 }
 
@@ -778,6 +821,8 @@ impl BtcActor {
         };
         let mut reached_tip = false;
         let mut resolved_anchor = None;
+        // The birthday block's time, for display, when a kyoto connect resolved it this pass.
+        let mut resolved_time: Option<u64> = None;
         let result = match conn {
             // Bitcoind: a bounded blocking pull. The emitter's RPC calls block, so relocate
             // the worker's other tasks for the duration, exactly as the Zcash scan does.
@@ -831,6 +876,7 @@ impl BtcActor {
                     self.header_sync_failures = 0;
                     // No mempool view on this backend: the rebroadcast pass cannot filter.
                     self.node_mempool = None;
+                    resolved_time = kyoto.try_resolved_birthday_time();
                     self.wallet
                         .apply_update(update)
                         .map_err(|e| anyhow::anyhow!("apply kyoto update: {e}"))
@@ -843,6 +889,7 @@ impl BtcActor {
                 // checkpoint that retires the whole mechanism).
                 Ok(None) => {
                     resolved_anchor = kyoto.try_resolved_anchor();
+                    resolved_time = kyoto.try_resolved_birthday_time();
                     Ok(0)
                 }
                 // The node parked itself on a rejected header batch: count it, so the
@@ -854,6 +901,9 @@ impl BtcActor {
                 Err(e) => Err(anyhow::anyhow!(e)),
             },
         };
+        if let Some(time) = resolved_time {
+            self.birthday_block_time = Some(time);
+        }
         // Act on a resolved anchor only while the wallet is still checkpoint-less: the
         // resolution races the first update, and if an earlier pass applied one, the scan
         // is done - restarting a synced light client would tear down a healthy connection
@@ -883,8 +933,12 @@ impl BtcActor {
             // anchor up.
             self.conn = None;
             self.at_tip = false;
-            self.status_tx
-                .send_replace(status_of(&self.wallet, BtcConnState::Syncing));
+            self.status_tx.send_replace(status_of(
+                &self.wallet,
+                BtcConnState::Syncing,
+                self.birthday_anchor.as_ref(),
+                self.birthday_block_time,
+            ));
             return true;
         }
         match result {
@@ -898,7 +952,12 @@ impl BtcActor {
                 } else {
                     BtcConnState::Syncing
                 };
-                let status = status_of(&self.wallet, state);
+                let status = status_of(
+                    &self.wallet,
+                    state,
+                    self.birthday_anchor.as_ref(),
+                    self.birthday_block_time,
+                );
                 if applied > 0 {
                     debug!(
                         blocks = applied,
@@ -959,6 +1018,7 @@ impl BtcActor {
                     height: self.birthday,
                     time: self.birthday_time,
                     anchor: self.birthday_anchor,
+                    block_time: self.birthday_block_time,
                 };
                 let resync = crate::btc::kyoto::resync_depth(self.header_sync_failures);
                 e.connect(&self.wallet, &birthday, resync).map(|kyoto| {
@@ -973,6 +1033,16 @@ impl BtcActor {
         };
         match dial {
             Ok(conn) => {
+                // The birthday block's time, for display, from a node that can answer it
+                // directly - once, on the first connect that succeeds (a birthday above the
+                // node's tip, or a failed call, simply leaves it for the next connect).
+                if self.birthday_block_time.is_none() {
+                    if let Conn::Bitcoind { rpc, .. } = &conn {
+                        let birthday = self.birthday;
+                        self.birthday_block_time =
+                            tokio::task::block_in_place(|| rpc.block_time_blocking(birthday)).ok();
+                    }
+                }
                 self.conn = Some(conn);
                 self.at_tip = false;
                 // A fresh connection rebroadcasts once at its first tip, whatever the hash.
@@ -980,8 +1050,12 @@ impl BtcActor {
                 self.node_mempool = None;
                 self.backoff.reset();
                 self.reconnect_warned = false;
-                self.status_tx
-                    .send_replace(status_of(&self.wallet, BtcConnState::Syncing));
+                self.status_tx.send_replace(status_of(
+                    &self.wallet,
+                    BtcConnState::Syncing,
+                    self.birthday_anchor.as_ref(),
+                    self.birthday_block_time,
+                ));
                 true
             }
             Err(e) => {
@@ -993,8 +1067,12 @@ impl BtcActor {
                     self.reconnect_warned = true;
                 }
                 self.next_attempt = Instant::now() + delay;
-                self.status_tx
-                    .send_replace(status_of(&self.wallet, BtcConnState::Down));
+                self.status_tx.send_replace(status_of(
+                    &self.wallet,
+                    BtcConnState::Down,
+                    self.birthday_anchor.as_ref(),
+                    self.birthday_block_time,
+                ));
                 false
             }
         }
@@ -1006,8 +1084,12 @@ impl BtcActor {
         self.rebroadcast_tip = None;
         self.node_mempool = None;
         self.next_attempt = Instant::now() + self.backoff.next_delay();
-        self.status_tx
-            .send_replace(status_of(&self.wallet, BtcConnState::Down));
+        self.status_tx.send_replace(status_of(
+            &self.wallet,
+            BtcConnState::Down,
+            self.birthday_anchor.as_ref(),
+            self.birthday_block_time,
+        ));
     }
 
     /// Resubmit the wallet's unconfirmed transactions to the upstream. See the module doc for
@@ -1128,7 +1210,12 @@ impl BtcActor {
             } else {
                 BtcConnState::Syncing
             };
-            self.status_tx.send_replace(status_of(&self.wallet, state));
+            self.status_tx.send_replace(status_of(
+                &self.wallet,
+                state,
+                self.birthday_anchor.as_ref(),
+                self.birthday_block_time,
+            ));
         }
     }
 
@@ -1367,7 +1454,13 @@ impl BtcActor {
                     internal: keychain == KeychainKind::Internal,
                     next_index,
                     range_end: next_index.saturating_add(lookahead),
-                    timestamp: self.birthday_time.unwrap_or(0),
+                    timestamp: self
+                        .birthday_block_time
+                        .or(self.birthday_time)
+                        .unwrap_or_else(|| {
+                            crate::btc::birthdays::day_start_for_height(self.network, self.birthday)
+                                .unwrap_or(0)
+                        }),
                 }
             })
             .collect()
@@ -1912,8 +2005,12 @@ impl BtcActor {
             self.at_tip = false;
             self.rebroadcast_tip = None;
             self.node_mempool = None;
-            self.status_tx
-                .send_replace(status_of(&self.wallet, BtcConnState::Syncing));
+            self.status_tx.send_replace(status_of(
+                &self.wallet,
+                BtcConnState::Syncing,
+                self.birthday_anchor.as_ref(),
+                self.birthday_block_time,
+            ));
             info!(
                 %txid,
                 "restarting the light client so its broadcast queue forgets the abandoned \

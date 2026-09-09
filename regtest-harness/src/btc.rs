@@ -462,7 +462,16 @@ impl ZecdBtc {
                 &self.rpc_port.to_string(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(match std::env::var_os("ZECD_REGTEST_BTC_LOG") {
+                // Debug hook: ZECD_REGTEST_BTC_LOG=<dir> keeps each daemon's stderr as
+                // <dir>/zecd-<rpc port>.log (the port makes a rerun's files distinct).
+                Some(dir) => std::fs::File::create(
+                    std::path::Path::new(&dir).join(format!("zecd-{}.log", self.rpc_port)),
+                )
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::null()),
+                None => Stdio::null(),
+            })
             .spawn()
             .expect("spawn zecd");
         self.proc = Some(KillOnDrop(proc));

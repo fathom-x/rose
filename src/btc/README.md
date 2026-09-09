@@ -206,7 +206,14 @@ The two backends differ here as they do elsewhere:
   waits on an **own unconfirmed parent**: a conflict spent the inputs and confirmed, the
   transaction can never confirm as things stand, so it is marked evicted - a send's inputs
   are freed, a dead receive stops counting toward the unconfirmed balance (BDK evictions
-  are not final: a later block or mempool sighting re-canonicalizes the transaction). The
+  are not final: a later block or mempool sighting re-canonicalizes the transaction).
+  **Except when the receive's own block reorged out**: BDK keeps a transaction whose
+  anchor left the best chain canonical no matter what evictions are applied, so a
+  reorged-out receive double-spent by a conflict the wallet never sees stays pending for
+  good - on both backends, and over kyoto without even a verdict (the conflict spends the
+  sender's outputs, so no wallet script is in its block). The reorg suite's module doc has the analysis, the
+  probe pinning BDK's behaviour, and the persistence-level retirement that fixes it;
+  `regtest_btc_reorg`'s kyoto leg pins the gap until then. The
   same text on a child of an own unconfirmed send is a dependency, not a conflict, and just
   waits for the parent. Everything else retries at the next tip: `non-final` (the reorg case, which
   clears by itself when the locktime height arrives) quietly, any other policy rejection

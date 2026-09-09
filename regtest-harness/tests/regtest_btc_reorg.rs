@@ -19,13 +19,29 @@
 //! three-block tail until the replacement chain outgrows it at 104, resubmits there, and
 //! the send confirms in 105.
 //!
-//! The bitcoind leg then goes one step further: a receive whose block is orphaned and whose
-//! inputs the sender then spends elsewhere, confirming the conflict. The wallet resubmits
-//! received payments too (Core's rule, so a sender whose wallet never rebroadcasts cannot
-//! leave the recipient waiting), which is exactly why a merely-forgotten receive would come
-//! back; a double-spent one cannot, and the wallet must recognise that - the payment is
-//! evicted rather than resubmitted at every tip forever - and leave the confirmed balance
-//! and the UTXO set as they were before it arrived. The orphaned output is not money.
+//! Both legs then go one step further: a receive whose block is orphaned and whose inputs
+//! the sender then spends elsewhere, confirming the conflict. The wallet resubmits received
+//! payments too (Core's rule, so a sender whose wallet never rebroadcasts cannot leave the
+//! recipient waiting), which is exactly why a merely-forgotten receive would come back; a
+//! double-spent one cannot, and the wallet must recognise that - the payment is evicted
+//! rather than resubmitted at every tip forever - and leave the confirmed balance and the
+//! UTXO set as they were before it arrived. The orphaned output is not money. That holds
+//! over bitcoind, though not for the reason the step was written for: the node's wallet
+//! pays the orphan from change on the funding transaction, which also paid us, so the
+//! conflict spending that change is a relevant transaction to BDK and canonicalization
+//! retires the orphan on its own. A conflict funded from an output the wallet never held
+//! is invisible, and BDK ignores evictions of a transaction whose anchor reorged out - so
+//! over kyoto, where there is no mempool and no verdict either, the payment stays pending
+//! for good. The kyoto leg **pins that gap**: the assertion flips when the
+//! persistence-level retirement lands.
+//!
+//! The second flow (`chained_flow`) reorgs **two sends in a chain** - the child spends the
+//! parent's confirmed change - below both of their locktimes, so both drop from the node at
+//! once. Resubmission is then parents first and each transaction only once its own locktime
+//! is final: over bitcoind the parent goes straight back at the replacement 102 while the
+//! child draws a non-final verdict and waits for the next tip; over kyoto both are
+//! re-announced once the light client reorgs, in whatever order the peer asks, and the
+//! node's orphan handling pulls the parent for a child that arrived first.
 //!
 //! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
@@ -43,6 +59,177 @@ async fn btc_wallet_follows_a_reorg_over_bitcoind() {
 #[tokio::test(flavor = "multi_thread")]
 async fn btc_wallet_follows_a_reorg_over_kyoto() {
     reorg_flow(BtcBackend::Kyoto).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn btc_wallet_resubmits_chained_sends_after_a_reorg_over_bitcoind() {
+    chained_flow(BtcBackend::Bitcoind).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn btc_wallet_resubmits_chained_sends_after_a_reorg_over_kyoto() {
+    chained_flow(BtcBackend::Kyoto).await;
+}
+
+/// Two sends in a chain, both reorged below their locktimes - see the module doc.
+async fn chained_flow(backend: BtcBackend) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(bitcoind) = provisioned(dir.path()) else {
+        return;
+    };
+    let node = BitcoinD::start(&bitcoind, &dir.path().join("btcdata")).await;
+    node.mine(101).await;
+
+    let mut zecd = ZecdBtc::prepare(dir.path().join("zecddata"), backend, &node, &["btc"]);
+    zecd.init_ok("btc", &["--birthday", "0"]);
+    zecd.start().await;
+    zecd.wait_height(101).await;
+
+    // 1. Fund at 102. The parent send is built at tip 102 (nLockTime 102) and confirms at
+    //    103; the child is built at tip 103 (nLockTime 103) spending the parent's confirmed
+    //    change - the wallet's only output - and confirms at 104.
+    let addr = zecd
+        .call("getnewaddress", json!([]))
+        .await
+        .expect("getnewaddress");
+    let addr = addr.as_str().unwrap().to_string();
+    let fund_txid = node
+        .call("sendtoaddress", json!([addr, 1.0]))
+        .await
+        .expect("fund");
+    let fund_txid_str = fund_txid.as_str().unwrap().to_string();
+    let old_102 = node.mine(1).await.remove(0);
+    zecd.wait_height(102).await;
+    zecd.wait_wallet_balance("btc", 1.0).await;
+    let miner = node.new_address().await;
+    let parent_txid = zecd
+        .call(
+            "sendtoaddress",
+            json!([miner, 0.25, null, null, false, null, null, null, null, 2]),
+        )
+        .await
+        .expect("parent send");
+    let parent_txid_str = parent_txid.as_str().unwrap().to_string();
+    let old_103 = node.mine(1).await.remove(0);
+    zecd.wait_height(103).await;
+    zecd.wait_wallet_best_hash("btc", &old_103).await;
+    let child_txid = zecd
+        .call(
+            "sendtoaddress",
+            json!([miner, 0.1, null, null, false, null, null, null, null, 2]),
+        )
+        .await
+        .expect("child send");
+    let child_txid_str = child_txid.as_str().unwrap().to_string();
+    let child = node
+        .call("getrawtransaction", json!([child_txid, true]))
+        .await
+        .expect("decode the child");
+    assert!(
+        child["vin"]
+            .as_array()
+            .expect("vin")
+            .iter()
+            .any(|vin| vin["txid"] == parent_txid),
+        "the child spends the parent's change: {child}"
+    );
+    let old_104 = node.mine(1).await.remove(0);
+    zecd.wait_height(104).await;
+    zecd.wait_wallet_best_hash("btc", &old_104).await;
+    let balance = zecd
+        .call("getbalance", json!([]))
+        .await
+        .expect("getbalance");
+    let balance = balance.as_f64().unwrap();
+    assert!(balance > 0.649 && balance < 0.65, "{balance}");
+
+    // 2. Reorg below both locktimes: drop 102 (and 103, 104 above it). The funding receive
+    //    returns to the node's mempool; the parent (nLockTime 102) and the child (103) are
+    //    both non-final at height 101 and dropped. The replacement 102 re-mines the receive.
+    node.call("invalidateblock", json!([old_102]))
+        .await
+        .expect("invalidateblock");
+    assert_eq!(node.height().await, 101);
+    let mempool = node.mempool().await;
+    assert!(mempool.contains(&fund_txid_str), "{mempool:?}");
+    assert!(!mempool.contains(&parent_txid_str), "{mempool:?}");
+    assert!(!mempool.contains(&child_txid_str), "{mempool:?}");
+    let replacement_miner = node.new_address().await;
+    let replacement_102 = node.mine_to(&replacement_miner, 1).await.remove(0);
+    assert_ne!(replacement_102, old_102);
+    assert!(node.mempool().await.is_empty(), "the receive was re-mined");
+
+    // 3. Resubmission, parents first, each once its own locktime is final.
+    let (parent_block, parent_height, child_block, child_height) = match backend {
+        BtcBackend::Bitcoind => {
+            // The emitter mirrors the invalidation: at the replacement 102 the wallet
+            // unconfirms both sends and resubmits. The parent is final for block 103 and
+            // goes straight back; the child is not (its locktime is 103), the node answers
+            // non-final, and the pass retries it at the next tip - so it must NOT be in the
+            // mempool yet, and must be once 103 exists.
+            zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+                .await;
+            node.wait_mempool_contains(&parent_txid_str).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mempool = node.mempool().await;
+            assert!(
+                !mempool.contains(&child_txid_str),
+                "the child (nLockTime 103) is non-final at 102 and must wait: {mempool:?}"
+            );
+            let replacement_103 = node.mine_to(&replacement_miner, 1).await.remove(0);
+            assert!(node.mempool().await.is_empty(), "the parent was re-mined");
+            zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+                .await;
+            node.wait_mempool_contains(&child_txid_str).await;
+            let replacement_104 = node.mine_to(&replacement_miner, 1).await.remove(0);
+            (replacement_103, 103u64, replacement_104, 104u64)
+        }
+        BtcBackend::Kyoto => {
+            // A light client follows work: the replacement chain has to outgrow the old
+            // four-block tail (102..104) before the wallet reorgs, so nothing is resubmitted
+            // until the replacement 105. By then both locktimes are final; both are
+            // re-announced on detached tasks in no particular order, and a child the node
+            // hears first sits in its orphanage until the parent arrives.
+            node.mine_to(&replacement_miner, 3).await;
+            zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+                .await;
+            node.wait_mempool_contains(&parent_txid_str).await;
+            node.wait_mempool_contains(&child_txid_str).await;
+            let replacement_106 = node.mine_to(&replacement_miner, 1).await.remove(0);
+            (replacement_106.clone(), 106u64, replacement_106, 106u64)
+        }
+    };
+    assert!(node.mempool().await.is_empty(), "the chain was re-mined");
+    let tip = node.height().await;
+
+    // 4. The wallet converges on the node: every transaction re-anchored in its
+    //    replacement block, the balance and the UTXO set as before the reorg.
+    zecd.wait_height(tip).await;
+    zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+        .await;
+    zecd.wait_wallet_balance("btc", balance).await;
+    for (txid, hash, height) in [
+        (&fund_txid, &replacement_102, 102u64),
+        (&parent_txid, &parent_block, parent_height),
+        (&child_txid, &child_block, child_height),
+    ] {
+        let tx = zecd
+            .call("gettransaction", json!([txid]))
+            .await
+            .expect("gettransaction after the reorg");
+        assert_eq!(tx["blockhash"], json!(hash), "{tx}");
+        assert_eq!(tx["confirmations"], json!(tip - height + 1), "{tx}");
+    }
+    let unspent = zecd
+        .call("listunspent", json!([]))
+        .await
+        .expect("listunspent after the reorg");
+    assert_eq!(
+        unspent.as_array().map(Vec::len),
+        Some(1),
+        "only the child's change: {unspent}"
+    );
+    assert_eq!(unspent[0]["txid"], child_txid, "{unspent}");
 }
 
 async fn reorg_flow(backend: BtcBackend) {
@@ -201,21 +388,27 @@ async fn reorg_flow(backend: BtcBackend) {
         "{next}"
     );
 
-    if backend != BtcBackend::Bitcoind {
-        return;
-    }
-
     // 4. An orphaned receive whose sender double-spends it. Confirm a second receive at
-    //    105 and invalidate its block: the payment falls back into the node's mempool (and
-    //    the wallet, which resubmits received payments too, would keep it there). Then the
-    //    sender - the node's wallet - spends the same inputs to the miner with a fee no
-    //    replacement rule can refuse, and that conflict confirms in the new 105. The wallet
-    //    must end with the payment evicted: gone from `gettransaction`, the unconfirmed
-    //    balance back at zero, the confirmed balance and UTXO set as before it arrived.
-    //    Either of two paths gets it there and the test does not care which - the emitter's
-    //    mempool pass reports the eviction if the wallet had seen the payment in the mempool
-    //    after the invalidation, and otherwise the rebroadcast pass draws a missing-inputs
-    //    verdict from the node and marks it evicted itself.
+    //    the next height and invalidate its block: the payment falls back into the node's
+    //    mempool (and the wallet, which resubmits received payments too, would keep it
+    //    there). Then the sender - the node's wallet - spends the same inputs to the miner
+    //    with a fee no replacement rule can refuse, and that conflict confirms in the
+    //    replacement block. The wallet must end with the payment evicted: gone from
+    //    `gettransaction`, the unconfirmed balance back at zero, the confirmed balance and
+    //    UTXO set as before it arrived. Over bitcoind either of two paths gets it there and
+    //    the test does not care which - the emitter's mempool pass reports the eviction if
+    //    the wallet had seen the payment in the mempool after the invalidation, and
+    //    otherwise the rebroadcast pass draws a missing-inputs verdict from the node and
+    //    marks it evicted itself - though neither is what actually retires it here: the
+    //    node's wallet funds the orphan from its change on the funding transaction, which
+    //    the wallet holds in full because it paid us, so the conflict spending that change
+    //    is relevant to BDK and canonicalization retires the orphan by itself (see the
+    //    module doc). Over kyoto the conflict is invisible: it spends the
+    //    *sender's* outputs and pays the miner, so no wallet script is in its block and the
+    //    light client never fetches it; and BDK keeps a transaction whose anchor reorged
+    //    out canonical no matter what evictions are applied. So the kyoto leg pins the
+    //    gap: the payment is still pending after the conflict and the reorg depth.
+    let orphan_height = tip + 1;
     let orphan_txid = node
         .call("sendtoaddress", json!([addr, 0.5]))
         .await
@@ -225,13 +418,13 @@ async fn reorg_flow(backend: BtcBackend) {
         .call("getrawtransaction", json!([orphan_txid, true]))
         .await
         .expect("decode the second receive");
-    let old_105 = node.mine(1).await.remove(0);
-    zecd.wait_height(105).await;
+    let old_orphan_block = node.mine(1).await.remove(0);
+    zecd.wait_height(orphan_height).await;
     zecd.wait_wallet_balance("btc", balance + 0.5).await;
-    node.call("invalidateblock", json!([old_105]))
+    node.call("invalidateblock", json!([old_orphan_block]))
         .await
-        .expect("invalidateblock 105");
-    assert_eq!(node.height().await, 104);
+        .expect("invalidateblock the orphaned receive's block");
+    assert_eq!(node.height().await, orphan_height - 1);
     assert!(
         node.mempool().await.contains(&orphan_txid_str),
         "the orphaned receive is back in the node's mempool"
@@ -278,8 +471,11 @@ async fn reorg_flow(backend: BtcBackend) {
         !mempool.contains(&orphan_txid_str),
         "the orphaned receive was replaced: {mempool:?}"
     );
+    // Two replacement blocks: the conflict's, and one more so the replacement chain
+    // outgrows the orphaned tail (a light client reorgs on work, not on the operator's
+    // `invalidateblock`; the bitcoind emitter has already followed it).
     let replacement = node.mine_to(&replacement_miner, 2).await;
-    assert_ne!(replacement[0], old_105);
+    assert_ne!(replacement[0], old_orphan_block);
     assert!(node.mempool().await.is_empty(), "the conflict was mined");
     let conflict = node
         .call(
@@ -290,10 +486,38 @@ async fn reorg_flow(backend: BtcBackend) {
         .expect("the conflict is on chain");
     assert_eq!(conflict["blockhash"], json!(replacement[0]), "{conflict}");
 
-    zecd.wait_height(106).await;
+    zecd.wait_height(orphan_height + 1).await;
     zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
     zecd.wait_wallet_balance("btc", balance).await;
+    if backend == BtcBackend::Kyoto {
+        // THE GAP: the payment stays pending. Mine the regtest reorg depth
+        // (6) past the conflict, to the replacement miner so nothing pays the wallet, and
+        // it is still there - in the unconfirmed balance, in `gettransaction` at 0
+        // confirmations - while the confirmed balance and UTXO set are right. When the
+        // retirement lands, replace this block with the bitcoind leg's assertions below.
+        node.mine_to(&replacement_miner, 6).await;
+        zecd.wait_height(orphan_height + 7).await;
+        zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+            .await;
+        let pending = zecd
+            .call("getunconfirmedbalance", json!([]))
+            .await
+            .expect("getunconfirmedbalance");
+        assert_eq!(pending.as_f64(), Some(0.5), "pins the gap: {pending}");
+        let tx = zecd
+            .call("gettransaction", json!([orphan_txid]))
+            .await
+            .expect("the double-spent receive is still a wallet transaction (the gap)");
+        assert_eq!(tx["confirmations"], json!(0), "{tx}");
+        let unspent = zecd
+            .call("listunspent", json!([]))
+            .await
+            .expect("listunspent");
+        assert_eq!(unspent.as_array().map(Vec::len), Some(1), "{unspent}");
+        assert_eq!(unspent[0]["txid"], send_txid, "{unspent}");
+        return;
+    }
     zecd.wait_unconfirmed(0.0).await;
     let unspent = zecd
         .call("listunspent", json!([]))

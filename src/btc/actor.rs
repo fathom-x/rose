@@ -2514,4 +2514,107 @@ mod tests {
         );
         assert!(order_parents_first(Vec::new()).is_empty());
     }
+
+    /// Pins a BDK behaviour: a transaction whose anchor reorged out of
+    /// the best chain stays canonical as "unconfirmed" no matter what evictions are applied:
+    /// with no `last_seen`, seen-then-evicted after the reorg, or seen-then-evicted
+    /// before it. `bdk_chain`'s canonicalization routes such a transaction through its
+    /// leftover path, which never consults `last_evicted`. So neither the rebroadcast
+    /// pass's `-25` verdict nor a kyoto-side rule can retire a reorged-out receive whose
+    /// conflict the wallet has not seen; the fix is the persistence-level retirement the
+    /// issue describes. If this test starts failing, BDK changed - re-check the issue.
+    #[test]
+    fn bdk_keeps_a_reorged_out_transaction_canonical_despite_evictions() {
+        use bdk_wallet::bitcoin::block::{Header, Version};
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        use bdk_wallet::bitcoin::{
+            absolute, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, TxIn, TxMerkleNode,
+            TxOut, Txid, Witness,
+        };
+        use std::str::FromStr as _;
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let build = || {
+            Wallet::create(
+                keys.descriptor(KeychainKind::External),
+                keys.descriptor(KeychainKind::Internal),
+            )
+            .network(keys.network)
+            .create_wallet_no_persist()
+            .unwrap()
+        };
+        let block =
+            |prev: bdk_wallet::bitcoin::BlockHash, nonce: u32, txs: Vec<Transaction>| Block {
+                header: Header {
+                    version: Version::TWO,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time: 1_700_000_000 + nonce,
+                    bits: CompactTarget::from_consensus(0x207f_ffff),
+                    nonce,
+                },
+                txdata: txs,
+            };
+        // A receive confirmed at 3, then a reorg replacing 3 (and adding 4). `before`
+        // runs between confirmation and reorg, `after` once the reorg is applied.
+        let run = |before: &dyn Fn(&mut Wallet, &Transaction, Txid),
+                   after: &dyn Fn(&mut Wallet, &Transaction, Txid)| {
+            let mut wallet = build();
+            let addr = wallet.reveal_next_address(KeychainKind::External).address;
+            let receive = Transaction {
+                version: bdk_wallet::bitcoin::transaction::Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_str(&"22".repeat(32)).unwrap(), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_000_000),
+                    script_pubkey: addr.script_pubkey(),
+                }],
+            };
+            let txid = receive.compute_txid();
+            let b1 = block(wallet.latest_checkpoint().hash(), 1, vec![]);
+            wallet.apply_block(&b1, 1).unwrap();
+            let b2 = block(b1.block_hash(), 2, vec![]);
+            wallet.apply_block(&b2, 2).unwrap();
+            let b3 = block(b2.block_hash(), 3, vec![receive.clone()]);
+            wallet.apply_block(&b3, 3).unwrap();
+            assert_eq!(wallet.balance().confirmed, Amount::from_sat(50_000_000));
+            before(&mut wallet, &receive, txid);
+            let b3b = block(b2.block_hash(), 33, vec![]);
+            wallet.apply_block(&b3b, 3).unwrap();
+            let b4 = block(b3b.block_hash(), 4, vec![]);
+            wallet.apply_block(&b4, 4).unwrap();
+            after(&mut wallet, &receive, txid);
+            let balance = wallet.balance();
+            assert_eq!(balance.confirmed, Amount::ZERO);
+            let listed = wallet.transactions().any(|t| t.tx_node.txid == txid);
+            (balance.untrusted_pending, listed)
+        };
+        let pending = Amount::from_sat(50_000_000);
+        // Evicted with no last_seen at all.
+        assert_eq!(
+            run(&|_, _, _| {}, &|w, _, id| w
+                .apply_evicted_txs([(id, 1_800_000_000)])),
+            (pending, true)
+        );
+        // Seen, then evicted, both after the reorg.
+        assert_eq!(
+            run(&|_, _, _| {}, &|w, tx, id| {
+                w.apply_unconfirmed_txs([(tx.clone(), 1_800_000_001)]);
+                w.apply_evicted_txs([(id, 1_800_000_002)]);
+            }),
+            (pending, true)
+        );
+        // Seen while still anchored (bitcoind's ordering), evicted after the reorg.
+        assert_eq!(
+            run(
+                &|w, tx, _| w.apply_unconfirmed_txs([(tx.clone(), 1_700_000_100)]),
+                &|w, _, id| w.apply_evicted_txs([(id, 1_700_000_200)])
+            ),
+            (pending, true)
+        );
+    }
 }

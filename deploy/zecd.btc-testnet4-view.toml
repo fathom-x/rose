@@ -1,0 +1,47 @@
+# zecd on Bitcoin testnet4 over the kyoto (BIP-157) light client: a WATCH-ONLY sibling of
+# the bitcoind-backed wallet in zecd.btc-testnet4.toml, built from that wallet's exported
+# account xpub (`zecd --conf deploy/zecd.btc-testnet4.toml export-xpub --wallet btc`), and
+# peered with the same compose node's P2P port (which serves compact block filters:
+# -blockfilterindex + -peerblockfilters in deploy/docker-compose.btc-testnet4.yml).
+#
+# Purpose: run beside the bitcoind-backed daemon so the two backends can be compared on the
+# live chain - the same transactions, the same reorgs (scripts/btc-reorg-watch.py reads
+# both). Distinct datadir and ports so the two daemons coexist on one host.
+#
+#   zecd --conf deploy/zecd.btc-testnet4-view.toml init --wallet view \
+#       --xpub '[fingerprint/84h/1h/0h]tpub...' --birthday <height>
+#   ZECD_RPC_PASSWORD=... zecd --conf deploy/zecd.btc-testnet4-view.toml
+#
+# Nothing here can spend: no seed, no age identity. The first sync starts at the shipped
+# testnet4 scan floor (146000) and resolves the birthday to an anchor against the light
+# client's own headers.
+
+network = "test"
+btc_testnet = "testnet4"
+datadir = "./data-btc-testnet4-view"
+default_wallet = "view"
+
+[wallets.view]
+coin = "bitcoin"
+# The compose node's P2P port, as a pinned trusted peer (never a DNS name). Naming one peer
+# makes the light client whitelist-only: headers, filters and blocks all come from it.
+server = "kyoto://127.0.0.1:48333"
+
+[rpc]
+bind = "127.0.0.1"
+port = 48233
+user = "btc"
+# Refused as-is: set ZECD_RPC_PASSWORD in the environment (deploy/.env).
+password = "CHANGE-ME"
+
+[sync]
+interval_secs = 5
+
+[health]
+# /readyz is 200 once the light client reports the wallet at the tip; distinct from the
+# bitcoind-backed daemon's 49233.
+port = 49234
+
+[log]
+level = "info"
+format = "text"

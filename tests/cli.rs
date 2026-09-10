@@ -1396,10 +1396,11 @@ fn bitcoin_sample_configs() -> &'static [&'static str] {
     &[]
 }
 
-const BITCOIN_SAMPLE_CONFIGS: [&str; 4] = [
+const BITCOIN_SAMPLE_CONFIGS: [&str; 5] = [
     "deploy/zecd.btc-testnet3.toml",
     "deploy/zecd.btc-testnet4.toml",
     "deploy/zecd.btc-testnet4-kyoto.toml",
+    "deploy/zecd.btc-testnet4-view.toml",
     "deploy/zecd.btc-mainnet.toml",
 ];
 

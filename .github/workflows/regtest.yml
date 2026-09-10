@@ -514,7 +514,8 @@ jobs:
   # across a restart (regtest_btc), the same over the kyoto BIP-157 light client
   # (regtest_btc_kyoto), and three suites that run over BOTH chain sources: the watch-only
   # xpub pairing (regtest_btc_watchonly), restore from mnemonic (regtest_btc_restore), a
-  # live reorg (regtest_btc_reorg), and a hung node (regtest_btc_hang). Its own small job
+  # live reorg (regtest_btc_reorg), a hung node (regtest_btc_hang), and coinbase maturity
+  # on the read path (regtest_btc_coinbase). Its own small job
   # rather than a leg of the `regtest` matrix: it needs
   # neither zebra, nor the funder, nor the chain snapshot, and the matrix legs' zecd is the
   # default-feature build (where the same test self-skips by design). A debug zecd is
@@ -585,5 +586,5 @@ jobs:
           cargo test --locked --no-fail-fast \
             --test regtest_btc --test regtest_btc_kyoto \
             --test regtest_btc_watchonly --test regtest_btc_restore --test regtest_btc_reorg \
-            --test regtest_btc_hang \
+            --test regtest_btc_hang --test regtest_btc_coinbase \
             -- --nocapture

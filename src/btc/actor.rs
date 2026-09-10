@@ -58,6 +58,7 @@ use crate::btc::kyoto::{KyotoConn, KyotoFailure};
 use crate::btc::store::Persister;
 use crate::coin::BitcoinNetwork;
 use crate::error::{codes, RpcError};
+use bdk_wallet::bitcoin::constants::COINBASE_MATURITY;
 
 /// Command channel depth; matches the Zcash actor's order of magnitude.
 const COMMAND_BUFFER: usize = 64;
@@ -111,6 +112,13 @@ pub struct BtcUtxo {
     /// from a foreign sender. Always true once confirmed. Drives `listunspent.safe` and the
     /// `getbalance` trusted-funds rule.
     pub trusted: bool,
+    /// Whether the output is a coinbase reward (the wallet's address was a block's payout).
+    /// Never immature: `list_unspent` withholds a coinbase until it has
+    /// `COINBASE_MATURITY + 1` confirmations, exactly as Core's `listunspent` and depth-
+    /// filtered `getbalance` do - BDK's own `list_unspent` has no maturity filter, and
+    /// counting an unspendable reward as a spendable balance is a reporting
+    /// bug. `getbalances.mine.immature` is where the withheld value shows.
+    pub coinbase: bool,
 }
 
 /// What the engine knows about an address, for `getaddressinfo`-shaped reads.
@@ -1291,6 +1299,29 @@ impl BtcActor {
         self.wallet.latest_checkpoint().height()
     }
 
+    fn is_coinbase(&self, txid: Txid) -> bool {
+        self.wallet
+            .get_tx(txid)
+            .is_some_and(|wtx| wtx.tx_node.tx.is_coinbase())
+    }
+
+    /// Core's coinbase maturity rule, for the read path: a reward is immature until its
+    /// block has `COINBASE_MATURITY` blocks on top of it - `GetBlocksToMaturity` is
+    /// `COINBASE_MATURITY + 1 - depth`, so mature at 101 confirmations, immature at 100.
+    /// BDK's `balance()` (`bdk_chain::ChainPosition::is_confirmed_and_spendable`) calls it
+    /// mature one block earlier (a spend could enter the *next* block), so the actor
+    /// applies this rule itself on `listunspent` and the balance split rather than
+    /// inheriting a `getbalances` that disagrees with Core by a block. An unconfirmed
+    /// coinbase cannot exist.
+    fn coinbase_immature(&self, output: &bdk_wallet::LocalOutput) -> bool {
+        let bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } = &output.chain_position
+        else {
+            return false;
+        };
+        let depth = self.tip_height().saturating_sub(anchor.block_id.height) + 1;
+        depth <= COINBASE_MATURITY && self.is_coinbase(output.outpoint.txid)
+    }
+
     fn confirmations(&self, anchor_height: Option<u32>) -> u64 {
         match anchor_height {
             Some(h) => u64::from(self.tip_height().saturating_sub(h)) + 1,
@@ -1311,11 +1342,22 @@ impl BtcActor {
             }
             BtcCommand::Balance { reply } => {
                 let b = self.wallet.balance();
+                // Re-split confirmed/immature on Core's maturity rule: BDK calls a coinbase
+                // mature one block earlier than Core does (see `coinbase_immature`), so
+                // its `immature` bucket is one block short of what `getbalances` reports
+                // in Core's dialect. The two buckets sum to the same total either way.
+                let immature: u64 = self
+                    .wallet
+                    .list_unspent()
+                    .filter(|output| self.coinbase_immature(output))
+                    .map(|output| output.txout.value.to_sat())
+                    .sum();
                 let _ = reply.send(Ok(BtcBalance {
-                    confirmed: b.confirmed.to_sat(),
+                    confirmed: (b.confirmed.to_sat() + b.immature.to_sat())
+                        .saturating_sub(immature),
                     trusted_pending: b.trusted_pending.to_sat(),
                     untrusted_pending: b.untrusted_pending.to_sat(),
-                    immature: b.immature.to_sat(),
+                    immature,
                 }));
             }
             BtcCommand::ListUnspent { reply } => {
@@ -1333,14 +1375,18 @@ impl BtcActor {
                 let utxos = self
                     .wallet
                     .list_unspent()
-                    .map(|output| {
+                    .filter_map(|output| {
                         let confirmations = match &output.chain_position {
                             bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => {
                                 u64::from(tip.saturating_sub(anchor.block_id.height)) + 1
                             }
                             bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => 0,
                         };
-                        BtcUtxo {
+                        if self.coinbase_immature(&output) {
+                            return None;
+                        }
+                        let coinbase = self.is_coinbase(output.outpoint.txid);
+                        Some(BtcUtxo {
                             txid: output.outpoint.txid.to_string(),
                             vout: output.outpoint.vout,
                             amount_sat: output.txout.value.to_sat(),
@@ -1353,7 +1399,8 @@ impl BtcActor {
                             change: output.keychain == KeychainKind::Internal,
                             confirmations,
                             trusted: confirmations > 0 || own_txids.contains(&output.outpoint.txid),
-                        }
+                            coinbase,
+                        })
                     })
                     .collect();
                 let _ = reply.send(Ok(utxos));

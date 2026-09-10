@@ -1212,6 +1212,27 @@ async fn init_bitcoin_wallet(
         }
         None if restore => {
             let height = bip84_history_floor(btc_network);
+            // On mainnet the floor is ~485k blocks of filters, and on kyoto that scan
+            // persists nothing until it completes: an unfinished first
+            // sync starts over. Refuse rather than default there - the operator who
+            // really wants the floor names it (`--birthday 481824`), and a restore
+            // with a known date gets an offline anchor from the per-day table.
+            if btc_network == crate::coin::BitcoinNetwork::Main {
+                return Err(anyhow!(
+                    "wallet '{}': --birthday is required to {} on mainnet. Pass the date \
+                     (YYYY-MM-DD) or height of the wallet's first transaction - erring \
+                     early is safe, a later birthday misses funds - or --birthday {} to \
+                     scan every block since SegWit activation (a full history rescan; \
+                     over kyoto it must finish in one run before anything is persisted).",
+                    wallet,
+                    if imported.is_some() {
+                        "import an xpub"
+                    } else {
+                        "restore a seed"
+                    },
+                    height
+                ));
+            }
             warn!(
                 "no --birthday given; scanning from SegWit activation (height {height}) - a \
                  full history rescan that is slow on mainnet. Pass --birthday <height> at or \
@@ -2607,6 +2628,65 @@ mod tests {
             crate::btc::store::Persister::open(&config.wallets["btc"].engine_dir()).unwrap();
         assert_eq!(persister.load_birthday_anchor().unwrap(), None);
         assert!(outcome.generated_mnemonic.is_some());
+    }
+
+    /// A restore or an xpub import on **mainnet** without `--birthday` is refused: the alternative is a from-SegWit-activation scan that a kyoto wallet must finish
+    /// in one run. The refusal names the explicit floor and fires before anything is written;
+    /// the testnets keep the warned default.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_mainnet_restore_or_import_requires_a_birthday() {
+        use crate::btc::keys::tests::BIP84_MNEMONIC;
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"main\"\ndatadir = {:?}\n[bitcoind]\nserver = \"kyoto\"\n\
+                 [wallets.btc]\ncoin = \"bitcoin\"\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+        let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let config = AppConfig::resolve(&cli).unwrap();
+        let phrase = <Mnemonic<English>>::from_phrase(BIP84_MNEMONIC).unwrap();
+        let err = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Restore(MnemonicInput::Phrase(phrase)),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: None,
+            },
+        )
+        .await
+        .err()
+        .expect("a mainnet restore without a birthday is refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--birthday is required"), "{msg}");
+        assert!(msg.contains("restore a seed"), "{msg}");
+        assert!(msg.contains("--birthday 481824"), "{msg}");
+        assert!(
+            !WalletStore::exists(&config.wallets["btc"].keys_path()),
+            "refusal must precede writes"
+        );
+
+        // The same seed with an explicit height initializes offline (kyoto, nothing dialed).
+        let phrase = <Mnemonic<English>>::from_phrase(BIP84_MNEMONIC).unwrap();
+        let outcome = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Restore(MnemonicInput::Phrase(phrase)),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Height(481_824)),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.birthday, 481_824);
     }
 
     /// A generated wallet with no `--birthday` needs the node: the failed dial is an

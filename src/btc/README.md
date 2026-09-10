@@ -18,7 +18,11 @@ its key origin, `zecd init --xpub` builds a seedless wallet from it (any number 
 one spender), `keys.toml` pins it, and the wallet syncs, reports and refuses to spend
 exactly as a UFVK watch-only Zcash wallet does. Import is BIP 84 first-account keys only,
 the one derivation the engine has; a bare xpub (no key origin, as most wallets show it) is
-accepted as that account and pinned with the all-zero fingerprint.
+accepted as that account and pinned with the all-zero fingerprint. On **mainnet** an xpub
+import or a seed restore requires `--birthday` (a date or height; `--birthday 481824` asks
+for the full scan from SegWit activation explicitly): the alternative is ~485k blocks of
+filters that a kyoto first sync must finish in one run, since `bip157` persists nothing
+until it completes. The testnets keep the warned from-activation default.
 
 ## The two backends are not equivalent
 

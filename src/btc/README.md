@@ -171,14 +171,56 @@ zecd handles it at its seam rather than patching the crate (`kyoto.rs`, module d
   second failure each redial is a `ScanType::Recovery` from an older checkpoint on the
   wallet's own chain (`resync_depth`: 16, 64, 256... blocks below the tip;
   `resync_checkpoint` picks the wallet's checkpoint at or below that height), bottoming
-  out at the first-scan start - the recorded birthday anchor or the shipped floor, never
-  genesis. A delivered update resets the count. The recovery scan watches the same script
-  lookahead a first scan does, a superset of `Sync`'s, so the rescanned band cannot miss
-  an address revealed since.
+  out at the first-scan start - the recorded birthday anchor, else the shipped floor. A
+  delivered update resets the count. The recovery scan watches the same script lookahead a
+  first scan does, a superset of `Sync`'s, so the rescanned band cannot miss an address
+  revealed since. **A reorg deeper than the anchor** is the one case the bottom does not
+  cover: the anchor's own block has left the chain, so every redial from it fails (a peer
+  answers a locator it does not know from genesis, and the batch does not connect). A
+  redial that already bottomed out at the anchor and failed again marks it suspect
+  (`resync_bottomed_at_anchor`; a checkpoint-less wallet gets two tries): the actor clears
+  the recorded anchor (`Persister::clear_birthday_anchor`) and the next redial starts from
+  the network's recovery floor - the shipped floor, or genesis where there is none - whose
+  headers do sync; the wallet unwinds the dead blocks from the update, and the resolution
+  task re-records an anchor against the new chain (a synced wallet without an anchor now
+  resolves one on connect and records it without a restart). `regtest_btc_reorg_deep`
+  pins it over both backends; over bitcoind the emitter finds no agreement point among
+  the wallet's checkpoints and re-emits from the birthday on the new chain.
 
 The `HeaderSync`/`Stream` split on `KyotoFailure` is deliberate: a node that merely stopped
 or lost its peers redials at the same depth, so a flaky peer does not walk the restart point
 down the chain. The fix that removes the workaround belongs upstream (2140-dev/kyoto).
+
+## Witness data over kyoto
+
+`bip157` requests blocks as `MSG_BLOCK` by default, which a peer serves witness-stripped
+(BIP 144). Every received transaction would then reach the wallet without its witness:
+`gettransaction.hex` incomplete, and a resubmission of it after a reorg - the recipient's
+rebroadcast Core's rule calls for - rejected by every node for the missing witness.
+`KyotoEndpoint::connect` asks for `MSG_WITNESS_BLOCK` (`fetch_witness_data`), at the cost
+of the witness bytes on each block download. Found by `regtest_btc_reorg_deep`, whose
+kyoto leg resubmits an orphaned *received* transaction and checks the wallet's hex against
+the node's.
+
+## Watching live reorgs on testnet4
+
+Regtest pins the mechanics; testnet4 supplies the real thing, daily: CPU miners contest
+min-difficulty tips, and `scripts/btc-miner.py` mines a lone block for every unconfirmed
+wallet transaction - exactly the block a competing miner orphans. Two daemons watch the
+same wallet over both backends: the bitcoind-backed one from `deploy/zecd.btc-testnet4.toml`
+and a watch-only kyoto sibling from `deploy/zecd.btc-testnet4-view.toml`, built from the
+spender's exported xpub and peered with the same compose node's filter-serving P2P port.
+`scripts/btc-reorg-watch.py` polls the node (`getbestblockhash`, `getchaintips`) and each
+wallet (`getwalletinfo`, its history) and logs one line per event: `REORG` when the node's
+tip is replaced, `FORK` for a newly rejected branch, `WALLET` for each wallet's height and
+hash against the node's, `TX MOVED` / `TX UNCONFIRMED` / `TX CONFIRMED` / `TX GONE` for a
+wallet transaction whose block changed; `--send-every N` adds a small self-payment every N
+minutes so most locally mined blocks carry a wallet transaction. A day of that log is the
+live evidence the reorg suite cannot produce - the first entry came fifteen minutes in
+(2026-09-10 17:22 UTC): the watcher's self-payment, mined by the local miner into 151812
+together with a coinbase paying the wallet, was reorged out by a competing chain; both
+backends re-anchored the payment in the new 151813 and dropped the orphaned coinbase
+within 20 s, the kyoto side by way of the min-difficulty header error and a plain redial.
 
 ## History accounting: the Zcash side's shape (Core's)
 
@@ -234,19 +276,42 @@ The two backends differ here as they do elsewhere:
   transaction can never confirm as things stand, so it is marked evicted - a send's inputs
   are freed, a dead receive stops counting toward the unconfirmed balance (BDK evictions
   are not final: a later block or mempool sighting re-canonicalizes the transaction).
-  **Except when the receive's own block reorged out**: BDK keeps a transaction whose
-  anchor left the best chain canonical no matter what evictions are applied, so a
-  reorged-out receive double-spent by a conflict the wallet never sees stays pending for
-  good - on both backends, and over kyoto without even a verdict (the conflict spends the
-  sender's outputs, so no wallet script is in its block). The reorg suite's module doc has the analysis, the
-  probe pinning BDK's behaviour, and the persistence-level retirement that fixes it;
-  `regtest_btc_reorg`'s kyoto leg pins the gap until then. The
+  One case BDK cannot express on its own: a receive **whose own block reorged out**. BDK
+  keeps a transaction whose anchor left the best chain canonical no matter what evictions
+  it is given (`bdk_chain`'s leftover canonicalization path never consults
+  `last_evicted`; `actor.rs::bdk_keeps_a_reorged_out_transaction_canonical_despite_evictions`
+  pins it), and offers no way to drop an anchor from a live graph. So every eviction the
+  actor applies - this verdict, the emitter's mempool report, `abandontransaction` - goes
+  through `BtcActor::retire`: a tombstone in the engine database
+  (`Persister::retire_tx`), and when any retired transaction holds an anchor, a reload of
+  the wallet (`reload_wallet`, rebuilding the connection from the unchanged checkpoint),
+  whose loader strips each retired transaction's out-of-chain anchors while merging the
+  changeset log. The end state is BDK's own contract: no in-chain anchor, `last_evicted`
+  past `last_seen`, not canonical - and a transaction that confirms after all gains an
+  in-chain anchor the strip leaves alone. Over bitcoind this rarely has to fire for a
+  reorged-out receive: the emitter applies every block, and BDK's block apply inserts any
+  transaction that conflicts with one the graph holds (`is_tx_or_conflict_relevant`), so
+  the confirmed conflict enters the graph and canonicalization retires the orphan on its
+  own; the tombstone path covers what the node evicts for other reasons.
+  The reorg suite funds the orphan from an output the wallet never held and
+  asserts the retirement over both backends. The
   same text on a child of an own unconfirmed send is a dependency, not a conflict, and just
   waits for the parent. Everything else retries at the next tip: `non-final` (the reorg case, which
   clears by itself when the locktime height arrives) quietly, any other policy rejection
   with one WARN then DEBUG on repeats.
 - **kyoto** has no mempool and no verdicts (peers stopped sending `reject` with BIP 61's
-  removal), so every unconfirmed send is re-announced at each new tip on a detached task:
+  removal). Its one piece of evidence that a reorged-out receive was double-spent is
+  time: a receive is only ever unconfirmed on this backend because a reorg unwound it, a
+  valid one is re-mined within a block or two, a conflicted one never is - and the
+  conflict itself, spending the sender's outputs to pay someone else, touches no wallet
+  script, so the light client never fetches its block. So a once-confirmed received
+  transaction still unconfirmed after the network's reorg depth of tips
+  (`kyoto::anchor_reorg_margin`: 6 on mainnet and regtest, 100 on the testnets) is
+  retired (`expire_reorged_receives`). Own sends are exempt - their inputs are wallet
+  scripts, so a conflict spending them is filter-visible and BDK retires them directly -
+  and so is anything the wallet only ever saw unconfirmed (no anchor: BDK's own
+  seen-versus-evicted accounting applies). Every unconfirmed send is re-announced at each
+  new tip on a detached task:
   a peer that already holds the transaction never asks for it, and the light client's
   broadcast timeout must not hold the actor. The pass reads the mempool question three
   ways - known held, known absent, unknown - so a kyoto mempool view (below) narrows the

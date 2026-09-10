@@ -25,15 +25,17 @@
 //! recipient waiting), which is exactly why a merely-forgotten receive would come back; a
 //! double-spent one cannot, and the wallet must recognise that - the payment is evicted
 //! rather than resubmitted at every tip forever - and leave the confirmed balance and the
-//! UTXO set as they were before it arrived. The orphaned output is not money. That holds
-//! over bitcoind, though not for the reason the step was written for: the node's wallet
-//! pays the orphan from change on the funding transaction, which also paid us, so the
-//! conflict spending that change is a relevant transaction to BDK and canonicalization
-//! retires the orphan on its own. A conflict funded from an output the wallet never held
-//! is invisible, and BDK ignores evictions of a transaction whose anchor reorged out - so
-//! over kyoto, where there is no mempool and no verdict either, the payment stays pending
-//! for good. The kyoto leg **pins that gap**: the assertion flips when the
-//! persistence-level retirement lands.
+//! UTXO set as they were before it arrived. The orphaned output is not money. The orphan
+//! is funded from a coinbase output the wallet never held, so nothing the wallet watches
+//! is in the conflict. Over bitcoind that is still enough: the emitter hands the wallet
+//! every block, and BDK's block apply inserts any transaction that conflicts with one the
+//! graph holds (`bdk_chain`'s `is_tx_or_conflict_relevant`), so the conflict lands in the
+//! graph and canonicalization retires the orphan on its own. Over kyoto the conflict's
+//! block matches no filter and is never fetched, and BDK keeps a transaction whose anchor
+//! reorged out canonical no matter what evictions it is given - so the
+//! retirement is zecd's: a once-confirmed receive still unconfirmed after the regtest
+//! reorg margin (6 tips) is tombstoned and the wallet reloaded, its loader stripping the
+//! stale anchor. Both legs assert the same end state.
 //!
 //! The second flow (`chained_flow`) reorgs **two sends in a chain** - the child spends the
 //! parent's confirmed change - below both of their locktimes, so both drop from the node at
@@ -395,22 +397,45 @@ async fn reorg_flow(backend: BtcBackend) {
     //    with a fee no replacement rule can refuse, and that conflict confirms in the
     //    replacement block. The wallet must end with the payment evicted: gone from
     //    `gettransaction`, the unconfirmed balance back at zero, the confirmed balance and
-    //    UTXO set as before it arrived. Over bitcoind either of two paths gets it there and
-    //    the test does not care which - the emitter's mempool pass reports the eviction if
-    //    the wallet had seen the payment in the mempool after the invalidation, and
-    //    otherwise the rebroadcast pass draws a missing-inputs verdict from the node and
-    //    marks it evicted itself - though neither is what actually retires it here: the
-    //    node's wallet funds the orphan from its change on the funding transaction, which
-    //    the wallet holds in full because it paid us, so the conflict spending that change
-    //    is relevant to BDK and canonicalization retires the orphan by itself (see the
-    //    module doc). Over kyoto the conflict is invisible: it spends the
-    //    *sender's* outputs and pays the miner, so no wallet script is in its block and the
-    //    light client never fetches it; and BDK keeps a transaction whose anchor reorged
-    //    out canonical no matter what evictions are applied. So the kyoto leg pins the
-    //    gap: the payment is still pending after the conflict and the reorg depth.
+    //    UTXO set as before it arrived. The orphan is built raw from an untouched coinbase
+    //    output the wallet never held, so no wallet script is in the conflict (the node's
+    //    wallet would otherwise fund it from change on the funding transaction, which the
+    //    wallet holds because it paid us - a conflict that is relevant outright). Over
+    //    bitcoind the emitter applies the conflict's block and BDK inserts the conflict as
+    //    a conflict of a graph transaction, retiring the orphan itself (the graph gains a
+    //    fourth transaction; the rebroadcast pass never sees a candidate). Over kyoto the
+    //    block is never fetched and there is no verdict: the receive, unconfirmed since the
+    //    reorg, is retired by the actor once the tip is the regtest reorg margin (6) past
+    //    where it fell out.
     let orphan_height = tip + 1;
+    let coinbase = node
+        .call("listunspent", json!([1]))
+        .await
+        .expect("node listunspent")
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|u| u["amount"].as_f64() == Some(50.0))
+        .cloned()
+        .expect("an untouched 50 BTC coinbase output");
+    let node_change = node.new_address().await;
+    let orphan_hex = node
+        .call(
+            "createrawtransaction",
+            json!([
+                [{ "txid": coinbase["txid"], "vout": coinbase["vout"] }],
+                { addr.clone(): 0.5, node_change.clone(): 49.499 }
+            ]),
+        )
+        .await
+        .expect("createrawtransaction for the second receive");
+    let orphan_signed = node
+        .call("signrawtransactionwithwallet", json!([orphan_hex]))
+        .await
+        .expect("sign the second receive");
+    assert_eq!(orphan_signed["complete"], json!(true), "{orphan_signed}");
     let orphan_txid = node
-        .call("sendtoaddress", json!([addr, 0.5]))
+        .call("sendrawtransaction", json!([orphan_signed["hex"]]))
         .await
         .expect("second receive");
     let orphan_txid_str = orphan_txid.as_str().unwrap().to_string();
@@ -491,32 +516,11 @@ async fn reorg_flow(backend: BtcBackend) {
         .await;
     zecd.wait_wallet_balance("btc", balance).await;
     if backend == BtcBackend::Kyoto {
-        // THE GAP: the payment stays pending. Mine the regtest reorg depth
-        // (6) past the conflict, to the replacement miner so nothing pays the wallet, and
-        // it is still there - in the unconfirmed balance, in `gettransaction` at 0
-        // confirmations - while the confirmed balance and UTXO set are right. When the
-        // retirement lands, replace this block with the bitcoind leg's assertions below.
-        node.mine_to(&replacement_miner, 6).await;
-        zecd.wait_height(orphan_height + 7).await;
-        zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
-            .await;
-        let pending = zecd
-            .call("getunconfirmedbalance", json!([]))
-            .await
-            .expect("getunconfirmedbalance");
-        assert_eq!(pending.as_f64(), Some(0.5), "pins the gap: {pending}");
-        let tx = zecd
-            .call("gettransaction", json!([orphan_txid]))
-            .await
-            .expect("the double-spent receive is still a wallet transaction (the gap)");
-        assert_eq!(tx["confirmations"], json!(0), "{tx}");
-        let unspent = zecd
-            .call("listunspent", json!([]))
-            .await
-            .expect("listunspent");
-        assert_eq!(unspent.as_array().map(Vec::len), Some(1), "{unspent}");
-        assert_eq!(unspent[0]["txid"], send_txid, "{unspent}");
-        return;
+        // No verdict on this backend: the retirement is on time. The receive fell out at
+        // the reorg (the wallet's tip orphan_height + 1); the actor retires it once the tip
+        // is `anchor_reorg_margin` (6 on regtest) past that. One block of slack.
+        node.mine_to(&replacement_miner, 7).await;
+        zecd.wait_height(orphan_height + 8).await;
     }
     zecd.wait_unconfirmed(0.0).await;
     let unspent = zecd

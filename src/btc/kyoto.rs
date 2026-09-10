@@ -304,6 +304,26 @@ pub(crate) fn resync_checkpoint(
     }
 }
 
+/// Whether the redial built after `failures_before` consecutive header-sync failures
+/// already restarted from the recorded birthday anchor - the bottom of the escalation - so
+/// that one more failure means the anchor itself is on a dead branch. A checkpoint-less
+/// wallet restarts from the anchor every time, so it gets two tries before the anchor is
+/// suspect; a synced wallet's redial bottoms out once [`resync_checkpoint`] clamps to it.
+/// The actor then clears the anchor (`Persister::clear_birthday_anchor`) and the next
+/// redial starts from [`recovery_floor`], whose headers a live network does serve.
+pub(crate) fn resync_bottomed_at_anchor(
+    tip: &CheckPoint,
+    failures_before: u32,
+    anchor: (u32, BlockHash),
+) -> bool {
+    let anchor = HashCheckpoint::new(anchor.0, anchor.1);
+    if tip.height() == 0 {
+        return failures_before >= 2;
+    }
+    resync_depth(failures_before)
+        .is_some_and(|depth| resync_checkpoint(tip, depth, anchor) == anchor)
+}
+
 /// What a kyoto connect knows about the wallet's birthday, assembled by the actor from
 /// `keys.toml` (`height`, `time`) and the engine database's recorded anchor (`anchor`,
 /// via `btc::store::Persister::load_birthday_anchor`).
@@ -499,7 +519,15 @@ impl KyotoEndpoint {
         let mut builder = Builder::new(network)
             .data_dir(self.data_dir.clone())
             .required_peers(self.required_peers)
-            .response_timeout(RESPONSE_TIMEOUT);
+            .response_timeout(RESPONSE_TIMEOUT)
+            // bip157 requests blocks as `MSG_BLOCK` by default, which a peer serves
+            // witness-stripped (BIP 144): every received transaction would then be stored
+            // without its witness - `gettransaction.hex` incomplete, and a rebroadcast of it
+            // after a reorg rejected by every node for a missing witness (found by
+            // `regtest_btc_reorg_deep`, where the node answered the re-announce's `getdata`
+            // with a 113-byte, witness-less transaction it then dropped). `MSG_WITNESS_BLOCK`
+            // costs the witness bytes on the block download and nothing else.
+            .fetch_witness_data();
         for (ip, port) in &self.peers {
             // `AddrV2` is the P2P address encoding; it has no blanket `From<IpAddr>`, so pick
             // the variant per family.
@@ -664,8 +692,18 @@ impl KyotoEndpoint {
     ) -> (ScanType, Option<(u32, AnchorTarget)>) {
         let tip = wallet.latest_checkpoint();
         if tip.height() > 0 {
+            // A synced wallet without an anchor - one from before the per-wallet anchor
+            // existed, or one whose anchor reorged out and was cleared - resolves one
+            // against the live headers; the actor records it without a restart, so the
+            // next resync bottoms out at the birthday instead of the floor.
+            let resolution = if birthday.anchor.is_none() {
+                let floor = recovery_floor(self.network, birthday.height);
+                resolution_target(floor.height, birthday).map(|target| (floor.height, target))
+            } else {
+                None
+            };
             let Some(depth) = resync else {
-                return (ScanType::Sync, None);
+                return (ScanType::Sync, resolution);
             };
             let checkpoint = resync_checkpoint(&tip, depth, self.first_scan_start(birthday));
             info!(
@@ -679,7 +717,7 @@ impl KyotoEndpoint {
                 used_script_index: recovery_script_lookahead(wallet),
                 checkpoint,
             };
-            return (scan, None);
+            return (scan, resolution);
         }
         if let Some((height, hash)) = birthday.anchor {
             debug!(
@@ -1635,6 +1673,43 @@ mod tests {
         assert_eq!((own.height, own.hash), (100, hash(1)));
         let past = resync_checkpoint(&tip, 100, lower);
         assert_eq!((past.height, past.hash), (90, hash(9)));
+    }
+
+    /// The anchor becomes suspect exactly when the redial before the latest failure had
+    /// already restarted from it: a synced wallet once the escalation clamps to the anchor,
+    /// a checkpoint-less one after two failed tries (every redial of its starts there).
+    #[test]
+    fn the_anchor_is_suspect_once_a_redial_from_it_has_failed() {
+        use bdk_wallet::chain::BlockId;
+        let tip = [(0u32, 0u8), (100, 1), (110, 2), (120, 3), (130, 4)]
+            .into_iter()
+            .fold(None::<CheckPoint>, |cp, (height, n)| {
+                let id = BlockId {
+                    height,
+                    hash: hash(n),
+                };
+                Some(match cp {
+                    None => CheckPoint::new(id),
+                    Some(cp) => cp.insert(id),
+                })
+            })
+            .unwrap();
+        let anchor = (100, hash(1));
+        // Failures 0 and 1 precede a plain `Sync` redial; failure 2's redial is 16 deep
+        // (checkpoint 110); failure 3's is 64 deep - clamped to the anchor. So the anchor
+        // is suspect only from the failure after that one.
+        assert!(!resync_bottomed_at_anchor(&tip, 0, anchor));
+        assert!(!resync_bottomed_at_anchor(&tip, 1, anchor));
+        assert!(!resync_bottomed_at_anchor(&tip, 2, anchor));
+        assert!(resync_bottomed_at_anchor(&tip, 3, anchor));
+        assert!(resync_bottomed_at_anchor(&tip, 9, anchor));
+        // A checkpoint-less wallet: two tries from the anchor, then suspect.
+        let genesis = CheckPoint::new(BlockId {
+            height: 0,
+            hash: hash(0),
+        });
+        assert!(!resync_bottomed_at_anchor(&genesis, 1, anchor));
+        assert!(resync_bottomed_at_anchor(&genesis, 2, anchor));
     }
 
     /// A synced wallet redials with `Sync` unless a resync depth is given, in which case it

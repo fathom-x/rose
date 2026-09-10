@@ -680,6 +680,8 @@ pub fn spawn(
         rebroadcast_tip: None,
         node_mempool: None,
         rebroadcast_rejections: HashMap::new(),
+        lookahead,
+        unconfirmed_since: HashMap::new(),
         sync_interval,
         status_tx,
         cmd_rx,
@@ -767,6 +769,11 @@ struct BtcActor {
     /// The last rejection each unconfirmed send drew from bitcoind, for WARN-once logging
     /// (a repeat of the same verdict drops to DEBUG). Pruned to the current candidate set.
     rebroadcast_rejections: HashMap<Txid, String>,
+    /// See [`BtcActorConfig::lookahead`]; needed again by [`BtcActor::reload_wallet`].
+    lookahead: u32,
+    /// Kyoto only: the wallet tip at which each once-confirmed received transaction was
+    /// first seen unconfirmed again - a reorg unwound it - for [`BtcActor::expire_reorged_receives`].
+    unconfirmed_since: HashMap<Txid, u32>,
     sync_interval: Duration,
     status_tx: watch::Sender<BtcSyncStatus>,
     cmd_rx: mpsc::Receiver<BtcCommand>,
@@ -1048,6 +1055,12 @@ impl BtcActor {
         let mut resolved_anchor = None;
         // The birthday block's time, for display, when a kyoto connect resolved it this pass.
         let mut resolved_time: Option<u64> = None;
+        // What the emitter's mempool pass reported evicted this pass, retired below once the
+        // connection is no longer borrowed (retirement may rebuild it).
+        let mut evicted_now: Vec<(Txid, u64)> = Vec::new();
+        // Kyoto: the redial that just failed header sync had already restarted from the
+        // recorded birthday anchor, so the anchor is on a dead branch.
+        let mut anchor_suspect = false;
         let result = match conn {
             // Bitcoind: a bounded blocking pull. The emitter's RPC calls block, so relocate
             // the worker's other tasks for the duration, exactly as the Zcash scan does.
@@ -1083,7 +1096,7 @@ impl BtcActor {
                                     .collect(),
                             );
                             self.wallet.apply_unconfirmed_txs(event.update);
-                            self.wallet.apply_evicted_txs(event.evicted);
+                            evicted_now = event.evicted;
                             return Ok(applied);
                         }
                         Err(e) => return Err(anyhow::anyhow!("next_block: {e}")),
@@ -1120,7 +1133,15 @@ impl BtcActor {
                 // The node parked itself on a rejected header batch: count it, so the
                 // redial below (via `drop_conn`) restarts from an older checkpoint.
                 Err(e @ KyotoFailure::HeaderSync(_)) => {
-                    self.header_sync_failures = self.header_sync_failures.saturating_add(1);
+                    let before = self.header_sync_failures;
+                    self.header_sync_failures = before.saturating_add(1);
+                    if let Some(anchor) = self.birthday_anchor {
+                        anchor_suspect = crate::btc::kyoto::resync_bottomed_at_anchor(
+                            &self.wallet.latest_checkpoint(),
+                            before,
+                            anchor,
+                        );
+                    }
                     Err(anyhow::anyhow!(e))
                 }
                 Err(e) => Err(anyhow::anyhow!(e)),
@@ -1166,7 +1187,25 @@ impl BtcActor {
             ));
             return true;
         }
-        match result {
+        // A synced wallet's resolution (no anchor on record: a wallet from before the
+        // per-wallet anchor, or one whose anchor reorged out and was cleared) is recorded
+        // and nothing restarts: the scan is past the birthday, and the anchor only steers
+        // where a future resync bottoms out.
+        if let Some((height, hash)) = resolved_anchor {
+            if let Err(e) = self
+                .persister
+                .save_birthday_anchor(height, &hash.to_string())
+            {
+                warn!("failed to record the resolved birthday anchor: {e:#}");
+            }
+            self.birthday_anchor = Some((height, hash));
+            info!(
+                anchor = height,
+                "birthday anchor recorded against the synced headers (the wallet is past it; \
+                 no restart)"
+            );
+        }
+        let worked = match result {
             Ok(applied) => {
                 self.persist("sync pass");
                 if reached_tip {
@@ -1187,6 +1226,13 @@ impl BtcActor {
                     debug!(
                         blocks = applied,
                         height = status.synced_height,
+                        unconfirmed = self
+                            .wallet
+                            .transactions()
+                            .filter(|t| !t.chain_position.is_confirmed())
+                            .count(),
+                        graph_txs = self.wallet.tx_graph().full_txs().count(),
+                        anchored = self.wallet.tx_graph().all_anchors().len(),
                         "applied block range"
                     );
                 }
@@ -1198,10 +1244,180 @@ impl BtcActor {
                 // (An apply failure would recur, but reconnecting rebuilds the emitter from
                 // the wallet's own checkpoint, which is also the reorg recovery path.)
                 warn!("sync error against the upstream (reconnecting with backoff): {e:#}");
+                if anchor_suspect {
+                    if let Some((height, _)) = self.birthday_anchor.take() {
+                        // A reorg deeper than the anchor: every redial from it fails, and
+                        // the escalation has nowhere lower to go. Forget it - the next
+                        // redial starts from the network's recovery floor, and the
+                        // resolution task records a fresh anchor against the new chain.
+                        warn!(
+                            anchor = height,
+                            "header sync keeps failing from the recorded birthday anchor: \
+                             its block has left the chain; clearing it and restarting from \
+                             the recovery floor"
+                        );
+                        if let Err(e) = self.persister.clear_birthday_anchor() {
+                            warn!("failed to clear the birthday anchor: {e:#}");
+                        }
+                    }
+                }
                 self.drop_conn();
-                true
+                return true;
+            }
+        };
+        if !evicted_now.is_empty() {
+            // The node dropped them from its mempool: BDK records the eviction, and the
+            // tombstone plus reload retires any that had reorged out of a block (which the
+            // eviction alone never does - `Persister::retire_tx`).
+            self.retire(evicted_now, "mempool eviction");
+            return true;
+        }
+        if reached_tip
+            && matches!(self.conn, Some(Conn::Kyoto(_)))
+            && self.expire_reorged_receives()
+        {
+            return true;
+        }
+        worked
+    }
+
+    /// Retire evicted transactions for good where BDK will not: write the tombstone beside
+    /// the eviction, and when any of them holds an anchor - a once-confirmed transaction the
+    /// eviction cannot demote - reload the wallet so the load-time strip takes effect now
+    /// rather than at the next daemon start. See `Persister::retire_tx`.
+    fn retire(&mut self, evicted: Vec<(Txid, u64)>, why: &str) {
+        let mut anchored = false;
+        for (txid, at) in &evicted {
+            if let Err(e) = self.persister.retire_tx(txid, *at) {
+                warn!(%txid, "failed to record the retirement ({why}): {e:#}");
+            }
+            if self.wallet.tx_graph().all_anchors().contains_key(txid) {
+                anchored = true;
+            }
+            self.unconfirmed_since.remove(txid);
+            self.rebroadcast_rejections.remove(txid);
+        }
+        info!(
+            retired = evicted.len(),
+            anchored,
+            "retired evicted transactions ({why}){}",
+            if anchored {
+                "; reloading the wallet to drop their stale anchors"
+            } else {
+                ""
+            }
+        );
+        self.wallet.apply_evicted_txs(evicted.iter().copied());
+        self.persist(why);
+        if anchored {
+            self.reload_wallet(why);
+        }
+        let state = if self.at_tip {
+            BtcConnState::Ready
+        } else {
+            BtcConnState::Syncing
+        };
+        self.status_tx.send_replace(status_of(
+            &self.wallet,
+            state,
+            self.birthday_anchor.as_ref(),
+            self.birthday_block_time,
+        ));
+    }
+
+    /// Reload the wallet from the persister - the only way an edit the changeset log makes
+    /// on the way in (`Persister::initialize`) reaches the live wallet - and rebuild the
+    /// connection, whose emitter or light client is positioned on the old one. A deliberate
+    /// restart, not an outage: no backoff, the next pass redials at once from the wallet's
+    /// own checkpoint, which the reload does not move.
+    fn reload_wallet(&mut self, why: &str) {
+        let keys = match AccountKeys::from_wallet(&self.wallet) {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!("cannot reload the wallet ({why}): {e:#}");
+                return;
+            }
+        };
+        let load = Wallet::load()
+            .check_network(keys::network(self.network))
+            .lookahead(self.lookahead)
+            .descriptor(
+                KeychainKind::External,
+                Some(keys.descriptor(KeychainKind::External)),
+            )
+            .descriptor(
+                KeychainKind::Internal,
+                Some(keys.descriptor(KeychainKind::Internal)),
+            );
+        match PersistedWallet::load(&mut self.persister, load) {
+            Ok(Some(wallet)) => {
+                self.wallet = wallet;
+                info!(
+                    height = self.wallet.latest_checkpoint().height(),
+                    "reloaded the wallet ({why}); the retired transactions are gone"
+                );
+            }
+            Ok(None) => warn!("cannot reload the wallet ({why}): the database is empty"),
+            Err(e) => {
+                warn!("cannot reload the wallet ({why}): {e:#}");
+                return;
             }
         }
+        self.conn = None;
+        self.at_tip = false;
+        self.rebroadcast_tip = None;
+        self.node_mempool = None;
+    }
+
+    /// The kyoto backend's only evidence that a reorged-out receive was double-spent is
+    /// time. There is no mempool and no verdict there, and the conflict - spending the
+    /// sender's outputs, paying someone else - touches no wallet script, so the light
+    /// client never fetches its block. But a receive is only ever unconfirmed on this
+    /// backend because a reorg unwound it (nothing else puts an unconfirmed foreign
+    /// transaction in the wallet), a valid one is re-mined within a block or two, and a
+    /// conflicted one never is. So a once-confirmed received transaction still unconfirmed
+    /// after the network's reorg depth of tips (`kyoto::anchor_reorg_margin`) is retired.
+    /// The wallet's own sends are exempt: their inputs are wallet scripts, so a conflict
+    /// spending them is filter-visible and BDK retires them directly; and a transaction the
+    /// wallet only ever saw unconfirmed (one it broadcast itself) has no anchor and is left
+    /// to BDK's own seen-versus-evicted accounting. Returns whether anything was retired.
+    fn expire_reorged_receives(&mut self) -> bool {
+        let tip = self.tip_height();
+        let margin = crate::btc::kyoto::anchor_reorg_margin(self.network);
+        let anchors = self.wallet.tx_graph().all_anchors();
+        let mut current = HashSet::new();
+        let mut expired = Vec::new();
+        for wtx in self.wallet.transactions() {
+            if wtx.chain_position.is_confirmed() {
+                continue;
+            }
+            let txid = wtx.tx_node.txid;
+            if !anchors.contains_key(&txid)
+                || self.wallet.sent_and_received(&wtx.tx_node.tx).0 > Amount::ZERO
+            {
+                continue;
+            }
+            current.insert(txid);
+            let since = *self.unconfirmed_since.entry(txid).or_insert(tip);
+            if tip.saturating_sub(since) >= margin {
+                expired.push((txid, unix_now()));
+            }
+        }
+        self.unconfirmed_since
+            .retain(|txid, _| current.contains(txid));
+        if expired.is_empty() {
+            return false;
+        }
+        for (txid, _) in &expired {
+            warn!(
+                %txid,
+                margin,
+                "a received transaction reorged out of its block and stayed unconfirmed for \
+                 the reorg depth: retiring it as double-spent (it returns if it confirms)"
+            );
+        }
+        self.retire(expired, "reorg-expired receive");
+        true
     }
 
     /// Dial the endpoint and build the emitter. Returns whether a connection now exists.
@@ -1428,19 +1644,7 @@ impl BtcActor {
             }
         }
         if !evicted.is_empty() {
-            self.wallet.apply_evicted_txs(evicted);
-            self.persist("rebroadcast eviction");
-            let state = if self.at_tip {
-                BtcConnState::Ready
-            } else {
-                BtcConnState::Syncing
-            };
-            self.status_tx.send_replace(status_of(
-                &self.wallet,
-                state,
-                self.birthday_anchor.as_ref(),
-                self.birthday_block_time,
-            ));
+            self.retire(evicted, "rebroadcast eviction");
         }
     }
 
@@ -2170,12 +2374,10 @@ impl BtcActor {
             }
         }
         let now = unix_now();
-        for id in &abandoned {
-            self.rebroadcast_rejections.remove(id);
-        }
-        self.wallet
-            .apply_evicted_txs(abandoned.iter().map(|id| (*id, now)));
-        self.persist("abandontransaction");
+        self.retire(
+            abandoned.iter().map(|id| (*id, now)).collect(),
+            "abandontransaction",
+        );
         info!(
             target: "zecd::audit",
             %txid,

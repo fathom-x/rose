@@ -80,6 +80,76 @@ impl Persister {
         Ok(())
     }
 
+    /// Retire `txid`: record that the wallet evicted it at `evicted_at` (unix seconds) so
+    /// that the next load strips every anchor of it that is no longer in the local chain.
+    ///
+    /// BDK keeps a transaction whose anchor reorged out canonical (unconfirmed) no matter
+    /// what evictions it is given - `bdk_chain`'s "leftover" canonicalization path never
+    /// consults `last_evicted` - so a reorged-out receive whose inputs were then spent
+    /// elsewhere would stay pending forever. BDK also offers no way to drop an
+    /// anchor from a live `TxGraph`; the changeset log is the one place it can be edited,
+    /// and only on the way in. So the actor writes a tombstone here beside the eviction it
+    /// applies, then reloads the wallet ([`crate::btc::actor`]'s `reload_wallet`), and
+    /// [`WalletPersister::initialize`] strips the stale anchors while merging. What remains
+    /// is BDK's own contract: without an in-chain anchor the transaction is canonical only
+    /// while its `last_seen` outruns its `last_evicted`, and a transaction that confirms
+    /// after all gains an in-chain anchor the strip leaves alone - evictions are not final.
+    pub fn retire_tx(
+        &mut self,
+        txid: &bdk_wallet::bitcoin::Txid,
+        evicted_at: u64,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch(RETIRED_TABLE_SQL)
+            .context("create retired_txs table")?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO retired_txs (txid, evicted_at) VALUES (?1, ?2)",
+                rusqlite::params![txid.to_string(), evicted_at],
+            )
+            .context("record retired transaction")?;
+        Ok(())
+    }
+
+    /// Every retired txid (see [`Persister::retire_tx`]).
+    pub fn retired_txs(&self) -> anyhow::Result<Vec<bdk_wallet::bitcoin::Txid>> {
+        self.conn
+            .execute_batch(RETIRED_TABLE_SQL)
+            .context("create retired_txs table")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT txid FROM retired_txs")
+            .context("read retired transactions")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("read retired transactions")?;
+        let mut out = Vec::new();
+        for row in rows {
+            let encoded = row.context("read retired row")?;
+            out.push(
+                encoded
+                    .parse()
+                    .with_context(|| format!("decode retired txid {encoded}"))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Forget the recorded birthday anchor: the actor's answer to an anchor whose block
+    /// reorged out of the chain (every redial from it fails header sync, and the escalation
+    /// bottoms out there - `kyoto::resync_bottomed_at_anchor`). The next scan falls back to
+    /// the network's recovery floor, and the resolution task re-records an anchor against
+    /// the live headers.
+    pub fn clear_birthday_anchor(&mut self) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch(ANCHOR_TABLE_SQL)
+            .context("create birthday_anchor table")?;
+        self.conn
+            .execute("DELETE FROM birthday_anchor", [])
+            .context("clear birthday anchor")?;
+        Ok(())
+    }
+
     /// The recorded birthday anchor, if any - see [`Persister::save_birthday_anchor`].
     pub fn load_birthday_anchor(&self) -> anyhow::Result<Option<(u32, String)>> {
         self.conn
@@ -107,6 +177,34 @@ const ANCHOR_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS birthday_anchor (
     height INTEGER NOT NULL,
     hash TEXT NOT NULL
 )";
+
+/// The retired-transaction tombstones (see [`Persister::retire_tx`]): one row per txid,
+/// re-retiring overwrites the time.
+const RETIRED_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS retired_txs (
+    txid TEXT PRIMARY KEY,
+    evicted_at INTEGER NOT NULL
+)";
+
+/// Strip from a merged changeset every anchor of a retired transaction whose block is not
+/// in the changeset's own local chain (the height missing, or held by another hash), and
+/// return how many were dropped. An in-chain anchor is left alone: a retired transaction
+/// that confirmed after all is confirmed. See [`Persister::retire_tx`].
+fn strip_retired_anchors(
+    changeset: &mut ChangeSet,
+    retired: &[bdk_wallet::bitcoin::Txid],
+) -> usize {
+    if retired.is_empty() {
+        return 0;
+    }
+    let retired: std::collections::HashSet<_> = retired.iter().copied().collect();
+    let chain = &changeset.local_chain.blocks;
+    let before = changeset.tx_graph.anchors.len();
+    changeset.tx_graph.anchors.retain(|(anchor, txid)| {
+        !retired.contains(txid)
+            || chain.get(&anchor.block_id.height) == Some(&Some(anchor.block_id.hash))
+    });
+    before - changeset.tx_graph.anchors.len()
+}
 
 /// Create the wallet database from the account's public keys (seed-derived for a spending
 /// wallet, imported for a watch-only one) - `zecd init`'s half of the engine (the daemon's
@@ -157,6 +255,15 @@ impl WalletPersister for Persister {
             let changeset: ChangeSet =
                 serde_json::from_str(&encoded).context("decode stored changeset")?;
             aggregate.merge(changeset);
+        }
+        let retired = persister.retired_txs()?;
+        let stripped = strip_retired_anchors(&mut aggregate, &retired);
+        if stripped > 0 {
+            tracing::debug!(
+                stripped,
+                retired = retired.len(),
+                "dropped the out-of-chain anchors of retired transactions on load"
+            );
         }
         Ok(aggregate)
     }
@@ -272,11 +379,124 @@ mod tests {
             // A re-resolution replaces the row rather than accumulating a second one.
             persister.save_birthday_anchor(146_500, "bb").unwrap();
         }
-        let persister = Persister::open(&engine_dir).unwrap();
+        let mut persister = Persister::open(&engine_dir).unwrap();
         assert_eq!(
             persister.load_birthday_anchor().unwrap(),
             Some((146_500, "bb".to_string()))
         );
+        // Cleared (a reorged-out anchor): back to the no-anchor read, ready to re-record.
+        persister.clear_birthday_anchor().unwrap();
+        assert_eq!(persister.load_birthday_anchor().unwrap(), None);
+        persister.save_birthday_anchor(146_600, "cc").unwrap();
+        assert_eq!(
+            persister.load_birthday_anchor().unwrap(),
+            Some((146_600, "cc".to_string()))
+        );
+    }
+
+    /// A retired transaction whose anchor reorged out is not canonical after a reload - the
+    /// retirement BDK cannot express - while one that confirms after all keeps
+    /// its in-chain anchor and stays confirmed.
+    #[test]
+    fn a_retired_transaction_loses_its_stale_anchor_on_load() {
+        use bdk_wallet::bitcoin::block::{Header, Version};
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        use bdk_wallet::bitcoin::{
+            absolute, Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence,
+            Transaction, TxIn, TxMerkleNode, TxOut, Txid, Witness,
+        };
+        use std::str::FromStr as _;
+        let block = |prev: BlockHash, nonce: u32, txs: Vec<Transaction>| Block {
+            header: Header {
+                version: Version::TWO,
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_700_000_000 + nonce,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce,
+            },
+            txdata: txs,
+        };
+        let load = |persister: &mut Persister| {
+            PersistedWallet::load(
+                persister,
+                Wallet::load().check_network(bdk_wallet::bitcoin::Network::Regtest),
+            )
+            .unwrap()
+            .expect("wallet data present")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let engine_dir = dir.path().join("btc").join("bdk");
+        let mut persister = Persister::open(&engine_dir).unwrap();
+        let mut wallet = create(&mut persister);
+        let addr = wallet.reveal_next_address(KeychainKind::External).address;
+        let receive = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_str(&"22".repeat(32)).unwrap(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: addr.script_pubkey(),
+            }],
+        };
+        let txid = receive.compute_txid();
+        // Confirmed at 3, then 3 reorgs out (3' and 4 replace it): pending, per BDK.
+        let b1 = block(wallet.latest_checkpoint().hash(), 1, vec![]);
+        wallet.apply_block(&b1, 1).unwrap();
+        let b2 = block(b1.block_hash(), 2, vec![]);
+        wallet.apply_block(&b2, 2).unwrap();
+        let b3 = block(b2.block_hash(), 3, vec![receive.clone()]);
+        wallet.apply_block(&b3, 3).unwrap();
+        let b3b = block(b2.block_hash(), 33, vec![]);
+        wallet.apply_block(&b3b, 3).unwrap();
+        let b4 = block(b3b.block_hash(), 4, vec![]);
+        wallet.apply_block(&b4, 4).unwrap();
+        wallet.apply_evicted_txs([(txid, 1_800_000_000)]);
+        wallet.persist(&mut persister).unwrap();
+        assert_eq!(
+            wallet.balance().untrusted_pending,
+            Amount::from_sat(50_000_000)
+        );
+        drop(wallet);
+
+        // The eviction alone changes nothing across a reload (the gap).
+        let wallet = load(&mut persister);
+        assert_eq!(
+            wallet.balance().untrusted_pending,
+            Amount::from_sat(50_000_000)
+        );
+        assert!(wallet.transactions().any(|t| t.tx_node.txid == txid));
+        drop(wallet);
+
+        // Retired: the stale anchor is stripped on load and the transaction is gone from
+        // the canonical view - not spendable, not pending, not listed.
+        persister.retire_tx(&txid, 1_800_000_000).unwrap();
+        let mut wallet = load(&mut persister);
+        assert_eq!(wallet.balance().untrusted_pending, Amount::ZERO);
+        assert_eq!(wallet.balance().confirmed, Amount::ZERO);
+        assert!(!wallet.transactions().any(|t| t.tx_node.txid == txid));
+        assert_eq!(
+            wallet.latest_checkpoint().height(),
+            4,
+            "the chain is untouched"
+        );
+
+        // Confirmed after all at 5: the new anchor is in the chain and survives the next
+        // load - retirement is not final, exactly like BDK's evictions.
+        let b5 = block(b4.block_hash(), 5, vec![receive.clone()]);
+        wallet.apply_block(&b5, 5).unwrap();
+        wallet.persist(&mut persister).unwrap();
+        drop(wallet);
+        let wallet = load(&mut persister);
+        assert_eq!(wallet.balance().confirmed, Amount::from_sat(50_000_000));
+        assert!(wallet
+            .get_tx(txid)
+            .is_some_and(|t| t.chain_position.is_confirmed()));
     }
 
     /// Empty changesets are not appended: reopening an untouched wallet leaves the log alone.

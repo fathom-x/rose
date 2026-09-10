@@ -346,15 +346,18 @@ Everything here is refused with a clear error rather than silently ignored or ha
   public host) or the bridge gateway alone and repoint every local client (`--zecd-url`,
   `curl`). A list of bind addresses would remove the choice; daemon-wide, not engine-specific,
   noted here because the kyoto/UI deployments are where it bites.
-- **Health/readiness integration** - `/healthz`/`/readyz`/`/status` speak Zcash-sync
-  vocabulary and do not aggregate bitcoin wallets' sync state yet. Per wallet, the
-  connection state is on `getwalletinfo` as the zecd extension `upstream_connected`; the
-  wallet birthday and how it resolved (`birthday.height`, its `time` - the birthday
-  block's own time once the chain source answers, else the offline record - and the scan
-  `anchor` once recorded) is the extension beside it, and `listdescriptors.timestamp`
-  carries the same time as Core's rescan-from time
-  (false once a hung or unreachable upstream is noticed - the bitcoind client's
-  per-request deadline is `chain::RPC_DEADLINE`, 15s - true again after a reconnect).
+- **Health/readiness** - covered since 2026-09-10: `/readyz` counts every Bitcoin wallet
+  (ready iff its actor is alive and `conn_state` is `ready`, i.e. the chain source reported
+  the tip; `connected` mode accepts `syncing`), `/status` lists each with `coin`, `server`,
+  `conn_state` and `synced_height`. The engine measures no lag against a tip it has not
+  reached, so `max_scan_lag` does not apply and there is no `scan_lag` field. Per wallet,
+  `getwalletinfo` carries the same connection state as the zecd extension
+  `upstream_connected` (false once a hung or unreachable upstream is noticed - the bitcoind
+  client's per-request deadline is `chain::RPC_DEADLINE`, 15s - true again after a
+  reconnect), the wallet birthday and how it resolved (`birthday.height`, its `time` - the
+  birthday block's own time once the chain source answers, else the offline record - and
+  the scan `anchor` once recorded), and `listdescriptors.timestamp` carries the same time
+  as Core's rescan-from time.
 - **`derive-address`** refuses bitcoin wallets (naming what to do instead); a bitcoin
   equivalent of offline address derivation is future work. `export-ufvk` refuses too,
   pointing at `export-xpub`. (`rescan` covers bitcoin wallets since 2026-09-05: it deletes

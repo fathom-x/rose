@@ -337,14 +337,17 @@ pub struct ZecdBtc {
     pub datadir: PathBuf,
     conf: PathBuf,
     pub rpc_port: u16,
+    /// The `[health]` port (`/healthz` `/readyz` `/status`), picked at `prepare` so the
+    /// config can name it before the daemon starts.
+    pub health_port: u16,
     default_wallet: String,
 }
 
 impl ZecdBtc {
     /// Write the daemon config for `wallets` (the first is `default_wallet`), all on
     /// `backend` against `node`. A tight sync interval so mempool passes land quickly; the
-    /// health server is disabled to avoid a port pick for a surface these suites do not
-    /// assert.
+    /// health server is on, on a picked port, so a suite can hold `/readyz` and `/status`
+    /// to the Bitcoin wallets (see [`ZecdBtc::health_url`]).
     pub fn prepare(
         datadir: PathBuf,
         backend: BtcBackend,
@@ -366,7 +369,10 @@ impl ZecdBtc {
         if backend == BtcBackend::Bitcoind {
             text.push_str("[bitcoind]\nrpc_user = \"harness\"\nrpc_password = \"harness\"\n");
         }
-        text.push_str("[sync]\ninterval_secs = 1\n[health]\nenabled = false\n");
+        let health_port = pick_port().expect("pick zecd health port");
+        text.push_str(&format!(
+            "[sync]\ninterval_secs = 1\n[health]\nbind = \"127.0.0.1\"\nport = {health_port}\n"
+        ));
         std::fs::write(&conf, text).unwrap();
         ZecdBtc {
             proc: None,
@@ -375,7 +381,42 @@ impl ZecdBtc {
             datadir,
             conf,
             rpc_port: 0,
+            health_port,
             default_wallet: wallets[0].to_string(),
+        }
+    }
+
+    /// The health server's base URL (`http://127.0.0.1:<health_port>`).
+    pub fn health_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.health_port)
+    }
+
+    /// `GET <health_url>/<path>`: the HTTP status and the JSON body.
+    pub async fn health_get(&self, path: &str) -> (u16, Value) {
+        let resp = self
+            .client
+            .get(format!("{}/{path}", self.health_url()))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET /{path}: {e}"));
+        let code = resp.status().as_u16();
+        let body = resp.json().await.unwrap_or(Value::Null);
+        (code, body)
+    }
+
+    /// Poll `/readyz` until its status code is `code`, or panic with `what`.
+    pub async fn wait_readyz(&self, code: u16, what: &str) -> Value {
+        let deadline = Instant::now() + SYNC_TIMEOUT;
+        loop {
+            let (got, body) = self.health_get("readyz").await;
+            if got == code {
+                return body;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "/readyz never reached {code}: {what} (last: {got} {body})"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 

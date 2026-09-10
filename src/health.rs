@@ -1,10 +1,13 @@
 //! Unauthenticated liveness/readiness HTTP server on a separate port, for cloud-native
 //! deployment (Kubernetes probes, load balancers).
 //!
-//! - `GET /healthz` - liveness: always 200 while the process is running.
+//! - `GET /healthz` - liveness: always 200 while the process is running. Healthy means the
+//!   daemon is up and answering on its ports, nothing about sync.
 //! - `GET /readyz` - readiness: 200/503, gated by the configured [`ReadinessMode`] (see
 //!   `[health] readiness`): either "the wallet has scanned to near the tip" or "the backend is
-//!   connected and live".
+//!   connected and live". Every loaded wallet counts, whichever coin it serves: a Zcash wallet
+//!   by its scan height against zebra's tip, a Bitcoin wallet by whether its chain source
+//!   (bitcoind or the kyoto light client) reports it caught up to the tip.
 //! - `GET /status` - JSON snapshot of per-wallet sync state (for humans/ops).
 
 use std::net::SocketAddr;
@@ -19,7 +22,7 @@ use tracing::{info, warn};
 
 use crate::config::{HealthConfig, ReadinessMode};
 use crate::state::AppState;
-use crate::wallet::SyncStatus;
+use crate::wallet::{CoinWallet, SyncStatus};
 
 /// Whether one wallet is ready to serve, per the configured readiness mode. The actor-liveness
 /// check is applied by the caller.
@@ -66,6 +69,30 @@ fn wallet_ready(st: &SyncStatus, cfg: &HealthConfig) -> bool {
             // No tip yet (or, defensively, no birthday) means we can't sanity-check the upstream.
             _ => false,
         },
+    }
+}
+
+/// Whether one Bitcoin wallet is ready to serve, per the configured readiness mode. The
+/// actor-liveness check is applied by the caller, as for [`wallet_ready`].
+///
+/// The Bitcoin engine has no scan-height-versus-tip pair to measure a lag from: its chain
+/// source says outright when the wallet is at the tip - the bitcoind emitter when it runs out
+/// of blocks to hand over, the kyoto light client when it delivers a sync-to-tip update - and
+/// the actor publishes that as `conn_state = Ready`. So the height-gap modes both gate on it
+/// (`max_scan_lag` does not apply: the wallet is at the tip the source reports, or it is not),
+/// and there is no enhancement backlog to tell `synced` and `scanned` apart. A Bitcoin wallet
+/// is never "ready on an abandoned tip" through this path: a dropped or hung upstream flips
+/// the state back to `Down` (and a kyoto peer that stalls silently is the documented gap the
+/// engine's redial rules cover, not something readiness can see).
+#[cfg(feature = "bitcoin")]
+fn bitcoin_wallet_ready(st: &crate::btc::actor::BtcSyncStatus, cfg: &HealthConfig) -> bool {
+    use crate::btc::actor::BtcConnState;
+    match cfg.readiness {
+        ReadinessMode::Synced | ReadinessMode::Scanned => st.conn_state == BtcConnState::Ready,
+        // Lenient: connected is enough, as on the Zcash side. The birthday sanity check has
+        // no counterpart here - the engine has no upstream tip to compare the birthday to
+        // until it has synced, at which point the strict answer is available anyway.
+        ReadinessMode::Connected => st.conn_state != BtcConnState::Down,
     }
 }
 
@@ -134,7 +161,56 @@ fn snapshot(state: &AppState) -> Snapshot {
     let mut any_enhancing = false;
     let mut wallets = Map::new();
     for name in names {
-        if let Ok(h) = state.registry.get(Some(&name)) {
+        let Ok(wallet) = state.registry.get_coin(Some(&name)) else {
+            continue;
+        };
+        let coin = wallet.coin().name();
+        let h = match wallet {
+            CoinWallet::Zcash(h) => h,
+            // A Bitcoin wallet reports through its own actor's status: its chain source's
+            // connection state and the wallet's applied height. Before this arm existed the
+            // Bitcoin wallets were skipped outright, so a bitcoin-only daemon reported ready
+            // with nothing checked - a fail-open.
+            #[cfg(feature = "bitcoin")]
+            CoinWallet::Bitcoin(h) => {
+                use crate::btc::actor::BtcConnState;
+                let st = h.status();
+                let actor_alive = h.actor_alive();
+                let w_ready = actor_alive && bitcoin_wallet_ready(&st, &state.config.health);
+                ready = ready && w_ready;
+                if st.conn_state == BtcConnState::Down {
+                    any_down = true;
+                }
+                if !actor_alive {
+                    any_actor_down = true;
+                }
+                wallets.insert(
+                    name,
+                    json!({
+                        "coin": coin,
+                        "network": h.network.name(),
+                        "connected": st.conn_state != BtcConnState::Down,
+                        "actor_alive": actor_alive,
+                        "server": h.upstream,
+                        "conn_state": st.conn_state.as_str(),
+                        // The wallet's own applied height and hash - what its `getblockcount`
+                        // answers. At `ready` this is the tip the chain source reported; while
+                        // `syncing` the source's tip is ahead by an amount the engine does not
+                        // measure (see `bitcoin_wallet_ready`), so there is no `scan_lag`.
+                        "synced_height": st.synced_height,
+                        "synced_hash": st.synced_hash,
+                        "birthday": h.birthday,
+                        "scanning": st.conn_state == BtcConnState::Syncing,
+                        // A watch-only (xpub) wallet holds no seed; nothing to lock.
+                        "encrypted": false,
+                        "locked": false,
+                        "ready": w_ready,
+                    }),
+                );
+                continue;
+            }
+        };
+        {
             let st = h.status();
             // A dead writer actor means sends/address-generation are broken even though reads
             // still answer from the DB - so it must fail readiness, not silently report ready.
@@ -171,6 +247,7 @@ fn snapshot(state: &AppState) -> Snapshot {
             wallets.insert(
                 name,
                 json!({
+                    "coin": coin,
                     "connected": st.connected,
                     "actor_alive": actor_alive,
                     "server": st.server,
@@ -401,5 +478,53 @@ mod tests {
             ..SyncStatus::default()
         };
         assert!(!is_locked(&unencrypted));
+    }
+}
+
+#[cfg(all(test, feature = "bitcoin"))]
+mod bitcoin_tests {
+    use super::bitcoin_wallet_ready;
+    use crate::btc::actor::{BtcConnState, BtcSyncStatus};
+    use crate::config::{HealthConfig, ReadinessMode};
+
+    fn st(conn_state: BtcConnState) -> BtcSyncStatus {
+        BtcSyncStatus {
+            conn_state,
+            synced_height: 100,
+            synced_hash: String::new(),
+            birthday_anchor: None,
+            birthday_block_time: None,
+        }
+    }
+
+    fn cfg(readiness: ReadinessMode) -> HealthConfig {
+        HealthConfig {
+            enabled: true,
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 9333,
+            readiness,
+            max_scan_lag: 4,
+        }
+    }
+
+    #[test]
+    fn the_height_gap_modes_require_the_chain_source_to_report_the_tip() {
+        for mode in [ReadinessMode::Synced, ReadinessMode::Scanned] {
+            let cfg = cfg(mode);
+            // Caught up: the emitter ran dry / the light client delivered an update.
+            assert!(bitcoin_wallet_ready(&st(BtcConnState::Ready), &cfg));
+            // Connected but still applying blocks: reads answer from a stale height.
+            assert!(!bitcoin_wallet_ready(&st(BtcConnState::Syncing), &cfg));
+            // No upstream, or a dropped/hung one.
+            assert!(!bitcoin_wallet_ready(&st(BtcConnState::Down), &cfg));
+        }
+    }
+
+    #[test]
+    fn the_connected_mode_is_satisfied_by_any_live_connection() {
+        let cfg = cfg(ReadinessMode::Connected);
+        assert!(bitcoin_wallet_ready(&st(BtcConnState::Ready), &cfg));
+        assert!(bitcoin_wallet_ready(&st(BtcConnState::Syncing), &cfg));
+        assert!(!bitcoin_wallet_ready(&st(BtcConnState::Down), &cfg));
     }
 }

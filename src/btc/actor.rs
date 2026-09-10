@@ -217,6 +217,17 @@ pub enum BtcConnState {
     Ready,
 }
 
+impl BtcConnState {
+    /// The `/status` spelling, shared with the Zcash `ConnState` so one dashboard reads both.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BtcConnState::Down => "down",
+            BtcConnState::Syncing => "syncing",
+            BtcConnState::Ready => "ready",
+        }
+    }
+}
+
 /// The actor's published sync status, mirrored after the Zcash `SyncStatus` at the scale the
 /// engine needs: what `getwalletinfo`/`getblockcount` read, via [`BtcWalletHandle::status`].
 #[derive(Clone, Debug)]
@@ -320,6 +331,10 @@ pub struct BtcWalletHandle {
     /// birthday height in (mainnet; at or before the block's own time). `None` off-table.
     /// Display only - the actor's own resolution target stays the operator's date alone.
     pub birthday_time: Option<u64>,
+    /// The configured chain source, as the log lines name it (`bitcoind host:port`, or the
+    /// kyoto peer set); `None` for an offline wallet with no upstream. `/status` reports it
+    /// as `server`, beside the Zcash wallets' zebra endpoint.
+    pub upstream: Option<String>,
     cmd_tx: mpsc::Sender<BtcCommand>,
     status_rx: watch::Receiver<BtcSyncStatus>,
 }
@@ -411,6 +426,14 @@ impl BtcWalletHandle {
     /// The actor's latest published sync status.
     pub fn status(&self) -> BtcSyncStatus {
         self.status_rx.borrow().clone()
+    }
+
+    /// Whether the wallet's actor task is still servicing commands. False once the task has
+    /// ended (a panic, or shutdown): every command then fails with "wallet actor is not
+    /// running", and `/readyz` reports the wallet `actor_down` rather than ready on a
+    /// status snapshot the dead task can no longer refresh.
+    pub fn actor_alive(&self) -> bool {
+        !self.cmd_tx.is_closed()
     }
 }
 
@@ -591,6 +614,7 @@ pub fn spawn(
         None,
     ));
     let span = info_span!("wallet", name = %name);
+    let upstream = endpoint.as_ref().map(BtcEndpoint::describe);
     let actor = BtcActor {
         wallet,
         persister,
@@ -626,6 +650,7 @@ pub fn spawn(
             birthday,
             birthday_time: birthday_time
                 .or_else(|| crate::btc::birthdays::day_start_for_height(network, birthday)),
+            upstream,
             cmd_tx,
             status_rx,
         },

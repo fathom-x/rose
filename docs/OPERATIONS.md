@@ -227,6 +227,12 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
   `walletpassphrase` before it can spend. It is reported independently of readiness (a locked
   wallet can be `ready: true`), so a controller can drive an unlock without mistaking it for a
   sync stall.
+- **Bitcoin wallets** (`coin = "bitcoin"`) report on the same endpoints: `/healthz` is
+  liveness, `/readyz` is 200 only once every Bitcoin wallet's chain source (bitcoind or the
+  kyoto light client) reports it at the tip - `conn_state: ready` - and `/status` lists each
+  with `coin`, `server`, `conn_state`, `synced_height`. A first sync is 503 `reason=syncing`;
+  a dropped or hung upstream 503 `reason=upstream_down`. No `scan_lag` or enhancement
+  backlog on this path.
 - `getrpcinfo.active_commands` - what's executing right now.
 - Logs: set `[log] format = "json"` for aggregation. Every RPC call logs method,
   wallet, elapsed_ms (errors add code/message); connection failover logs at warn.

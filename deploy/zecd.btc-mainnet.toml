@@ -79,9 +79,11 @@ auto_unlock = true
 interval_secs = 20
 
 [health]
-# Reports on Zcash wallets only, so on this config /status is empty and /readyz trivially
-# ready; poll getblockcount / getwalletinfo.upstream_connected for sync state. Loopback, and
-# a port distinct from the testnet4 configs' 49233/49243 so the stacks can run side by side.
+# /healthz is liveness (the daemon is running); /readyz is 200 only once the light client
+# reports the wallet at the tip (503 with reason "upstream_down" or "syncing" until then, so
+# a first sync from the birthday holds it at 503); /status lists the wallet with its
+# conn_state and synced_height. Loopback, and a port distinct from the testnet4 configs'
+# 49233/49243 so the stacks can run side by side.
 bind = "127.0.0.1"
 port = 9243
 

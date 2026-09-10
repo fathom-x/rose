@@ -79,6 +79,30 @@ async fn hang_flow(backend: BtcBackend) {
         .await
         .expect("getwalletinfo");
     assert_eq!(wi["upstream_connected"], json!(true), "{wi}");
+    // The health server sees the Bitcoin wallet: healthy means running, ready means the
+    // chain source reports the wallet at its tip. Before the fix a bitcoin-only
+    // daemon's /readyz was 200 with nothing checked and /status listed no wallets.
+    let (code, body) = zecd.health_get("healthz").await;
+    assert_eq!(code, 200, "{body}");
+    let ready = zecd
+        .wait_readyz(200, "the synced wallet reports ready")
+        .await;
+    assert_eq!(ready["ready"], json!(true), "{ready}");
+    let w = &ready["wallets"]["btc"];
+    assert_eq!(w["coin"], json!("bitcoin"), "{ready}");
+    assert_eq!(w["network"], json!("regtest"), "{ready}");
+    assert_eq!(w["conn_state"], json!("ready"), "{ready}");
+    assert_eq!(w["actor_alive"], json!(true), "{ready}");
+    assert_eq!(w["synced_height"], json!(102), "{ready}");
+    assert_eq!(w["birthday"], json!(0), "{ready}");
+    assert!(
+        w["server"]
+            .as_str()
+            .is_some_and(|s| s.starts_with(backend.label())),
+        "{ready}"
+    );
+    let (_, status) = zecd.health_get("status").await;
+    assert_eq!(status["wallets"]["btc"]["ready"], json!(true), "{status}");
     let miner = node.new_address().await;
 
     let mut queued_txid: Option<String> = None;
@@ -133,6 +157,19 @@ async fn hang_flow(backend: BtcBackend) {
                 backend.label(),
                 t0.elapsed()
             );
+            // Readiness follows the detection: 503 naming the upstream, while liveness
+            // stays 200 - the process is fine, its chain source is not.
+            let body = zecd
+                .wait_readyz(503, "the hung upstream fails readiness")
+                .await;
+            assert_eq!(body["reason"], json!("upstream_down"), "{body}");
+            assert_eq!(
+                body["wallets"]["btc"]["conn_state"],
+                json!("down"),
+                "{body}"
+            );
+            let (code, _) = zecd.health_get("healthz").await;
+            assert_eq!(code, 200, "/healthz is liveness, not readiness");
             // A send while disconnected is refused up front (-4, no upstream), not parked
             // on the dead socket for fee estimation and broadcast.
             let (code, msg) = tokio::time::timeout(
@@ -281,6 +318,14 @@ async fn hang_flow(backend: BtcBackend) {
         .await
         .expect("getwalletinfo after recovery");
     assert_eq!(wi["upstream_connected"], json!(true), "{wi}");
+    let ready = zecd
+        .wait_readyz(200, "readiness returns once the wallet is back at the tip")
+        .await;
+    assert_eq!(
+        ready["wallets"]["btc"]["synced_height"],
+        json!(105),
+        "{ready}"
+    );
     let balance = zecd
         .call("getbalance", json!([]))
         .await

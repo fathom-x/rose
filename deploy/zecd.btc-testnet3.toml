@@ -105,10 +105,10 @@ auto_unlock = true
 interval_secs = 5
 
 [health]
-# NB the health server reports on Zcash wallets only - /status lists them and /readyz gates on
-# them - so on this bitcoin-only config /status shows an empty wallet map and /readyz is
-# trivially ready. Poll `getwalletinfo.lastprocessedblock` (or getblockcount, which answers
-# from the wallet's own applied height, never the node's tip) for sync state instead. The
+# /healthz is liveness (the daemon is running); /readyz is 200 only once the wallet's chain
+# source reports it at the tip (503 with reason "upstream_down" or "syncing" until then), and
+# /status lists the wallet with its conn_state and synced_height. Poll getblockcount for the
+# wallet's own applied height (never the node's tip). The
 # port is set here only so a testnet4 daemon can run alongside this one.
 port = 19233
 

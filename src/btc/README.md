@@ -24,6 +24,21 @@ for the full scan from SegWit activation explicitly): the alternative is ~485k b
 filters that a kyoto first sync must finish in one run, since `bip157` persists nothing
 until it completes. The testnets keep the warned from-activation default.
 
+## Restores and the address lookahead
+
+BDK derives and watches a fixed number of addresses past the last revealed index of each
+keychain - its *lookahead*, 25 by default - and attributes an output only to an address in
+that window; a payment found at an unrevealed index reveals up to it and pushes the window
+on. On a restore or an `init --xpub` import nothing is revealed yet, so the lookahead is
+the BIP-44 gap limit: the longest run of never-paid addresses the scan can bridge. A
+wallet whose history skipped more than that between payments **silently misses** the later
+funds - over kyoto too, where the recovery scan asks the node to watch 100 scripts per
+keychain but the wallet's own index still decides what an output belongs to. Set
+`[wallets.<name>] lookahead` above the wallet's widest gap before restoring (the engine
+applies it at every load, and kyoto's recovery hint follows it upward);
+`regtest_btc_lookahead.rs` pins both halves. The Zcash side's knob is
+`[pools] transparent_gap_limit`.
+
 ## The two backends are not equivalent
 
 Choosing `kyoto` buys privacy and drops a dependency; it also gives up capabilities the

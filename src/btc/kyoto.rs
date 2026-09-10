@@ -213,9 +213,18 @@ pub(crate) fn scan_floor(network: BitcoinNetwork) -> Option<&'static ScanFloor> 
 }
 
 /// The gap-limit hint given to a recovery scan: how many scripts of each keychain kyoto
-/// should watch for. The engine reveals addresses on demand, so this only has to cover the
-/// unused lookahead beyond what the wallet has already revealed.
+/// should watch for, at least. The engine reveals addresses on demand, so this only has to
+/// cover the unused lookahead beyond what the wallet has already revealed - and a wallet
+/// whose `[wallets.<name>] lookahead` is wider than this watches that many instead
+/// ([`recovery_script_lookahead`]): the node fetching a block is worth nothing unless the
+/// wallet's own index attributes the output, and it attributes only within its lookahead.
 const RECOVERY_SCRIPT_LOOKAHEAD: u32 = 100;
+
+/// The scripts per keychain a recovery scan watches for `wallet`: the fixed floor, or the
+/// wallet's configured lookahead when that is wider.
+fn recovery_script_lookahead(wallet: &Wallet) -> u32 {
+    RECOVERY_SCRIPT_LOOKAHEAD.max(wallet.spk_index().lookahead())
+}
 
 /// How far back the *second* consecutive header-sync failure restarts the light client, in
 /// blocks below the wallet's checkpoint tip, and the factor each further failure multiplies
@@ -667,7 +676,7 @@ impl KyotoEndpoint {
                  client from an older checkpoint"
             );
             let scan = ScanType::Recovery {
-                used_script_index: RECOVERY_SCRIPT_LOOKAHEAD,
+                used_script_index: recovery_script_lookahead(wallet),
                 checkpoint,
             };
             return (scan, None);
@@ -679,7 +688,7 @@ impl KyotoEndpoint {
                 "kyoto recovery scan start (recorded birthday anchor)"
             );
             let scan = ScanType::Recovery {
-                used_script_index: RECOVERY_SCRIPT_LOOKAHEAD,
+                used_script_index: recovery_script_lookahead(wallet),
                 checkpoint: HashCheckpoint::new(height, hash),
             };
             return (scan, None);
@@ -693,7 +702,7 @@ impl KyotoEndpoint {
             "kyoto recovery scan start"
         );
         let scan = ScanType::Recovery {
-            used_script_index: RECOVERY_SCRIPT_LOOKAHEAD,
+            used_script_index: recovery_script_lookahead(wallet),
             checkpoint: floor,
         };
         (scan, resolution.map(|target| (floor.height, target)))

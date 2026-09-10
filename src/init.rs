@@ -472,6 +472,7 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
                 .keys
                 .fresh_wallet_birthday_margin
                 .unwrap_or(FRESH_WALLET_BIRTHDAY_MARGIN),
+            lookahead: crate::config::DEFAULT_LOOKAHEAD,
         })
 }
 
@@ -2177,6 +2178,7 @@ mod tests {
             fees: crate::config::FeesConfig::default(),
             birthday: 0,
             birthday_time: None,
+            lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),
@@ -2285,6 +2287,7 @@ mod tests {
             fees: crate::config::FeesConfig::default(),
             birthday: 0,
             birthday_time: None,
+            lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),
@@ -3129,6 +3132,7 @@ mod tests {
                 transparent_allow_beyond_recovery_window: true,
                 transparent_gap_warn_threshold: 5,
                 fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
+                lookahead: crate::config::DEFAULT_LOOKAHEAD,
             },
         );
         wallets.insert(
@@ -3148,6 +3152,7 @@ mod tests {
                 transparent_allow_beyond_recovery_window: true,
                 transparent_gap_warn_threshold: 5,
                 fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
+                lookahead: crate::config::DEFAULT_LOOKAHEAD,
             },
         );
 
@@ -3197,6 +3202,7 @@ mod tests {
                     transparent_allow_beyond_recovery_window: true,
                     transparent_gap_warn_threshold: 5,
                     fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
+                    lookahead: crate::config::DEFAULT_LOOKAHEAD,
                 },
             );
         }

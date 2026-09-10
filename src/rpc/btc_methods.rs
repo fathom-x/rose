@@ -785,6 +785,7 @@ mod tests {
             fees: crate::config::FeesConfig::default(),
             birthday: 0,
             birthday_time: None,
+            lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),

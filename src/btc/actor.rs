@@ -463,6 +463,10 @@ impl std::fmt::Display for BtcBindingMismatch {
 
 impl std::error::Error for BtcBindingMismatch {}
 
+/// BDK's default lookahead (25): what a wallet runs on when `[wallets.<name>] lookahead` is
+/// unset. Re-exported so the config layer and tests name one number.
+pub const DEFAULT_LOOKAHEAD: u32 = bdk_wallet::chain::keychain_txout::DEFAULT_LOOKAHEAD;
+
 /// What `spawn` needs to bring a Bitcoin wallet up.
 pub struct BtcActorConfig {
     pub name: String,
@@ -495,6 +499,12 @@ pub struct BtcActorConfig {
     /// kyoto date path - see `WalletStore::birthday_time`); the kyoto first sync resolves
     /// it to a real `(height, hash)` anchor. `None` everywhere else.
     pub birthday_time: Option<u64>,
+    /// How far past the last revealed index of each keychain the wallet derives and
+    /// watches (`[wallets.<name>] lookahead`): BDK's lookahead, which on a restore or an
+    /// xpub import is the BIP-44 gap limit - the longest run of never-paid addresses the
+    /// scan can bridge, since a payment found at an unrevealed index reveals up to it and
+    /// pushes the window on. Not persisted; applied at every load.
+    pub lookahead: u32,
     /// How often to poll the upstream once caught up (`[sync] interval_secs`).
     pub sync_interval: Duration,
     /// Reconnect backoff bounds (`[backend] reconnect_base_secs`/`reconnect_max_secs`).
@@ -522,6 +532,7 @@ pub fn spawn(
         fees,
         birthday,
         birthday_time,
+        lookahead,
         sync_interval,
         reconnect_base,
         reconnect_max,
@@ -535,7 +546,9 @@ pub fn spawn(
         None => imported_keys,
     };
     let mut persister = Persister::open(&engine_dir)?;
-    let mut load = Wallet::load().check_network(keys::network(network));
+    let mut load = Wallet::load()
+        .check_network(keys::network(network))
+        .lookahead(lookahead);
     if let Some(keys) = &keys {
         // Assert the stored descriptors against the known ones (seed-derived, or the
         // pinned import); a mismatch fails the load (and thus the spawn) with a descriptor
@@ -591,7 +604,8 @@ pub fn spawn(
                     keys.descriptor(KeychainKind::External),
                     keys.descriptor(KeychainKind::Internal),
                 )
-                .network(keys.network),
+                .network(keys.network)
+                .lookahead(lookahead),
             )?
         }
     };
@@ -2248,6 +2262,7 @@ mod tests {
             fees: crate::config::FeesConfig::default(),
             birthday: 0,
             birthday_time: None,
+            lookahead: DEFAULT_LOOKAHEAD,
             sync_interval: Duration::from_secs(20),
             reconnect_base: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),

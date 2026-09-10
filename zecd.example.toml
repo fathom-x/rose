@@ -45,6 +45,15 @@ dir = "./data/default"
 # lightwalletd-backed watch-only replica. Deployment-wide settings (timeouts, reconnect
 # backoff, the cleartext-locality rules) and the [zebra] credentials stay global.
 # server = "zebra://127.0.0.1:8234"
+# Bitcoin wallets only (coin = "bitcoin", a `--features bitcoin` build): how many addresses
+# past the last revealed one of each keychain the engine derives and watches - BDK's
+# lookahead, and on a restore or an xpub import the BIP-44 gap limit the scan can bridge.
+# A payment found at an unrevealed index reveals up to it and pushes the window on, so the
+# number only has to cover the longest run of never-paid addresses in the wallet's history.
+# Raise it BEFORE restoring a wallet that handed out more addresses than that between
+# payments; a restore that misses funds this way recovers nothing until a rescan with it
+# raised. The Zcash equivalent is [pools] transparent_gap_limit.
+# lookahead = 25
 
 [backend]
 # The chain upstream: a LOCAL zebrad's JSON-RPC ("full mode", the default and the

@@ -49,6 +49,10 @@ default_wallet = "btc"
 
 [wallets.btc]
 coin = "bitcoin"
+# Addresses watched past the last revealed one (BDK's lookahead, default 25): the gap an
+# xpub import can bridge. Raise it before `init --xpub` for a key whose history skipped
+# more addresses than that between payments.
+# lookahead = 25
 # The project's own mainnet node, as a pinned trusted peer (never a DNS name). Naming one
 # peer makes the light client whitelist-only, so block data and the peer-derived fee
 # signals all come from a node we run. Beside the compose stack on the same host:

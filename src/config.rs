@@ -266,6 +266,11 @@ pub struct PoolsConfig {
     pub transparent_gap_warn_threshold: u32,
 }
 
+/// The Bitcoin engine's default address lookahead: BDK's own 25. Spelled here rather than
+/// through `btc::actor` so a build without the `bitcoin` feature resolves the same config
+/// (the key is refused on Zcash wallets, so the number is inert there).
+pub const DEFAULT_LOOKAHEAD: u32 = 25;
+
 /// Default external transparent gap limit. Above librustzcash's built-in 10 to give a safer margin
 /// for typical sparse issuance, while keeping restore scans cheap.
 pub const DEFAULT_TRANSPARENT_GAP_LIMIT: u32 = 20;
@@ -433,6 +438,12 @@ pub struct WalletEntry {
     /// `server`; the per-coin default exists because the same block count spans ~10x more
     /// wall-clock time on Bitcoin than on Zcash.
     pub fresh_wallet_birthday_margin: u32,
+    /// The Bitcoin engine's address lookahead (`[wallets.<name>] lookahead`, Bitcoin wallets
+    /// only): how far past the last revealed index of each keychain BDK derives and watches -
+    /// on a restore or an xpub import, the BIP-44 gap limit the scan can bridge. Defaults to
+    /// BDK's own 25 ([`crate::btc::actor::DEFAULT_LOOKAHEAD`]); carried at that default on
+    /// a Zcash wallet, whose gap limit is `transparent_gap_limit`.
+    pub lookahead: u32,
 }
 
 impl WalletEntry {
@@ -1203,6 +1214,9 @@ struct WalletFile {
     /// Override the global `[keys] fresh_wallet_birthday_margin` for this wallet. Legal on
     /// every coin, like `server`.
     fresh_wallet_birthday_margin: Option<u32>,
+    /// The Bitcoin engine's address lookahead (BDK's; the restore gap limit). Bitcoin
+    /// wallets only - a Zcash wallet's gap limit is `transparent_gap_limit`.
+    lookahead: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1949,6 +1963,21 @@ impl AppConfig {
                     );
                 }
             }
+            // The mirror image: the Bitcoin engine's own knob is refused on a Zcash wallet,
+            // naming the key that plays its role there.
+            if coin == Coin::Zcash && w.lookahead.is_some() {
+                anyhow::bail!(
+                    "[wallets.{name}] lookahead does not apply to a zcash wallet (it configures \
+                     the Bitcoin engine's address lookahead; a Zcash wallet's gap limit is \
+                     transparent_gap_limit)"
+                );
+            }
+            if w.lookahead == Some(0) {
+                anyhow::bail!(
+                    "[wallets.{name}] lookahead must be at least 1 (0 would watch no address \
+                     past the last revealed one and recover nothing on a restore)"
+                );
+            }
             let dir = w.dir.clone().unwrap_or_else(|| wallet_dir(&datadir, name));
             let backend_override = resolve_wallet_backend(name, w)?;
             let (
@@ -1996,6 +2025,7 @@ impl AppConfig {
                         .fresh_wallet_birthday_margin
                         .or(global_birthday_margin)
                         .unwrap_or_else(|| crate::init::default_fresh_wallet_birthday_margin(coin)),
+                    lookahead: w.lookahead.unwrap_or(DEFAULT_LOOKAHEAD),
                 },
             );
         }
@@ -2018,6 +2048,7 @@ impl AppConfig {
                 transparent_gap_warn_threshold: pools.transparent_gap_warn_threshold,
                 fresh_wallet_birthday_margin: global_birthday_margin
                     .unwrap_or(crate::init::FRESH_WALLET_BIRTHDAY_MARGIN),
+                lookahead: DEFAULT_LOOKAHEAD,
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {
@@ -3910,6 +3941,48 @@ mod tests {
             );
             assert!(err.contains("Zcash engine"), "{key}: {err}");
         }
+    }
+
+    /// The Bitcoin engine's `lookahead`: resolved per wallet with BDK's default, at least 1,
+    /// and refused on a Zcash wallet naming the key that plays its role there.
+    #[test]
+    #[cfg(all(feature = "cli", feature = "bitcoin"))]
+    fn lookahead_is_a_bitcoin_wallet_knob() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        let resolve = |body: &str| {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            AppConfig::resolve(&cli)
+        };
+        let cfg =
+            resolve("network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n")
+                .unwrap();
+        assert_eq!(cfg.wallets["btc"].lookahead, DEFAULT_LOOKAHEAD);
+        assert_eq!(DEFAULT_LOOKAHEAD, 25, "BDK's default");
+        let cfg = resolve(
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\nlookahead = 40\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.wallets["btc"].lookahead, 40);
+        let err = resolve(
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\nlookahead = 0\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("[wallets.btc] lookahead must be at least 1"),
+            "{err}"
+        );
+        let err = resolve("network = \"test\"\ndatadir = \"/d\"\n[wallets.zec]\nlookahead = 40\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[wallets.zec] lookahead does not apply to a zcash wallet"),
+            "{err}"
+        );
+        assert!(err.contains("transparent_gap_limit"), "{err}");
     }
 
     #[test]

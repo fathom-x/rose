@@ -727,6 +727,7 @@ mod tests {
             transparent_allow_beyond_recovery_window: true,
             transparent_gap_warn_threshold: 5,
             fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
+            lookahead: crate::config::DEFAULT_LOOKAHEAD,
         };
 
         assert_eq!(

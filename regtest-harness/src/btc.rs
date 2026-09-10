@@ -354,6 +354,18 @@ impl ZecdBtc {
         node: &BitcoinD,
         wallets: &[&str],
     ) -> ZecdBtc {
+        Self::prepare_with(datadir, backend, node, wallets, "")
+    }
+
+    /// [`ZecdBtc::prepare`] with `wallet_extra` (TOML lines) appended to every wallet's
+    /// `[wallets.<name>]` table - a per-wallet knob such as `lookahead = 40`.
+    pub fn prepare_with(
+        datadir: PathBuf,
+        backend: BtcBackend,
+        node: &BitcoinD,
+        wallets: &[&str],
+        wallet_extra: &str,
+    ) -> ZecdBtc {
         std::fs::create_dir_all(&datadir).unwrap();
         let conf = datadir.join("zecd.toml");
         let server = match backend {
@@ -363,7 +375,7 @@ impl ZecdBtc {
         let mut text = format!("default_wallet = \"{}\"\n", wallets[0]);
         for wallet in wallets {
             text.push_str(&format!(
-                "[wallets.{wallet}]\ncoin = \"bitcoin\"\nserver = \"{server}\"\n"
+                "[wallets.{wallet}]\ncoin = \"bitcoin\"\nserver = \"{server}\"\n{wallet_extra}\n"
             ));
         }
         if backend == BtcBackend::Bitcoind {

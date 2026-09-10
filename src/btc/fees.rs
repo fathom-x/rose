@@ -207,21 +207,15 @@ pub fn validate_endpoint_override(key: &str, url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// mempool.space's response body. Every field is sat/vB; only `hourFee` is read (the
-/// [`TARGET_BLOCKS`] target), but naming the rest documents what the endpoint offers if a
-/// caller ever wants a configurable target.
+/// mempool.space's response body, reduced to the one field read: `hourFee` (sat/vB, the
+/// [`TARGET_BLOCKS`] target). The endpoint also serves `fastestFee`, `halfHourFee`,
+/// `economyFee` and `minimumFee`; they are deliberately not declared, so an upstream
+/// rename or removal of a band this code never reads cannot break the whole oracle
+/// (serde ignores unknown fields). A configurable target would add its band here.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Recommended {
-    #[allow(dead_code)]
-    fastest_fee: f64,
-    #[allow(dead_code)]
-    half_hour_fee: f64,
     hour_fee: f64,
-    #[allow(dead_code)]
-    economy_fee: f64,
-    #[allow(dead_code)]
-    minimum_fee: f64,
 }
 
 /// Ask one HTTP tier. `Ok` is a rate that has already passed the zero and ceiling checks;

@@ -206,8 +206,9 @@ pub struct BtcTxRecord {
     /// Whether the transaction signals BIP 125 replaceability (`bip125-replaceable` is
     /// `"yes"` only while it is also unconfirmed, like Core).
     pub explicit_rbf: bool,
-    /// Raw transaction hex (`gettransaction`'s `hex` field).
-    pub hex: String,
+    /// Raw transaction hex (`gettransaction`'s `hex` field) - serialized for a single
+    /// lookup only; a history listing, which never shows it, leaves it `None`.
+    pub hex: Option<String>,
     /// The wallet-relevant outputs, in `vout` order. Empty for a transaction with no
     /// visible entry (every output is change), which `listtransactions` then omits while
     /// `gettransaction` still resolves.
@@ -287,8 +288,16 @@ enum BtcCommand {
         txid: Txid,
         reply: oneshot::Sender<Result<(), RpcError>>,
     },
+    /// A window of the history in Core's `listtransactions` terms: skip `skip` entries from
+    /// the newest end, then up to `count` entries, oldest first. Only that window is built.
     ListTransactions {
+        count: usize,
+        skip: usize,
         reply: oneshot::Sender<Result<Vec<BtcTxRecord>, RpcError>>,
+    },
+    /// How many transactions the wallet holds (`getwalletinfo.txcount`), without building any.
+    TxCount {
+        reply: oneshot::Sender<Result<usize, RpcError>>,
     },
     GetTransaction {
         txid: String,
@@ -409,9 +418,22 @@ impl BtcWalletHandle {
             .await
     }
 
-    pub async fn list_transactions(&self) -> Result<Vec<BtcTxRecord>, RpcError> {
-        self.dispatch(|reply| BtcCommand::ListTransactions { reply })
+    /// Core's `listtransactions` window: the newest `count` visible entries after skipping
+    /// `skip` newer ones, oldest first. Each returned record carries only the entries
+    /// (`details`) inside the window, so a boundary that falls inside one transaction's
+    /// fan-out is honoured exactly as Core does.
+    pub async fn list_transactions(
+        &self,
+        count: usize,
+        skip: usize,
+    ) -> Result<Vec<BtcTxRecord>, RpcError> {
+        self.dispatch(|reply| BtcCommand::ListTransactions { count, skip, reply })
             .await
+    }
+
+    /// Every wallet transaction, counted without being built.
+    pub async fn tx_count(&self) -> Result<usize, RpcError> {
+        self.dispatch(|reply| BtcCommand::TxCount { reply }).await
     }
 
     pub async fn get_transaction(&self, txid: String) -> Result<Option<BtcTxRecord>, RpcError> {
@@ -772,6 +794,162 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Confirmations of a transaction anchored at `height` against the wallet's own tip
+/// (0 for an unconfirmed one), Core's counting: the anchoring block is the first.
+fn confirmations_at(wallet: &Wallet, height: Option<u32>) -> u64 {
+    match height {
+        Some(h) => u64::from(wallet.latest_checkpoint().height().saturating_sub(h)) + 1,
+        None => 0,
+    }
+}
+
+/// Where a transaction sorts in the history and how many visible entries it fans out
+/// to - the cheap half of [`Self::tx_entry`], computed for every transaction so the
+/// window can be chosen before anything is serialized.
+fn tx_position(wallet: &Wallet, wtx: &bdk_wallet::WalletTx<'_>) -> (u64, u64, usize) {
+    let (sort_key, time) = match &wtx.chain_position {
+        bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => {
+            (u64::from(anchor.block_id.height), anchor.confirmation_time)
+        }
+        bdk_wallet::chain::ChainPosition::Unconfirmed {
+            first_seen,
+            last_seen,
+        } => {
+            // Unconfirmed sorts after every mined transaction.
+            (u64::MAX, first_seen.or(*last_seen).unwrap_or(0))
+        }
+    };
+    let tx = &wtx.tx_node.tx;
+    let funded = wallet.sent_and_received(tx).0 > Amount::ZERO;
+    let entries = tx
+        .output
+        .iter()
+        .map(|txout| {
+            let keychain = wallet
+                .derivation_of_spk(txout.script_pubkey.clone())
+                .map(|(keychain, _)| keychain);
+            categories(funded, keychain).len()
+        })
+        .sum();
+    (sort_key, time, entries)
+}
+
+/// Core's accounting (and the Zcash side's `tx_entries`) for one output: on a funded
+/// transaction, a foreign output is a `send`, an own external-keychain output is a
+/// self-payment (send+receive pair), and change (internal keychain) is hidden. On a
+/// transaction the wallet did not fund, only the wallet's own outputs appear, as
+/// `receive`.
+fn categories(funded: bool, keychain: Option<KeychainKind>) -> &'static [&'static str] {
+    match (funded, keychain) {
+        (true, None) => &["send"],
+        (true, Some(KeychainKind::External)) => &["send", "receive"],
+        (true, Some(KeychainKind::Internal)) => &[],
+        (false, Some(_)) => &["receive"],
+        (false, None) => &[],
+    }
+}
+
+/// One wallet transaction as a wire-shaped record with its per-output fan-out. The
+/// fee needs every input resolved and the hex a full serialization, so this is built
+/// only for the transactions a caller will actually see: the `listtransactions` window,
+/// or the one `gettransaction` names (`with_hex`, the only reader of the hex).
+fn tx_entry(wallet: &Wallet, wtx: &bdk_wallet::WalletTx<'_>, with_hex: bool) -> BtcTxRecord {
+    let network = wallet.network();
+    let tx = &wtx.tx_node.tx;
+    let (sent, _received) = wallet.sent_and_received(tx);
+    let funded = sent > Amount::ZERO;
+    let fee = if funded {
+        wallet.calculate_fee(tx).ok().map(|a| a.to_sat())
+    } else {
+        None
+    };
+    let (height, blockhash, time) = match &wtx.chain_position {
+        bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => (
+            Some(anchor.block_id.height),
+            Some(anchor.block_id.hash.to_string()),
+            anchor.confirmation_time,
+        ),
+        bdk_wallet::chain::ChainPosition::Unconfirmed {
+            first_seen,
+            last_seen,
+        } => (None, None, first_seen.or(*last_seen).unwrap_or(0)),
+    };
+    let mut details = Vec::new();
+    for (vout, txout) in tx.output.iter().enumerate() {
+        let vout = u32::try_from(vout).unwrap_or(u32::MAX);
+        let keychain = wallet
+            .derivation_of_spk(txout.script_pubkey.clone())
+            .map(|(keychain, _)| keychain);
+        let address = Address::from_script(&txout.script_pubkey, network)
+            .ok()
+            .map(|a| a.to_string());
+        let value = i64::try_from(txout.value.to_sat()).unwrap_or(i64::MAX);
+        for category in categories(funded, keychain) {
+            details.push(BtcTxDetail {
+                category,
+                amount_sat: if *category == "send" { -value } else { value },
+                address: address.clone(),
+                vout,
+            });
+        }
+    }
+    BtcTxRecord {
+        txid: wtx.tx_node.txid.to_string(),
+        fee_sat: fee,
+        confirmations: confirmations_at(wallet, height),
+        height,
+        blockhash,
+        time,
+        explicit_rbf: tx.is_explicitly_rbf(),
+        hex: with_hex.then(|| bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx.as_ref())),
+        details,
+    }
+}
+
+/// Core's `listtransactions` window over the visible entries, oldest first (confirmed
+/// by height, then unconfirmed by first-seen): skip `skip` entries from the newest end,
+/// then up to `count`. Every transaction is positioned (cheap), only those inside the
+/// window are built, and a record at either boundary carries just the entries within
+/// it - so the cost of a page is the page, not the history.
+fn tx_history(wallet: &Wallet, count: usize, skip: usize) -> Vec<BtcTxRecord> {
+    let mut positioned: Vec<(u64, u64, usize, Txid)> = wallet
+        .transactions()
+        .map(|wtx| {
+            let (sort_key, time, entries) = tx_position(wallet, &wtx);
+            (sort_key, time, entries, wtx.tx_node.txid)
+        })
+        .collect();
+    positioned.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let total: usize = positioned.iter().map(|p| p.2).sum();
+    let upper = total.saturating_sub(skip);
+    let lower = upper.saturating_sub(count);
+    if lower == upper {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for (_, _, entries, txid) in positioned {
+        let start = offset;
+        offset += entries;
+        if entries == 0 || offset <= lower {
+            continue;
+        }
+        if start >= upper {
+            break;
+        }
+        let Some(wtx) = wallet.get_tx(txid) else {
+            continue;
+        };
+        let mut record = tx_entry(wallet, &wtx, false);
+        // Trim to the window where a boundary falls inside this transaction's fan-out.
+        let keep_from = lower.saturating_sub(start);
+        let keep_to = (upper - start).min(record.details.len());
+        record.details = record.details.drain(keep_from..keep_to).collect();
+        out.push(record);
+    }
+    out
 }
 
 impl BtcActor {
@@ -1337,10 +1515,7 @@ impl BtcActor {
     }
 
     fn confirmations(&self, anchor_height: Option<u32>) -> u64 {
-        match anchor_height {
-            Some(h) => u64::from(self.tip_height().saturating_sub(h)) + 1,
-            None => 0,
-        }
+        confirmations_at(&self.wallet, anchor_height)
     }
 
     async fn handle(&mut self, cmd: BtcCommand) {
@@ -1453,15 +1628,18 @@ impl BtcActor {
             BtcCommand::AbandonTransaction { txid, reply } => {
                 let _ = reply.send(self.do_abandon(txid));
             }
-            BtcCommand::ListTransactions { reply } => {
-                let _ = reply.send(Ok(self.tx_entries()));
+            BtcCommand::ListTransactions { count, skip, reply } => {
+                let _ = reply.send(Ok(tx_history(&self.wallet, count, skip)));
+            }
+            BtcCommand::TxCount { reply } => {
+                let _ = reply.send(Ok(self.wallet.transactions().count()));
             }
             BtcCommand::GetTransaction { txid, reply } => {
                 let result = match Txid::from_str(&txid) {
                     Ok(txid) => Ok(self
-                        .tx_entries()
-                        .into_iter()
-                        .find(|e| e.txid == txid.to_string())),
+                        .wallet
+                        .get_tx(txid)
+                        .map(|wtx| tx_entry(&self.wallet, &wtx, true))),
                     Err(_) => Err(RpcError::invalid_address_or_key(format!(
                         "Invalid txid: {txid}"
                     ))),
@@ -1550,85 +1728,6 @@ impl BtcActor {
                 }
             })
             .collect()
-    }
-
-    /// Every wallet transaction as a wire-shaped record with its per-output fan-out, oldest
-    /// first (confirmed by height, then unconfirmed by first-seen).
-    fn tx_entries(&self) -> Vec<BtcTxRecord> {
-        let network = self.wallet.network();
-        let mut entries: Vec<(u64, BtcTxRecord)> = self
-            .wallet
-            .transactions()
-            .map(|wtx| {
-                let tx = wtx.tx_node.tx.clone();
-                let txid = wtx.tx_node.txid;
-                let (sent, _received) = self.wallet.sent_and_received(&tx);
-                let fee = self.wallet.calculate_fee(&tx).ok().map(|a| a.to_sat());
-                let (height, blockhash, time, sort_key) = match &wtx.chain_position {
-                    bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => (
-                        Some(anchor.block_id.height),
-                        Some(anchor.block_id.hash.to_string()),
-                        anchor.confirmation_time,
-                        u64::from(anchor.block_id.height),
-                    ),
-                    bdk_wallet::chain::ChainPosition::Unconfirmed {
-                        first_seen,
-                        last_seen,
-                    } => {
-                        let seen = first_seen.or(*last_seen).unwrap_or(0);
-                        // Unconfirmed sorts after every mined transaction.
-                        (None, None, seen, u64::MAX)
-                    }
-                };
-                let funded = sent > Amount::ZERO;
-                let mut details = Vec::new();
-                for (vout, txout) in tx.output.iter().enumerate() {
-                    let vout = u32::try_from(vout).unwrap_or(u32::MAX);
-                    let keychain = self
-                        .wallet
-                        .derivation_of_spk(txout.script_pubkey.clone())
-                        .map(|(keychain, _)| keychain);
-                    let address = Address::from_script(&txout.script_pubkey, network)
-                        .ok()
-                        .map(|a| a.to_string());
-                    let value = i64::try_from(txout.value.to_sat()).unwrap_or(i64::MAX);
-                    // Core's accounting (and the Zcash side's `tx_entries`): on a funded
-                    // transaction, a foreign output is a `send`, an own external-keychain
-                    // output is a self-payment (send+receive pair), and change (internal
-                    // keychain) is hidden. On a transaction the wallet did not fund, only
-                    // the wallet's own outputs appear, as `receive`.
-                    let categories: &[&'static str] = match (funded, keychain) {
-                        (true, None) => &["send"],
-                        (true, Some(KeychainKind::External)) => &["send", "receive"],
-                        (true, Some(KeychainKind::Internal)) => &[],
-                        (false, Some(_)) => &["receive"],
-                        (false, None) => &[],
-                    };
-                    for category in categories {
-                        details.push(BtcTxDetail {
-                            category,
-                            amount_sat: if *category == "send" { -value } else { value },
-                            address: address.clone(),
-                            vout,
-                        });
-                    }
-                }
-                let entry = BtcTxRecord {
-                    txid: txid.to_string(),
-                    fee_sat: funded.then_some(fee).flatten(),
-                    confirmations: self.confirmations(height),
-                    height,
-                    blockhash,
-                    time,
-                    explicit_rbf: tx.is_explicitly_rbf(),
-                    hex: bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx.as_ref()),
-                    details,
-                };
-                (sort_key, entry)
-            })
-            .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.time.cmp(&b.1.time)));
-        entries.into_iter().map(|(_, e)| e).collect()
     }
 
     /// The upstream's fee rate for a send, in whichever dialect is connected.
@@ -2284,7 +2383,8 @@ mod tests {
         assert_eq!(a1, "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g");
         assert_eq!(handle.balance().await.unwrap(), BtcBalance::default());
         assert!(handle.list_unspent().await.unwrap().is_empty());
-        assert!(handle.list_transactions().await.unwrap().is_empty());
+        assert!(handle.list_transactions(10, 0).await.unwrap().is_empty());
+        assert_eq!(handle.tx_count().await.unwrap(), 0);
 
         // With no upstream configured the status is Down at the genesis checkpoint.
         let status = handle.status();
@@ -2702,6 +2802,132 @@ mod tests {
                 &|w, _, id| w.apply_evicted_txs([(id, 1_700_000_200)])
             ),
             (pending, true)
+        );
+    }
+
+    /// The `listtransactions` window is Core's: entries oldest first, `skip` from the newest
+    /// end, then `count`; a boundary inside one transaction's fan-out trims that record to
+    /// the entries within the window; and only the window is built. The count is the
+    /// transaction total, visible entries or not.
+    #[test]
+    fn history_window_pages_entries_like_core() {
+        use bdk_wallet::bitcoin::block::{Header, Version};
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        use bdk_wallet::bitcoin::{
+            absolute, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, TxIn, TxMerkleNode,
+            TxOut, Txid, Witness,
+        };
+        use std::str::FromStr as _;
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let mut wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .create_wallet_no_persist()
+        .unwrap();
+        let block =
+            |prev: bdk_wallet::bitcoin::BlockHash, nonce: u32, txs: Vec<Transaction>| Block {
+                header: Header {
+                    version: Version::TWO,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time: 1_700_000_000 + nonce,
+                    bits: CompactTarget::from_consensus(0x207f_ffff),
+                    nonce,
+                },
+                txdata: txs,
+            };
+        let pay = |outputs: Vec<(ScriptBuf, u64)>, salt: u8| Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(
+                    Txid::from_str(&format!("{salt:02x}").repeat(32)).unwrap(),
+                    0,
+                ),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: outputs
+                .into_iter()
+                .map(|(spk, value)| TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: spk,
+                })
+                .collect(),
+        };
+        let a0 = wallet.reveal_next_address(KeychainKind::External).address;
+        let a1 = wallet.reveal_next_address(KeychainKind::External).address;
+        let a2 = wallet.reveal_next_address(KeychainKind::External).address;
+        // Block 1: one transaction paying two wallet outputs (two entries). Block 2: one
+        // output (one entry). Then an unconfirmed receive (one entry, sorts last).
+        let two = pay(
+            vec![(a0.script_pubkey(), 1_000), (a1.script_pubkey(), 2_000)],
+            0x11,
+        );
+        let one = pay(vec![(a2.script_pubkey(), 3_000)], 0x22);
+        let mempool = pay(vec![(a0.script_pubkey(), 4_000)], 0x33);
+        let b1 = block(wallet.latest_checkpoint().hash(), 1, vec![two.clone()]);
+        wallet.apply_block(&b1, 1).unwrap();
+        let b2 = block(b1.block_hash(), 2, vec![one.clone()]);
+        wallet.apply_block(&b2, 2).unwrap();
+        wallet.apply_unconfirmed_txs([(mempool.clone(), 1_700_000_100)]);
+        assert_eq!(wallet.transactions().count(), 3);
+
+        let flat = |records: Vec<BtcTxRecord>| -> Vec<(String, i64)> {
+            records
+                .iter()
+                .flat_map(|r| {
+                    r.details
+                        .iter()
+                        .map(move |d| (r.txid.clone(), d.amount_sat))
+                })
+                .collect()
+        };
+        let (t2, t1, tm) = (
+            two.compute_txid().to_string(),
+            one.compute_txid().to_string(),
+            mempool.compute_txid().to_string(),
+        );
+        // Everything, oldest first: the block-1 pair, block 2, then the mempool receive.
+        let all = tx_history(&wallet, 10, 0);
+        assert!(
+            all.iter().all(|r| r.hex.is_none()),
+            "a listing carries no hex"
+        );
+        assert_eq!(
+            flat(all),
+            vec![
+                (t2.clone(), 1_000),
+                (t2.clone(), 2_000),
+                (t1.clone(), 3_000),
+                (tm.clone(), 4_000)
+            ]
+        );
+        // The newest one.
+        assert_eq!(flat(tx_history(&wallet, 1, 0)), vec![(tm.clone(), 4_000)]);
+        // Skip the newest, take two: the boundary falls inside the block-1 pair, which is
+        // trimmed to its second entry.
+        assert_eq!(
+            flat(tx_history(&wallet, 2, 1)),
+            vec![(t2.clone(), 2_000), (t1.clone(), 3_000)]
+        );
+        // The oldest entry alone, through the other boundary.
+        assert_eq!(flat(tx_history(&wallet, 1, 3)), vec![(t2.clone(), 1_000)]);
+        // Past either end: nothing.
+        assert!(tx_history(&wallet, 0, 0).is_empty());
+        assert!(tx_history(&wallet, 5, 4).is_empty());
+        assert!(tx_history(&wallet, 5, 40).is_empty());
+        // A single lookup carries the hex and the whole fan-out.
+        let wtx = wallet.get_tx(two.compute_txid()).unwrap();
+        let entry = tx_entry(&wallet, &wtx, true);
+        assert_eq!(entry.details.len(), 2);
+        assert_eq!(entry.confirmations, 2);
+        assert_eq!(
+            entry.hex.as_deref(),
+            Some(bdk_wallet::bitcoin::consensus::encode::serialize_hex(&two).as_str())
         );
     }
 }

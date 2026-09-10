@@ -165,6 +165,9 @@ fn snapshot(state: &AppState) -> Snapshot {
             continue;
         };
         let coin = wallet.coin().name();
+        // Infallible without the `bitcoin` feature (one variant); the second arm exists
+        // with it, so this stays a match rather than a `let` destructure.
+        #[allow(clippy::infallible_destructuring_match)]
         let h = match wallet {
             CoinWallet::Zcash(h) => h,
             // A Bitcoin wallet reports through its own actor's status: its chain source's

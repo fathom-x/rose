@@ -165,8 +165,9 @@ async fn getunconfirmedbalance(handle: &BtcWalletHandle) -> Result<Value, RpcErr
 async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
     let b = handle.balance().await?;
     let status = handle.status();
-    // Core's txcount: every wallet transaction, visible history entry or not.
-    let txcount = handle.list_transactions().await?.len();
+    // Core's txcount: every wallet transaction, visible history entry or not - counted,
+    // not built.
+    let txcount = handle.tx_count().await?;
     Ok(json!({
         "walletname": handle.name,
         "walletversion": 169900,
@@ -355,17 +356,16 @@ async fn listtransactions(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<
     }
     // Shared with the Zcash handler: a negative count/skip is -8, a non-number -3.
     let (count, skip) = count_from_params(req, 1, 2)?;
-    let records = handle.list_transactions().await?;
-    // Flatten to per-output entries first (a change-only transaction contributes none);
-    // Core's pagination then applies to the entries: skip from the newest end, return up
-    // to `count`, oldest first.
+    // The actor applies Core's pagination over the per-output entries (a change-only
+    // transaction contributes none): skip from the newest end, up to `count`, oldest
+    // first - building only that window. Each record comes back holding exactly the
+    // entries inside it, so this is a flatten, not a slice.
+    let records = handle.list_transactions(count, skip).await?;
     let entries: Vec<Value> = records
         .iter()
         .flat_map(|e| e.details.iter().map(move |d| tx_entry_json(e, d)))
         .collect();
-    let upper = entries.len().saturating_sub(skip);
-    let lower = upper.saturating_sub(count);
-    Ok(Value::Array(entries[lower..upper].to_vec()))
+    Ok(Value::Array(entries))
 }
 
 async fn gettransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {

@@ -195,6 +195,14 @@ an unconfirmed, explicitly-signaling transaction); `gettransaction`'s top-level 
 the sum of the details, so a self-payment nets to zero and change never distorts it. Still
 omitted, matching the Zcash side: `walletconflicts` and `abandoned`.
 
+The cost of a page is the page, not the history: `listtransactions` positions
+every transaction (chain position and visible-entry count, no fee or serialization), sorts,
+and builds only the records inside Core's `count`/`skip` window, trimming a record at either
+boundary to the entries within it (`actor.rs::tx_history`); `gettransaction` builds the one
+transaction it names (`Wallet::get_tx`) and is the only reader that serializes hex;
+`getwalletinfo.txcount` counts without building. `received_by_address` still walks every
+transaction once per call, bounded by the revealed address set.
+
 ## Rebroadcast of unconfirmed transactions
 
 A transaction the wallet holds can drop out of the network's view while the wallet's own

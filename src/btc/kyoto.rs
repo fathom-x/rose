@@ -403,8 +403,8 @@ pub(crate) fn anchor_reorg_margin(network: BitcoinNetwork) -> u32 {
 #[derive(Clone, Debug)]
 pub struct KyotoEndpoint {
     network: BitcoinNetwork,
-    /// Explicit trusted peers from `kyoto://host:port` tokens. Empty means discovery through
-    /// the network's DNS seeds, which is the bare `kyoto` token's meaning.
+    /// Explicit trusted peers from `kyoto://host:port[,host:port...]` tokens. Empty means
+    /// discovery through the network's DNS seeds, which is the bare `kyoto` token's meaning.
     peers: Vec<(IpAddr, Option<u16>)>,
     /// Where kyoto is *told* to keep its store, beside the BDK wallet database at
     /// `<wallet>/btc/kyoto`.
@@ -419,6 +419,25 @@ pub struct KyotoEndpoint {
     required_peers: u8,
 }
 
+/// The one-line description of a kyoto peer selection, shared by the endpoint and by
+/// `config check`/`config show` (which describe a token with no endpoint built). Every
+/// named peer is listed, so what the report shows is exactly what will be dialed.
+pub fn describe_peers(peers: &[(IpAddr, Option<u16>)]) -> String {
+    let render = |(ip, port): &(IpAddr, Option<u16>)| match port {
+        Some(p) => format!("{ip}:{p}"),
+        None => ip.to_string(),
+    };
+    match peers {
+        [] => "kyoto (p2p, dns-seeded peers)".to_string(),
+        [one] => format!("kyoto (p2p, trusted peer {})", render(one)),
+        many => format!(
+            "kyoto (p2p, {} trusted peers as failover: {})",
+            many.len(),
+            many.iter().map(render).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 impl KyotoEndpoint {
     /// Build an endpoint from a resolved peer list and the wallet's kyoto data directory.
     pub fn new(
@@ -426,16 +445,20 @@ impl KyotoEndpoint {
         peers: Vec<(IpAddr, Option<u16>)>,
         data_dir: PathBuf,
     ) -> Self {
-        // With an explicit peer list the node is whitelist-only (see `connect`), so a
-        // requirement above the number of peers named can never be satisfied: kyoto keeps
+        // With an explicit peer list the node is whitelist-only (see `connect`), and the
+        // requirement is ONE connection whatever the list's length. Two things decide that.
+        // A requirement above the number of peers named can never be satisfied - kyoto keeps
         // waiting for connections and never advances past the header sync to request
-        // filters. Cap it at what the operator actually named.
+        // filters - so it could never exceed the count. And an explicit list is the operator
+        // naming nodes they run and trust: its second entry is there as failover for the
+        // first, not as a witness against it, so requiring both would turn one replica's
+        // outage into a stalled wallet - the opposite of why it was listed. The
+        // disagreement-detection argument behind `DEFAULT_REQUIRED_PEERS` is about strangers
+        // from the DNS seeds, and stays there.
         let required_peers = if peers.is_empty() {
             DEFAULT_REQUIRED_PEERS
         } else {
-            u8::try_from(peers.len())
-                .unwrap_or(u8::MAX)
-                .min(DEFAULT_REQUIRED_PEERS)
+            1
         };
         Self {
             network,
@@ -452,17 +475,7 @@ impl KyotoEndpoint {
     }
 
     pub fn describe(&self) -> String {
-        match self.peers.len() {
-            0 => "kyoto (p2p, dns-seeded peers)".to_string(),
-            1 => {
-                let (ip, port) = self.peers[0];
-                match port {
-                    Some(p) => format!("kyoto (p2p, trusted peer {ip}:{p})"),
-                    None => format!("kyoto (p2p, trusted peer {ip})"),
-                }
-            }
-            n => format!("kyoto (p2p, {n} trusted peers)"),
-        }
+        describe_peers(&self.peers)
     }
 
     /// The configuration-only checks a connect would fail on, so `zecd config check` reports
@@ -1591,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn one_pinned_peer_lowers_the_connection_requirement() {
+    fn explicit_peers_require_one_connection_whatever_their_number() {
         // whitelist_only + required_peers(2) + one peer is unsatisfiable: the client syncs
         // headers and then waits forever instead of requesting filters. Observed against a
         // real node before this cap existed.
@@ -1602,16 +1615,15 @@ mod tests {
             endpoint(BitcoinNetwork::Main, vec![]).required_peers,
             DEFAULT_REQUIRED_PEERS
         );
-        // More peers than the default does not raise it.
+        // A list is a failover set: any one of the named replicas keeps the wallet syncing,
+        // so naming more never raises the requirement (it used to climb to the default,
+        // which made one replica's outage stall a wallet listing two).
         let three = vec![
             ("127.0.0.1".parse::<IpAddr>().unwrap(), None),
             ("10.0.0.1".parse::<IpAddr>().unwrap(), None),
             ("10.0.0.2".parse::<IpAddr>().unwrap(), None),
         ];
-        assert_eq!(
-            endpoint(BitcoinNetwork::Main, three).required_peers,
-            DEFAULT_REQUIRED_PEERS
-        );
+        assert_eq!(endpoint(BitcoinNetwork::Main, three).required_peers, 1);
     }
 
     #[test]

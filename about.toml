@@ -8,9 +8,10 @@
 
 # Only consider the dependencies that actually ship in the binary: the release targets
 # below (cargo-about unions them), with the feature set the release artifacts are built
-# with - the default features (`server` + `cli`) plus `mimalloc-secure`, which the static
-# musl images opt into. `scripts/generate-licenses.sh` passes that feature set on the
-# command line; keep the two in step if the release build ever changes features.
+# with - the default features (`server` + `cli`) plus `mimalloc-secure` and the `bitcoin`
+# wallet engine, which the static musl images opt into. `scripts/generate-licenses.sh`
+# passes that feature set on the command line; keep the two in step if the release build
+# ever changes features.
 targets = [
     "x86_64-unknown-linux-musl",
     "x86_64-unknown-linux-gnu",
@@ -40,7 +41,6 @@ accepted = [
     "Zlib",
     "CDLA-Permissive-2.0",
     # Mirrors deny.toml: MIT +no-false-attribs, from the rust-bitcoin stack behind the
-    # off-by-default `bitcoin` feature. Not in the shipped (default-feature) bundle today,
-    # but the two allowlists describe one policy.
+    # `bitcoin` feature, which the shipped images carry.
     "MITNFA",
 ]

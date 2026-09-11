@@ -23,8 +23,9 @@ on:
       - Cargo.lock
       - rust-toolchain.toml
       - .github/workflows/docker.yml
-      # the config the smoke test feeds to `zecd config check` in the container
+      # the configs the smoke test feeds to `zecd config check` in the container
       - deploy/zecd.toml
+      - deploy/zecd.btc-mainnet-view.toml
   push:
     branches: [main, master]
     paths:
@@ -38,8 +39,9 @@ on:
       - Cargo.lock
       - rust-toolchain.toml
       - .github/workflows/docker.yml
-      # the config the smoke test feeds to `zecd config check` in the container
+      # the configs the smoke test feeds to `zecd config check` in the container
       - deploy/zecd.toml
+      - deploy/zecd.btc-mainnet-view.toml
   workflow_dispatch:
 
 concurrency:
@@ -90,6 +92,17 @@ jobs:
         run: |
           docker run --rm -e ZECD_RPC_PASSWORD=smoke-test \
             -v "$PWD/deploy/zecd.toml:/etc/zecd/zecd.toml:ro" zecd \
+            config check --conf /etc/zecd/zecd.toml
+
+      # The images carry the `bitcoin` wallet engine (`--features mimalloc-secure,bitcoin` in
+      # both Dockerfiles), which a default `cargo build` does not - so the step above proves
+      # nothing about it. Check a config that selects it: a binary built without the feature
+      # refuses `coin = "bitcoin"` at config resolve ("this build supports: zcash"), so this
+      # step going green is the proof that the engine shipped in the image.
+      - name: Check a Bitcoin config inside the container
+        run: |
+          docker run --rm -e ZECD_RPC_PASSWORD=smoke-test \
+            -v "$PWD/deploy/zecd.btc-mainnet-view.toml:/etc/zecd/zecd.toml:ro" zecd \
             config check --conf /etc/zecd/zecd.toml
 
       - name: Extract static binaries via the export stage

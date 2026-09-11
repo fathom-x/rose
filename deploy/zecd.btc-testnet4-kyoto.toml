@@ -47,15 +47,17 @@ default_wallet = "btc"
 coin = "bitcoin"
 # Kyoto peering. Two forms:
 #   "kyoto"                    - DNS-seeded public testnet4 peers; no local node at all.
-#   "kyoto://<ip>:48333"       - pin ONE trusted peer by IP (never a DNS name), which
-#                                switches the node to whitelist-only. 48333 is the P2P port
-#                                the deploy/docker-compose.btc-testnet4.yml node publishes
+#   "kyoto://<ip>:48333"       - pin a trusted peer by IP (never a DNS name), which
+#                                switches the node to whitelist-only; a comma-separated
+#                                list names several as a failover set (one connection
+#                                required). 48333 is the P2P port the
+#                                deploy/docker-compose.btc-testnet4.yml node publishes
 #                                (it runs -peerblockfilters), so this peers with a node we
 #                                run while still exercising the light-client path.
 # Pinned to the project's own testnet4 node (the compose file above, deployed on the
-# 216.230.225.61 host). On that host itself, or beside a local copy of the stack, use
+# 216.230.225.43 host). On that host itself, or beside a local copy of the stack, use
 # 127.0.0.1 instead.
-server = "kyoto://216.230.225.61:48333"
+server = "kyoto://216.230.225.43:48333"
 # server = "kyoto://127.0.0.1:48333"
 # server = "kyoto"
 

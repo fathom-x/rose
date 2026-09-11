@@ -1,0 +1,88 @@
+# zecd on Bitcoin MAINNET over the kyoto (BIP-157) light client, WATCH-ONLY: the shape for a
+# service that issues deposit addresses and watches for payments without holding a key.
+# Built from a spending wallet's exported account xpub
+# (`zecd --conf deploy/zecd.btc-mainnet.toml export-xpub --wallet btc`, or the BIP 84
+# first-account xpub of any other wallet) and peered with the project's own mainnet
+# replicas, which serve compact block filters on their public P2P port
+# (-blockfilterindex + -peerblockfilters, deploy/docker-compose.btc-mainnet.yml).
+#
+# REAL MONEY, but nothing here can spend: no seed, no age identity. The datadir holds the
+# xpub pin in keys.toml and rebuildable chain state; losing it means the same init again
+# and a rescan, and every address ever issued derives from the xpub, so in-flight payments
+# stay valid across it. The RPC password grants VIEW access (balances, every address and
+# transaction) - keep it as private as any credential.
+#
+# Needs a zecd built with the `bitcoin` feature - the release images carry it, a default
+# `cargo build` does not. Probe:
+#   zecd --conf deploy/zecd.btc-mainnet-view.toml config check
+#
+# Bring-up (offline: kyoto init dials nothing):
+#   zecd --conf deploy/zecd.btc-mainnet-view.toml init --wallet view \
+#       --xpub '[fingerprint/84h/0h/0h]xpub...' --birthday 2026-09-01
+#   ZECD_RPC_PASSWORD=... zecd --conf deploy/zecd.btc-mainnet-view.toml
+#
+# `--birthday` is REQUIRED on a mainnet xpub import (the alternative is a scan from SegWit
+# activation). A date or height resolves offline from the shipped per-day table to a
+# (height, hash) anchor, and the first sync starts within a day of blocks of it. Use the
+# spending wallet's own birthday, or the date the key first handed out an address; for a
+# key with no history yet, today.
+#
+# No 0-conf by default: filters are block-derived, so a payment is first seen at its
+# first confirmation. The opt-in [mempool] feed (commented below) adds the "detected"
+# state before the block. No sends, so the [fees] chain is never consulted.
+
+network = "main"
+datadir = "./data-btc-mainnet-view"
+default_wallet = "view"
+
+[wallets.view]
+coin = "bitcoin"
+# The project's mainnet replicas, as pinned trusted peers (IPs, never DNS names). Naming any
+# peer makes the light client whitelist-only - headers, filters and blocks come only from
+# these - and a comma-separated list is a FAILOVER set: one connection is required, so a
+# replica being down costs nothing while the other answers. Each must run
+# -blockfilterindex=1 -peerblockfilters=1 with the filter index built (getindexinfo);
+# a peer advertising filters it has not built stalls the wallet at the missing height.
+server = "kyoto://216.230.225.43:8333,216.230.225.42:8333"
+# Addresses watched past the last revealed one on each keychain (BDK's lookahead, default
+# 25). A running wallet reveals as it issues, so this bounds only what a REBUILD from the
+# xpub can bridge: after this many consecutive never-paid addresses a restore stops
+# attributing later funds. A service handing out one address per payment request, most of
+# them never paid, needs it well above the default; the cost is derivation at load and
+# scripts in the filter match, both cheap at this size.
+lookahead = 200
+
+# [mempool] - the opt-in 0-conf feed, OFF by default, so a payment is seen before its
+# block: what turns a merchant's "waiting" into "detected" at broadcast. "p2p" is a relay
+# connection to the trusted replicas above (every transaction entering their mempool,
+# ~150-300 MB a day at raw size, no server); add p2p_snapshot = true only once the
+# replicas grant this host the `mempool` permission (-whitelist=mempool@<host>), since
+# Core disconnects a peer that asks without it. See deploy/zecd.btc-mainnet.toml and
+# deploy/zecd.btc-testnet4-kyoto.toml for the full note and the mempool.space alternative.
+# [mempool]
+# sources = ["p2p"]
+# p2p_snapshot = true
+
+[rpc]
+# zecd's own Bitcoin-Core-dialect JSON-RPC. Loopback here; a container whose clients are
+# sibling services binds the interface they reach it on instead, and nothing wider - the
+# password grants full view access.
+bind = "127.0.0.1"
+port = 8233
+user = "view"
+# Refused as-is on every network: set ZECD_RPC_PASSWORD in the environment.
+password = "CHANGE-ME"
+
+[sync]
+interval_secs = 20
+
+[health]
+# /readyz is 200 only once the light client reports the wallet at the tip (503 with reason
+# "upstream_down" or "syncing" until then); /status lists the wallet with its conn_state and
+# synced_height. Distinct from the spending mainnet config's 9243.
+bind = "127.0.0.1"
+port = 9244
+
+[log]
+level = "info"
+format = "json"

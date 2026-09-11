@@ -70,7 +70,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         # heap hardening (guard pages, canary free-lists) for <4% on the proving path, recovering
         # the mitigations dropped by replacing musl's malloc-ng. glibc dev/test builds skip this.
         # (mimalloc-sys compiles C the same way libsqlite3-sys already does here.)
-        --features mimalloc-secure \
+        # `bitcoin` is the BDK wallet engine, off by default for `cargo build` so a dev build
+        # stays byte-identical to a pre-BDK one; the shipped image carries both engines so one
+        # image serves a Zcash or a Bitcoin wallet (a binary without it refuses
+        # `coin = "bitcoin"` at config resolve). THIRD-PARTY-LICENSES.txt is generated with
+        # the same feature set - keep scripts/generate-licenses.sh in step with this line.
+        --features mimalloc-secure,bitcoin \
     # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the
     # unprivileged runtime user can write its datadirs (and SQLite its temp files).
     && install -d -m 0755 /rootfs/var/lib/zecd \

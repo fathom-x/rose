@@ -1380,7 +1380,8 @@ const SAMPLE_CONFIGS: [&str; 3] = [
     "deploy/zecd.mainnet.toml",
 ];
 
-/// The Bitcoin dev-stack samples (the zecd side of `deploy/docker-compose.btc-testnet*.yml`).
+/// The Bitcoin samples (the zecd side of `deploy/docker-compose.btc-*.yml`, plus the mainnet
+/// watch-only shape).
 /// They select the BDK engine, so they are shipped-and-valid only for a build carrying the
 /// `bitcoin` feature; a default build refuses them, which
 /// `the_bitcoin_sample_configs_need_the_engine_they_select` asserts from the other side. The
@@ -1396,12 +1397,13 @@ fn bitcoin_sample_configs() -> &'static [&'static str] {
     &[]
 }
 
-const BITCOIN_SAMPLE_CONFIGS: [&str; 5] = [
+const BITCOIN_SAMPLE_CONFIGS: [&str; 6] = [
     "deploy/zecd.btc-testnet3.toml",
     "deploy/zecd.btc-testnet4.toml",
     "deploy/zecd.btc-testnet4-kyoto.toml",
     "deploy/zecd.btc-testnet4-view.toml",
     "deploy/zecd.btc-mainnet.toml",
+    "deploy/zecd.btc-mainnet-view.toml",
 ];
 
 /// Every sample config, for whichever engines this build carries.

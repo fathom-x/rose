@@ -36,11 +36,12 @@ if ! command -v cargo-about >/dev/null 2>&1; then
 fi
 
 # The shipped tree: the default features (`server` + `cli`) plus the `mimalloc-secure`
-# allocator the static musl release images build with, on the release targets named in
-# about.toml. `--all-features` would pull optional deps the artifacts don't carry.
+# allocator and the `bitcoin` wallet engine the static musl release images build with
+# (both Dockerfiles), on the release targets named in about.toml. `--all-features` would
+# pull optional deps the artifacts don't carry.
 cargo about generate about.hbs \
     --locked \
-    --features mimalloc-secure \
+    --features mimalloc-secure,bitcoin \
     --output-file "$OUTPUT"
 
 echo "Wrote $OUTPUT"

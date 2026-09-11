@@ -6,7 +6,8 @@ Core are headed, so a reader of this directory does not mistake a phase boundary
 decision (or vice versa).
 
 Status: phases 1, 2 and 3 are complete. A bitcoin wallet (`coin = "bitcoin"`, behind the
-`bitcoin` cargo feature) derives BIP 84 keys from the shared seed, persists public
+`bitcoin` cargo feature - off for a plain `cargo build`, on in the shipped Docker images,
+which carry both engines) derives BIP 84 keys from the shared seed, persists public
 descriptors only, syncs against a local bitcoind (checkpoint-anchored block emission, a
 mempool pass at tip for 0-conf, reorg recovery, restart resume), tracks Core's
 trusted/untrusted confirmation semantics, and sends (per-send seed-derived signers,

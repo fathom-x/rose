@@ -21,10 +21,11 @@
 //!  * `kyoto` - the light client, finding peers through the network's DNS seeds. The
 //!    credential-free counterpart of `zecrocks`, and like it, meaningless on regtest (no
 //!    seeds), where it is refused naming the explicit form.
-//!  * `kyoto://host:port` - the light client pinned to one trusted peer, which must be an IP
+//!  * `kyoto://host:port` - the light client pinned to a trusted peer, which must be an IP
 //!    address (a P2P address, not a DNS name) serving compact filters. Naming peers switches
 //!    the node to whitelist-only, so discovery does not silently top up an operator's chosen
-//!    set.
+//!    set. A comma-separated list (`kyoto://10.0.0.1:8333,10.0.0.2:8333`) names several, any
+//!    one of which keeps the wallet syncing - an operator's own replicas as failover.
 //!
 //! The Zcash tokens (`zebra`, `zecrocks`, `https://...`) are refused here by construction: a
 //! bitcoin wallet cannot dial a Zcash upstream, and the error says which grammar applies.
@@ -234,6 +235,13 @@ fn is_kyoto_token(token: &str) -> bool {
 /// bracketed (`kyoto://[2001:db8::1]:8333`): an unbracketed multi-colon string is taken
 /// whole as the address, since `2001:db8::1:8333` is itself a valid IPv6 address and
 /// guessing a port out of it would silently whitelist a different peer.
+///
+/// Several peers are comma-separated (`kyoto://10.0.0.1:8333,10.0.0.2:8333`), in the order
+/// written. The list is a failover set, not a quorum: the endpoint requires one connection
+/// from it (see [`KyotoEndpoint::new`](crate::btc::kyoto::KyotoEndpoint::new)), so a named
+/// replica being down costs nothing while another answers. A repeated address is refused
+/// rather than deduplicated - it is a copy-paste slip that would otherwise silently leave
+/// the operator with one peer where they believe they have two.
 pub fn resolve_kyoto_peers(token: &str) -> anyhow::Result<Vec<(std::net::IpAddr, Option<u16>)>> {
     if token == "kyoto" {
         return Ok(Vec::new());
@@ -245,6 +253,26 @@ pub fn resolve_kyoto_peers(token: &str) -> anyhow::Result<Vec<(std::net::IpAddr,
     if rest.is_empty() {
         bail!("invalid endpoint '{token}': empty peer address");
     }
+    let mut peers = Vec::new();
+    for item in rest.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            bail!("invalid endpoint '{token}': empty peer address in the list");
+        }
+        let peer = parse_kyoto_peer(item, token)?;
+        if peers.contains(&peer) {
+            bail!(
+                "invalid endpoint '{token}': peer '{item}' is listed twice (each replica \
+                 once; the list is a failover set)"
+            );
+        }
+        peers.push(peer);
+    }
+    Ok(peers)
+}
+
+/// One `host[:port]` item of a kyoto token, with `token` naming the whole for error messages.
+fn parse_kyoto_peer(rest: &str, token: &str) -> anyhow::Result<(std::net::IpAddr, Option<u16>)> {
     // Split off the optional `:port`. Count the colons first: an unbracketed IPv6 literal
     // is all address, and only a bracketed one can carry a port.
     let (host, port) = if let Some(bracketed) = rest.strip_prefix('[') {
@@ -278,7 +306,7 @@ pub fn resolve_kyoto_peers(token: &str) -> anyhow::Result<Vec<(std::net::IpAddr,
         ),
         None => None,
     };
-    Ok(vec![(ip, port)])
+    Ok((ip, port))
 }
 
 /// Validate a server token in either dialect and describe what it resolves to, for
@@ -287,11 +315,7 @@ pub fn resolve_kyoto_peers(token: &str) -> anyhow::Result<Vec<(std::net::IpAddr,
 pub fn describe_token(token: &str, network: BitcoinNetwork) -> anyhow::Result<String> {
     if is_kyoto_token(token) {
         let peers = resolve_kyoto_peers(token)?;
-        return Ok(match peers.first() {
-            None => "kyoto (p2p, dns-seeded peers)".to_string(),
-            Some((ip, Some(port))) => format!("kyoto (p2p, trusted peer {ip}:{port})"),
-            Some((ip, None)) => format!("kyoto (p2p, trusted peer {ip})"),
-        });
+        return Ok(crate::btc::kyoto::describe_peers(&peers));
     }
     let (host, port) = resolve(token, network)?;
     Ok(format!("bitcoind {host}:{port}"))
@@ -360,8 +384,8 @@ pub fn resolve(token: &str, network: BitcoinNetwork) -> anyhow::Result<(String, 
             "invalid server '{token}' for a bitcoin wallet: expected 'bitcoind' (a local \
              bitcoind on the standard port), 'bitcoind://host:port', 'kyoto' (the BIP-157 \
              light client, peers from the network's DNS seeds) or 'kyoto://ip:port' (the \
-             light client pinned to a trusted peer) - the zebra/lightwalletd tokens name \
-             Zcash upstreams"
+             light client pinned to a trusted peer; several comma-separated as failover) - \
+             the zebra/lightwalletd tokens name Zcash upstreams"
         );
     };
     let rest = rest.trim_end_matches('/');
@@ -511,6 +535,44 @@ mod tests {
     }
 
     #[test]
+    fn a_comma_separated_token_names_several_peers_in_order() {
+        // Two replicas of one operator's node: either alone keeps the wallet syncing.
+        let peers = resolve_kyoto_peers("kyoto://192.0.2.7:8333,192.0.2.8:8333").unwrap();
+        assert_eq!(
+            peers,
+            vec![
+                ("192.0.2.7".parse().unwrap(), Some(8333)),
+                ("192.0.2.8".parse().unwrap(), Some(8333)),
+            ]
+        );
+        // Whitespace around the commas and a per-item port are both tolerated; bracketed
+        // IPv6 items keep their own port split.
+        let peers =
+            resolve_kyoto_peers("kyoto://192.0.2.7, [2001:db8::1]:8333 ,192.0.2.9:1/").unwrap();
+        assert_eq!(
+            peers,
+            vec![
+                ("192.0.2.7".parse().unwrap(), None),
+                ("2001:db8::1".parse().unwrap(), Some(8333)),
+                ("192.0.2.9".parse().unwrap(), Some(1)),
+            ]
+        );
+        // An empty item is a typo, not an implicit DNS-seed fallback.
+        for bad in [
+            "kyoto://192.0.2.7,",
+            "kyoto://,192.0.2.7",
+            "kyoto://192.0.2.7,,192.0.2.8",
+        ] {
+            assert!(resolve_kyoto_peers(bad).is_err(), "{bad}");
+        }
+        // A repeated peer is refused: the operator believes they named two.
+        let err = resolve_kyoto_peers("kyoto://192.0.2.7:8333,192.0.2.7:8333").unwrap_err();
+        assert!(err.to_string().contains("listed twice"), "{err}");
+        // One bad item fails the whole token, naming the grammar.
+        assert!(resolve_kyoto_peers("kyoto://192.0.2.7,node.example:8333").is_err());
+    }
+
+    #[test]
     fn an_ipv6_peer_survives_the_port_split() {
         // The naive rsplit_once(':') would shred an IPv6 literal; bracketed form carries a
         // port, bare form does not.
@@ -560,6 +622,13 @@ mod tests {
             describe_token("kyoto://192.0.2.7:8333", BitcoinNetwork::Main)
                 .unwrap()
                 .contains("192.0.2.7:8333")
+        );
+        // A list names every peer, so `config check` shows exactly what will be dialed.
+        let listed =
+            describe_token("kyoto://192.0.2.7:8333,192.0.2.8", BitcoinNetwork::Main).unwrap();
+        assert!(
+            listed.contains("192.0.2.7:8333") && listed.contains("192.0.2.8"),
+            "{listed}"
         );
         assert!(describe_token("nonsense", BitcoinNetwork::Main).is_err());
     }

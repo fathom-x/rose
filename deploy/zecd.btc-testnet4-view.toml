@@ -23,6 +23,10 @@ default_wallet = "view"
 
 [wallets.view]
 coin = "bitcoin"
+# Addresses watched past the last one the view has seen paid. The spender hands out a fresh
+# address per request whether or not it gets paid, so the view's window must cover the
+# spender's issuance run-ahead; 25 (the default) was overtaken within a day on this host.
+lookahead = 200
 # The compose node's P2P port, as a pinned trusted peer (never a DNS name). Naming one peer
 # makes the light client whitelist-only: headers, filters and blocks all come from it.
 server = "kyoto://127.0.0.1:48333"
@@ -33,6 +37,15 @@ port = 48233
 user = "btc"
 # Refused as-is: set ZECD_RPC_PASSWORD in the environment (deploy/.env).
 password = "CHANGE-ME"
+
+# 0-conf visibility for the light client: BIP-158 filters are block-derived, so without a
+# feed a payment is first seen in its block. The p2p source is zecd's own relay connection
+# to the wallet's kyoto trusted peer above (announced transactions, fetched and matched
+# locally; a testnet-sized trickle of bandwidth). `p2p_snapshot` would add BIP 35 mempool
+# requests for the pre-connect blind spot and evictions, but needs
+# `-whitelist=mempool@127.0.0.1` on the node, which the compose file does not set.
+[mempool]
+sources = ["p2p"]
 
 [sync]
 interval_secs = 5

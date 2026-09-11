@@ -58,8 +58,9 @@ coin = "bitcoin"
 # peer makes the light client whitelist-only, so block data and the peer-derived fee
 # signals all come from a node we run. Beside the compose stack on the same host:
 server = "kyoto://127.0.0.1:8333"
-# From elsewhere, the node's public P2P port:
-# server = "kyoto://216.230.225.61:8333"
+# From elsewhere, the project's mainnet replicas on their public P2P ports - a
+# comma-separated list is a failover set (one connection required, either replica serves):
+# server = "kyoto://216.230.225.43:8333,216.230.225.42:8333"
 # Or no node of ours at all - DNS-seeded public filter-serving peers:
 # server = "kyoto"
 

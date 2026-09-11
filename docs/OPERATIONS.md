@@ -233,6 +233,26 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
   with `coin`, `server`, `conn_state`, `synced_height`. A first sync is 503 `reason=syncing`;
   a dropped or hung upstream 503 `reason=upstream_down`. No `scan_lag` or enhancement
   backlog on this path.
+- **Kyoto wallets with the `[mempool]` feed on** report it under
+  `getwalletinfo.mempool_feed`: `state` (`disabled` / `connecting` / `connected`), the
+  endpoint (`p2p://<ip>:<port> (relay[ + mempool snapshots])` or the websocket URL),
+  `last_delta` (unix time of the last delta or snapshot - a healthy mainnet feed delivers
+  one every couple of seconds; testnet4 can go minutes between them), and per-process
+  `deltas` / `matched` / `dropped` counters. A `dropped` count that keeps growing on the
+  websocket source means the server's transaction shape has drifted from what zecd parses
+  (run the `#[ignore]`d `the_public_feed_still_answers_in_the_shape_we_parse` test to
+  confirm). Budget the **bandwidth** before turning a feed on: the `p2p` source carries
+  every transaction entering the node's mempool at raw size, roughly 150-300 MB a day on
+  mainnet; the `mempool_space` source carries the same as JSON, 2-20 KB each, several GB a
+  day at mainnet ingress; both are negligible on testnet4, and both cost one always-on
+  connection per wallet. A feed reconnects with the `[backend]` reconnect backoff and needs
+  no catch-up, since whatever entered the mempool while it was down is first seen in its
+  block. **Node side, for `p2p_snapshot`:** grant the wallet host the `mempool` permission
+  (`-whitelist=mempool@<wallet host or subnet>`, or `-whitebind`); Bitcoin Core disconnects
+  a peer that sends `mempool` without it, so a wallet with the flag on against an
+  unpermissioned node reconnects every few seconds and never settles. Keep that permission
+  to known hosts - each request costs the node an `inv` of its whole mempool. Alert on
+  `state` staying `connecting` for more than a few minutes.
 - `getrpcinfo.active_commands` - what's executing right now.
 - Logs: set `[log] format = "json"` for aggregation. Every RPC call logs method,
   wallet, elapsed_ms (errors add code/message); connection failover logs at warn.

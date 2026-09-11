@@ -28,8 +28,9 @@
 # What kyoto gives up versus the bitcoind backend (behavioral, not bugs - filters cover
 # blocks only, so there is no mempool):
 #   - NO 0-conf receives: an incoming payment is invisible until it confirms, and
-#     getbalances' untrusted_pending stays empty.
-#   - NO eviction reporting.
+#     getbalances' untrusted_pending stays empty - unless the opt-in [mempool] feed below
+#     is on.
+#   - NO eviction reporting (again, unless the feed is on).
 #   - NO estimatesmartfee: sends price from the [fees] oracle chain below (mempool.space,
 #     then a Blockstream-style Esplora, then a peer-derived block median), or from the
 #     explicit `fee_rate` argument.
@@ -88,6 +89,37 @@ server = "kyoto://216.230.225.61:48333"
 # NB Blockstream.info runs no **testnet4** Esplora, so on this network the `esplora` tier is
 # skipped unless `esplora_url` names an instance that does serve it - `zecd config check`
 # reports that, rather than leaving the chain quietly one tier shorter than it reads.
+
+# [mempool] - the opt-in 0-conf feed, OFF by default. Filters cover blocks only, so a kyoto
+# wallet otherwise first sees a payment in its block; with a feed on, an incoming payment
+# shows in getbalances' untrusted_pending, listtransactions and `listunspent 0` before its
+# block, and a transaction that leaves the mempool is evicted at the next scan tip. Both
+# sources match every transaction locally - no address or txid ever leaves the wallet -
+# and `sources` is a preference order (the first that can run for this wallet wins).
+# getwalletinfo.mempool_feed reports the feed's state.
+#
+#   * "p2p": a relay connection to the trusted node above (the kyoto:// peer; p2p_peer
+#     overrides it) over the Bitcoin P2P protocol - every transaction entering its mempool,
+#     at raw size (negligible here; ~150-300 MB/day on mainnet), no server involved. With
+#     p2p_snapshot the client also asks for the node's whole mempool at connect and every
+#     five minutes, which is what closes the pre-connect blind spot and reports evictions;
+#     Bitcoin Core answers that request only for a peer with the `mempool` permission
+#     (-whitelist=mempool@<this host> on the node) and DISCONNECTS one that asks without it,
+#     so leave it off against a node you do not run.
+# [mempool]
+# sources = ["p2p"]
+# p2p_snapshot = true
+# p2p_snapshot_interval_secs = 300   # how stale an eviction may be; one mempool inv per request
+# p2p_peer = "216.230.225.61:48333"
+#
+#   * "mempool_space": a websocket to a mempool.space instance
+#     (wss://mempool.space/testnet4/api/v1/ws here) instead - 2-20 KB of JSON per network
+#     transaction (several GB a day on mainnet) and a third party knowing a wallet is online
+#     at this IP; a self-hosted instance removes the third party (ws:// allowed on a trusted
+#     network; no credentials ride the socket).
+# [mempool]
+# sources = ["mempool_space"]
+# mempool_space_url = "ws://mempool.internal:8999/api/v1/ws"
 
 [rpc]
 # zecd's own Bitcoin-Core-dialect JSON-RPC. Distinct port from the bitcoind-backed config's

@@ -497,6 +497,7 @@ mod bitcoin_tests {
             synced_hash: String::new(),
             birthday_anchor: None,
             birthday_block_time: None,
+            mempool_feed: None,
         }
     }
 

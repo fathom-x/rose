@@ -686,6 +686,7 @@ fn spawn_bitcoin_wallet(
         imported_keys,
         endpoint: Some(endpoint),
         fees: config.fees.clone(),
+        mempool: config.mempool.clone(),
         birthday: u32::from(store.birthday),
         birthday_time: store.birthday_time,
         lookahead: entry.lookahead,
@@ -945,6 +946,8 @@ pub(crate) mod testutil {
             bitcoind: Default::default(),
             #[cfg(feature = "bitcoin")]
             fees: Default::default(),
+            #[cfg(feature = "bitcoin")]
+            mempool: Default::default(),
             fleet: Default::default(),
             rpc,
             keys: KeysConfig {

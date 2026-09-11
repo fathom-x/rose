@@ -55,6 +55,7 @@ use crate::backoff::Backoff;
 use crate::btc::chain::{BitcoindRpc, BroadcastError, BtcEndpoint};
 use crate::btc::keys::{self, AccountKeys};
 use crate::btc::kyoto::{KyotoConn, KyotoFailure};
+use crate::btc::mempool_feed::{feed_target, FeedDelta, FeedEvent, MempoolFeed};
 use crate::btc::store::Persister;
 use crate::coin::BitcoinNetwork;
 use crate::error::{codes, RpcError};
@@ -258,6 +259,32 @@ pub struct BtcSyncStatus {
     /// light client once its headers cover the birthday over kyoto. `None` until then.
     /// `getwalletinfo` prefers it for `birthday.time` over the offline record.
     pub birthday_block_time: Option<u64>,
+    /// The opt-in mempool feed's state (`[mempool]`, kyoto only): `None` when no feed is
+    /// configured for this wallet - the default, and always the case over bitcoind, which
+    /// has a mempool of its own. Reported by `getwalletinfo` as `mempool_feed`.
+    pub mempool_feed: Option<MempoolFeedStatus>,
+}
+
+/// What the wallet knows about its mempool feed (`crate::btc::mempool_feed`), for
+/// `getwalletinfo`. Counters are per actor life, not persisted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MempoolFeedStatus {
+    /// The `[mempool] sources` name the feed runs on.
+    pub source: &'static str,
+    /// Where it connects (`FeedTarget::describe`).
+    pub endpoint: String,
+    /// Whether the socket is up and subscribed right now.
+    pub connected: bool,
+    /// When the last delta arrived (unix seconds); `None` before the first.
+    pub last_delta: Option<u64>,
+    /// Deltas received.
+    pub deltas: u64,
+    /// Transactions the feed delivered that touched this wallet and were applied.
+    pub matched: u64,
+    /// Added transactions the feed delivered that did not rebuild to their reported txid
+    /// and were dropped - a count that grows steadily means the parser has drifted from
+    /// the server's shape.
+    pub dropped: u64,
 }
 
 enum BtcCommand {
@@ -515,6 +542,9 @@ pub struct BtcActorConfig {
     /// The fee-oracle chain (`[fees]`), consulted only on the kyoto backend - a bitcoind
     /// upstream answers with `estimatesmartfee` and never reaches it.
     pub fees: crate::config::FeesConfig,
+    /// The opt-in mempool feed (`[mempool]`), run only on the kyoto backend - bitcoind has
+    /// a mempool of its own, and `config check` warns when the section is set on one.
+    pub mempool: crate::config::MempoolConfig,
     /// The height the block scan starts from on an empty chain state (recorded by init).
     pub birthday: u32,
     /// The operator's `--birthday` date when init could only record it approximately (the
@@ -552,6 +582,7 @@ pub fn spawn(
         imported_keys,
         endpoint,
         fees,
+        mempool,
         birthday,
         birthday_time,
         lookahead,
@@ -656,6 +687,7 @@ pub fn spawn(
         BtcConnState::Down,
         birthday_anchor.as_ref(),
         None,
+        None,
     ));
     let span = info_span!("wallet", name = %name);
     let upstream = endpoint.as_ref().map(BtcEndpoint::describe);
@@ -667,6 +699,11 @@ pub fn spawn(
         network,
         endpoint,
         fees,
+        mempool,
+        feed: None,
+        feed_status: None,
+        feed_held: HashSet::new(),
+        feed_pending_evictions: HashMap::new(),
         birthday,
         birthday_time,
         birthday_anchor,
@@ -674,6 +711,8 @@ pub fn spawn(
         conn: None,
         at_tip: false,
         backoff: Backoff::new(reconnect_base, reconnect_max),
+        reconnect_base,
+        reconnect_max,
         next_attempt: Instant::now(),
         reconnect_warned: false,
         header_sync_failures: 0,
@@ -735,6 +774,25 @@ struct BtcActor {
     endpoint: Option<BtcEndpoint>,
     /// See [`BtcActorConfig::fees`].
     fees: crate::config::FeesConfig,
+    /// See [`BtcActorConfig::mempool`].
+    mempool: crate::config::MempoolConfig,
+    /// The running mempool feed, started once at actor start when the wallet is kyoto-backed
+    /// and `[mempool]` names a source with an endpoint for this network; lives for the
+    /// actor's life (its own task redials with backoff), independent of `conn`.
+    feed: Option<MempoolFeed>,
+    /// The feed's reported state, `Some` exactly when [`Self::feed`] is.
+    feed_status: Option<MempoolFeedStatus>,
+    /// Wallet transactions the feed has reported as held by the server's mempool and not
+    /// since removed: the rebroadcast pass skips them, the way the bitcoind pass skips what
+    /// that node holds. Pruned to the unconfirmed set on every delta.
+    feed_held: HashSet<Txid>,
+    /// `removed` txids the wallet held unconfirmed when the feed reported them gone, with
+    /// when. **Deferred** to the next sync pass that reaches tip: the server also drops a
+    /// transaction from its mempool when a block mines it, and the filter scan can trail
+    /// that by a minute, so evicting on arrival would briefly un-count a payment that has in
+    /// fact just confirmed. Settled by [`Self::settle_feed_evictions`]: still unconfirmed
+    /// once the scan has caught up means genuinely evicted.
+    feed_pending_evictions: HashMap<Txid, u64>,
     birthday: u32,
     /// See [`BtcActorConfig::birthday_time`].
     birthday_time: Option<u64>,
@@ -749,6 +807,9 @@ struct BtcActor {
     /// Whether the last sync pass reached the upstream's tip (drives Ready vs Syncing).
     at_tip: bool,
     backoff: Backoff,
+    /// The backoff bounds, kept for the feed's own task (it redials independently).
+    reconnect_base: Duration,
+    reconnect_max: Duration,
     next_attempt: Instant,
     /// WARN once per outage, then DEBUG (the logging convention for reconnect streams).
     reconnect_warned: bool,
@@ -785,6 +846,7 @@ fn status_of(
     conn_state: BtcConnState,
     birthday_anchor: Option<&(u32, bdk_wallet::bitcoin::BlockHash)>,
     birthday_block_time: Option<u64>,
+    mempool_feed: Option<&MempoolFeedStatus>,
 ) -> BtcSyncStatus {
     let cp = wallet.latest_checkpoint();
     BtcSyncStatus {
@@ -793,6 +855,16 @@ fn status_of(
         synced_hash: cp.hash().to_string(),
         birthday_anchor: birthday_anchor.map(|(height, hash)| (*height, hash.to_string())),
         birthday_block_time,
+        mempool_feed: mempool_feed.cloned(),
+    }
+}
+
+/// The feed's next event, or never when there is no feed - so the actor's idle `select!`
+/// can name the branch unconditionally (its guard skips it when `feed` is `None`).
+async fn feed_next(feed: &mut Option<MempoolFeed>) -> Option<FeedEvent> {
+    match feed {
+        Some(feed) => feed.next().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -973,6 +1045,7 @@ impl BtcActor {
                  service only)"
             ),
         }
+        self.start_feed();
         loop {
             if *self.shutdown.borrow() {
                 break;
@@ -993,11 +1066,14 @@ impl BtcActor {
             if closed || *self.shutdown.borrow() {
                 break;
             }
+            // The feed's deltas first: cheap, and a 0-conf sighting should not wait behind
+            // a sync pass.
+            let fed = self.feed_step();
             let worked = if self.endpoint.is_some() {
                 self.sync_step()
             } else {
                 false
-            };
+            } || fed;
             // At a tip the wallet has not rebroadcast at: resubmit what the network may
             // have dropped. `at_tip` only survives a successful pass (an error drops the
             // connection and clears it), and the hash comparison makes a quiet tip free.
@@ -1027,6 +1103,20 @@ impl BtcActor {
                 maybe_cmd = self.cmd_rx.recv() => match maybe_cmd {
                     Some(cmd) => self.handle(cmd).await,
                     None => break,
+                },
+                // A feed event wakes the loop like a command does, so a 0-conf sighting is
+                // applied when it arrives rather than at the next scheduled pass.
+                event = feed_next(&mut self.feed), if self.feed.is_some() => match event {
+                    Some(event) => {
+                        self.on_feed_event(event);
+                    }
+                    None => {
+                        warn!("the mempool feed task ended; the feed is off until restart");
+                        self.feed = None;
+                        if let Some(status) = &mut self.feed_status {
+                            status.connected = false;
+                        }
+                    }
                 },
                 _ = tokio::time::sleep(wait) => {}
             }
@@ -1184,6 +1274,7 @@ impl BtcActor {
                 BtcConnState::Syncing,
                 self.birthday_anchor.as_ref(),
                 self.birthday_block_time,
+                self.feed_status.as_ref(),
             ));
             return true;
         }
@@ -1221,6 +1312,7 @@ impl BtcActor {
                     state,
                     self.birthday_anchor.as_ref(),
                     self.birthday_block_time,
+                    self.feed_status.as_ref(),
                 );
                 if applied > 0 {
                     debug!(
@@ -1278,7 +1370,229 @@ impl BtcActor {
         {
             return true;
         }
+        if reached_tip && self.settle_feed_evictions() {
+            return true;
+        }
         worked
+    }
+
+    /// Start the mempool feed, if this wallet is to run one: kyoto-backed, and `[mempool]`
+    /// names a source with an endpoint for this network. Once per actor life.
+    fn start_feed(&mut self) {
+        let Some(BtcEndpoint::Kyoto(kyoto)) = &self.endpoint else {
+            if !self.mempool.sources.is_empty() {
+                info!(
+                    "[mempool] sources is set but this wallet is not kyoto-backed (a bitcoind \
+                     upstream has a mempool of its own); the feed is not started here"
+                );
+            }
+            return;
+        };
+        let Some(target) = feed_target(&self.mempool, self.network, kyoto.peers()) else {
+            if !self.mempool.sources.is_empty() {
+                warn!(
+                    network = self.network.name(),
+                    "[mempool] names no source that can run for this wallet (p2p needs a \
+                     kyoto:// trusted peer or p2p_peer; mempool_space needs a public instance \
+                     for the network or mempool_space_url); running without the 0-conf feed"
+                );
+            }
+            return;
+        };
+        let source = target.source();
+        let endpoint = target.describe();
+        info!(
+            source = source.as_str(),
+            %endpoint,
+            "starting the mempool feed (0-conf receives)"
+        );
+        self.feed_status = Some(MempoolFeedStatus {
+            source: source.as_str(),
+            endpoint,
+            connected: false,
+            last_delta: None,
+            deltas: 0,
+            matched: 0,
+            dropped: 0,
+        });
+        self.feed = Some(MempoolFeed::start(
+            target,
+            self.reconnect_base,
+            self.reconnect_max,
+        ));
+        self.publish_status();
+    }
+
+    /// Drain every queued feed event. Returns whether a delta changed the wallet.
+    fn feed_step(&mut self) -> bool {
+        let mut worked = false;
+        while let Some(event) = self.feed.as_mut().and_then(MempoolFeed::try_next) {
+            worked |= self.on_feed_event(event);
+        }
+        worked
+    }
+
+    /// One feed event. Returns whether it changed the wallet.
+    fn on_feed_event(&mut self, event: FeedEvent) -> bool {
+        match event {
+            FeedEvent::Connected => {
+                if let Some(status) = &mut self.feed_status {
+                    status.connected = true;
+                }
+                self.publish_status();
+                false
+            }
+            FeedEvent::Disconnected(_) => {
+                if let Some(status) = &mut self.feed_status {
+                    status.connected = false;
+                }
+                self.publish_status();
+                false
+            }
+            FeedEvent::Delta(delta) => self.apply_feed_delta(delta),
+            FeedEvent::Snapshot(held) => self.apply_feed_snapshot(&held),
+        }
+    }
+
+    /// The P2P source's view of the node's whole mempool. Two things follow from it. A
+    /// wallet transaction the feed had reported held and that the node no longer lists is
+    /// queued for eviction (deferred like a websocket `removed`, for the same reason: a
+    /// mined transaction leaves the mempool too). And every unconfirmed wallet transaction
+    /// the node does list is known held - the wallet's own sends included, which the
+    /// rebroadcast pass then stops re-announcing. Never changes the wallet directly.
+    fn apply_feed_snapshot(&mut self, held: &HashSet<Txid>) -> bool {
+        let now = unix_now();
+        if let Some(status) = &mut self.feed_status {
+            status.last_delta = Some(now);
+            status.deltas += 1;
+        }
+        let gone: Vec<Txid> = self
+            .feed_held
+            .iter()
+            .filter(|txid| !held.contains(*txid))
+            .copied()
+            .collect();
+        for txid in gone {
+            self.feed_held.remove(&txid);
+            if self
+                .wallet
+                .get_tx(txid)
+                .is_some_and(|wtx| !wtx.chain_position.is_confirmed())
+            {
+                debug!(%txid, "mempool feed: the node no longer holds a wallet transaction");
+                self.feed_pending_evictions.entry(txid).or_insert(now);
+            }
+        }
+        let unconfirmed: Vec<Txid> = self
+            .wallet
+            .transactions()
+            .filter(|wtx| !wtx.chain_position.is_confirmed())
+            .map(|wtx| wtx.tx_node.txid)
+            .filter(|txid| held.contains(txid))
+            .collect();
+        for txid in unconfirmed {
+            self.feed_held.insert(txid);
+            self.feed_pending_evictions.remove(&txid);
+        }
+        self.publish_status();
+        false
+    }
+
+    /// Apply one delta: every added transaction that touches the wallet is recorded
+    /// unconfirmed (the 0-conf sighting), and every removed txid the wallet holds
+    /// unconfirmed is queued for eviction at the next scan tip (see
+    /// [`Self::feed_pending_evictions`] for why not now). Returns whether the wallet changed.
+    fn apply_feed_delta(&mut self, delta: FeedDelta) -> bool {
+        let now = unix_now();
+        if let Some(status) = &mut self.feed_status {
+            status.last_delta = Some(now);
+            status.deltas += 1;
+            status.dropped += delta.dropped as u64;
+        }
+        let matched: Vec<(Arc<Transaction>, u64)> = delta
+            .added
+            .iter()
+            .filter(|feed_tx| crate::btc::mempool_feed::wallet_relevant(&self.wallet, feed_tx))
+            .map(|feed_tx| (feed_tx.tx.clone(), feed_tx.seen))
+            .collect();
+        for txid in &delta.removed {
+            // Gone from the server's mempool: no longer known held (so the rebroadcast
+            // pass may resubmit it if it turns out to still be valid), and a candidate for
+            // eviction if the scan does not confirm it.
+            self.feed_held.remove(txid);
+            if self
+                .wallet
+                .get_tx(*txid)
+                .is_some_and(|wtx| !wtx.chain_position.is_confirmed())
+            {
+                self.feed_pending_evictions.entry(*txid).or_insert(now);
+            }
+        }
+        if matched.is_empty() {
+            // Nothing for the wallet, but the delta itself is news: `last_delta` is what an
+            // operator reads to tell a live feed from a silently dead one.
+            self.publish_status();
+            return false;
+        }
+        for (tx, _) in &matched {
+            let txid = tx.compute_txid();
+            info!(%txid, "mempool feed: a wallet transaction is in the mempool");
+            self.feed_held.insert(txid);
+            // Seen again means not evicted after all - the feed re-added it.
+            self.feed_pending_evictions.remove(&txid);
+        }
+        if let Some(status) = &mut self.feed_status {
+            status.matched += matched.len() as u64;
+        }
+        self.wallet.apply_unconfirmed_txs(matched);
+        self.persist("mempool feed");
+        self.feed_held.retain(|txid| {
+            self.wallet
+                .get_tx(*txid)
+                .is_some_and(|wtx| !wtx.chain_position.is_confirmed())
+        });
+        self.publish_status();
+        true
+    }
+
+    /// Settle the deferred feed evictions against a wallet that has just reached tip: a
+    /// transaction the scan anchored meanwhile was mined, not evicted, and is forgotten
+    /// here; one still unconfirmed is evicted for real. Returns whether anything was.
+    fn settle_feed_evictions(&mut self) -> bool {
+        if self.feed_pending_evictions.is_empty() {
+            return false;
+        }
+        let pending = std::mem::take(&mut self.feed_pending_evictions);
+        let evicted: Vec<(Txid, u64)> = pending
+            .into_iter()
+            .filter(|(txid, _)| {
+                self.wallet
+                    .get_tx(*txid)
+                    .is_some_and(|wtx| !wtx.chain_position.is_confirmed())
+            })
+            .collect();
+        if evicted.is_empty() {
+            return false;
+        }
+        self.retire(evicted, "mempool feed eviction");
+        true
+    }
+
+    fn publish_status(&self) {
+        let state = if self.conn.is_none() {
+            BtcConnState::Down
+        } else if self.at_tip {
+            BtcConnState::Ready
+        } else {
+            BtcConnState::Syncing
+        };
+        self.status_tx.send_replace(status_of(
+            &self.wallet,
+            state,
+            self.birthday_anchor.as_ref(),
+            self.birthday_block_time,
+            self.feed_status.as_ref(),
+        ));
     }
 
     /// Retire evicted transactions for good where BDK will not: write the tombstone beside
@@ -1296,6 +1610,8 @@ impl BtcActor {
             }
             self.unconfirmed_since.remove(txid);
             self.rebroadcast_rejections.remove(txid);
+            self.feed_held.remove(txid);
+            self.feed_pending_evictions.remove(txid);
         }
         info!(
             retired = evicted.len(),
@@ -1322,6 +1638,7 @@ impl BtcActor {
             state,
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
+            self.feed_status.as_ref(),
         ));
     }
 
@@ -1496,6 +1813,7 @@ impl BtcActor {
                     BtcConnState::Syncing,
                     self.birthday_anchor.as_ref(),
                     self.birthday_block_time,
+                    self.feed_status.as_ref(),
                 ));
                 true
             }
@@ -1513,6 +1831,7 @@ impl BtcActor {
                     BtcConnState::Down,
                     self.birthday_anchor.as_ref(),
                     self.birthday_block_time,
+                    self.feed_status.as_ref(),
                 ));
                 false
             }
@@ -1530,6 +1849,7 @@ impl BtcActor {
             BtcConnState::Down,
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
+            self.feed_status.as_ref(),
         ));
     }
 
@@ -1663,6 +1983,9 @@ impl BtcActor {
                     .node_mempool
                     .as_ref()
                     .is_some_and(|mempool| mempool.contains(*txid))
+                    // Over kyoto the feed is the one mempool view there is: a transaction
+                    // it reports held has propagated, so re-announcing it is noise.
+                    && !self.feed_held.contains(*txid)
             })
             .map(|(txid, tx)| {
                 // A dependency is an input whose funding transaction the wallet itself
@@ -2397,6 +2720,7 @@ impl BtcActor {
                 BtcConnState::Syncing,
                 self.birthday_anchor.as_ref(),
                 self.birthday_block_time,
+                self.feed_status.as_ref(),
             ));
             info!(
                 %txid,
@@ -2561,6 +2885,7 @@ mod tests {
             imported_keys: None,
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
+            mempool: crate::config::MempoolConfig::default(),
             birthday: 0,
             birthday_time: None,
             lookahead: DEFAULT_LOOKAHEAD,

@@ -516,7 +516,9 @@ jobs:
   # xpub pairing (regtest_btc_watchonly), restore from mnemonic (regtest_btc_restore), a
   # live reorg (regtest_btc_reorg), a hung node (regtest_btc_hang), coinbase maturity on
   # the read path (regtest_btc_coinbase), the address lookahead on a restore
-  # (regtest_btc_lookahead), and a reorg below the birthday anchor (regtest_btc_reorg_deep).
+  # (regtest_btc_lookahead), and a reorg below the birthday anchor (regtest_btc_reorg_deep);
+  # plus the kyoto-only 0-conf feed over zecd's own P2P relay connection
+  # (regtest_btc_p2p_mempool: the node grants the wallet host the `mempool` permission).
   # Its own small job
   # rather than a leg of the `regtest` matrix: it needs
   # neither zebra, nor the funder, nor the chain snapshot, and the matrix legs' zecd is the
@@ -589,5 +591,5 @@ jobs:
             --test regtest_btc --test regtest_btc_kyoto \
             --test regtest_btc_watchonly --test regtest_btc_restore --test regtest_btc_reorg \
             --test regtest_btc_hang --test regtest_btc_coinbase --test regtest_btc_lookahead \
-            --test regtest_btc_reorg_deep \
+            --test regtest_btc_reorg_deep --test regtest_btc_p2p_mempool \
             -- --nocapture

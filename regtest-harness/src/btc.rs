@@ -108,6 +108,13 @@ impl BitcoinD {
     /// [`BitcoinD::restart`] resubmits its unconfirmed transactions to the mempool, which
     /// is exactly what a restart with `-persistmempool=0` is used to prevent.
     pub async fn start(bin: &Path, datadir: &Path) -> BitcoinD {
+        Self::start_with(bin, datadir, &[]).await
+    }
+
+    /// [`BitcoinD::start`] with `extra` flags appended to the node's command line - a
+    /// permission such as `-whitelist=mempool@127.0.0.1`. NB [`BitcoinD::restart`] takes its
+    /// own `extra`; pass the flags again there if the scenario still needs them.
+    pub async fn start_with(bin: &Path, datadir: &Path, extra: &[&str]) -> BitcoinD {
         std::fs::create_dir_all(datadir).unwrap();
         let rpc_port = pick_port().expect("pick bitcoind rpc port");
         let p2p_port = pick_port().expect("pick bitcoind p2p port");
@@ -120,7 +127,7 @@ impl BitcoinD {
             rpc_port,
             p2p_port,
         };
-        node.spawn(&[]).await;
+        node.spawn(extra).await;
         node.call("createwallet", json!(["miner"]))
             .await
             .expect("create miner wallet");
@@ -366,6 +373,19 @@ impl ZecdBtc {
         wallets: &[&str],
         wallet_extra: &str,
     ) -> ZecdBtc {
+        Self::prepare_full(datadir, backend, node, wallets, wallet_extra, "")
+    }
+
+    /// [`ZecdBtc::prepare_with`] plus `global_extra` (TOML, whole tables) appended after the
+    /// wallet tables - a daemon-wide section such as `[mempool]`.
+    pub fn prepare_full(
+        datadir: PathBuf,
+        backend: BtcBackend,
+        node: &BitcoinD,
+        wallets: &[&str],
+        wallet_extra: &str,
+        global_extra: &str,
+    ) -> ZecdBtc {
         std::fs::create_dir_all(&datadir).unwrap();
         let conf = datadir.join("zecd.toml");
         let server = match backend {
@@ -380,6 +400,10 @@ impl ZecdBtc {
         }
         if backend == BtcBackend::Bitcoind {
             text.push_str("[bitcoind]\nrpc_user = \"harness\"\nrpc_password = \"harness\"\n");
+        }
+        text.push_str(global_extra);
+        if !global_extra.is_empty() && !global_extra.ends_with('\n') {
+            text.push('\n');
         }
         let health_port = pick_port().expect("pick zecd health port");
         text.push_str(&format!(

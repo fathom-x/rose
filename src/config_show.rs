@@ -209,6 +209,68 @@ pub fn render(config: &AppConfig) -> String {
                 )),
             }
         }
+
+        // `[mempool]` - the kyoto backend's opt-in 0-conf feed, rendered on the `[fees]`
+        // pattern: `sources` always (an empty list is the effective "off" and says so), the
+        // URL as the real key only when overridden, else the resolved endpoint as a note.
+        table(&mut s, "mempool");
+        let sources: Vec<String> = config
+            .mempool
+            .sources
+            .iter()
+            .map(|source| source.as_str().to_string())
+            .collect();
+        kv(&mut s, "sources", list_val(&sources));
+        if config
+            .mempool
+            .sources
+            .contains(&crate::config::MempoolSource::P2p)
+        {
+            match config.mempool.p2p_peer {
+                Some(peer) => kv_note(
+                    &mut s,
+                    "p2p_peer",
+                    str_val(&peer.to_string()),
+                    "overrides each wallet's kyoto:// peer",
+                ),
+                // Per wallet, not one value: each kyoto wallet peers with its own trusted
+                // node, so there is nothing this key could carry.
+                None => s.push_str(
+                    "# p2p_peer unset - each kyoto wallet peers with its own kyoto://<ip>:<port> \
+                     node (a DNS-seeded wallet runs no p2p feed)\n",
+                ),
+            }
+            kv(&mut s, "p2p_snapshot", config.mempool.p2p_snapshot);
+            kv(
+                &mut s,
+                "p2p_snapshot_interval_secs",
+                config.mempool.p2p_snapshot_interval_secs,
+            );
+        }
+        if config
+            .mempool
+            .sources
+            .contains(&crate::config::MempoolSource::MempoolSpace)
+        {
+            match (
+                config.mempool.mempool_space_url.as_deref(),
+                crate::btc::mempool_feed::endpoint_for(&config.mempool, btc_network),
+            ) {
+                (Some(url), _) => kv_note(
+                    &mut s,
+                    "mempool_space_url",
+                    str_val(url),
+                    "overrides the built-in",
+                ),
+                (None, Some(built_in)) => {
+                    s.push_str(&format!("# mempool_space_url unset - using {built_in}\n"))
+                }
+                (None, None) => s.push_str(
+                    "# mempool_space_url unset and no built-in endpoint for this network - \
+                     the feed does not start\n",
+                ),
+            }
+        }
     }
 
     table(&mut s, "rpc");
@@ -735,6 +797,89 @@ mod tests {
         // A source not in the chain renders nothing at all: its endpoint is never asked.
         assert!(!overridden.contains("mempool_space_url"), "{overridden}");
         assert_eq!(overridden, render(&resolve_from(&overridden, dir.path())));
+    }
+
+    /// The mempool feed renders its effective (default: empty) source list, names the
+    /// endpoint it would subscribe at, and round-trips.
+    #[test]
+    #[cfg(feature = "bitcoin")]
+    fn the_mempool_feed_renders_its_endpoint_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let show = |body: &str| render(&resolve_from(body, dir.path()));
+
+        // Off by default: the empty list is the effective value, rendered so a reader sees
+        // the knob exists, and nothing else about it.
+        let off = show(&format!(
+            "network = \"test\"\nbtc_testnet = \"testnet4\"\ndatadir = {:?}\n",
+            dir.path()
+        ));
+        assert!(off.contains("[mempool]\nsources = []\n"), "{off}");
+        // Nothing about the endpoint in the section (the `[fees]` section has a key of the
+        // same name, so look at this section alone).
+        let section = off.split("[mempool]").nth(1).unwrap();
+        let section = section.split("\n[").next().unwrap();
+        assert!(!section.contains("mempool_space_url"), "{off}");
+        assert_eq!(off, render(&resolve_from(&off, dir.path())));
+
+        // Named: the resolved public endpoint rides as a note (it is not a config value).
+        let on = show(&format!(
+            "network = \"test\"\nbtc_testnet = \"testnet4\"\ndatadir = {:?}\n\
+             [mempool]\nsources = [\"mempool_space\"]\n",
+            dir.path()
+        ));
+        assert!(on.contains("sources = [\"mempool_space\"]"), "{on}");
+        assert!(
+            on.contains("# mempool_space_url unset - using wss://mempool.space/testnet4/api/v1/ws"),
+            "{on}"
+        );
+        assert_eq!(on, render(&resolve_from(&on, dir.path())));
+
+        // Overridden: the real key, surviving a re-resolve.
+        let hosted = show(&format!(
+            "network = \"regtest\"\ndatadir = {:?}\n\
+             [mempool]\nsources = [\"mempool_space\"]\n\
+             mempool_space_url = \"ws://mempool.internal:8999/api/v1/ws\"\n",
+            dir.path()
+        ));
+        assert!(
+            hosted.contains("mempool_space_url = \"ws://mempool.internal:8999/api/v1/ws\""),
+            "{hosted}"
+        );
+        let section = hosted.split("[mempool]").nth(1).unwrap();
+        let section = section.split("\n[").next().unwrap();
+        assert!(!section.contains("p2p_"), "{hosted}");
+        assert_eq!(hosted, render(&resolve_from(&hosted, dir.path())));
+
+        // The P2P source: the peer is per wallet unless overridden, and the snapshot flag
+        // renders with its effective value.
+        let p2p = show(&format!(
+            "network = \"test\"\nbtc_testnet = \"testnet4\"\ndatadir = {:?}\n\
+             [mempool]\nsources = [\"p2p\"]\n",
+            dir.path()
+        ));
+        assert!(
+            p2p.contains("# p2p_peer unset - each kyoto wallet"),
+            "{p2p}"
+        );
+        assert!(p2p.contains("p2p_snapshot = false"), "{p2p}");
+        assert!(p2p.contains("p2p_snapshot_interval_secs = 300"), "{p2p}");
+        // (Again scoped to the section: `[fees]` has a key of the same name.)
+        let section = p2p.split("[mempool]").nth(1).unwrap();
+        let section = section.split("\n[").next().unwrap();
+        assert!(!section.contains("mempool_space_url"), "{p2p}");
+        assert_eq!(p2p, render(&resolve_from(&p2p, dir.path())));
+        let pinned = show(&format!(
+            "network = \"test\"\nbtc_testnet = \"testnet4\"\ndatadir = {:?}\n\
+             [mempool]\nsources = [\"p2p\", \"mempool_space\"]\n\
+             p2p_peer = \"[2001:db8::7]:48333\"\np2p_snapshot = true\n",
+            dir.path()
+        ));
+        assert!(
+            pinned.contains("p2p_peer = \"[2001:db8::7]:48333\""),
+            "{pinned}"
+        );
+        assert!(pinned.contains("p2p_snapshot = true"), "{pinned}");
+        assert_eq!(pinned, render(&resolve_from(&pinned, dir.path())));
     }
 
     /// Every value the file left unset appears, filled in by this build - the whole point of the

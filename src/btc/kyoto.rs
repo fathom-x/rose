@@ -445,6 +445,12 @@ impl KyotoEndpoint {
         }
     }
 
+    /// The explicit trusted peers (`kyoto://host:port`), empty for DNS discovery. The
+    /// mempool feed's P2P source peers with the first of them by default.
+    pub fn peers(&self) -> &[(IpAddr, Option<u16>)] {
+        &self.peers
+    }
+
     pub fn describe(&self) -> String {
         match self.peers.len() {
             0 => "kyoto (p2p, dns-seeded peers)".to_string(),

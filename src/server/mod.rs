@@ -326,6 +326,8 @@ mod tests {
             bitcoind: Default::default(),
             #[cfg(feature = "bitcoin")]
             fees: Default::default(),
+            #[cfg(feature = "bitcoin")]
+            mempool: Default::default(),
             fleet: Default::default(),
             rpc: rpc.clone(),
             keys: KeysConfig {

@@ -16,7 +16,10 @@
 //! receives, tracks confirmations, and sends. Phase 3 (this tree) adds the second backend:
 //! `kyoto`, a BIP-157/158 light client that peers over P2P with no server and no
 //! credentials, behind `chain::BtcEndpoint`; `fees` is the mempool.space fee oracle that
-//! backend's spend path needs, since a filter client has no `estimatesmartfee`.
+//! backend's spend path needs, since a filter client has no `estimatesmartfee`; and
+//! `mempool_feed` is that backend's opt-in 0-conf source - a mempool.space websocket, or
+//! `p2p_feed`'s own relay connection to the trusted peer - whose transactions the wallet
+//! matches locally, since filters cover blocks only.
 
 pub mod actor;
 pub mod birthdays;
@@ -24,4 +27,6 @@ pub mod chain;
 pub mod fees;
 pub mod keys;
 pub mod kyoto;
+pub mod mempool_feed;
+pub mod p2p_feed;
 pub mod store;

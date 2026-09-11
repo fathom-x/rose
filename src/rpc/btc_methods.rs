@@ -219,6 +219,24 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
                 .as_ref()
                 .map(|(height, hash)| json!({ "height": height, "hash": hash })),
         },
+        // zecd extension: the opt-in mempool feed (`[mempool]`, kyoto only) - the one source
+        // of 0-conf sightings on that backend, so a merchant integration can tell "no
+        // payment detected" from "nothing could have been detected". `state` is `disabled`
+        // (no feed configured for this wallet: the default, and always over bitcoind, which
+        // has a mempool of its own), `connecting` (configured, socket down or not yet up),
+        // or `connected`; the rest is present only when a feed is configured.
+        "mempool_feed": match &status.mempool_feed {
+            None => json!({ "state": "disabled" }),
+            Some(feed) => json!({
+                "state": if feed.connected { "connected" } else { "connecting" },
+                "source": feed.source,
+                "endpoint": feed.endpoint,
+                "last_delta": feed.last_delta,
+                "deltas": feed.deltas,
+                "matched": feed.matched,
+                "dropped": feed.dropped,
+            }),
+        },
         // zecd extension: which engine serves this wallet. The Zcash handler reports its own
         // extensions (pools, transparent) here; `coin` is the field a mixed-coin deployment
         // tells wallets apart by.
@@ -783,6 +801,7 @@ mod tests {
             imported_keys: None,
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
+            mempool: crate::config::MempoolConfig::default(),
             birthday: 0,
             birthday_time: None,
             lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
@@ -834,6 +853,9 @@ mod tests {
         // The wallet's own chain view: a fresh wallet sits at its genesis checkpoint, and
         // getblockcount/getbestblockhash answer from the same authority.
         assert_eq!(info["lastprocessedblock"]["height"], json!(0));
+        // No `[mempool]` section: the feed reports itself disabled rather than absent, so a
+        // client can tell "nothing detected" from "nothing could be".
+        assert_eq!(info["mempool_feed"], json!({ "state": "disabled" }));
         assert_eq!(call("getblockcount", vec![]).await.unwrap(), json!(0));
         let best = call("getbestblockhash", vec![]).await.unwrap();
         assert_eq!(

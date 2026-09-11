@@ -139,6 +139,9 @@ pub struct AppConfig {
     /// `[fees]` - the fee-oracle chain the BDK engine's kyoto (light) mode prices sends from.
     #[cfg(feature = "bitcoin")]
     pub fees: FeesConfig,
+    /// `[mempool]` - the opt-in 0-conf feed for the BDK engine's kyoto (light) mode.
+    #[cfg(feature = "bitcoin")]
+    pub mempool: MempoolConfig,
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
     pub sync: SyncConfig,
@@ -773,6 +776,106 @@ impl Default for FeesConfig {
     }
 }
 
+/// One source of the kyoto backend's opt-in mempool feed, named in `[mempool] sources`.
+///
+/// A BIP-157 light client sees a transaction when it confirms and not before. The feed is a
+/// long-lived websocket to a mempool.space instance whose deltas the wallet matches locally
+/// (`crate::btc::mempool_feed`), which is what gives a kyoto wallet 0-conf receives. One
+/// variant today; the list shape mirrors `[fees] sources` so a second can be added without a
+/// config change. The bitcoind backend never consults it - it has a real mempool.
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MempoolSource {
+    /// mempool.space's `/api/v1/ws` websocket, subscribed with `track-mempool`.
+    MempoolSpace,
+    /// zecd's own relay connection to one node over the Bitcoin P2P protocol - by default
+    /// the wallet's `kyoto://` trusted peer, else `p2p_peer` (`crate::btc::p2p_feed`).
+    P2p,
+}
+
+#[cfg(feature = "bitcoin")]
+impl MempoolSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MempoolSource::MempoolSpace => "mempool_space",
+            MempoolSource::P2p => "p2p",
+        }
+    }
+
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "mempool_space" => Ok(MempoolSource::MempoolSpace),
+            "p2p" => Ok(MempoolSource::P2p),
+            other => Err(anyhow::anyhow!(
+                "invalid [mempool] source {other:?}: expected \"p2p\" or \"mempool_space\""
+            )),
+        }
+    }
+}
+
+/// `[mempool]` - the kyoto backend's opt-in 0-conf feed: which sources to try, in order, and
+/// where each connects instead of its default.
+///
+/// **Off by default** (`sources = []`): a feed costs an always-on connection and tells the
+/// other side that a wallet is online at this IP. The `p2p` source keeps that to the node the
+/// wallet already peers with (raw-size bandwidth, no server); the `mempool_space` source adds
+/// a third party and, on mainnet, gigabytes a day of JSON - its override is the answer to the
+/// third party (a self-hosted instance), and `ws://` is allowed for it on the same terms
+/// `[fees]` allows plain `http://` (no credentials, no wallet data on the wire).
+///
+/// The value type lives here (shared layer); the engine resolves it into an endpoint and
+/// runs the socket at its edge (`crate::btc::mempool_feed`).
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MempoolConfig {
+    /// The sources to subscribe to, in preference order; the first with an endpoint for
+    /// the wallet's network runs. Empty (the default) is "no feed".
+    pub sources: Vec<MempoolSource>,
+    /// Full websocket URL for the [`MempoolSource::MempoolSpace`] source, replacing the
+    /// built-in per-network endpoint. Unset uses the public instance (and leaves the feed
+    /// off where there is none - regtest).
+    pub mempool_space_url: Option<String>,
+    /// The node the [`MempoolSource::P2p`] source peers with (`ip:port`), replacing the
+    /// wallet's own `kyoto://` trusted peer. Unset uses that peer; a DNS-seeded wallet with
+    /// no override runs no P2P feed.
+    pub p2p_peer: Option<std::net::SocketAddr>,
+    /// Whether the P2P source also requests the node's mempool (BIP 35) at connect and
+    /// periodically - the pre-connect blind spot and evictions, at the cost of a full
+    /// mempool fetch per connect. Needs the `mempool` permission on the node
+    /// (`-whitelist=mempool@<wallet host>`): Bitcoin Core disconnects a peer that asks
+    /// without it. Default false.
+    pub p2p_snapshot: bool,
+    /// How often the P2P source re-requests the snapshot, in seconds (default
+    /// [`DEFAULT_P2P_SNAPSHOT_INTERVAL_SECS`], minimum [`MIN_P2P_SNAPSHOT_INTERVAL_SECS`]).
+    /// Bounds how stale an eviction can be; each request costs the node an `inv` of its
+    /// whole mempool, which is why the default is minutes rather than seconds.
+    pub p2p_snapshot_interval_secs: u64,
+}
+
+/// `[mempool] p2p_snapshot_interval_secs` when unset: five minutes.
+#[cfg(feature = "bitcoin")]
+pub const DEFAULT_P2P_SNAPSHOT_INTERVAL_SECS: u64 = 300;
+
+/// The floor on `[mempool] p2p_snapshot_interval_secs`: below this the requests would
+/// overlap their own collection window (the source collects a snapshot's announcements
+/// for thirty seconds), and the node would be answering with its whole mempool
+/// continuously. Low enough that a regtest suite can exercise the periodic path.
+#[cfg(feature = "bitcoin")]
+pub const MIN_P2P_SNAPSHOT_INTERVAL_SECS: u64 = 5;
+
+#[cfg(feature = "bitcoin")]
+impl Default for MempoolConfig {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            mempool_space_url: None,
+            p2p_peer: None,
+            p2p_snapshot: false,
+            p2p_snapshot_interval_secs: DEFAULT_P2P_SNAPSHOT_INTERVAL_SECS,
+        }
+    }
+}
+
 /// `[zebra]` - credentials for the `zebra://host:port` endpoint (direct-to-zebrad mode).
 /// A cookie file wins over user/password, and nothing set means no auth (zebrad with
 /// `enable_cookie_auth = false`).
@@ -1134,6 +1237,9 @@ struct ConfigFile {
     /// `[fees]`, same rule as `[bitcoind]`: a section only the BDK engine has any use for.
     #[cfg(feature = "bitcoin")]
     fees: Option<FeesFile>,
+    /// `[mempool]`, same rule again.
+    #[cfg(feature = "bitcoin")]
+    mempool: Option<MempoolFile>,
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
     sync: Option<SyncFile>,
@@ -1276,6 +1382,19 @@ struct FeesFile {
     sources: Option<Vec<String>>,
     mempool_space_url: Option<String>,
     esplora_url: Option<String>,
+}
+
+#[cfg(feature = "bitcoin")]
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MempoolFile {
+    /// Source names (`p2p` / `mempool_space`), in preference order; unset or empty is no
+    /// feed.
+    sources: Option<Vec<String>>,
+    mempool_space_url: Option<String>,
+    p2p_peer: Option<String>,
+    p2p_snapshot: Option<bool>,
+    p2p_snapshot_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2191,6 +2310,55 @@ impl AppConfig {
             }
         };
 
+        #[cfg(feature = "bitcoin")]
+        let mempool = {
+            let mempool_file = file.mempool.unwrap_or_default();
+            // Unset and empty both mean "no feed" - the default, since the feed is opt-in. A
+            // repeated name is refused like a repeated fee source: subscribing twice is never
+            // what was meant.
+            let mut sources: Vec<MempoolSource> = Vec::new();
+            for name in mempool_file.sources.unwrap_or_default().iter() {
+                let source = MempoolSource::parse(name)?;
+                if sources.contains(&source) {
+                    anyhow::bail!("[mempool] sources names {name:?} more than once");
+                }
+                sources.push(source);
+            }
+            let mempool_space_url = mempool_file
+                .mempool_space_url
+                .filter(|u| !u.trim().is_empty());
+            if let Some(url) = &mempool_space_url {
+                crate::btc::mempool_feed::validate_endpoint_override("mempool_space_url", url)?;
+            }
+            // An IP and a port, like `kyoto://` - never a DNS name, so nothing resolves
+            // outside the wallet's control at dial time.
+            let p2p_peer = match mempool_file.p2p_peer.filter(|p| !p.trim().is_empty()) {
+                None => None,
+                Some(peer) => Some(peer.parse::<std::net::SocketAddr>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "[mempool] p2p_peer must be \"<ip>:<port>\" (an IP address, not a DNS \
+                         name; IPv6 in brackets), got {peer:?}: {e}"
+                    )
+                })?),
+            };
+            let p2p_snapshot_interval_secs = mempool_file
+                .p2p_snapshot_interval_secs
+                .unwrap_or(DEFAULT_P2P_SNAPSHOT_INTERVAL_SECS);
+            if p2p_snapshot_interval_secs < MIN_P2P_SNAPSHOT_INTERVAL_SECS {
+                anyhow::bail!(
+                    "[mempool] p2p_snapshot_interval_secs must be at least \
+                     {MIN_P2P_SNAPSHOT_INTERVAL_SECS}, got {p2p_snapshot_interval_secs}"
+                );
+            }
+            MempoolConfig {
+                sources,
+                mempool_space_url,
+                p2p_peer,
+                p2p_snapshot: mempool_file.p2p_snapshot.unwrap_or(false),
+                p2p_snapshot_interval_secs,
+            }
+        };
+
         let rpc_file = file.rpc.unwrap_or(RpcFile {
             bind: None,
             port: None,
@@ -2414,6 +2582,8 @@ impl AppConfig {
             bitcoind,
             #[cfg(feature = "bitcoin")]
             fees,
+            #[cfg(feature = "bitcoin")]
+            mempool,
             rpc,
             keys,
             sync,
@@ -4120,6 +4290,104 @@ mod tests {
         // Set but unnamed in `sources`: kept as configured (resolve records, it does not
         // second-guess), and simply never asked.
         assert!(cfg.fees.mempool_space_url.is_some());
+    }
+
+    #[cfg(all(feature = "cli", feature = "bitcoin"))]
+    #[test]
+    fn the_mempool_feed_is_off_by_default_and_opt_in() {
+        use clap::Parser as _;
+        // No `[mempool]` at all: no feed. The cost (bandwidth, an always-on connection to a
+        // third party) is the operator's to opt into.
+        let cli = Cli::parse_from(["zecd"]);
+        let cfg = AppConfig::resolve(&cli).unwrap();
+        assert_eq!(cfg.mempool, MempoolConfig::default());
+        assert!(cfg.mempool.sources.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        let resolve = |body: &str| {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            AppConfig::resolve(&cli)
+        };
+        // Named, at a self-hosted instance - plaintext allowed, like the fee overrides.
+        let cfg = resolve(
+            "[mempool]\nsources = [\"mempool_space\"]\n\
+             mempool_space_url = \"ws://mempool.internal:8999/api/v1/ws\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.mempool.sources, vec![MempoolSource::MempoolSpace]);
+        assert_eq!(
+            cfg.mempool.mempool_space_url.as_deref(),
+            Some("ws://mempool.internal:8999/api/v1/ws")
+        );
+        assert!(cfg.mempool.p2p_peer.is_none());
+        assert!(!cfg.mempool.p2p_snapshot);
+        // The P2P source, in preference order ahead of the websocket, pinned to a node with
+        // the snapshot requests on.
+        let cfg = resolve(
+            "[mempool]\nsources = [\"p2p\", \"mempool_space\"]\n\
+             p2p_peer = \"[2001:db8::7]:48333\"\np2p_snapshot = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.mempool.sources,
+            vec![MempoolSource::P2p, MempoolSource::MempoolSpace]
+        );
+        assert_eq!(
+            cfg.mempool.p2p_peer.map(|p| p.to_string()).as_deref(),
+            Some("[2001:db8::7]:48333")
+        );
+        assert!(cfg.mempool.p2p_snapshot);
+        assert_eq!(
+            cfg.mempool.p2p_snapshot_interval_secs,
+            DEFAULT_P2P_SNAPSHOT_INTERVAL_SECS
+        );
+        // The interval has a floor: below it the requests overlap their own window.
+        let cfg =
+            resolve("[mempool]\nsources = [\"p2p\"]\np2p_snapshot_interval_secs = 5\n").unwrap();
+        assert_eq!(cfg.mempool.p2p_snapshot_interval_secs, 5);
+        let err = resolve("[mempool]\np2p_snapshot_interval_secs = 4\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("p2p_snapshot_interval_secs"), "{err}");
+        // A DNS name is refused, naming the grammar - the peer is dialed by address only.
+        let err = resolve("[mempool]\np2p_peer = \"node.example:8333\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[mempool] p2p_peer"), "{err}");
+        assert!(err.contains("<ip>:<port>"), "{err}");
+        assert!(resolve("[mempool]\np2p_peer = \"10.0.0.1\"\n").is_err());
+        // A blank override is unset (a template shipping the key empty must not fail).
+        let cfg = resolve("[mempool]\nsources = [\"mempool_space\"]\nmempool_space_url = \"\"\n")
+            .unwrap();
+        assert!(cfg.mempool.mempool_space_url.is_none());
+        // An explicit empty list is off, same as unset.
+        assert!(resolve("[mempool]\nsources = []\n")
+            .unwrap()
+            .mempool
+            .sources
+            .is_empty());
+
+        // Refusals, each naming the line to fix: an unknown source, a repeated one, and an
+        // override that is the HTTP API rather than the websocket.
+        let err = resolve("[mempool]\nsources = [\"mempool\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid [mempool] source"), "{err}");
+        assert!(err.contains("mempool_space"), "{err}");
+        assert!(err.contains("p2p"), "{err}");
+        let err = resolve("[mempool]\nsources = [\"mempool_space\", \"mempool_space\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than once"), "{err}");
+        let err = resolve("[mempool]\nmempool_space_url = \"https://mempool.space/api/v1/ws\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[mempool] mempool_space_url"), "{err}");
+        assert!(err.contains("wss://"), "{err}");
+        // And an unknown key in the section is refused like everywhere else.
+        assert!(resolve("[mempool]\nsource = \"mempool_space\"\n").is_err());
     }
 
     #[cfg(all(feature = "cli", feature = "bitcoin"))]

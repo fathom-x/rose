@@ -47,9 +47,9 @@ bitcoind backend has. The differences are behavioral, not cosmetic:
 | | `bitcoind` | `kyoto` |
 |---|---|---|
 | Credentials | rpcauth/cookie, cleartext-locality gated | none - nothing secret on the wire |
-| 0-conf receives | yes (mempool pass at tip) | **no** - filters are block-derived (an opt-in feed is designed below, not built) |
-| Eviction reporting | yes | **no** |
-| Rebroadcast of unconfirmed transactions | at each new tip, skipping what the node's mempool holds, verdicts classified (see below) | at each new tip, blind - every unconfirmed transaction re-announced, no verdicts |
+| 0-conf receives | yes (mempool pass at tip) | **only with the opt-in `[mempool]` feed** - a relay connection to the trusted peer (`p2p`) or a mempool.space websocket (`mempool_space`), both matched locally (see below) - since filters are block-derived, and without it a payment is first seen in its block |
+| Eviction reporting | yes | only via the feed - `p2p_snapshot` mempool snapshots, or the websocket's `removed` deltas - settled at the next scan tip; **none** without it |
+| Rebroadcast of unconfirmed transactions | at each new tip, skipping what the node's mempool holds, verdicts classified (see below) | at each new tip, skipping what the feed reports held when one runs, else blind - every unconfirmed transaction re-announced; no verdicts either way |
 | Fee estimation | `estimatesmartfee` | the `[fees]` oracle chain (mempool.space, then Esplora), falling back to a relay floor + block median |
 | Birthday at `init` | dials once for the tip | **defaults to today**, offline; `--birthday` overrides |
 | Fresh-wallet scan start | the birthday | the recorded birthday anchor, else a shipped checkpoint at/below the birthday (see below) |
@@ -395,44 +395,83 @@ Everything here is refused with a clear error rather than silently ignored or ha
   on the send RPCs plus an opt-in to spend the wallet's own unconfirmed outputs. Both want
   a kyoto design pass of their own: without a mempool the replaced transaction cannot be
   seen evicted, only superseded at confirmation.
-- **A mempool for the kyoto backend.** BIP-158 filters cover blocks only, so on that
-  backend an incoming payment is invisible until it confirms and `getbalances`'
-  `untrusted_pending` stays empty. Nothing in BIP-157 fixes this. Two mechanisms could,
-  and one of them is designed and verified but not built:
-  - **A mempool.space feed (designed 2026-09-03).** The public websocket
-    (`wss://mempool.space/api/v1/ws`, per-network paths like `/testnet4/api/v1/ws`, no key)
-    answers `{"track-mempool": true}` with a `mempool-transactions` delta every ~2s -
-    `{sequence, added, removed, replaced, mined}` - where every `added` entry is a **full
-    Esplora-shape transaction**: version, locktime, each input with its `prevout` script,
-    address and value, witness and sequence, each output with script, address and value,
-    plus fee, vsize and first-seen (backend `websocket-handler.ts`, `MempoolDelta`;
-    checked against the live instance and the source). That is enough to match
-    **locally**, so no address and no txid of interest ever leaves the wallet: the
-    disclosure is one long-lived connection saying a wallet is online at this IP, strictly
-    less than any per-address backend and removable outright with a self-hosted instance.
-    Shape: a bridge task owning the socket (the kyoto update-bridge pattern, since the
-    read is not cancel-safe) feeding a channel the actor drains; the actor rebuilds a
-    `bitcoin::Transaction` from the JSON and **checks its txid against the reported one**
-    (integrity of the reconstruction, not validity), runs `is_mine` over outputs and over
-    `prevout` scripts, and applies matches with `apply_unconfirmed_txs` and `removed` with
-    `apply_evicted_txs` - the same two calls the bitcoind backend's mempool pass makes;
-    confirmation stays the filter scan's job. **Deltas only**: there is no snapshot on
-    subscribe and the full set is 5.8 MB of txids on mainnet plus a fetch per transaction,
-    so whatever is already in the mempool at connect is invisible until it confirms - a
-    blind spot the scan closes within a block or two, and the reason a reconnect needs no
-    catch-up. Config would mirror `[fees]`: a `[mempool]` section with a source name, a URL
-    override validated at `resolve` (`ws://` allowed for a self-hosted instance, the same
-    argument as the fee overrides), **off by default**, kyoto only (`config check` warning
-    on a bitcoind wallet, which has a real mempool), with the feed's state on
-    `getwalletinfo`. Trust is the existing 0-conf posture: the oracle's mempool is not our
-    peers' and could lie, and both only move `untrusted_pending`, never confirmed state.
-    The cost that keeps it opt-in is bandwidth - 2 to 20 KB of JSON per transaction (asm
-    strings, ancestor data), several GB a day at mainnet ingress, negligible on testnet4 -
-    plus the always-on connection. The parser deserves an `#[ignore]`d live shape test
-    like `the_public_oracles_still_answer_in_the_shape_we_parse`.
-  - **Unfiltered transaction relay from the trusted peer.** No server at all, raw-size
-    bandwidth, and the wallet matches every relayed transaction locally. It needs the
-    `bip157` crate to expose transaction relay, which it does not today.
+- **A mempool for the kyoto backend** - the opt-in `[mempool]` feed covers it since
+  2026-09-10 (`mempool_feed.rs` + `p2p_feed.rs`), from either of two sources
+  named in `sources` (a preference order; the first that can run for the wallet wins).
+  BIP-158 filters cover blocks only, so
+  without it an incoming payment is invisible until it confirms and `getbalances`'
+  `untrusted_pending` stays empty; nothing in BIP-157 fixes that.
+  **`"p2p"` (2026-09-11)** is zecd's own relay connection to one node over the Bitcoin
+  P2P protocol - by default the wallet's `kyoto://<ip>:<port>` trusted peer,
+  `p2p_peer = "<ip>:<port>"` overriding it (a DNS-seeded wallet with no override runs no
+  P2P feed): a minimal client of our own (version handshake announcing `relay = true` at
+  protocol 70015, below wtxid relay, so announcements come by txid; `inv` -> `getdata` by
+  witness txid, in batches of 1000; `tx`; `ping`/`pong`; unknown messages ignored) that
+  requests **every** announced transaction and hands each to the actor, which matches it
+  locally - outputs by `is_mine`, inputs by outpoints the wallet holds (the wire carries no
+  prevout scripts). The node learns "a wallet at this IP wants relay", what any full-node
+  peer tells it, and relays everything to every such peer, so it cannot tell which
+  transactions matter; bandwidth is raw transaction size, roughly 150-300 MB a day on
+  mainnet, negligible on testnet4. `p2p_snapshot = true` adds BIP 35 `mempool` requests at
+  connect and every 5 minutes: the node answers with an `inv` of its whole mempool, fetched
+  like any announcement (closing the pre-connect blind spot) and reported as a snapshot the
+  actor diffs against what the feed had reported held - the P2P source's only eviction
+  signal, since Core never announces one. It is opt-in because Core answers `mempool` only
+  for a peer with the `mempool` permission (`-whitelist=mempool@<wallet host>` on the node)
+  or with `-peerbloomfilters`, and **disconnects** an unpermissioned peer that asks. Why a
+  client of our own: `bip157` sends `relay: false` and drops transaction inventory, and its
+  maintainer closed the request to expose relay (2140-dev/kyoto#220) suggesting a side-car;
+  this is that side-car, on a connection of its own beside kyoto's.
+  **`"mempool_space"`**: the wallet holds one long-lived websocket to a
+  mempool.space instance (`wss://mempool.space/api/v1/ws`, per-network paths like
+  `/testnet4/api/v1/ws`, no key; `mempool_space_url` overrides it, `ws://` allowed for a
+  self-hosted instance on the same terms as the `[fees]` overrides) subscribed with
+  `{"track-mempool": true}`, and reads its `mempool-transactions` deltas -
+  `{sequence, added, removed, replaced, mined}`, every `added` entry a full Esplora-shape
+  transaction. Everything is matched **locally**: a bridge task owns the socket (the kyoto
+  update-bridge shape, since the read is not cancel-safe) and feeds a channel the actor
+  drains; each added transaction is rebuilt into a `bitcoin::Transaction` and its txid
+  **checked against the reported one** (a reconstruction that does not round-trip is
+  dropped and counted, never applied), `is_mine` runs over outputs and over the inputs'
+  `prevout` scripts, and a match is applied with `apply_unconfirmed_txs` - so a payment
+  shows in `untrusted_pending`, `listtransactions` and `listunspent 0` before its block,
+  and the filter scan anchors it later without duplication. A `removed` txid the wallet
+  holds unconfirmed is evicted with `apply_evicted_txs` (BDK evictions are not final; a
+  later sighting re-canonicalizes) - **settled at the next scan tip rather than on
+  arrival**, because the server also drops a transaction when a block mines it and the scan
+  can trail that by a minute; a genuinely evicted transaction is retired within a block. A
+  transaction the feed reports held is skipped by the rebroadcast pass, the way the
+  bitcoind pass skips what that node holds. No address and no txid of interest ever leaves
+  the wallet; what the server learns is that a wallet is online at this IP for as long as
+  the socket lives, strictly less than any per-address backend and removable outright with
+  a self-hosted instance. Trust is the existing 0-conf posture: the oracle's mempool is not
+  our peers' and could lie, and a lie only moves `untrusted_pending`, never confirmed
+  state. **Deltas only**: there is no snapshot on subscribe, so whatever is already in the
+  mempool at connect is invisible until it confirms - a blind spot the scan closes within a
+  block or two, and the reason a reconnect needs no catch-up. **Off by default** because of
+  the cost: 2 to 20 KB of JSON per transaction, several GB a day at mainnet ingress
+  (negligible on testnet4), plus the always-on connection; kyoto only (`config check` warns
+  when the section is set on a bitcoind wallet, which has a real mempool, or named on a
+  network with no instance and no override); the feed dials directly, not through
+  `[backend] proxy`, like the fee oracles. State on `getwalletinfo.mempool_feed`
+  (`disabled` / `connecting` / `connected`, the endpoint, last delta time, delta / matched /
+  dropped counters). Coverage: `mempool_feed.rs` (parse + reconstruction + txid check +
+  relevance, the websocket path end to end against an in-process fake feed, and the P2P
+  path end to end against an in-process fake node - handshake, announcement, ping, mempool
+  snapshot, close and redial), `p2p_feed.rs` (frame codec, version, announcement filter),
+  the config parse/check/show tests, the `#[ignore]`d live shape test
+  `the_public_feed_still_answers_in_the_shape_we_parse`, and for the P2P source a live
+  regtest suite, `regtest_btc_p2p_mempool.rs` (a Core run with
+  `-whitelist=mempool@127.0.0.1` and `p2p_snapshot_interval_secs = 10`: the feed connects
+  on the node's P2P port, a relayed payment shows at 0-conf and confirms without a second
+  history entry, a `bumpfee` replacement supersedes its original, and a receive
+  double-spent away from the wallet - which relay never shows it - is evicted by the
+  snapshot at the next scan tip). `p2p_snapshot_interval_secs` (default 300, minimum 5)
+  bounds how stale a P2P eviction can be, at one whole-mempool `inv` from the node per
+  request. The websocket source has no regtest suite (regtest has no mempool.space). The
+  rest of the P2P design in `TODO.md` - broadcasting
+  on a separate connection so a send never goes through the server, a local fee estimate
+  built from the relay stream, Tor for the broadcast hop - is not built.
 - **`[rpc] bind` is one address.** A host that must serve both loopback clients and a
   container across the docker bridge has to choose `0.0.0.0` (every interface, wrong on a
   public host) or the bridge gateway alone and repoint every local client (`--zecd-url`,

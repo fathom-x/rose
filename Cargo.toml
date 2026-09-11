@@ -157,6 +157,14 @@ bdk_kyoto = { version = "0.17", optional = true }
 # Mozilla root set rather than reading the host trust store, so the fee lookup behaves the same
 # in a scratch container as on a developer box.
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "webpki-tokio"], optional = true }
+# WebSocket client for the BDK engine's opt-in kyoto mempool feed (`src/btc/mempool_feed.rs`,
+# the mempool.space `track-mempool` stream). `rustls-tls-webpki-roots` rides the same rustls
+# 0.23 + tokio-rustls + compiled-in Mozilla roots the rest of the tree already carries; the
+# crate enables no rustls crypto-provider feature of its own, so `ring` stays the only one
+# (see the `tls-ring` note above). `handshake` is what the offline tests' in-process fake
+# feed server needs (`accept_async`). 0.28 is the last line on `sha1 0.10`; 0.29+ wants
+# `digest 0.11`, which the pinned librustzcash pre-release `bip32` cannot share.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
 
 # Optional drop-in allocator, enabled by both musl release images (`Dockerfile` and
 # `Dockerfile.arm64`). musl's default `malloc-ng` contends under Orchard proving's multi-threaded
@@ -191,7 +199,7 @@ cli = ["dep:clap", "dep:tracing-subscriber"]
 # holds: no `bdk_wallet` type in a shared signature, config struct, or cross-coin enum -
 # the engine joins the shared shell at the two sanctioned seams (`wallet::CoinWallet` and
 # the RPC handlers), everything else lives in `src/btc/`.
-bitcoin = ["dep:bdk_wallet", "dep:bdk_bitcoind_rpc", "dep:bdk_kyoto", "dep:hyper-rustls"]
+bitcoin = ["dep:bdk_wallet", "dep:bdk_bitcoind_rpc", "dep:bdk_kyoto", "dep:hyper-rustls", "dep:tokio-tungstenite"]
 # Use mimalloc as the global allocator. Off by default; the musl release images opt in.
 mimalloc = ["dep:mimalloc"]
 # Hardened mimalloc (MI_SECURE): guard pages, encrypted/canary free-lists, randomized

@@ -277,6 +277,63 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
         }
     }
 
+    // The kyoto mempool feed. Two ways the section can be set and do nothing: on a wallet
+    // whose upstream is a bitcoind (which has a mempool of its own - the feed is kyoto-only
+    // and the actor never starts it there), and on a network no named source has an endpoint
+    // for (regtest, with no override). Both are legal, both are silent at runtime beyond a
+    // log line, and both are worth a warning here, where the fix is one line away.
+    #[cfg(feature = "bitcoin")]
+    if !config.mempool.sources.is_empty() {
+        let btc_network =
+            crate::coin::BitcoinNetwork::from_environment(config.network, config.btc_testnet);
+        for (name, wallet) in &config.wallets {
+            if wallet.coin != crate::coin::Coin::Bitcoin {
+                continue;
+            }
+            match crate::btc::chain::resolve_for_wallet(config, wallet) {
+                Ok(crate::btc::chain::BtcEndpoint::Kyoto(kyoto)) => {
+                    if crate::btc::mempool_feed::feed_target(
+                        &config.mempool,
+                        btc_network,
+                        kyoto.peers(),
+                    )
+                    .is_none()
+                    {
+                        // Say per source why it cannot run, so the fix is the named knob.
+                        let reasons: Vec<String> = config
+                            .mempool
+                            .sources
+                            .iter()
+                            .map(|source| match source {
+                                crate::config::MempoolSource::P2p => "\"p2p\" needs a node \
+                                     to peer with, and this wallet is DNS-seeded (a \
+                                     kyoto://<ip>:<port> server, or [mempool] p2p_peer)"
+                                    .to_string(),
+                                crate::config::MempoolSource::MempoolSpace => format!(
+                                    "\"mempool_space\" has no public instance for {} and \
+                                     [mempool] mempool_space_url is unset",
+                                    btc_network.name()
+                                ),
+                            })
+                            .collect();
+                        findings.push(Finding::warning(format!(
+                            "[mempool] sources names no source that can run for \
+                             [wallets.{name}], so it has no 0-conf receives: {}",
+                            reasons.join("; ")
+                        )));
+                    }
+                }
+                Ok(_) => findings.push(Finding::warning(format!(
+                    "[mempool] sources is set, but [wallets.{name}] runs on a bitcoind, which \
+                     has a mempool of its own: the feed is kyoto-only and is not started for \
+                     this wallet (it already sees unconfirmed transactions)"
+                ))),
+                // An unresolvable endpoint is reported as an error by the per-wallet check.
+                Err(_) => {}
+            }
+        }
+    }
+
     for (name, wallet) in &config.wallets {
         // A bitcoin wallet's endpoint has its own grammar and preflight (`crate::btc::chain`),
         // and none of the Zcash warnings below apply to it.
@@ -996,6 +1053,81 @@ mod tests {
         // A bitcoind upstream prices from estimatesmartfee and never reads the chain at all.
         let bitcoind = inspect(&resolve(&wallet("bitcoind"), dir.path()));
         assert!(!names_esplora(&bitcoind), "{bitcoind:?}");
+    }
+
+    /// The mempool feed is kyoto-only and opt-in: set on a bitcoind wallet it is inert (the
+    /// node has a mempool), and named on a network with no public instance it never starts.
+    /// Both are warnings naming the wallet or the knob; a kyoto wallet on a served network,
+    /// or one with an override, is clean.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn a_mempool_feed_that_would_not_run_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = |network: &str, server: &str| {
+            format!(
+                "network = \"{network}\"\ndatadir = {:?}\n\
+                 [wallets.btc]\ncoin = \"bitcoin\"\nserver = \"{server}\"\n\
+                 [mempool]\nsources = [\"mempool_space\"]\n",
+                dir.path()
+            )
+        };
+        let about_feed = |findings: &[Finding]| -> Vec<String> {
+            warnings(findings)
+                .into_iter()
+                .filter(|w| w.contains("[mempool]"))
+                .map(str::to_string)
+                .collect()
+        };
+
+        // The intended shape: a kyoto wallet on a network mempool.space serves.
+        let kyoto = inspect(&resolve(&wallet("test", "kyoto"), dir.path()));
+        assert!(about_feed(&kyoto).is_empty(), "{kyoto:?}");
+        // A bitcoind wallet has its own mempool; the feed would never start there.
+        let bitcoind = inspect(&resolve(&wallet("test", "bitcoind"), dir.path()));
+        let found = about_feed(&bitcoind);
+        assert_eq!(found.len(), 1, "{bitcoind:?}");
+        assert!(found[0].contains("[wallets.btc]"), "{found:?}");
+        assert!(found[0].contains("kyoto-only"), "{found:?}");
+        // Regtest has no public instance: named but never started, unless an override
+        // supplies the endpoint.
+        let regtest = inspect(&resolve(
+            &wallet("regtest", "kyoto://127.0.0.1:18444"),
+            dir.path(),
+        ));
+        let found = about_feed(&regtest);
+        assert_eq!(found.len(), 1, "{regtest:?}");
+        assert!(found[0].contains("mempool_space_url"), "{found:?}");
+        assert!(found[0].contains("[wallets.btc]"), "{found:?}");
+        // The P2P source runs anywhere the wallet has a trusted peer - regtest included -
+        // and nowhere it is DNS-seeded, unless `p2p_peer` names a node.
+        let p2p = |server: &str| {
+            wallet("test", server).replace("sources = [\"mempool_space\"]", "sources = [\"p2p\"]")
+        };
+        let pinned = inspect(&resolve(&p2p("kyoto://192.0.2.7:48333"), dir.path()));
+        assert!(about_feed(&pinned).is_empty(), "{pinned:?}");
+        let seeded = inspect(&resolve(&p2p("kyoto"), dir.path()));
+        let found = about_feed(&seeded);
+        assert_eq!(found.len(), 1, "{seeded:?}");
+        assert!(found[0].contains("p2p_peer"), "{found:?}");
+        let overridden = inspect(&resolve(
+            &format!("{}p2p_peer = \"192.0.2.7:48333\"\n", p2p("kyoto")),
+            dir.path(),
+        ));
+        assert!(about_feed(&overridden).is_empty(), "{overridden:?}");
+        let hosted = inspect(&resolve(
+            &format!(
+                "{}mempool_space_url = \"ws://127.0.0.1:8999/api/v1/ws\"\n",
+                wallet("regtest", "kyoto://127.0.0.1:18444")
+            ),
+            dir.path(),
+        ));
+        assert!(about_feed(&hosted).is_empty(), "{hosted:?}");
+        // Unset - the default - says nothing at all, on any wallet.
+        let off = inspect(&resolve(
+            &wallet("test", "bitcoind").replace("[mempool]\nsources = [\"mempool_space\"]\n", ""),
+            dir.path(),
+        ));
+        assert!(about_feed(&off).is_empty(), "{off:?}");
     }
 
     #[test]

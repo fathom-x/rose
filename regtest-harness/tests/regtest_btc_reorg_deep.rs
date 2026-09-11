@@ -20,9 +20,17 @@
 //! the next redial starts from the network's recovery floor (genesis on regtest), whose
 //! headers do sync; the resolution task then re-records the anchor against the new chain.
 //!
-//! (When the light client happens to be idle at the moment the replacement chain arrives it
-//! sometimes follows the fork by itself and the escalation never fires; the daemon log of a
-//! run that did escalate shows the whole path, and either way the end state below holds.)
+//! When the light client happens to be idle at the moment the replacement chain arrives it
+//! follows the fork by itself and the escalation never fires. The anchor's block is gone all
+//! the same, so after any update that reorged the wallet's tip the actor re-resolves the
+//! birthday against the light client's headers and re-records the anchor if it moved (the
+//! wallet's own chain cannot tell: BDK keeps a checkpoint below the lowest conflict a sparse
+//! update names). Either path ends with an anchor on the new chain, which the last step
+//! asserts.
+//!
+//! A third run puts the fork just under the anchor (`UNDER_ANCHOR`): the light client's
+//! header tree reaches below it, so the client reorgs by itself and only the update-time
+//! re-resolution can notice the orphaned anchor - the deterministic cover for that path.
 //!
 //! Both legs end converged on the node's best block, with the receive confirmed on the
 //! new chain, the balance unchanged, and - over kyoto - `getwalletinfo.birthday.anchor`
@@ -36,18 +44,54 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
-const BIRTHDAY: u64 = 150;
-const FORK: u64 = 140;
-const LOCKTIME: u64 = 160;
+/// The shape of one run: the wallet's birthday, the height the node invalidates (below the
+/// birthday, so the anchor's block is orphaned), and the orphaned receive's locktime (above
+/// the birthday, so it is re-mined above the birthday on the new chain).
+#[derive(Clone, Copy)]
+struct Fork {
+    birthday: u64,
+    fork: u64,
+    locktime: u64,
+    /// The chain height when the node forks. The daemon is restarted at this height first,
+    /// so over kyoto the light client's header tree is a `Sync` tree that starts seven
+    /// blocks below it - which decides whether the client can reorg by itself.
+    old_tip: u64,
+}
+
+/// Deep: the fork is far below the light client's header tree (199..205 after the restart),
+/// so the kyoto redials fail header sync and escalate down to the dead anchor.
+const DEEP: Fork = Fork {
+    birthday: 150,
+    fork: 140,
+    locktime: 160,
+    old_tip: 205,
+};
+
+/// Just under the anchor: the fork point (199) is the header tree's first block (206 - 7),
+/// so the client reorgs by itself and no redial ever fails - the anchor's block at 200 is
+/// orphaned all the same, and the actor has to notice from the update alone. The birthday
+/// resolves to an anchor only once the tip is the reorg margin (6) past it, hence 206.
+const UNDER_ANCHOR: Fork = Fork {
+    birthday: 200,
+    fork: 200,
+    // Final when broadcast at 201, non-final at 199 once the fork drops the node there.
+    locktime: 201,
+    old_tip: 206,
+};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn btc_wallet_survives_a_reorg_below_its_anchor_over_bitcoind() {
-    deep_reorg_flow(BtcBackend::Bitcoind).await;
+    deep_reorg_flow(BtcBackend::Bitcoind, DEEP).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn btc_wallet_survives_a_reorg_below_its_anchor_over_kyoto() {
-    deep_reorg_flow(BtcBackend::Kyoto).await;
+    deep_reorg_flow(BtcBackend::Kyoto, DEEP).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn btc_wallet_reanchors_after_a_fork_just_under_its_anchor_over_kyoto() {
+    deep_reorg_flow(BtcBackend::Kyoto, UNDER_ANCHOR).await;
 }
 
 async fn block_hash(node: &BitcoinD, height: u64) -> String {
@@ -59,7 +103,14 @@ async fn block_hash(node: &BitcoinD, height: u64) -> String {
         .to_string()
 }
 
-async fn deep_reorg_flow(backend: BtcBackend) {
+async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
+    let Fork {
+        birthday,
+        fork,
+        locktime,
+        old_tip,
+    } = shape;
+    let new_tip = old_tip + 4;
     let dir = tempfile::tempdir().expect("tempdir");
     let Some(bitcoind) = provisioned(dir.path()) else {
         return;
@@ -75,21 +126,9 @@ async fn deep_reorg_flow(backend: BtcBackend) {
     node.mine(201).await;
 
     let mut zecd = ZecdBtc::prepare(dir.path().join("zecddata"), backend, &node, &["btc"]);
-    zecd.init_ok("btc", &["--birthday", &BIRTHDAY.to_string()]);
+    zecd.init_ok("btc", &["--birthday", &birthday.to_string()]);
     zecd.start().await;
     zecd.wait_height(201).await;
-    if backend == BtcBackend::Kyoto {
-        // The first scan resolved the birthday to an anchor on the original chain.
-        let old_150 = block_hash(&node, BIRTHDAY).await;
-        zecd.wait_wallet(
-            "btc",
-            "getwalletinfo",
-            json!([]),
-            "the birthday anchor is recorded",
-            |wi| wi["birthday"]["anchor"]["hash"] == json!(old_150),
-        )
-        .await;
-    }
 
     // 1. A receive confirmed at 202, built raw from an old coinbase (height 1, mature on
     //    either side of the fork) with the locktime that keeps it out of the replacement
@@ -116,7 +155,7 @@ async fn deep_reorg_flow(backend: BtcBackend) {
             json!([
                 [{ "txid": coinbase["txid"], "vout": coinbase["vout"] }],
                 { addr.clone(): 1.0, node_change: 48.999 },
-                LOCKTIME
+                locktime
             ]),
         )
         .await
@@ -131,37 +170,60 @@ async fn deep_reorg_flow(backend: BtcBackend) {
         .await
         .expect("broadcast the receive");
     let old_202 = node.mine(1).await.remove(0);
-    node.mine(3).await;
-    zecd.wait_height(205).await;
+    node.mine(old_tip - 202).await;
+    zecd.wait_height(old_tip).await;
     zecd.wait_wallet_balance("btc", 1.0).await;
     let tx = zecd
         .call("gettransaction", json!([receive_txid]))
         .await
         .expect("gettransaction");
     assert_eq!(tx["blockhash"], json!(old_202), "{tx}");
+    let old_anchor_block = block_hash(&node, birthday).await;
+    if backend == BtcBackend::Kyoto {
+        // The birthday resolved to an anchor on the original chain (the resolution waits
+        // for the tip to be the reorg margin past the birthday).
+        zecd.wait_wallet(
+            "btc",
+            "getwalletinfo",
+            json!([]),
+            "the birthday anchor is recorded",
+            |wi| wi["birthday"]["anchor"]["hash"] == json!(old_anchor_block),
+        )
+        .await;
+    }
+    // Restart at the old tip: over kyoto the light client comes back with a `Sync` header
+    // tree from seven blocks below it, which fixes where the fork lands relative to the tree.
+    zecd.restart().await;
+    zecd.wait_height(old_tip).await;
+    zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+        .await;
 
-    // 2. The deep reorg: invalidate 140, below the birthday and every wallet checkpoint,
-    //    and outgrow the old chain with 70 blocks to a fresh address. The receive is
-    //    non-final at 139 and leaves the node's mempool.
-    let old_140 = block_hash(&node, FORK).await;
-    node.call("invalidateblock", json!([old_140]))
+    // 2. The reorg: invalidate the fork height, below the birthday, and outgrow the old
+    //    chain by four blocks to a fresh address. The receive is non-final at the fork and
+    //    leaves the node's mempool.
+    let old_fork_block = block_hash(&node, fork).await;
+    node.call("invalidateblock", json!([old_fork_block]))
         .await
         .expect("invalidateblock");
-    assert_eq!(node.height().await, FORK - 1);
+    assert_eq!(node.height().await, fork - 1);
     assert!(
         node.mempool().await.is_empty(),
         "the non-final receive left the mempool: {:?}",
         node.mempool().await
     );
     let replacement_miner = node.new_address().await;
-    node.mine_to(&replacement_miner, 70).await;
-    assert_eq!(node.height().await, 209);
-    let new_150 = block_hash(&node, BIRTHDAY).await;
-    assert_ne!(new_150, old_140, "sanity");
+    node.mine_to(&replacement_miner, new_tip - (fork - 1)).await;
+    assert_eq!(node.height().await, new_tip);
+    let new_anchor_block = block_hash(&node, birthday).await;
+    assert_ne!(
+        new_anchor_block, old_anchor_block,
+        "the anchor's block was orphaned"
+    );
 
-    // 3. Convergence: the wallet follows the new chain to its tip. Over kyoto this is the
-    //    escalation bottoming out at the dead anchor, clearing it, and restarting from
-    //    genesis - several redials with backoff.
+    // 3. Convergence: the wallet follows the new chain to its tip. Over kyoto the deep
+    //    shape is the escalation bottoming out at the dead anchor, clearing it, and
+    //    restarting from genesis - several redials with backoff; the under-anchor shape is
+    //    the light client reorging by itself.
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         let wi = zecd
@@ -225,7 +287,7 @@ async fn deep_reorg_flow(backend: BtcBackend) {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let new_block = node.mine_to(&replacement_miner, 1).await.remove(0);
-    zecd.wait_height(210).await;
+    zecd.wait_height(new_tip + 1).await;
     zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
     zecd.wait_wallet_balance("btc", 1.0).await;
@@ -266,8 +328,8 @@ async fn deep_reorg_flow(backend: BtcBackend) {
             json!([]),
             "the birthday anchor names the new chain's block",
             |wi| {
-                wi["birthday"]["anchor"]["height"] == json!(BIRTHDAY)
-                    && wi["birthday"]["anchor"]["hash"] == json!(new_150)
+                wi["birthday"]["anchor"]["height"] == json!(birthday)
+                    && wi["birthday"]["anchor"]["hash"] == json!(new_anchor_block)
             },
         )
         .await;

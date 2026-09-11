@@ -183,7 +183,12 @@ zecd handles it at its seam rather than patching the crate (`kyoto.rs`, module d
   the network's recovery floor - the shipped floor, or genesis where there is none - whose
   headers do sync; the wallet unwinds the dead blocks from the update, and the resolution
   task re-records an anchor against the new chain (a synced wallet without an anchor now
-  resolves one on connect and records it without a restart). `regtest_btc_reorg_deep`
+  resolves one on connect and records it without a restart). When the light client follows
+  the fork by itself instead - an idle client handed the whole replacement chain at once -
+  no redial fails, so after any update that reorged the wallet's tip the actor re-resolves
+  the birthday against the light client's headers (`KyotoConn::re_resolve_anchor`) and
+  re-records the anchor if it moved; the wallet's own chain cannot be asked, because BDK
+  keeps a checkpoint below the lowest conflict a sparse update names. `regtest_btc_reorg_deep`
   pins it over both backends; over bitcoind the emitter finds no agreement point among
   the wallet's checkpoints and re-emits from the birthday on the new chain.
 

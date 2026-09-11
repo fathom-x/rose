@@ -1205,10 +1205,42 @@ impl BtcActor {
                     // No mempool view on this backend: the rebroadcast pass cannot filter.
                     self.node_mempool = None;
                     resolved_time = kyoto.try_resolved_birthday_time();
-                    self.wallet
+                    let tip_before = {
+                        let cp = self.wallet.latest_checkpoint();
+                        (cp.height(), cp.hash())
+                    };
+                    let applied = self
+                        .wallet
                         .apply_update(update)
                         .map_err(|e| anyhow::anyhow!("apply kyoto update: {e}"))
-                        .map(|()| 1usize)
+                        .map(|()| 1usize);
+                    // A reorg: the block the wallet had at its old tip height is not the
+                    // one it has there now. The light client may have followed a fork below
+                    // the recorded birthday anchor by itself, with no redial ever failing
+                    // from it, so the anchor is verified against the node's headers rather
+                    // than the wallet's chain (see `KyotoConn::re_resolve_anchor`); the
+                    // answer lands on a later idle poll and is recorded only if it moved.
+                    let reorged = tip_before.0 > 0
+                        && self
+                            .wallet
+                            .latest_checkpoint()
+                            .get(tip_before.0)
+                            .is_none_or(|cp| cp.hash() != tip_before.1);
+                    if reorged && self.birthday_anchor.is_some() {
+                        let birthday = crate::btc::kyoto::KyotoBirthday {
+                            height: self.birthday,
+                            time: self.birthday_time,
+                            anchor: self.birthday_anchor,
+                            block_time: self.birthday_block_time,
+                        };
+                        kyoto.re_resolve_anchor(self.network, &birthday);
+                        info!(
+                            old_tip = tip_before.0,
+                            "reorg applied over kyoto; verifying the birthday anchor against \
+                             the new headers"
+                        );
+                    }
+                    applied
                 }
                 // No update yet: the client is still finding peers or downloading filters.
                 // The idle poll is also where a resolved birthday anchor arrives (it can
@@ -1278,23 +1310,40 @@ impl BtcActor {
             ));
             return true;
         }
-        // A synced wallet's resolution (no anchor on record: a wallet from before the
-        // per-wallet anchor, or one whose anchor reorged out and was cleared) is recorded
-        // and nothing restarts: the scan is past the birthday, and the anchor only steers
-        // where a future resync bottoms out.
+        // A synced wallet's resolution - no anchor on record (a wallet from before the
+        // per-wallet anchor, or one whose anchor was cleared), or a verification after a
+        // reorg - is recorded and nothing restarts: the scan is past the birthday, and the
+        // anchor only steers where a future resync bottoms out. A verification that comes
+        // back with the anchor already on record changes nothing.
         if let Some((height, hash)) = resolved_anchor {
-            if let Err(e) = self
-                .persister
-                .save_birthday_anchor(height, &hash.to_string())
-            {
-                warn!("failed to record the resolved birthday anchor: {e:#}");
+            if self.birthday_anchor == Some((height, hash)) {
+                debug!(
+                    anchor = height,
+                    "birthday anchor verified against the headers"
+                );
+            } else {
+                let moved = self.birthday_anchor.is_some();
+                if let Err(e) = self
+                    .persister
+                    .save_birthday_anchor(height, &hash.to_string())
+                {
+                    warn!("failed to record the resolved birthday anchor: {e:#}");
+                }
+                self.birthday_anchor = Some((height, hash));
+                if moved {
+                    warn!(
+                        anchor = height,
+                        "the recorded birthday anchor's block left the chain in a reorg; \
+                         re-recorded against the new chain"
+                    );
+                } else {
+                    info!(
+                        anchor = height,
+                        "birthday anchor recorded against the synced headers (the wallet is \
+                         past it; no restart)"
+                    );
+                }
             }
-            self.birthday_anchor = Some((height, hash));
-            info!(
-                anchor = height,
-                "birthday anchor recorded against the synced headers (the wallet is past it; \
-                 no restart)"
-            );
         }
         let worked = match result {
             Ok(applied) => {

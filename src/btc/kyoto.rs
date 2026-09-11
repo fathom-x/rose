@@ -994,6 +994,38 @@ impl KyotoConn {
         self.requester.clone()
     }
 
+    /// Resolve the birthday anchor again against the node's headers - the actor's move
+    /// after an update that reorged the wallet's chain. A fork below the anchor leaves its
+    /// block orphaned, and the wallet's own chain cannot say so: BDK keeps a checkpoint
+    /// below the lowest conflict an update names, so a stale anchor checkpoint survives a
+    /// sparse update untouched. The headers can say so, and [`resolve_birthday_anchor`]
+    /// waits for them to cover the birthday plus the reorg margin before answering; the
+    /// result arrives through [`KyotoConn::try_resolved_anchor`] like a first scan's, and
+    /// the actor records it only if it differs from the anchor on record. Replaces any
+    /// resolution still in flight.
+    pub fn re_resolve_anchor(&mut self, network: BitcoinNetwork, birthday: &KyotoBirthday) {
+        let floor = recovery_floor(network, birthday.height);
+        let Some(target) = resolution_target(floor.height, birthday) else {
+            return;
+        };
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        let requester = self.requester.clone();
+        let margin = anchor_reorg_margin(network);
+        let (tx, rx) = oneshot::channel();
+        let task = runtime.spawn(async move {
+            if let Some(anchor) =
+                resolve_birthday_anchor(requester, floor.height, target, margin).await
+            {
+                let _ = tx.send(anchor);
+            }
+        });
+        if let Some((_, previous)) = self.anchor.replace((rx, task)) {
+            previous.abort();
+        }
+    }
+
     /// The node's current tip height, for progress reporting and `init`'s birthday anchor.
     pub async fn tip_height(&self) -> anyhow::Result<u32> {
         tip_height(self.requester.clone()).await

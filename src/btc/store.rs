@@ -29,6 +29,35 @@ pub fn wallet_db_path(engine_dir: &Path) -> PathBuf {
 /// wallet root, above both.
 pub const ENGINE_ARTIFACTS: [&str; 3] = ["wallet.sqlite", "wallet.sqlite-wal", "wallet.sqlite-shm"];
 
+/// How long a write waits on another connection's lock before failing (`busy_timeout`).
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The layout this module reads and writes, stamped in the database's `user_version`. Bump
+/// it when the tables or the changeset encoding change shape; [`check_schema_version`] then
+/// refuses a database from a *newer* build with a message that names the way out, rather
+/// than failing on the first row `initialize` cannot decode. A fresh database (or one
+/// written before the stamp existed - the same layout as version 1) is stamped on open.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Stamp a fresh (or pre-stamp) database and refuse one written by a newer layout.
+fn check_schema_version(conn: &Connection, path: &Path) -> anyhow::Result<()> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .context("read the schema version")?;
+    if version == 0 {
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .context("stamp the schema version")?;
+    } else if version > SCHEMA_VERSION {
+        anyhow::bail!(
+            "{} was written by a newer zecd (schema version {version}; this build reads \
+             {SCHEMA_VERSION}). Upgrade zecd, or run `zecd rescan --wallet <name>` to rebuild \
+             the wallet database from the chain",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// A [`WalletPersister`] backed by one SQLite table of serde-encoded changesets.
 pub struct Persister {
     conn: Connection,
@@ -45,7 +74,40 @@ impl Persister {
         let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("set WAL mode")?;
+        // A second opener (a `rescan` racing a daemon, an operator's sqlite shell) would
+        // otherwise turn every write into an immediate `SQLITE_BUSY`, which `persist` can
+        // only log - the staged changeset then survives no restart. Wait it out instead.
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .context("set the sqlite busy timeout")?;
+        check_schema_version(&conn, &path)?;
         Ok(Persister { conn })
+    }
+
+    /// Run `f` inside one SQLite transaction: every write it makes lands together or not at
+    /// all. The actor's retirement needs it - a tombstone without the eviction it accompanies
+    /// reloads a transaction as canonical-unconfirmed with its anchors stripped, wrong on
+    /// both sides (see [`Persister::retire_tx`]).
+    pub fn transactionally<R>(
+        &mut self,
+        f: impl FnOnce(&mut Persister) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .context("begin transaction")?;
+        match f(self) {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .context("commit transaction")?;
+                Ok(value)
+            }
+            Err(e) => {
+                if let Err(rollback) = self.conn.execute_batch("ROLLBACK") {
+                    tracing::warn!("rollback after a failed transaction: {rollback}");
+                }
+                Err(e)
+            }
+        }
     }
 
     /// An in-memory persister (tests).
@@ -244,16 +306,26 @@ impl WalletPersister for Persister {
             .context("create bdk_changesets table")?;
         let mut stmt = persister
             .conn
-            .prepare("SELECT changeset FROM bdk_changesets ORDER BY id")
+            .prepare("SELECT id, changeset FROM bdk_changesets ORDER BY id")
             .context("read changesets")?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .context("read changesets")?;
         let mut aggregate = ChangeSet::default();
         for row in rows {
-            let encoded = row.context("read changeset row")?;
-            let changeset: ChangeSet =
-                serde_json::from_str(&encoded).context("decode stored changeset")?;
+            let (id, encoded) = row.context("read changeset row")?;
+            // A row this build cannot decode means the encoding moved under the database
+            // (a bdk changeset serde change the schema stamp did not anticipate); say what
+            // the operator can do about it, since the serde error alone names nothing.
+            let changeset: ChangeSet = serde_json::from_str(&encoded).with_context(|| {
+                format!(
+                    "decode stored changeset row {id}: the wallet database was written with a \
+                     changeset encoding this zecd cannot read; run `zecd rescan --wallet <name>` \
+                     to rebuild it from the chain"
+                )
+            })?;
             aggregate.merge(changeset);
         }
         let retired = persister.retired_txs()?;
@@ -340,6 +412,68 @@ mod tests {
             3,
             "all three revealed addresses are known after the reload"
         );
+    }
+
+    /// A fresh database is stamped with this build's schema version, a pre-stamp one (the
+    /// same layout, `user_version` 0) is stamped on open, and one from a newer layout is
+    /// refused up front with the way out named - not on the first undecodable row.
+    #[test]
+    fn the_schema_stamp_admits_older_and_refuses_newer_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_dir = dir.path().join("btc").join("bdk");
+        let read_version = |p: &Persister| -> i64 {
+            p.conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        {
+            let mut persister = Persister::open(&engine_dir).unwrap();
+            assert_eq!(read_version(&persister), SCHEMA_VERSION);
+            create(&mut persister);
+            // Pretend the stamp never existed (a database from before it did).
+            persister
+                .conn
+                .pragma_update(None, "user_version", 0)
+                .unwrap();
+        }
+        {
+            let persister = Persister::open(&engine_dir).unwrap();
+            assert_eq!(
+                read_version(&persister),
+                SCHEMA_VERSION,
+                "backfilled on open"
+            );
+            persister
+                .conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let err = match Persister::open(&engine_dir) {
+            Ok(_) => panic!("a newer schema must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("newer zecd"), "{err}");
+        assert!(err.contains("zecd rescan"), "{err}");
+    }
+
+    /// A stored changeset this build cannot decode names the rescan that rebuilds the
+    /// database, rather than surfacing the bare serde error.
+    #[test]
+    fn an_undecodable_changeset_names_the_rescan() {
+        let mut persister = Persister::in_memory();
+        create(&mut persister);
+        persister
+            .conn
+            .execute(
+                "INSERT INTO bdk_changesets (changeset) VALUES (?1)",
+                ["{\"not\": \"a changeset\"}"],
+            )
+            .unwrap();
+        let err = format!(
+            "{:#}",
+            <Persister as WalletPersister>::initialize(&mut persister).unwrap_err()
+        );
+        assert!(err.contains("zecd rescan"), "{err}");
     }
 
     /// Creating over existing data is refused by `PersistedWallet::create` (the analog of

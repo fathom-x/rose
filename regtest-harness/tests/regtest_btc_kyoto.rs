@@ -373,19 +373,26 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
     assert!(address.starts_with("bcrt1"), "{address}");
 
     // Fund the wallet. Filters are block-derived, so kyoto has NO mempool: the receive
-    // must stay invisible on every 0-conf surface until it confirms.
+    // must stay invisible on every 0-conf surface until it confirms. "Nothing happened"
+    // has no event to await, so the assertion is held across several of the actor's sync
+    // passes rather than read once, milliseconds after the send, when it would pass even
+    // against a backend that did see the mempool.
     node.call("sendtoaddress", json!([address, 1.0]))
         .await
         .expect("fund zecd");
-    let unconfirmed = zecd
-        .call("getunconfirmedbalance", json!([]))
-        .await
-        .expect("getunconfirmedbalance");
-    assert_eq!(
-        unconfirmed.as_f64(),
-        Some(0.0),
-        "kyoto has no mempool; a receive cannot appear at 0-conf"
-    );
+    let hold = std::time::Instant::now();
+    while hold.elapsed() < std::time::Duration::from_secs(6) {
+        let unconfirmed = zecd
+            .call("getunconfirmedbalance", json!([]))
+            .await
+            .expect("getunconfirmedbalance");
+        assert_eq!(
+            unconfirmed.as_f64(),
+            Some(0.0),
+            "kyoto has no mempool; a receive cannot appear at 0-conf"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 
     // Confirming it makes the block's filter match the wallet's script; kyoto downloads
     // that one block and the receive lands.

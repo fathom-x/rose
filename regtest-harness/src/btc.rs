@@ -65,7 +65,8 @@ pub fn zecd_has_bitcoin_feature(datadir: &Path) -> bool {
 }
 
 /// Both provisioning probes at once. `Some(bitcoind)` when the test can run; `None` after
-/// printing the `skipping:` line the CI logs are grepped for.
+/// printing the `skipping:` line the `btc-e2e` CI job greps its log for (a skip there fails
+/// the job: it supplies both prerequisites, so a skip is a broken job, not a missing one).
 pub fn provisioned(datadir: &Path) -> Option<PathBuf> {
     let Some(bitcoind) = bitcoind_bin() else {
         eprintln!("skipping: no bitcoind (set BITCOIND_BIN or put bitcoind on PATH)");

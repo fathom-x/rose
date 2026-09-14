@@ -18,7 +18,9 @@ reads the node's best block and `getchaintips`, and each wallet's `getwalletinfo
     reorg reached the wallet's own history;
   * SEND: with `--send-every N` minutes, a small self-payment from the first wallet to
     its own fresh address, so most of the blocks the local miner produces carry a wallet
-    transaction (the miner mines on the wallet's unconfirmed transactions).
+    transaction (the miner mines on the wallet's unconfirmed transactions). Refused on
+    mainnet (`--allow-mainnet` overrides), priced at an explicit `--fee-rate` (never a
+    wallet estimate), and skipped while the balance is under `--min-balance`.
 
 Stdlib only. Wallet RPCs are zecd's; the node's are Bitcoin Core's. Output is one line
 per event, timestamped, to stdout (tee it to a file for a day).
@@ -132,11 +134,26 @@ class Wallet:
                         self.txs[txid] = None
 
 
-def self_send(wallet, amount):
+def self_send(wallet, amount, fee_rate, min_balance):
+    """One self-payment, priced explicitly and floored on balance.
+
+    Every send carries an explicit `fee_rate` (Core's tenth `sendtoaddress` argument, sat/vB):
+    a wallet-estimated rate follows the mempool, and a busy testnet mempool priced the
+    watcher's 2026-09-11 sends at hundreds of sat/vB until the spender was empty. The
+    balance floor is the other half of that: the watcher stops paying before the wallet
+    runs dry, so it never spends what a reorg test was meant to observe.
+    """
     try:
+        balance = float(rpc(wallet.url, "getbalance", []))
+        if balance < min_balance:
+            log("SEND", f"[{wallet.label}] skipped: balance {balance} is below --min-balance {min_balance}")
+            return
         addr = rpc(wallet.url, "getnewaddress", [])
-        txid = rpc(wallet.url, "sendtoaddress", [addr, amount])
-        log("SEND", f"[{wallet.label}] {amount} to own {addr[-10:]}: {txid}")
+        # address, amount, comment, comment_to, subtractfeefromamount, replaceable,
+        # conf_target, estimate_mode, avoid_reuse, fee_rate - the estimation pair stays
+        # null (zecd refuses it alongside fee_rate, as Core does).
+        txid = rpc(wallet.url, "sendtoaddress", [addr, amount, "", "", False, None, None, None, None, fee_rate])
+        log("SEND", f"[{wallet.label}] {amount} to own {addr[-10:]} at {fee_rate} sat/vB: {txid}")
     except Exception as e:
         log("SEND", f"[{wallet.label}] failed: {e}")
 
@@ -148,7 +165,18 @@ def main():
     ap.add_argument("--poll", type=int, default=20, help="seconds between polls")
     ap.add_argument("--send-every", type=int, default=0, help="minutes between self-payments from the first wallet (0 = never)")
     ap.add_argument("--send-amount", type=float, default=0.0001)
+    ap.add_argument("--fee-rate", type=float, default=1.0, help="explicit sat/vB for every self-payment, never a wallet estimate (default 1)")
+    ap.add_argument("--min-balance", type=float, default=0.001, help="skip the self-payment while the first wallet's balance is below this (BTC)")
+    ap.add_argument("--allow-mainnet", action="store_true", help="permit --send-every against a mainnet node (refused otherwise: this loop spends real money)")
     args = ap.parse_args()
+    if args.send_every:
+        # The send loop exists to feed a testnet miner; on mainnet it is a slow drain of real
+        # funds. Read the node's chain once, before the first payment, and refuse it.
+        chain = rpc(args.node, "getblockchaininfo", []).get("chain")
+        if chain == "main" and not args.allow_mainnet:
+            sys.exit(f"--send-every against a mainnet node (chain={chain!r}) is refused; pass --allow-mainnet to override")
+        if args.fee_rate <= 0:
+            sys.exit("--fee-rate must be a positive sat/vB")
     wallets = []
     for spec in args.wallet:
         label, _, url = spec.partition("=")
@@ -185,7 +213,7 @@ def main():
             for w in wallets:
                 w.poll(height, best)
             if args.send_every and wallets and time.time() - last_send >= args.send_every * 60:
-                self_send(wallets[0], args.send_amount)
+                self_send(wallets[0], args.send_amount, args.fee_rate, args.min_balance)
                 last_send = time.time()
         except Exception as e:
             log("ERROR", str(e))

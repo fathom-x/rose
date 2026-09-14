@@ -422,6 +422,11 @@ pub fn render(config: &AppConfig) -> String {
         // upstream" (the global `[backend]` for Zcash, a local bitcoind for Bitcoin).
         #[cfg(feature = "bitcoin")]
         if w.coin == crate::coin::Coin::Bitcoin {
+            // The engine's address lookahead, always rendered (like `transparent` on a
+            // Zcash wallet): it is the restore gap limit, and a config rebuilt from this
+            // output that silently fell back to BDK's 25 would miss funds a deployment
+            // relying on a wider window (the mainnet view sample runs 200) had recovered.
+            kv(&mut s, "lookahead", w.lookahead);
             if let Some(server) = &w.backend.server {
                 match crate::btc::chain::resolve_for_wallet(config, w) {
                     Ok(resolved) => {
@@ -713,6 +718,9 @@ mod tests {
             .map(|rest| rest.split("[wallets.").next().unwrap())
             .expect("bitcoin wallet section rendered");
         assert!(btc_section.contains("coin = \"bitcoin\""), "{first}");
+        // The lookahead renders at its effective value, default included: it is the restore
+        // gap limit, so a rebuilt config must not silently fall back to it.
+        assert!(btc_section.contains("lookahead = 25"), "{first}");
         for absent in ["pools", "transparent", "default_receivers", "server"] {
             assert!(
                 !btc_section.contains(absent),
@@ -748,6 +756,19 @@ mod tests {
             "{testnet4}"
         );
         assert_eq!(testnet4, render(&resolve_from(&testnet4, dir.path())));
+
+        // A widened lookahead survives the round trip at its configured value - the
+        // omission that used to restore a rebuilt mainnet view wallet at 25.
+        let wide = render(&resolve_from(
+            &format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.btc]\ncoin = \"bitcoin\"\n\
+                 lookahead = 200\n",
+                dir.path()
+            ),
+            dir.path(),
+        ));
+        assert!(wide.contains("lookahead = 200"), "{wide}");
+        assert_eq!(wide, render(&resolve_from(&wide, dir.path())));
     }
 
     /// The kyoto fee chain renders its effective order, names each tier's resolved endpoint

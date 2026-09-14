@@ -1479,13 +1479,15 @@ fn the_bitcoin_sample_configs_need_the_engine_they_select() {
             stdout_of(&out)
         );
         let stderr = stderr_of(&out);
-        // A default build refuses a bitcoin sample for the missing engine one of three ways:
-        // the `[bitcoind]` section trips deny_unknown_fields at parse (the full-node samples);
-        // for a kyoto sample, which has no `[bitcoind]` because kyoto needs no credentials,
-        // `btc_testnet` is refused at resolve behind the feature (the testnet4 kyoto sample);
-        // and a mainnet kyoto sample, which has neither key, reaches the coin doctrine check
-        // itself, which names the engines this build carries.
+        // A default build refuses a bitcoin sample for the missing engine one of four ways:
+        // the `[bitcoind]` section trips deny_unknown_fields at parse (the full-node samples),
+        // as does the engine-only `[mempool]` section (the testnet4 kyoto view sample, which
+        // opts into the p2p feed); for a kyoto sample with neither, since kyoto needs no
+        // credentials, `btc_testnet` is refused at resolve behind the feature; and a mainnet
+        // kyoto sample, which has none of those keys, reaches the coin doctrine check itself,
+        // which names the engines this build carries.
         let refused_for_missing_engine = stderr.contains("unknown field `bitcoind`")
+            || stderr.contains("unknown field `mempool`")
             || stderr.contains("requires a zecd build with the `bitcoin` feature")
             || stderr.contains("unsupported coin \"bitcoin\"");
         assert!(

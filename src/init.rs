@@ -1044,9 +1044,10 @@ fn kyoto_date_birthday(btc_network: crate::coin::BitcoinNetwork, date: u64) -> B
     let height = match crate::btc::kyoto::birthday_height_for_date(btc_network, date) {
         Some(height) => {
             tracing::info!(
-                "recorded the birthday date offline at height {height}, this build's \
-                 shipped scan floor; the first sync resolves the date to its true height \
-                 against the light client's own headers and anchors there from then on"
+                "recorded the birthday date offline at height {height}, the block after \
+                 this build's shipped scan floor; the first sync resolves the date to its \
+                 true height against the light client's own headers and anchors there \
+                 from then on"
             );
             height
         }
@@ -1076,9 +1077,14 @@ fn kyoto_date_birthday(btc_network: crate::coin::BitcoinNetwork, date: u64) -> B
 /// bitcoind emitter starts from the birthday by height and handles reorgs itself; only
 /// the hash-anchored kyoto path needs the depth). An anchor below the birthday merely
 /// scans a few extra blocks.
+///
+/// One below the birthday, never at it: kyoto scans from `anchor + 1`, so an anchor at the
+/// birthday skips the block the operator named as holding the first transaction.
 #[cfg(feature = "bitcoin")]
 fn init_anchor_height(birthday: u32, tip: u32, network: crate::coin::BitcoinNetwork) -> u32 {
-    birthday.min(tip.saturating_sub(crate::btc::kyoto::anchor_reorg_margin(network)))
+    birthday
+        .saturating_sub(1)
+        .min(tip.saturating_sub(crate::btc::kyoto::anchor_reorg_margin(network)))
 }
 
 /// The current day's 00:00:00 UTC as unix seconds - what a fresh kyoto wallet's defaulted
@@ -1201,10 +1207,12 @@ async fn init_bitcoin_wallet(
         Some(Birthday::Height(height)) => BitcoinBirthday {
             height,
             time: None,
-            // A height the table covers is anchored within a day of blocks below it;
-            // past the table's end the newest entry serves as the first scan's floor
-            // (`btc::kyoto::recovery_floor`) and the first sync anchors at the height.
-            anchor: crate::btc::birthdays::anchor_for_height(btc_network, height)
+            // A height the table covers is anchored within a day of blocks below it -
+            // strictly below: the scan resumes at anchor + 1, and the birthday block is
+            // the first that may hold funds. Past the table's end the newest entry serves
+            // as the first scan's floor (`btc::kyoto::recovery_floor`) and the first sync
+            // anchors just below the height.
+            anchor: crate::btc::birthdays::anchor_for_height(btc_network, height.saturating_sub(1))
                 .filter(|entry| entry.exact)
                 .map(|entry| (entry.height, entry.hash.to_string())),
         },
@@ -2577,20 +2585,21 @@ mod tests {
     #[test]
     fn init_anchor_height_respects_the_network_reorg_depth() {
         use crate::coin::BitcoinNetwork;
-        // Mainnet: birthday = tip - 6 is already at the mainnet depth.
+        // Mainnet: birthday = tip - 6 is already at the mainnet depth; the anchor sits one
+        // below it so the scan (from anchor + 1) covers the birthday block itself.
         assert_eq!(
             init_anchor_height(49_994, 50_000, BitcoinNetwork::Main),
-            49_994
+            49_993
         );
         // Testnet3/4: the same birthday is inside the 100-block storm band; the anchor
         // drops to the depth while the birthday record stays where it was.
         for network in [BitcoinNetwork::Testnet3, BitcoinNetwork::Testnet4] {
             assert_eq!(init_anchor_height(49_994, 50_000, network), 49_900);
         }
-        // A birthday already deep (a date search a day back) anchors at itself.
+        // A birthday already deep (a date search a day back) anchors just below itself.
         assert_eq!(
             init_anchor_height(40_000, 50_000, BitcoinNetwork::Testnet4),
-            40_000
+            39_999
         );
         // Degenerate short chains cannot underflow.
         assert_eq!(init_anchor_height(5, 50, BitcoinNetwork::Testnet3), 0);

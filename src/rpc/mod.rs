@@ -476,14 +476,28 @@ async fn dispatch_zecd(
             wallet_methods::z_getaddressforaccount(state, wallet, req).await
         }
 
-        // Bitcoin-only, served by `btc_methods` above; for every other wallet the coin gate
-        // has already answered -32601, so this arm is never reached. It exists so the
-        // dispatch table and `ALL_METHODS` stay in lockstep (the test scans these arms).
-        "listdescriptors" => Err(RpcError::method_not_found(&req.method)),
-        "abandontransaction" => Err(RpcError::method_not_found(&req.method)),
+        // Bitcoin-only, served by `btc_methods` above; for every other *loaded* wallet the
+        // coin gate has already answered -32601, so these arms are reached only for a wallet
+        // the registry cannot resolve - which must keep answering -18 like every other
+        // method (the gate deliberately does not error on it; see `dispatch`). They exist
+        // so the dispatch table and `ALL_METHODS` stay in lockstep (the test scans them).
+        "listdescriptors" => bitcoin_only_fallthrough(state, wallet, req),
+        "abandontransaction" => bitcoin_only_fallthrough(state, wallet, req),
 
         other => Err(RpcError::method_not_found(other)),
     }
+}
+
+/// The shared-table arm for a method only the Bitcoin engine serves: resolve the wallet so an
+/// unknown one answers -18, then method-not-found for whatever is left (a build without the
+/// engine, where the coin gate has no Bitcoin wallet to admit).
+fn bitcoin_only_fallthrough(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    state.registry.get_coin(wallet)?;
+    Err(RpcError::method_not_found(&req.method))
 }
 
 #[cfg(test)]

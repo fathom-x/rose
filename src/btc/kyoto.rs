@@ -190,15 +190,16 @@ const BTC_KYOTO_SCAN_FLOOR_TESTNET4: ScanFloor = ScanFloor {
 /// P2P node to read the chain) when the shipped per-day table
 /// ([`super::birthdays::anchor_for_date`], mainnet only, consulted first) does not cover
 /// the date: a date at or after the network's shipped scan floor - with a day of slack
-/// over the floor block's own header time - maps to the floor height, the height an
-/// anchor-less first scan starts at for any birthday at or above it ([`recovery_floor`]).
-/// The date itself is recorded alongside (`WalletStore::birthday_time`), and the first
-/// sync refines it to the true height via [`resolve_birthday_anchor`]. An earlier date
-/// (or regtest, which ships no floor) has no offline reference; the caller falls back to
-/// the BIP 84 history floor.
+/// over the floor block's own header time - maps to the block after the floor, the first
+/// block an anchor-less first scan from the floor covers (a checkpoint's own block is
+/// never scanned, so [`recovery_floor`] applies the floor only to a birthday strictly
+/// above it). The date itself is recorded alongside (`WalletStore::birthday_time`), and
+/// the first sync refines it to the true height via [`resolve_birthday_anchor`]. An
+/// earlier date (or regtest, which ships no floor) has no offline reference; the caller
+/// falls back to the BIP 84 history floor.
 pub(crate) fn birthday_height_for_date(network: BitcoinNetwork, date: u64) -> Option<u32> {
     let floor = scan_floor(network)?;
-    (date >= floor.time + 24 * 60 * 60).then_some(floor.height)
+    (date >= floor.time + 24 * 60 * 60).then_some(floor.height + 1)
 }
 
 /// The network's shipped floor. Regtest has none: its chains are built per run and stay
@@ -242,8 +243,10 @@ const RESYNC_ESCALATION: u32 = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KyotoFailure {
     /// The node rejected a header batch (a [`Warning::UnexpectedSyncError`]) and will not
-    /// advance until it is rebuilt from an older checkpoint.
-    HeaderSync(String),
+    /// advance until it is rebuilt from an older checkpoint. `tip` is the header tree's
+    /// height at the failure (when the node could still say): the actor implicates the
+    /// recorded birthday anchor only when the tree never grew past it.
+    HeaderSync { why: String, tip: Option<u32> },
     /// The node stopped, or lost every peer: the bridge's own `update()` failed or the
     /// channel closed.
     Stream(String),
@@ -252,9 +255,10 @@ pub enum KyotoFailure {
 impl std::fmt::Display for KyotoFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HeaderSync(why) => write!(
+            Self::HeaderSync { why, tip } => write!(
                 f,
-                "kyoto rejected a header batch and is parked on its current tip: {why}"
+                "kyoto rejected a header batch and is parked on its current tip{}: {why}",
+                tip.map(|tip| format!(" ({tip})")).unwrap_or_default()
             ),
             Self::Stream(why) => write!(f, "{why}"),
         }
@@ -263,13 +267,26 @@ impl std::fmt::Display for KyotoFailure {
 
 impl std::error::Error for KyotoFailure {}
 
+/// The text `bip157` prefixes a rejected header batch with (`node.rs`, the header-sync
+/// arm). The same `UnexpectedSyncError` variant also carries a bad merkle root, a block
+/// with an unknown hash, and filter / filter-header trouble - cases where the node bans
+/// the peer and carries on with the next one.
+const HEADER_SYNC_ERROR_PREFIX: &str = "Unexpected header syncing error";
+
 /// The warnings after which the node makes no further progress on its own - a rejected
 /// header batch parks it on its current tip (the module doc's fork case), so the only way
 /// forward is a rebuilt tree. Every other warning is transient or informational (peer
-/// churn, a fork under evaluation, a rejected broadcast) and the node handles it itself.
+/// churn, a fork under evaluation, a rejected broadcast, a peer serving a bad block or
+/// filter - banned and replaced) and the node handles it itself. Matching the whole
+/// `UnexpectedSyncError` variant used to tear the node down for those too, and on a
+/// checkpoint-less wallet three of them cleared a perfectly good birthday anchor.
 pub(crate) fn fatal_sync_warning(warning: &Warning) -> Option<String> {
     match warning {
-        Warning::UnexpectedSyncError { warning } => Some(warning.clone()),
+        Warning::UnexpectedSyncError { warning }
+            if warning.starts_with(HEADER_SYNC_ERROR_PREFIX) =>
+        {
+            Some(warning.clone())
+        }
         _ => None,
     }
 }
@@ -523,7 +540,8 @@ impl KyotoEndpoint {
     ) -> anyhow::Result<KyotoConn> {
         self.preflight()?;
         let network = crate::btc::keys::network(self.network);
-        let (scan_type, resolution) = self.scan_plan(wallet, birthday, resync);
+        let (scan_type, tree_start, target) = self.scan_plan(wallet, birthday, resync);
+        let resolution = target.map(|target| (tree_start, target));
 
         // Created so the path exists the moment the crate starts honoring it; today it stays
         // empty (see `data_dir`). Cheap, and it keeps the failure mode "empty directory"
@@ -593,6 +611,7 @@ impl KyotoEndpoint {
         // that the node has parked itself, and it only ever surfaces on that stream.
         let (tx, rx) = mpsc::channel(UPDATE_CHANNEL_BOUND);
         let fail_tx = tx.clone();
+        let probe = requester.clone();
         let describe = self.describe();
         let logs = tokio::spawn(async move {
             let mut info = logging.info_subscriber;
@@ -606,9 +625,14 @@ impl KyotoEndpoint {
                 while let Some(msg) = warns.recv().await {
                     warn!(upstream = %describe, "kyoto: {msg}");
                     if let Some(why) = fatal_sync_warning(&msg) {
+                        // Where the tree stands, for the actor's anchor verdict: the node
+                        // is parked, not gone, so it can still answer.
+                        let tip = probe.chain_tip().await.ok().map(|tip| tip.height);
                         // A closed channel means the actor already dropped this
                         // connection; nothing left to tell it.
-                        let _ = fail_tx.send(Err(KyotoFailure::HeaderSync(why))).await;
+                        let _ = fail_tx
+                            .send(Err(KyotoFailure::HeaderSync { why, tip }))
+                            .await;
                     }
                 }
             };
@@ -683,11 +707,13 @@ impl KyotoEndpoint {
             anchor,
             runtime: Some(runtime),
             birthday_time,
+            tree_start,
         })
     }
 
-    /// Where a fresh scan starts, and whether a birthday-anchor resolution should run
-    /// beside it.
+    /// Where a fresh scan starts, the height the light client's header tree is anchored
+    /// at for it (no header at or below that height is ever in the tree), and whether a
+    /// birthday-anchor resolution should run beside it.
     ///
     /// A wallet that has synced before resumes from its own checkpoint
     /// ([`ScanType::Sync`], which kyoto walks back by a reorg margin itself); everything
@@ -708,35 +734,43 @@ impl KyotoEndpoint {
         wallet: &Wallet,
         birthday: &KyotoBirthday,
         resync: Option<u32>,
-    ) -> (ScanType, Option<(u32, AnchorTarget)>) {
+    ) -> (ScanType, u32, Option<AnchorTarget>) {
         let tip = wallet.latest_checkpoint();
         if tip.height() > 0 {
+            let (scan, tree_start) = match resync {
+                None => (ScanType::Sync, sync_tree_start(&tip)),
+                Some(depth) => {
+                    let checkpoint =
+                        resync_checkpoint(&tip, depth, self.first_scan_start(birthday));
+                    info!(
+                        depth,
+                        from = checkpoint.height,
+                        wallet_tip = tip.height(),
+                        "kyoto resync after repeated header-sync failures: rebuilding the \
+                         light client from an older checkpoint"
+                    );
+                    let start = checkpoint.height;
+                    let scan = ScanType::Recovery {
+                        used_script_index: recovery_script_lookahead(wallet),
+                        checkpoint,
+                    };
+                    (scan, start)
+                }
+            };
             // A synced wallet without an anchor - one from before the per-wallet anchor
             // existed, or one whose anchor reorged out and was cleared - resolves one
             // against the live headers; the actor records it without a restart, so the
-            // next resync bottoms out at the birthday instead of the floor.
-            let resolution = if birthday.anchor.is_none() {
-                let floor = recovery_floor(self.network, birthday.height);
-                resolution_target(floor.height, birthday).map(|target| (floor.height, target))
+            // next resync bottoms out at the birthday instead of the floor. Only when the
+            // tree will hold the headers, though: a `Sync` tree starts a few checkpoints
+            // below the tip, so a birthday further down is simply not resolvable on this
+            // connection (the resolver used to poll for it every 5 s for the connection's
+            // life), and a resync tree starts at its own checkpoint.
+            let target = if birthday.anchor.is_none() {
+                resolution_target(tree_start, birthday)
             } else {
                 None
             };
-            let Some(depth) = resync else {
-                return (ScanType::Sync, resolution);
-            };
-            let checkpoint = resync_checkpoint(&tip, depth, self.first_scan_start(birthday));
-            info!(
-                depth,
-                from = checkpoint.height,
-                wallet_tip = tip.height(),
-                "kyoto resync after repeated header-sync failures: rebuilding the light \
-                 client from an older checkpoint"
-            );
-            let scan = ScanType::Recovery {
-                used_script_index: recovery_script_lookahead(wallet),
-                checkpoint,
-            };
-            return (scan, resolution);
+            return (scan, tree_start, target);
         }
         if let Some((height, hash)) = birthday.anchor {
             debug!(
@@ -748,22 +782,39 @@ impl KyotoEndpoint {
                 used_script_index: recovery_script_lookahead(wallet),
                 checkpoint: HashCheckpoint::new(height, hash),
             };
-            return (scan, None);
+            return (scan, height, None);
         }
         let floor = recovery_floor(self.network, birthday.height);
-        let resolution = resolution_target(floor.height, birthday);
+        let target = resolution_target(floor.height, birthday);
         debug!(
             birthday = birthday.height,
             floor = floor.height,
-            resolving = resolution.is_some(),
+            resolving = target.is_some(),
             "kyoto recovery scan start"
         );
+        let start = floor.height;
         let scan = ScanType::Recovery {
             used_script_index: recovery_script_lookahead(wallet),
             checkpoint: floor,
         };
-        (scan, resolution.map(|target| (floor.height, target)))
+        (scan, start, target)
     }
+}
+
+/// How many checkpoints back from the wallet's tip bdk_kyoto anchors a [`ScanType::Sync`]
+/// header tree (its `IMPOSSIBLE_REORG_DEPTH`; `walk_back_max_reorg` is not exported, so
+/// [`sync_tree_start`] replicates it). Below that height the tree holds no header.
+const SYNC_WALK_BACK_CHECKPOINTS: usize = 7;
+
+/// The height a `Sync` scan's header tree is anchored at: the checkpoint
+/// [`SYNC_WALK_BACK_CHECKPOINTS`] steps below the tip along the wallet's own (sparse)
+/// checkpoint chain, or the lowest one when the chain is shorter.
+fn sync_tree_start(tip: &CheckPoint) -> u32 {
+    tip.iter()
+        .take(SYNC_WALK_BACK_CHECKPOINTS + 1)
+        .last()
+        .map(|cp| cp.height())
+        .unwrap_or_else(|| tip.height())
 }
 
 impl KyotoEndpoint {
@@ -780,15 +831,20 @@ impl KyotoEndpoint {
 
 /// Whether an anchor-less first scan starting at `scan_start` can be improved by resolving
 /// the recorded birthday, and to what target. A date always resolves (its offline record
-/// was the floor, so the true height is only known from headers); a height resolves only
-/// when it actually sits above the scan start - anchoring *at* the start would change
-/// nothing, and a birthday below it (the mainnet pre-floor restore, clamped up to SegWit
-/// activation) must not drag the scan lower.
+/// was the floor, so the true height is only known from headers). A height resolves to
+/// the block **before** it: bip157 stores a recovery anchor as the tree's tip and fetches
+/// filters from `anchor + 1`, so an anchor at the birthday itself skipped the one block
+/// the operator was told to name - the height of the first transaction - and a restore
+/// whose first receive sat in it missed the payment silently. And only when that block
+/// sits above the scan start: anchoring *at* the start would change nothing, and a
+/// birthday below it (the mainnet pre-floor restore, clamped up to SegWit activation)
+/// must not drag the scan lower.
 fn resolution_target(scan_start: u32, birthday: &KyotoBirthday) -> Option<AnchorTarget> {
     if let Some(time) = birthday.time {
         return Some(AnchorTarget::Date(time));
     }
-    (birthday.height > scan_start).then_some(AnchorTarget::Height(birthday.height))
+    let anchor = birthday.height.checked_sub(1)?;
+    (anchor > scan_start).then_some(AnchorTarget::Height(anchor))
 }
 
 /// A header by height off the running node, `None` while the synced chain does not cover
@@ -830,10 +886,17 @@ async fn resolve_birthday_time(
             return Some(u64::from(header.time));
         }
         match anchor {
-            Some((height, hash)) if height == birthday => match requester.get_block(hash).await {
-                Ok(indexed) => return Some(u64::from(indexed.block.header.time)),
-                Err(_) => continue,
-            },
+            // An anchor recorded at the birthday itself (before anchors moved one block
+            // below it). The block is not in the header tree, so a fetch the node cannot
+            // serve fails the same way every time: give up on the first error rather than
+            // poll it for the connection's life.
+            Some((height, hash)) if height == birthday => {
+                return requester
+                    .get_block(hash)
+                    .await
+                    .ok()
+                    .map(|indexed| u64::from(indexed.block.header.time))
+            }
             _ => return None,
         }
     }
@@ -846,10 +909,11 @@ async fn resolve_birthday_time(
 /// The task polls until the header chain, which starts at the recovery checkpoint the scan
 /// was launched with (`scan_start`), has grown far enough to answer, then:
 ///
-///  * [`AnchorTarget::Height`]: one header fetch at the recorded height, made only once
-///    the synced chain extends `margin` blocks past it ([`anchor_reorg_margin`], per
-///    network) - so the anchor cannot name a block that could still reorg out, and a
-///    partially-synced header chain cannot cap it low.
+///  * [`AnchorTarget::Height`]: one header fetch at the target height (the block before
+///    the birthday - see [`resolution_target`]), made only once the synced chain extends
+///    `margin` blocks past it ([`anchor_reorg_margin`], per network) - so the anchor
+///    cannot name a block that could still reorg out, and a partially-synced header chain
+///    cannot cap it low.
 ///  * [`AnchorTarget::Date`]: the shared interpolated header-time search
 ///    ([`HeightSearch`], bracketed at `scan_start` where headers begin), for the last
 ///    header at or before the date minus the shared one-day margin - erring low exactly as
@@ -878,6 +942,11 @@ async fn resolve_birthday_anchor(
         }
         let goal = match target {
             AnchorTarget::Height(height) => {
+                // Below the tree's own start there is no header to fetch, ever - the poll
+                // would never end (`resolution_target` screens this, given the true start).
+                if height <= scan_start {
+                    return None;
+                }
                 // Wait until the synced headers reach the birthday plus the margin before
                 // recording anything: a partially-synced ceiling caught mid-header-sync
                 // would otherwise cap the anchor at wherever this poll happened to land -
@@ -896,6 +965,15 @@ async fn resolve_birthday_anchor(
                 // answers `None` forever and a bracket probing it would never complete.
                 // The search therefore starts one above the scan start.
                 let search_lo = scan_start + 1;
+                // The first synced header already past the target date means nothing
+                // here can improve on the scan start - a synced wallet's tree begins a
+                // few checkpoints below its tip, and a historical date is simply not in
+                // it. Give up now rather than poll until the chain outgrows the margin.
+                match header_at(&requester, search_lo).await {
+                    Some(first) if u64::from(first.time) >= target_time => return None,
+                    Some(_) => {}
+                    None => continue,
+                }
                 // The search's upper endpoint must be a synced header past the target
                 // date; until the chain reaches it, keep waiting.
                 let Some(ceiling_header) = header_at(&requester, ceiling).await else {
@@ -958,6 +1036,9 @@ pub struct KyotoConn {
     /// The birthday block-time resolution ([`resolve_birthday_time`]), when this connect
     /// launched one - polled like the anchor's.
     birthday_time: Option<(oneshot::Receiver<u64>, JoinHandle<()>)>,
+    /// The height the header tree is anchored at (see [`KyotoEndpoint::scan_plan`]): what
+    /// a later resolution on this connection can and cannot reach.
+    tree_start: u32,
 }
 
 impl KyotoConn {
@@ -1017,8 +1098,11 @@ impl KyotoConn {
     /// the actor records it only if it differs from the anchor on record. Replaces any
     /// resolution still in flight.
     pub fn re_resolve_anchor(&mut self, network: BitcoinNetwork, birthday: &KyotoBirthday) {
-        let floor = recovery_floor(network, birthday.height);
-        let Some(target) = resolution_target(floor.height, birthday) else {
+        // Against this connection's tree, not the recovery floor: a synced wallet's tree
+        // starts a few checkpoints below its tip, and a birthday below that cannot be
+        // verified here at all (the escalating redials cover a reorg that deep).
+        let tree_start = self.tree_start;
+        let Some(target) = resolution_target(tree_start, birthday) else {
             return;
         };
         let Some(runtime) = self.runtime.as_ref() else {
@@ -1029,7 +1113,7 @@ impl KyotoConn {
         let (tx, rx) = oneshot::channel();
         let task = runtime.spawn(async move {
             if let Some(anchor) =
-                resolve_birthday_anchor(requester, floor.height, target, margin).await
+                resolve_birthday_anchor(requester, tree_start, target, margin).await
             {
                 let _ = tx.send(anchor);
             }
@@ -1087,14 +1171,18 @@ impl KyotoConn {
 ///    practice the fallback for a birthday between the two, and the aging cost of the
 ///    fixed floor is bounded by how old the build is rather than how old the floor is.
 ///
-/// The `birthday >= height` comparison is the correctness gate, and it is per-wallet: a
-/// floor is used only for wallets whose birthday proves they cannot have funds below it.
-/// Scanning from too early is only slow; this function is what makes "too late"
-/// unreachable no matter what value the constants (or the table) hold.
+/// The `birthday > height` comparison is the correctness gate, and it is per-wallet: a
+/// floor is used only for wallets whose birthday proves they cannot have funds at or
+/// below it. Strictly below, because a checkpoint is the block the scan starts *after*
+/// (kyoto fetches filters from `anchor + 1`): a floor at the birthday itself would skip
+/// the birthday block, which is the first one that may hold funds. The same holds for
+/// the per-day entry, which is looked up below the birthday for that reason. Scanning
+/// from too early is only slow; this function is what makes "too late" unreachable no
+/// matter what value the constants (or the table) hold.
 fn recovery_floor(network: BitcoinNetwork, birthday: u32) -> HashCheckpoint {
     let shipped = match scan_floor(network) {
         None => HashCheckpoint::from_genesis(crate::btc::keys::network(network)),
-        Some(floor) if birthday >= floor.height => {
+        Some(floor) if birthday > floor.height => {
             let hash = floor
                 .hash
                 .parse::<BlockHash>()
@@ -1104,7 +1192,8 @@ fn recovery_floor(network: BitcoinNetwork, birthday: u32) -> HashCheckpoint {
         Some(_) if network == BitcoinNetwork::Main => HashCheckpoint::segwit_activation(),
         Some(_) => HashCheckpoint::from_genesis(crate::btc::keys::network(network)),
     };
-    match super::birthdays::anchor_for_height(network, birthday) {
+    let below = birthday.saturating_sub(1);
+    match super::birthdays::anchor_for_height(network, below) {
         Some(entry) if entry.height > shipped.height => {
             HashCheckpoint::new(entry.height, entry.hash)
         }
@@ -1337,10 +1426,18 @@ mod tests {
         // blocks below the birthday, or at the table's newest entry past its end.
         for network in [BitcoinNetwork::Testnet3, BitcoinNetwork::Testnet4] {
             let floor_height = scan_floor(network).unwrap().height;
-            for birthday in [floor_height, floor_height + 1, floor_height + 4_300] {
+            for birthday in [floor_height + 1, floor_height + 2, floor_height + 4_300] {
                 let cp = recovery_floor(network, birthday);
                 assert_eq!(cp.height, floor_height, "{network:?} birthday {birthday}");
             }
+            // A birthday AT the floor may hold funds in the floor block, which a scan from
+            // the floor skips; with no per-day table the testnets fall back to genesis -
+            // slow, never wrong (a date birthday records floor + 1 for this reason).
+            assert_eq!(
+                recovery_floor(network, floor_height).height,
+                0,
+                "{network:?}"
+            );
         }
         let floor_height = BTC_KYOTO_SCAN_FLOOR.height;
         let newest = super::super::birthdays::anchor_for_height(BitcoinNetwork::Main, u32::MAX)
@@ -1350,18 +1447,26 @@ mod tests {
             newest > floor_height,
             "the table postdates the shipped floor"
         );
-        for birthday in [floor_height, floor_height + 1, floor_height + 4_300] {
+        // A birthday AT the floor may hold funds in the floor block itself, which a scan
+        // from the floor would skip: it starts at the table entry a day earlier instead.
+        let at_floor = recovery_floor(BitcoinNetwork::Main, floor_height);
+        assert!(at_floor.height < floor_height, "{}", at_floor.height);
+        for birthday in [floor_height + 1, floor_height + 2, floor_height + 4_300] {
             let cp = recovery_floor(BitcoinNetwork::Main, birthday);
             assert!(
-                floor_height <= cp.height && cp.height <= birthday && birthday - cp.height < 300,
+                floor_height <= cp.height && cp.height < birthday && birthday - cp.height < 300,
                 "birthday {birthday}: start {}",
                 cp.height
             );
         }
-        for birthday in [newest, newest + 1, newest + 100_000, u32::MAX] {
+        for birthday in [newest + 1, newest + 100_000, u32::MAX] {
             let cp = recovery_floor(BitcoinNetwork::Main, birthday);
             assert_eq!(cp.height, newest, "birthday {birthday}");
         }
+        // A birthday AT the newest entry may hold funds in that block, which a scan from
+        // it would skip: it starts a day earlier.
+        let at_newest = recovery_floor(BitcoinNetwork::Main, newest);
+        assert!(at_newest.height < newest, "{}", at_newest.height);
     }
 
     #[test]
@@ -1370,14 +1475,16 @@ mod tests {
         // On mainnet the per-day table takes over from SegWit activation the day after it.
         let floor_height = BTC_KYOTO_SCAN_FLOOR.height;
         let segwit = HashCheckpoint::segwit_activation();
-        for birthday in [0, 481_824, 481_914] {
+        // 481_915 is the table's first entry; a birthday there starts at SegWit
+        // activation too, since the entry's own block is the one a scan from it skips.
+        for birthday in [0, 481_824, 481_914, 481_915] {
             let cp = recovery_floor(BitcoinNetwork::Main, birthday);
             assert_eq!(cp.height, segwit.height, "birthday {birthday}");
         }
-        for birthday in [481_915, 600_000, floor_height - 1] {
+        for birthday in [481_916, 600_000, floor_height - 1] {
             let cp = recovery_floor(BitcoinNetwork::Main, birthday);
             assert!(
-                segwit.height < cp.height && cp.height <= birthday && birthday - cp.height < 300,
+                segwit.height < cp.height && cp.height < birthday && birthday - cp.height < 300,
                 "birthday {birthday}: start {}",
                 cp.height
             );
@@ -1419,15 +1526,19 @@ mod tests {
                 floor_height + 1,
                 u32::MAX,
             ] {
+                // The earliest block this wallet could hold funds in: the birthday, but on
+                // mainnet no earlier than the first SegWit block (`segwit` is the last
+                // pre-SegWit one), and nowhere earlier than block 1 (genesis pays no one).
                 let earliest_possible = if network == BitcoinNetwork::Main {
-                    birthday.max(segwit)
+                    birthday.max(segwit + 1)
                 } else {
-                    birthday
+                    birthday.max(1)
                 };
                 let cp = recovery_floor(network, birthday);
+                // Strictly below: the checkpoint's own block is never scanned.
                 assert!(
-                    cp.height <= earliest_possible,
-                    "{network:?} birthday {birthday}: floor {} is above the earliest block \
+                    cp.height < earliest_possible,
+                    "{network:?} birthday {birthday}: floor {} is not below the earliest block \
                      this wallet could hold funds in ({earliest_possible})",
                     cp.height
                 );
@@ -1472,10 +1583,11 @@ mod tests {
             BitcoinNetwork::Testnet4,
         ] {
             let floor = scan_floor(network).unwrap();
-            // A full day past the floor block's own header time: the floor height serves.
+            // A full day past the floor block's own header time: the block after the
+            // floor serves (the floor's own block is the one the scan starts *after*).
             assert_eq!(
                 birthday_height_for_date(network, floor.time + day),
-                Some(floor.height),
+                Some(floor.height + 1),
                 "{network:?}"
             );
             // Anything closer has no safe offline answer (timestamps skew ~2h), nor does
@@ -1505,15 +1617,24 @@ mod tests {
 
     #[test]
     fn resolution_runs_only_when_it_can_improve_on_the_scan_start() {
-        // A height above the scan start is worth resolving to an anchor...
+        // A height above the scan start is worth resolving to an anchor - at the block
+        // BEFORE the birthday, since the scan resumes at anchor + 1 and the birthday
+        // block is the first that may hold funds...
         assert_eq!(
             resolution_target(146_000, &birthday(150_000)),
-            Some(AnchorTarget::Height(150_000))
+            Some(AnchorTarget::Height(149_999))
         );
-        // ...one at (or below - the mainnet pre-floor restore clamped up to SegWit
-        // activation) the start would change nothing, or drag the scan lower.
+        assert_eq!(
+            resolution_target(146_000, &birthday(146_002)),
+            Some(AnchorTarget::Height(146_001))
+        );
+        // ...one whose anchor would sit at (or below - the mainnet pre-floor restore
+        // clamped up to SegWit activation) the start would change nothing, or drag the
+        // scan lower.
+        assert_eq!(resolution_target(146_000, &birthday(146_001)), None);
         assert_eq!(resolution_target(146_000, &birthday(146_000)), None);
         assert_eq!(resolution_target(481_824, &birthday(100)), None);
+        assert_eq!(resolution_target(0, &birthday(0)), None);
         // A date always resolves: its offline record was the floor itself, so only the
         // headers know the true height.
         let dated = KyotoBirthday {
@@ -1524,6 +1645,38 @@ mod tests {
             resolution_target(146_000, &dated),
             Some(AnchorTarget::Date(1_787_000_000))
         );
+    }
+
+    /// The `Sync` tree starts where bdk_kyoto anchors it - seven checkpoints below the
+    /// tip along the wallet's own sparse chain, or the lowest checkpoint of a shorter one -
+    /// which is what bounds what a resolution on that connection can reach.
+    #[test]
+    fn the_sync_tree_starts_seven_checkpoints_below_the_tip() {
+        use bdk_wallet::chain::local_chain::LocalChain;
+        use bdk_wallet::chain::BlockId;
+        let genesis = BlockId {
+            height: 0,
+            hash: hash(0),
+        };
+        let (mut chain, _) = LocalChain::from_genesis_hash(genesis.hash);
+        for height in [10u32, 20, 30, 40, 50, 60, 70, 80, 90, 100] {
+            chain
+                .insert_block(BlockId {
+                    height,
+                    hash: hash(height as u8),
+                })
+                .unwrap();
+        }
+        // Tip 100, then 90, 80, ... : seven steps back lands on 30.
+        assert_eq!(sync_tree_start(&chain.tip()), 30);
+        let (mut short, _) = LocalChain::from_genesis_hash(genesis.hash);
+        short
+            .insert_block(BlockId {
+                height: 5,
+                hash: hash(5),
+            })
+            .unwrap();
+        assert_eq!(sync_tree_start(&short.tip()), 0);
     }
 
     #[test]
@@ -1564,20 +1717,17 @@ mod tests {
 
         // Anchor-less: the first scan starts at the shipped floor and wants a resolution
         // for the above-floor birthday.
-        let (scan, resolution) = endpoint.scan_plan(&wallet, &birthday(150_000), None);
+        let (scan, tree_start, target) = endpoint.scan_plan(&wallet, &birthday(150_000), None);
         match scan {
             ScanType::Recovery { checkpoint, .. } => {
                 assert_eq!(checkpoint.height, BTC_KYOTO_SCAN_FLOOR_TESTNET4.height)
             }
             other => panic!("expected a recovery scan, got {other:?}"),
         }
-        assert_eq!(
-            resolution,
-            Some((
-                BTC_KYOTO_SCAN_FLOOR_TESTNET4.height,
-                AnchorTarget::Height(150_000)
-            ))
-        );
+        assert_eq!(tree_start, BTC_KYOTO_SCAN_FLOOR_TESTNET4.height);
+        // The anchor names the block BEFORE the birthday: the scan resumes at anchor + 1,
+        // which must be the birthday block itself.
+        assert_eq!(target, Some(AnchorTarget::Height(149_999)));
 
         // With a recorded anchor the scan starts at the birthday itself, resolving nothing.
         let hash: BlockHash = BTC_KYOTO_SCAN_FLOOR_TESTNET4.hash.parse().unwrap();
@@ -1585,12 +1735,13 @@ mod tests {
             anchor: Some((150_000, hash)),
             ..birthday(150_000)
         };
-        let (scan, resolution) = endpoint.scan_plan(&wallet, &anchored, None);
+        let (scan, tree_start, target) = endpoint.scan_plan(&wallet, &anchored, None);
         match scan {
             ScanType::Recovery { checkpoint, .. } => assert_eq!(checkpoint.height, 150_000),
             other => panic!("expected a recovery scan, got {other:?}"),
         }
-        assert_eq!(resolution, None);
+        assert_eq!(tree_start, 150_000);
+        assert_eq!(target, None);
     }
 
     #[test]
@@ -1653,6 +1804,21 @@ mod tests {
         };
         let why = fatal_sync_warning(&fatal).expect("a rejected batch parks the node");
         assert!(why.contains("transition requirements"), "{why}");
+        // The same variant carries the errors the node handles itself by banning the peer
+        // and moving on; tearing the client down for those (and counting them toward the
+        // anchor-clearing escalation) restarted a first scan from the floor for nothing.
+        for handled in [
+            "Compact filter header syncing encountered an error: x",
+            "Found a conflict while peers are sending filter headers",
+            "Compact filter syncing encountered an error: x",
+            "A block received does not have a known hash",
+            "A block received does not have a valid merkle root",
+        ] {
+            let warning = Warning::UnexpectedSyncError {
+                warning: handled.to_string(),
+            };
+            assert_eq!(fatal_sync_warning(&warning), None, "{handled}");
+        }
         for transient in [
             Warning::NeedConnections {
                 connected: 0,
@@ -1798,11 +1964,11 @@ mod tests {
             ..birthday(150_000)
         };
 
-        let (scan, resolution) = endpoint.scan_plan(&wallet, &anchored, None);
+        let (scan, _, target) = endpoint.scan_plan(&wallet, &anchored, None);
         assert!(matches!(scan, ScanType::Sync), "{scan:?}");
-        assert_eq!(resolution, None);
+        assert_eq!(target, None);
 
-        let (scan, resolution) = endpoint.scan_plan(&wallet, &anchored, Some(15));
+        let (scan, tree_start, target) = endpoint.scan_plan(&wallet, &anchored, Some(15));
         match scan {
             ScanType::Recovery {
                 used_script_index,
@@ -1813,9 +1979,10 @@ mod tests {
             }
             other => panic!("expected a recovery scan, got {other:?}"),
         }
-        assert_eq!(resolution, None);
+        assert_eq!(tree_start, 160_000);
+        assert_eq!(target, None);
 
-        let (scan, _) = endpoint.scan_plan(&wallet, &anchored, Some(u32::MAX));
+        let (scan, _, _) = endpoint.scan_plan(&wallet, &anchored, Some(u32::MAX));
         match scan {
             ScanType::Recovery { checkpoint, .. } => {
                 assert_eq!((checkpoint.height, checkpoint.hash), (150_000, hash(7)))

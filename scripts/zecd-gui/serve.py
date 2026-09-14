@@ -195,6 +195,49 @@ def kyoto_fee_tiers(config, net):
     return tuple(tiers)
 
 
+# The RPC methods index.html calls - the whole surface the proxy forwards. Everything else
+# is refused before the credentials are attached: the page needs nothing more, and a proxy
+# that forwarded any method would hand the wallet's full RPC (sendmany, sendrawtransaction,
+# abandontransaction) to whatever could reach this port.
+ALLOWED_METHODS = frozenset({
+    "getbalances",
+    "getbestblockhash",
+    "getblockcount",
+    "getnewaddress",
+    "getwalletinfo",
+    "listdescriptors",
+    "listreceivedbyaddress",
+    "listtransactions",
+    "listunspent",
+    "sendtoaddress",
+})
+
+
+def rpc_error(code, message):
+    return json.dumps({"result": None, "error": {"code": code, "message": message}, "id": None}).encode()
+
+
+def request_is_same_origin(headers):
+    """Whether a browser request came from this server's own page.
+
+    The proxy injects the wallet credentials, so the page's origin is the only one that may
+    drive it: a page on any other site that could POST here would spend the wallet with the
+    operator's cookie-less session doing nothing to stop it. Browsers label every request
+    with `Sec-Fetch-Site` (same-origin / same-site / cross-site / none) and cross-origin
+    ones with `Origin`; a request carrying neither is a non-browser client (curl, a script)
+    on the operator's own machine, which has no cross-site problem to solve.
+    """
+    site = headers.get("Sec-Fetch-Site")
+    if site is not None and site not in ("same-origin", "none"):
+        return False
+    origin = headers.get("Origin")
+    if origin is not None:
+        host = headers.get("Host", "")
+        if origin.lower() not in (f"http://{host}".lower(), f"https://{host}".lower()):
+            return False
+    return True
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     # Filled in by main() before the server starts.
     upstream_url = None
@@ -293,8 +336,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path != "/rpc":
             self.send_error(404)
             return
+        if not request_is_same_origin(self.headers):
+            self.log_error("refused a cross-origin /rpc request (Origin=%s Sec-Fetch-Site=%s)",
+                           self.headers.get("Origin"), self.headers.get("Sec-Fetch-Site"))
+            return self.relay(403, rpc_error(-32600, "cross-origin requests are refused"))
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
+        # One request at a time, and only the methods the page uses; a batch or an unlisted
+        # method is refused with the shape the page already understands (zecd's own
+        # method-not-found), and never reaches the wallet.
+        try:
+            call = json.loads(body)
+        except ValueError:
+            return self.relay(400, rpc_error(-32700, "Parse error"))
+        method = call.get("method") if isinstance(call, dict) else None
+        if not isinstance(method, str) or method not in ALLOWED_METHODS:
+            self.log_error("refused /rpc method %r", method if isinstance(call, dict) else "<batch>")
+            return self.relay(403, rpc_error(-32601, "Method not allowed through this proxy"))
         req = urllib.request.Request(
             self.upstream_url,
             data=body,
@@ -327,8 +385,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
-        pass  # keep the terminal quiet; errors surface in the page
+    def log_request(self, code="-", size="-"):
+        # Successful requests stay off the terminal (the page is the operator's view);
+        # anything the proxy or zecd refused is logged, since a refusal that leaves no
+        # trace is how a misconfigured or probed proxy goes unnoticed.
+        try:
+            failed = int(code) >= 400
+        except (TypeError, ValueError):
+            failed = True
+        if failed:
+            super().log_request(code, size)
 
 
 def main():

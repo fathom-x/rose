@@ -587,9 +587,18 @@ jobs:
           # dual-backend suites. cargo runs the binaries sequentially; each test brings up
           # its own isolated stack. --no-fail-fast so one failing binary still lets the
           # others report.
+          set -o pipefail
           cargo test --locked --no-fail-fast \
             --test regtest_btc --test regtest_btc_kyoto \
             --test regtest_btc_watchonly --test regtest_btc_restore --test regtest_btc_reorg \
             --test regtest_btc_hang --test regtest_btc_coinbase --test regtest_btc_lookahead \
             --test regtest_btc_reorg_deep --test regtest_btc_p2p_mempool \
-            -- --nocapture
+            -- --nocapture 2>&1 | tee btc-e2e.log
+          # Every suite self-skips (printing `skipping:`, see the harness's `provisioned`)
+          # without a bitcoind or against a feature-less zecd. This job supplies both, so a
+          # skip here is a broken job passing as a green run of zero tests - the standard
+          # legs, where regtest_btc is MEANT to skip, do not grep for it.
+          if grep -q '^skipping:' btc-e2e.log; then
+            echo "::error::a Bitcoin e2e self-skipped; this job must run every suite it lists"
+            exit 1
+          fi

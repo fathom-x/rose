@@ -81,12 +81,14 @@ pub(crate) const FEE_TARGET_BLOCKS: u16 = 6;
 /// this; anything larger means the loop has genuinely not converged.
 const DUST_SLACK_SAT: u64 = 546;
 
-/// The wallet's balance in satoshis, bucketed the way BDK reports it.
+/// The wallet's balance in satoshis, bucketed on Core's rules (the actor's `Balance`
+/// command computes it from the unspent set rather than taking BDK's own `balance()`,
+/// whose maturity and trust rules both differ from Core's by a little).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BtcBalance {
     /// Confirmed and spendable.
     pub confirmed: u64,
-    /// Unconfirmed change (trusted: our own transactions).
+    /// Unconfirmed outputs of transactions the wallet funded (change and self-payments).
     pub trusted_pending: u64,
     /// Unconfirmed receives from others.
     pub untrusted_pending: u64,
@@ -757,9 +759,29 @@ pub fn spawn(
 enum Conn {
     Bitcoind {
         rpc: BitcoindRpc,
-        emitter: Emitter<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
+        /// The block emitter - `None` while it is out on a thread running its mempool pass
+        /// (`mempool` then holds the channel it comes back on).
+        emitter: Option<BitcoindEmitter>,
+        mempool: Option<std::sync::mpsc::Receiver<MempoolPass>>,
     },
     Kyoto(KyotoConn),
+}
+
+type BitcoindEmitter = Emitter<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>;
+
+/// What the mempool-pass thread hands back: the emitter it borrowed and the pass's result.
+type MempoolPass = (
+    BitcoindEmitter,
+    Result<bdk_bitcoind_rpc::MempoolEvent, bdk_bitcoind_rpc::bitcoincore_rpc::Error>,
+);
+
+/// How a bounded block pull ended.
+enum BlockPull {
+    /// Blocks applied; the node has more.
+    More(usize),
+    /// Blocks applied and the emitter ran dry: the tip is reached.
+    AtTip(usize),
+    Failed(anyhow::Error),
 }
 
 struct BtcActor {
@@ -888,20 +910,23 @@ fn confirmations_at(wallet: &Wallet, height: Option<u32>) -> u64 {
 /// to - the cheap half of [`Self::tx_entry`], computed for every transaction so the
 /// window can be chosen before anything is serialized.
 fn tx_position(wallet: &Wallet, wtx: &bdk_wallet::WalletTx<'_>) -> (u64, u64, usize) {
-    let (sort_key, time) = match &wtx.chain_position {
-        bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => {
-            (u64::from(anchor.block_id.height), anchor.confirmation_time)
-        }
+    let (sort_key, time, height) = match &wtx.chain_position {
+        bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => (
+            u64::from(anchor.block_id.height),
+            anchor.confirmation_time,
+            Some(anchor.block_id.height),
+        ),
         bdk_wallet::chain::ChainPosition::Unconfirmed {
             first_seen,
             last_seen,
         } => {
             // Unconfirmed sorts after every mined transaction.
-            (u64::MAX, first_seen.or(*last_seen).unwrap_or(0))
+            (u64::MAX, first_seen.or(*last_seen).unwrap_or(0), None)
         }
     };
     let tx = &wtx.tx_node.tx;
     let funded = wallet.sent_and_received(tx).0 > Amount::ZERO;
+    let coinbase = tx.is_coinbase().then(|| confirmations_at(wallet, height));
     let entries = tx
         .output
         .iter()
@@ -909,7 +934,7 @@ fn tx_position(wallet: &Wallet, wtx: &bdk_wallet::WalletTx<'_>) -> (u64, u64, us
             let keychain = wallet
                 .derivation_of_spk(txout.script_pubkey.clone())
                 .map(|(keychain, _)| keychain);
-            categories(funded, keychain).len()
+            categories(funded, keychain, coinbase).len()
         })
         .sum();
     (sort_key, time, entries)
@@ -919,14 +944,36 @@ fn tx_position(wallet: &Wallet, wtx: &bdk_wallet::WalletTx<'_>) -> (u64, u64, us
 /// transaction, a foreign output is a `send`, an own external-keychain output is a
 /// self-payment (send+receive pair), and change (internal keychain) is hidden. On a
 /// transaction the wallet did not fund, only the wallet's own outputs appear, as
-/// `receive`.
-fn categories(funded: bool, keychain: Option<KeychainKind>) -> &'static [&'static str] {
-    match (funded, keychain) {
-        (true, None) => &["send"],
-        (true, Some(KeychainKind::External)) => &["send", "receive"],
-        (true, Some(KeychainKind::Internal)) => &[],
-        (false, Some(_)) => &["receive"],
-        (false, None) => &[],
+/// `receive`. A coinbase reward (`coinbase` = its confirmations) is Core's
+/// `orphan`/`immature`/`generate` by depth instead, on every own output - so an immature
+/// reward no longer reads as a `receive` the balance does not count.
+fn categories(
+    funded: bool,
+    keychain: Option<KeychainKind>,
+    coinbase: Option<u64>,
+) -> &'static [&'static str] {
+    match (funded, keychain, coinbase) {
+        (_, Some(_), Some(confirmations)) => coinbase_category(confirmations),
+        (_, None, Some(_)) => &[],
+        (true, None, None) => &["send"],
+        (true, Some(KeychainKind::External), None) => &["send", "receive"],
+        (true, Some(KeychainKind::Internal), None) => &[],
+        (false, Some(_), None) => &["receive"],
+        (false, None, None) => &[],
+    }
+}
+
+/// Core's category for a coinbase output at `confirmations`: `orphan` while it is not in
+/// the chain, `immature` until maturity (`GetBlocksToMaturity` > 0, i.e. through
+/// `COINBASE_MATURITY` confirmations - the same bound `coinbase_immature` applies), then
+/// `generate`.
+fn coinbase_category(confirmations: u64) -> &'static [&'static str] {
+    if confirmations == 0 {
+        &["orphan"]
+    } else if confirmations <= u64::from(COINBASE_MATURITY) {
+        &["immature"]
+    } else {
+        &["generate"]
     }
 }
 
@@ -955,6 +1002,7 @@ fn tx_entry(wallet: &Wallet, wtx: &bdk_wallet::WalletTx<'_>, with_hex: bool) -> 
             last_seen,
         } => (None, None, first_seen.or(*last_seen).unwrap_or(0)),
     };
+    let coinbase = tx.is_coinbase().then(|| confirmations_at(wallet, height));
     let mut details = Vec::new();
     for (vout, txout) in tx.output.iter().enumerate() {
         let vout = u32::try_from(vout).unwrap_or(u32::MAX);
@@ -965,7 +1013,7 @@ fn tx_entry(wallet: &Wallet, wtx: &bdk_wallet::WalletTx<'_>, with_hex: bool) -> 
             .ok()
             .map(|a| a.to_string());
         let value = i64::try_from(txout.value.to_sat()).unwrap_or(i64::MAX);
-        for category in categories(funded, keychain) {
+        for category in categories(funded, keychain, coinbase) {
             details.push(BtcTxDetail {
                 category,
                 amount_sat: if *category == "send" { -value } else { value },
@@ -1152,30 +1200,23 @@ impl BtcActor {
         // recorded birthday anchor, so the anchor is on a dead branch.
         let mut anchor_suspect = false;
         let result = match conn {
-            // Bitcoind: a bounded blocking pull. The emitter's RPC calls block, so relocate
-            // the worker's other tasks for the duration, exactly as the Zcash scan does.
-            Conn::Bitcoind { emitter, .. } => tokio::task::block_in_place(|| {
-                let mut applied = 0usize;
-                while applied < SYNC_BLOCKS_PER_PASS {
-                    match emitter.next_block() {
-                        Ok(Some(event)) => {
-                            let height = event.block_height();
-                            self.wallet
-                                .apply_block_connected_to(
-                                    &event.block,
-                                    height,
-                                    event.connected_to(),
-                                )
-                                .map_err(|e| anyhow::anyhow!("apply block {height}: {e}"))?;
-                            applied += 1;
-                        }
-                        Ok(None) => {
+            // Bitcoind, with its mempool pass in flight on a thread: collect the result if
+            // it has landed, otherwise there is nothing to pull this pass (the emitter is
+            // out with the thread). The pass is one `getrawtransaction` per node-mempool
+            // txid the emitter has not seen - the whole mempool after every (re)connect and
+            // `reload_wallet`, minutes on mainnet - and running it here under
+            // `block_in_place` held every command the actor serves for that long.
+            Conn::Bitcoind {
+                emitter,
+                mempool: mempool @ Some(_),
+                ..
+            } => match mempool.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok((returned, event))) => {
+                    *emitter = Some(returned);
+                    *mempool = None;
+                    match event {
+                        Ok(event) => {
                             reached_tip = true;
-                            // Caught up: one mempool pass gives 0-conf visibility and eviction
-                            // handling (evictions are only reported once the emitter is at tip).
-                            let event = emitter
-                                .mempool()
-                                .map_err(|e| anyhow::anyhow!("mempool: {e}"))?;
                             // The pass fetched the node's whole mempool: keep its txid set,
                             // so the rebroadcast pass skips what the node already holds.
                             self.node_mempool = Some(
@@ -1186,14 +1227,93 @@ impl BtcActor {
                                     .collect(),
                             );
                             self.wallet.apply_unconfirmed_txs(event.update);
-                            evicted_now = event.evicted;
-                            return Ok(applied);
+                            // The emitter diffs the node's whole mempool, so nearly every
+                            // departure it reports is a foreign transaction the wallet never
+                            // held. Retiring those wrote one tombstone row apiece (244
+                            // against 38 wallet transactions on a testnet4 wallet, unbounded
+                            // on mainnet, all read back on every load) and counted as work,
+                            // skipping the sync interval for as long as the mempool churned.
+                            // Only a transaction in the wallet's own graph can be retired.
+                            evicted_now = event
+                                .evicted
+                                .into_iter()
+                                .filter(|(txid, _)| self.wallet.tx_graph().get_tx(*txid).is_some())
+                                .collect();
+                            Ok(0)
                         }
-                        Err(e) => return Err(anyhow::anyhow!("next_block: {e}")),
+                        Err(e) => Err(anyhow::anyhow!("mempool: {e}")),
                     }
                 }
-                Ok(applied)
-            }),
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) => Ok(0),
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) | None => Err(
+                    anyhow::anyhow!("the mempool pass ended without handing the emitter back"),
+                ),
+            },
+            // Bitcoind: a bounded blocking pull. The emitter's RPC calls block, so relocate
+            // the worker's other tasks for the duration, exactly as the Zcash scan does.
+            Conn::Bitcoind {
+                emitter, mempool, ..
+            } => {
+                let Some(mut pull) = emitter.take() else {
+                    return false;
+                };
+                let outcome = tokio::task::block_in_place(|| {
+                    let mut applied = 0usize;
+                    while applied < SYNC_BLOCKS_PER_PASS {
+                        match pull.next_block() {
+                            Ok(Some(event)) => {
+                                let height = event.block_height();
+                                if let Err(e) = self.wallet.apply_block_connected_to(
+                                    &event.block,
+                                    height,
+                                    event.connected_to(),
+                                ) {
+                                    return BlockPull::Failed(anyhow::anyhow!(
+                                        "apply block {height}: {e}"
+                                    ));
+                                }
+                                applied += 1;
+                            }
+                            Ok(None) => return BlockPull::AtTip(applied),
+                            Err(e) => return BlockPull::Failed(anyhow::anyhow!("next_block: {e}")),
+                        }
+                    }
+                    BlockPull::More(applied)
+                });
+                match outcome {
+                    BlockPull::More(applied) => {
+                        *emitter = Some(pull);
+                        Ok(applied)
+                    }
+                    BlockPull::Failed(e) => {
+                        *emitter = Some(pull);
+                        Err(e)
+                    }
+                    // Caught up: one mempool pass gives 0-conf visibility and eviction
+                    // handling (evictions are only reported once the emitter is at tip).
+                    // It goes out to a thread with the emitter (see the arm above); the
+                    // tip counts as reached when its result lands, so `at_tip`, the
+                    // rebroadcast pass and readiness keep their old ordering behind it.
+                    BlockPull::AtTip(applied) => {
+                        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                        let spawned = std::thread::Builder::new()
+                            .name("zecd-btc-mempool".into())
+                            .spawn(move || {
+                                let event = pull.mempool();
+                                // A closed receiver means the connection was dropped
+                                // meanwhile; the emitter dies with this thread.
+                                let _ = tx.send((pull, event));
+                            });
+                        match spawned {
+                            Ok(_) => {
+                                *mempool = Some(rx);
+                                Ok(applied)
+                            }
+                            Err(e) => Err(anyhow::anyhow!("spawn the mempool pass: {e}")),
+                        }
+                    }
+                }
+            }
             // Kyoto: a non-blocking poll of the bridge channel. An `Update` is a whole
             // sync-to-tip rather than one block, so its arrival *is* the tip signal - and
             // there is no mempool pass to follow it, the divergence `kyoto`'s module doc
@@ -1202,6 +1322,9 @@ impl BtcActor {
                 Ok(Some(update)) => {
                     reached_tip = true;
                     self.header_sync_failures = 0;
+                    // A delivered update is the light client's first proof of life - the
+                    // point its reconnect backoff resets (see `connect`).
+                    self.backoff.reset();
                     // No mempool view on this backend: the rebroadcast pass cannot filter.
                     self.node_mempool = None;
                     resolved_time = kyoto.try_resolved_birthday_time();
@@ -1254,15 +1377,25 @@ impl BtcActor {
                 }
                 // The node parked itself on a rejected header batch: count it, so the
                 // redial below (via `drop_conn`) restarts from an older checkpoint.
-                Err(e @ KyotoFailure::HeaderSync(_)) => {
+                Err(e @ KyotoFailure::HeaderSync { .. }) => {
                     let before = self.header_sync_failures;
                     self.header_sync_failures = before.saturating_add(1);
-                    if let Some(anchor) = self.birthday_anchor {
-                        anchor_suspect = crate::btc::kyoto::resync_bottomed_at_anchor(
-                            &self.wallet.latest_checkpoint(),
-                            before,
-                            anchor,
-                        );
+                    if let (Some(anchor), KyotoFailure::HeaderSync { tip, .. }) =
+                        (self.birthday_anchor, &e)
+                    {
+                        // The anchor is implicated only when the header tree never grew
+                        // past it. A batch rejected at a tip well above the anchor - a
+                        // testnet4 fork at the tip, during a first scan that has been
+                        // running from the anchor for hours - says nothing about the
+                        // anchor's block, which the tree already built on; clearing it
+                        // there restarted the whole scan from the floor.
+                        let tree_past_anchor = tip.is_some_and(|tip| tip > anchor.0);
+                        anchor_suspect = !tree_past_anchor
+                            && crate::btc::kyoto::resync_bottomed_at_anchor(
+                                &self.wallet.latest_checkpoint(),
+                                before,
+                                anchor,
+                            );
                     }
                     Err(anyhow::anyhow!(e))
                 }
@@ -1650,10 +1783,7 @@ impl BtcActor {
     /// rather than at the next daemon start. See `Persister::retire_tx`.
     fn retire(&mut self, evicted: Vec<(Txid, u64)>, why: &str) {
         let mut anchored = false;
-        for (txid, at) in &evicted {
-            if let Err(e) = self.persister.retire_tx(txid, *at) {
-                warn!(%txid, "failed to record the retirement ({why}): {e:#}");
-            }
+        for (txid, _) in &evicted {
             if self.wallet.tx_graph().all_anchors().contains_key(txid) {
                 anchored = true;
             }
@@ -1662,19 +1792,40 @@ impl BtcActor {
             self.feed_held.remove(txid);
             self.feed_pending_evictions.remove(txid);
         }
-        info!(
-            retired = evicted.len(),
-            anchored,
-            "retired evicted transactions ({why}){}",
-            if anchored {
-                "; reloading the wallet to drop their stale anchors"
-            } else {
-                ""
-            }
-        );
         self.wallet.apply_evicted_txs(evicted.iter().copied());
-        self.persist(why);
-        if anchored {
+        // The tombstones and the eviction they accompany land in ONE SQLite transaction. Written
+        // separately, a tombstone that outlived a failed eviction write reloaded the transaction
+        // with its anchors stripped but no `last_evicted` - canonical and unconfirmed, wrong on
+        // both sides. A failed write keeps the eviction staged in memory for the next persist,
+        // writes no tombstone, and skips the reload (which would only read the old log back).
+        let wallet = &mut self.wallet;
+        let written = self.persister.transactionally(|persister| {
+            for (txid, at) in &evicted {
+                persister.retire_tx(txid, *at)?;
+            }
+            wallet
+                .persist(persister)
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("persist the eviction: {e:#}"))
+        });
+        match &written {
+            Ok(()) => info!(
+                retired = evicted.len(),
+                anchored,
+                "retired evicted transactions ({why}){}",
+                if anchored {
+                    "; reloading the wallet to drop their stale anchors"
+                } else {
+                    ""
+                }
+            ),
+            Err(e) => error!(
+                retired = evicted.len(),
+                "failed to record the retirement ({why}); the eviction stays staged for the next \
+                 persist and no tombstone was written: {e:#}"
+            ),
+        }
+        if anchored && written.is_ok() {
             self.reload_wallet(why);
         }
         let state = if self.at_tip {
@@ -1814,7 +1965,11 @@ impl BtcActor {
                         self.birthday,
                         expected,
                     );
-                    Conn::Bitcoind { rpc, emitter }
+                    Conn::Bitcoind {
+                        rpc,
+                        emitter: Some(emitter),
+                        mempool: None,
+                    }
                 })
             }
             // Kyoto "connects" by starting its node task; peer discovery and header sync
@@ -1855,7 +2010,14 @@ impl BtcActor {
                 // A fresh connection rebroadcasts once at its first tip, whatever the hash.
                 self.rebroadcast_tip = None;
                 self.node_mempool = None;
-                self.backoff.reset();
+                // A bitcoind dial that succeeded is proof the node is back, so the backoff
+                // resets here. A kyoto "dial" cannot fail - it only starts the node task -
+                // so resetting it here made every redial take the attempt-0 delay: a node
+                // that kept failing was rebuilt, headers re-synced, once a second. Its
+                // backoff resets on the first update the client delivers instead.
+                if matches!(self.conn, Some(Conn::Bitcoind { .. })) {
+                    self.backoff.reset();
+                }
                 self.reconnect_warned = false;
                 self.status_tx.send_replace(status_of(
                     &self.wallet,
@@ -1946,11 +2108,7 @@ impl BtcActor {
         );
         let mut evicted = Vec::new();
         for candidate in candidates {
-            let RebroadcastCandidate {
-                tx,
-                txid,
-                waits_on_parent,
-            } = candidate;
+            let RebroadcastCandidate { tx, txid, parents } = candidate;
             match self.conn.as_ref() {
                 Some(Conn::Bitcoind { rpc, .. }) => {
                     let outcome = tokio::task::block_in_place(|| rpc.broadcast_blocking(&tx));
@@ -1960,7 +2118,7 @@ impl BtcActor {
                             info!(%txid, height = tip.height(), "re-broadcast an unconfirmed transaction");
                         }
                         Err(BroadcastError::Rejected { code, message }) => {
-                            match classify_rejection(code, &message, waits_on_parent) {
+                            match classify_rejection(code, &message, parents) {
                                 RebroadcastVerdict::AlreadyInChain => {
                                     debug!(%txid, "rebroadcast: already in the chain (the block is on its way)");
                                 }
@@ -2037,18 +2195,25 @@ impl BtcActor {
                     && !self.feed_held.contains(*txid)
             })
             .map(|(txid, tx)| {
-                // A dependency is an input whose funding transaction the wallet itself
-                // holds unconfirmed (an own chain of sends). A parent the wallet does not
-                // know - every input of a received payment - is not one: the wallet cannot
-                // resubmit it, so the node's verdict on the inputs is final for now.
-                let waits_on_parent = tx
-                    .input
-                    .iter()
-                    .any(|input| unconfirmed.contains_key(&input.previous_output.txid));
+                // An input funded by a wallet transaction the wallet holds unconfirmed (an
+                // own chain of sends) is a dependency; one funded by a transaction the
+                // wallet does not hold at all - every input of a received payment - makes
+                // the node's missing-inputs verdict unreadable (see `Parents::Foreign`).
+                let mut parents = Parents::Confirmed;
+                for input in &tx.input {
+                    let parent = input.previous_output.txid;
+                    if unconfirmed.contains_key(&parent) {
+                        parents = Parents::WaitsOnOwn;
+                        break;
+                    }
+                    if self.wallet.get_tx(parent).is_none() {
+                        parents = Parents::Foreign;
+                    }
+                }
                 RebroadcastCandidate {
                     tx: tx.clone(),
                     txid: *txid,
-                    waits_on_parent,
+                    parents,
                 }
             })
             .collect();
@@ -2071,6 +2236,29 @@ impl BtcActor {
         self.wallet
             .get_tx(txid)
             .is_some_and(|wtx| wtx.tx_node.tx.is_coinbase())
+    }
+
+    /// The transactions the wallet funded - Core's trust rule for an unconfirmed output
+    /// (trusted iff created by the wallet's own transaction: change, a self-payment),
+    /// never by a foreign sender's unconfirmed payment. Behind both `getbalance`'s
+    /// `trusted_pending` and `listunspent`'s `safe`, so the two cannot disagree.
+    fn funded_txids(&self) -> HashSet<Txid> {
+        self.wallet
+            .transactions()
+            .filter(|wtx| self.wallet.sent_and_received(&wtx.tx_node.tx).0 > Amount::ZERO)
+            .map(|wtx| wtx.tx_node.txid)
+            .collect()
+    }
+
+    /// The coinbase outputs Core still calls immature (`coinbase_immature`), withheld from
+    /// coin selection: BDK's own rule would admit a reward one block before Core does, and
+    /// `listunspent` already hides it for that block.
+    fn immature_coinbase_outpoints(&self) -> Vec<OutPoint> {
+        self.wallet
+            .list_unspent()
+            .filter(|output| self.coinbase_immature(output))
+            .map(|output| output.outpoint)
+            .collect()
     }
 
     /// Core's coinbase maturity rule, for the read path: a reward is immature until its
@@ -2106,37 +2294,42 @@ impl BtcActor {
                 let _ = reply.send(result);
             }
             BtcCommand::Balance { reply } => {
-                let b = self.wallet.balance();
-                // Re-split confirmed/immature on Core's maturity rule: BDK calls a coinbase
-                // mature one block earlier than Core does (see `coinbase_immature`), so
-                // its `immature` bucket is one block short of what `getbalances` reports
-                // in Core's dialect. The two buckets sum to the same total either way.
-                let immature: u64 = self
-                    .wallet
-                    .list_unspent()
-                    .filter(|output| self.coinbase_immature(output))
-                    .map(|output| output.txout.value.to_sat())
-                    .sum();
-                let _ = reply.send(Ok(BtcBalance {
-                    confirmed: (b.confirmed.to_sat() + b.immature.to_sat())
-                        .saturating_sub(immature),
-                    trusted_pending: b.trusted_pending.to_sat(),
-                    untrusted_pending: b.untrusted_pending.to_sat(),
-                    immature,
-                }));
+                // Every bucket on Core's rules, from the same unspent set `listunspent`
+                // reports: confirmed/immature split on Core's maturity (`coinbase_immature`
+                // - BDK calls a coinbase mature one block earlier), and trusted/untrusted
+                // on Core's trust rule (`funded_txids`: an unconfirmed output is trusted
+                // iff the wallet funded its transaction), which is also what
+                // `listunspent.safe` says. BDK's own `balance()` trusts the internal
+                // keychain instead, so an unconfirmed self-payment to an external address
+                // read `safe: true` in one and `untrusted_pending` in the other.
+                let own = self.funded_txids();
+                let mut balance = BtcBalance::default();
+                for output in self.wallet.list_unspent() {
+                    let value = output.txout.value.to_sat();
+                    let bucket = match &output.chain_position {
+                        bdk_wallet::chain::ChainPosition::Confirmed { .. } => {
+                            if self.coinbase_immature(&output) {
+                                &mut balance.immature
+                            } else {
+                                &mut balance.confirmed
+                            }
+                        }
+                        bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => {
+                            if own.contains(&output.outpoint.txid) {
+                                &mut balance.trusted_pending
+                            } else {
+                                &mut balance.untrusted_pending
+                            }
+                        }
+                    };
+                    *bucket += value;
+                }
+                let _ = reply.send(Ok(balance));
             }
             BtcCommand::ListUnspent { reply } => {
                 let network = self.wallet.network();
                 let tip = self.tip_height();
-                // Core's trust rule for unconfirmed outputs: trusted iff created by the
-                // wallet's own transaction (we funded it - change), never by a foreign
-                // sender's unconfirmed payment. Collected once per call, not per output.
-                let own_txids: std::collections::HashSet<Txid> = self
-                    .wallet
-                    .transactions()
-                    .filter(|wtx| self.wallet.sent_and_received(&wtx.tx_node.tx).0 > Amount::ZERO)
-                    .map(|wtx| wtx.tx_node.txid)
-                    .collect();
+                let own_txids = self.funded_txids();
                 let utxos = self
                     .wallet
                     .list_unspent()
@@ -2518,15 +2711,17 @@ impl BtcActor {
         }
 
         let started = Instant::now();
+        let immature = self.immature_coinbase_outpoints();
         let mut psbt = if options.subtract_fee_from.is_empty() {
             let mut builder = self.wallet.build_tx();
+            builder.unspendable(immature);
             for (address, amount) in &parsed {
                 builder.add_recipient(address.script_pubkey(), *amount);
             }
             builder.fee_rate(fee_rate);
             builder.finish().map_err(map_create_tx_error)?
         } else {
-            self.build_subtract_fee_psbt(&parsed, &options.subtract_fee_from, fee_rate)?
+            self.build_subtract_fee_psbt(&parsed, &options.subtract_fee_from, fee_rate, immature)?
         };
 
         // Signers are derived from the seed per send and dropped with this scope - the
@@ -2596,9 +2791,11 @@ impl BtcActor {
         parsed: &[(Address, Amount)],
         subtract: &[usize],
         fee_rate: FeeRate,
+        unspendable: Vec<OutPoint>,
     ) -> Result<Psbt, RpcError> {
         let inputs: Vec<OutPoint> = {
             let mut builder = self.wallet.build_tx();
+            builder.unspendable(unspendable);
             for (address, amount) in parsed {
                 builder.add_recipient(address.script_pubkey(), *amount);
             }
@@ -2796,9 +2993,29 @@ enum Relay {
 struct RebroadcastCandidate {
     tx: Arc<Transaction>,
     txid: Txid,
-    /// Some input's funding transaction is itself an unconfirmed wallet transaction, so a
-    /// missing-inputs verdict means "parent first", not "conflict".
-    waits_on_parent: bool,
+    /// What the wallet knows about the transactions its inputs spend - the context a
+    /// missing-inputs verdict is read in.
+    parents: Parents,
+}
+
+/// What the wallet knows about a candidate's funding transactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parents {
+    /// Every input spends a wallet transaction the wallet holds confirmed: the outputs are
+    /// in the node's UTXO set unless something else spent them, so a missing-inputs
+    /// verdict is a confirmed conflict.
+    Confirmed,
+    /// Some input spends a wallet transaction that is itself unconfirmed (an own chain of
+    /// sends): missing inputs means "parent first".
+    WaitsOnOwn,
+    /// Some input spends a transaction the wallet does not hold - every received payment.
+    /// Core answers `Missing inputs` for an unconfirmed parent it no longer holds (a
+    /// restart without mempool persistence, say) exactly as for a confirmed parent that
+    /// was double-spent, and the wallet cannot tell the two apart; a verdict here proves
+    /// nothing. A dead receive is retired by other means: over bitcoind BDK inserts the
+    /// conflict when its block is applied (`is_tx_or_conflict_relevant`), over kyoto
+    /// [`BtcActor::expire_reorged_receives`] times it out.
+    Foreign,
 }
 
 /// What a bitcoind rejection of a resubmitted send means for the wallet.
@@ -2806,13 +3023,13 @@ struct RebroadcastCandidate {
 enum RebroadcastVerdict {
     /// Core's `-27`: mined already; the block reaches the wallet on its own.
     AlreadyInChain,
-    /// The inputs are gone from the UTXO set and no input waits on an unconfirmed wallet
-    /// parent, so something else spent them and confirmed. Terminal: the transaction can
+    /// The inputs are gone from the UTXO set and every one of them was a confirmed wallet
+    /// output, so something else spent them and confirmed. Terminal: the transaction can
     /// never confirm as things stand.
     ConfirmedConflict,
     /// Anything else - `non-final` after a reorg, a fee-policy floor, a missing input whose
-    /// parent is an own unconfirmed send - clears with time or a parent, so try again next
-    /// tip.
+    /// parent is an own unconfirmed send or a foreign transaction - clears with time or a
+    /// parent, so try again next tip.
     Retry,
 }
 
@@ -2824,15 +3041,16 @@ const RPC_VERIFY_ALREADY_IN_CHAIN: i32 = -27;
 /// testable without a node: `-27` is [`RebroadcastVerdict::AlreadyInChain`]; `-25` with
 /// Core's missing-inputs text (`Missing inputs` from `sendrawtransaction`,
 /// `bad-txns-inputs-missingorspent` from mempool acceptance) is a
-/// [`RebroadcastVerdict::ConfirmedConflict`] **unless** the transaction waits on an own
-/// unconfirmed parent, where the same text just means "parent first"; everything else, the
-/// `-26` policy family included, is [`RebroadcastVerdict::Retry`].
-fn classify_rejection(code: i32, message: &str, waits_on_parent: bool) -> RebroadcastVerdict {
+/// [`RebroadcastVerdict::ConfirmedConflict`] **only** when every input spends a confirmed
+/// wallet transaction ([`Parents::Confirmed`]) - the same text means "parent first" on an
+/// own unconfirmed parent and proves nothing on a foreign one; everything else, the `-26`
+/// policy family included, is [`RebroadcastVerdict::Retry`].
+fn classify_rejection(code: i32, message: &str, parents: Parents) -> RebroadcastVerdict {
     let lower = message.to_ascii_lowercase();
     let missing_inputs = lower.contains("missing inputs") || lower.contains("missingorspent");
     match code {
         RPC_VERIFY_ALREADY_IN_CHAIN => RebroadcastVerdict::AlreadyInChain,
-        RPC_VERIFY_ERROR if missing_inputs && !waits_on_parent => {
+        RPC_VERIFY_ERROR if missing_inputs && parents == Parents::Confirmed => {
             RebroadcastVerdict::ConfirmedConflict
         }
         _ => RebroadcastVerdict::Retry,
@@ -3185,38 +3403,77 @@ mod tests {
             .unwrap();
     }
 
+    /// A coinbase reward reports Core's `orphan`/`immature`/`generate` by depth, on every
+    /// own output, instead of a `receive` the balance does not count; a foreign output of
+    /// a coinbase (another miner's) appears nowhere.
+    #[test]
+    fn coinbase_outputs_carry_cores_reward_categories() {
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            assert_eq!(categories(false, Some(keychain), Some(0)), &["orphan"]);
+            assert_eq!(categories(false, Some(keychain), Some(1)), &["immature"]);
+            assert_eq!(
+                categories(false, Some(keychain), Some(u64::from(COINBASE_MATURITY))),
+                &["immature"]
+            );
+            assert_eq!(
+                categories(
+                    false,
+                    Some(keychain),
+                    Some(u64::from(COINBASE_MATURITY) + 1)
+                ),
+                &["generate"]
+            );
+        }
+        assert!(categories(false, None, Some(5)).is_empty());
+        // The ordinary shapes are unchanged.
+        assert_eq!(categories(true, None, None), &["send"]);
+        assert_eq!(
+            categories(true, Some(KeychainKind::External), None),
+            &["send", "receive"]
+        );
+        assert!(categories(true, Some(KeychainKind::Internal), None).is_empty());
+        assert_eq!(
+            categories(false, Some(KeychainKind::External), None),
+            &["receive"]
+        );
+    }
+
     #[test]
     fn classify_rejection_reads_core_verdicts() {
+        use Parents::*;
         use RebroadcastVerdict::*;
         assert_eq!(
-            classify_rejection(-27, "Transaction already in block chain", false),
+            classify_rejection(-27, "Transaction already in block chain", Confirmed),
             AlreadyInChain
         );
-        // Missing inputs with no own unconfirmed parent: a conflict confirmed. This is also
-        // the shape for a received payment (its parents are foreign, never wallet txs).
+        // Missing inputs over confirmed wallet parents: a conflict confirmed.
         assert_eq!(
-            classify_rejection(-25, "Missing inputs", false),
+            classify_rejection(-25, "Missing inputs", Confirmed),
             ConfirmedConflict
         );
         assert_eq!(
-            classify_rejection(-25, "bad-txns-inputs-missingorspent", false),
+            classify_rejection(-25, "bad-txns-inputs-missingorspent", Confirmed),
             ConfirmedConflict
         );
         // The same text while waiting on an own unconfirmed parent is a dependency.
-        assert_eq!(classify_rejection(-25, "Missing inputs", true), Retry);
+        assert_eq!(classify_rejection(-25, "Missing inputs", WaitsOnOwn), Retry);
+        // And over a foreign parent (every received payment) it proves nothing: Core says
+        // it for an unconfirmed parent it no longer holds too, so tombstoning here retired
+        // valid 0-conf receives after a node restart without mempool persistence.
+        assert_eq!(classify_rejection(-25, "Missing inputs", Foreign), Retry);
         // The reorg shape and the policy family both retry.
-        assert_eq!(classify_rejection(-26, "non-final", false), Retry);
+        assert_eq!(classify_rejection(-26, "non-final", Confirmed), Retry);
         assert_eq!(
-            classify_rejection(-26, "min relay fee not met", false),
+            classify_rejection(-26, "min relay fee not met", Confirmed),
             Retry
         );
         assert_eq!(
-            classify_rejection(-26, "txn-mempool-conflict", false),
+            classify_rejection(-26, "txn-mempool-conflict", Confirmed),
             Retry
         );
         // An unfamiliar -25 is not read as a conflict.
         assert_eq!(
-            classify_rejection(-25, "mandatory-script-verify-flag-failed", false),
+            classify_rejection(-25, "mandatory-script-verify-flag-failed", Confirmed),
             Retry
         );
     }
@@ -3249,7 +3506,7 @@ mod tests {
             RebroadcastCandidate {
                 txid: tx.compute_txid(),
                 tx,
-                waits_on_parent: false,
+                parents: Parents::Confirmed,
             }
         }
         let external = OutPoint::new(Txid::from_str(&"11".repeat(32)).unwrap(), 0);

@@ -78,10 +78,16 @@ watch-only wallet at the top, and disables its send form.
 
 ### One-off container against a host zecd
 
+Publish the port on loopback (`-p 127.0.0.1:8080:8080`, as below and as the compose stacks
+do), never on every interface: the proxy holds the wallet's RPC credentials and forwards
+`sendtoaddress`, so an interface-wide publish hands the spend surface to the whole LAN. The
+proxy itself refuses cross-origin browser requests and any method the page does not use,
+but neither is a substitute for not exposing it.
+
 ```bash
 cd scripts/zecd-gui
 docker build -t zecd-gui .
-docker run --rm -p 8080:8080 \
+docker run --rm -p 127.0.0.1:8080:8080 \
   -e ZECD_RPC_PASSWORD \
   -v $(pwd)/../../deploy:/config:ro \
   --add-host host.docker.internal:host-gateway \
@@ -154,7 +160,7 @@ A rebuild is only needed when the `Dockerfile` itself changes:
 
 ```bash
 docker build -t zecd-gui .
-docker run --rm -p 8080:8080 \
+docker run --rm -p 127.0.0.1:8080:8080 \
   -v $(pwd)/../../deploy:/config:ro \
   --add-host host.docker.internal:host-gateway \
   zecd-gui --bind 0.0.0.0 --rpc-url http://host.docker.internal:48232
@@ -191,7 +197,7 @@ dependencies, so there is nothing to install.
 
 ```bash
 # Use a different port
-docker run -p 9000:8080 zecd-gui
+docker run -p 127.0.0.1:9000:8080 zecd-gui
 # Then open http://127.0.0.1:9000/
 ```
 

@@ -613,6 +613,13 @@ impl KyotoEndpoint {
         let fail_tx = tx.clone();
         let probe = requester.clone();
         let describe = self.describe();
+        // Raised by the warning drain the instant it sees a fatal warning, before the tip
+        // probe below: a rejected header batch also ends the update stream (the node bans
+        // its peer and, with no other, halts), and the bridge must not race a generic
+        // stream error past the header-sync verdict - the actor acts on whichever lands
+        // first, and only the verdict escalates the redial.
+        let fatal_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fatal_flag = fatal_seen.clone();
         let logs = tokio::spawn(async move {
             let mut info = logging.info_subscriber;
             let mut warns = logging.warning_subscriber;
@@ -625,9 +632,15 @@ impl KyotoEndpoint {
                 while let Some(msg) = warns.recv().await {
                     warn!(upstream = %describe, "kyoto: {msg}");
                     if let Some(why) = fatal_sync_warning(&msg) {
+                        fatal_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         // Where the tree stands, for the actor's anchor verdict: the node
-                        // is parked, not gone, so it can still answer.
-                        let tip = probe.chain_tip().await.ok().map(|tip| tip.height);
+                        // is parked, not gone, so it can usually still answer - bounded,
+                        // since a node that lost its last peer answers nothing.
+                        let tip = tokio::time::timeout(RESPONSE_TIMEOUT, probe.chain_tip())
+                            .await
+                            .ok()
+                            .and_then(|tip| tip.ok())
+                            .map(|tip| tip.height);
                         // A closed channel means the actor already dropped this
                         // connection; nothing left to tell it.
                         let _ = fail_tx
@@ -648,11 +661,15 @@ impl KyotoEndpoint {
                         }
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(KyotoFailure::Stream(format!(
-                                "kyoto update stream failed: {e}"
-                            ))))
-                            .await;
+                        // A fatal warning already in flight carries the verdict for this
+                        // failure; the drain delivers it once its tip probe returns.
+                        if !fatal_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                            let _ = tx
+                                .send(Err(KyotoFailure::Stream(format!(
+                                    "kyoto update stream failed: {e}"
+                                ))))
+                                .await;
+                        }
                         break;
                     }
                 }

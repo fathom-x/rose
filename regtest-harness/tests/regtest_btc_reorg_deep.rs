@@ -68,11 +68,12 @@ const DEEP: Fork = Fork {
 };
 
 /// Just under the anchor: the fork point (199) is the header tree's first block (206 - 7),
-/// so the client reorgs by itself and no redial ever fails - the anchor's block at 200 is
-/// orphaned all the same, and the actor has to notice from the update alone. The birthday
-/// resolves to an anchor only once the tip is the reorg margin (6) past it, hence 206.
+/// so the client reorgs by itself and no redial ever fails - the anchor's block at 200
+/// (one below the birthday of 201, where every height birthday anchors) is orphaned all
+/// the same, and the actor has to notice from the update alone. The anchor resolves only
+/// once the tip is the reorg margin (6) past it, hence 206.
 const UNDER_ANCHOR: Fork = Fork {
-    birthday: 200,
+    birthday: 201,
     fork: 200,
     // Final when broadcast at 201, non-final at 199 once the fork drops the node there.
     locktime: 201,
@@ -178,10 +179,12 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
         .await
         .expect("gettransaction");
     assert_eq!(tx["blockhash"], json!(old_202), "{tx}");
-    let old_anchor_block = block_hash(&node, birthday).await;
+    // A height birthday anchors one block below itself (kyoto scans from anchor + 1).
+    let anchor_height = birthday - 1;
+    let old_anchor_block = block_hash(&node, anchor_height).await;
     if backend == BtcBackend::Kyoto {
         // The birthday resolved to an anchor on the original chain (the resolution waits
-        // for the tip to be the reorg margin past the birthday).
+        // for the tip to be the reorg margin past the anchor).
         zecd.wait_wallet(
             "btc",
             "getwalletinfo",
@@ -214,7 +217,7 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
     let replacement_miner = node.new_address().await;
     node.mine_to(&replacement_miner, new_tip - (fork - 1)).await;
     assert_eq!(node.height().await, new_tip);
-    let new_anchor_block = block_hash(&node, birthday).await;
+    let new_anchor_block = block_hash(&node, anchor_height).await;
     assert_ne!(
         new_anchor_block, old_anchor_block,
         "the anchor's block was orphaned"
@@ -328,7 +331,7 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
             json!([]),
             "the birthday anchor names the new chain's block",
             |wi| {
-                wi["birthday"]["anchor"]["height"] == json!(birthday)
+                wi["birthday"]["anchor"]["height"] == json!(anchor_height)
                     && wi["birthday"]["anchor"]["hash"] == json!(new_anchor_block)
             },
         )

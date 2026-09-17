@@ -1,9 +1,11 @@
 //! The BDK-backed Bitcoin wallet engine, behind the `bitcoin` cargo feature.
 //!
-//! A coin is an engine, not a parameter (see the shared-layer boundary in the project docs): this module
-//! is the Bitcoin counterpart of the librustzcash-backed `wallet/`+`sync/`+`chain/` stack,
-//! self-contained behind the two sanctioned seams - the wallet registry
-//! (`wallet::CoinWallet`) and the RPC handlers. No `bdk_wallet` type may appear in a shared
+//! A coin is an engine and an engine is a feature (see the shared-layer boundary in the project docs):
+//! this module is the Bitcoin counterpart of the librustzcash-backed `wallet/`+`sync/`+
+//! `chain/` stack, which rides the `zcash` feature the same way - so zecd builds with either
+//! engine or both, and `--no-default-features --features bitcoin,server,cli` is a
+//! bitcoin-only daemon carrying no Zcash crate at all. Each is self-contained behind the two
+//! sanctioned seams - the wallet registry (`wallet::CoinWallet`) and the RPC handlers. No `bdk_wallet` type may appear in a shared
 //! signature, config struct, or cross-coin enum; everything the engine needs from BDK arrives
 //! through the one `bdk_wallet` dependency (which re-exports `bitcoin`, `miniscript` and
 //! `bdk_chain`).

@@ -65,73 +65,85 @@ pub fn render(config: &AppConfig) -> String {
 
     table(&mut s, "backend");
     let b = &config.backend;
-    // The token is what the operator writes; what it resolves to (host, port, protocol, and for
-    // lightwalletd the TLS decision) is the thing they actually want to confirm, and it is not
-    // itself a config key - so it rides as a comment, derived from the value beside it.
-    match crate::backend::resolve_configured(config) {
-        Ok(server) => kv_note(&mut s, "server", str_val(&b.server), &server.describe()),
-        Err(e) => kv_note(
-            &mut s,
-            "server",
-            str_val(&b.server),
-            &format!("UNRESOLVED: {e}"),
-        ),
-    }
-    // Rendered only when set, like tls_ca_file: an absent proxy has no key to write back.
-    // `SocksProxy`'s Display is the canonical token, so this re-parses to the same value -
-    // which `render_is_idempotent_through_a_resolve` depends on.
-    if let Some(proxy) = &b.proxy {
-        kv(&mut s, "proxy", str_val(&proxy.to_string()));
+    // The Zcash upstream's half of `[backend]`. A build without that engine refuses these keys
+    // at resolve, so rendering them would emit a config `config check` rejects - the
+    // idempotence contract holds per build, as it already does for `[bitcoind]`.
+    #[cfg(feature = "zcash")]
+    {
+        // The token is what the operator writes; what it resolves to (host, port, protocol, and
+        // for lightwalletd the TLS decision) is the thing they actually want to confirm, and it
+        // is not itself a config key - so it rides as a comment, derived from the value beside it.
+        match crate::backend::resolve_configured(config) {
+            Ok(server) => kv_note(&mut s, "server", str_val(&b.server), &server.describe()),
+            Err(e) => kv_note(
+                &mut s,
+                "server",
+                str_val(&b.server),
+                &format!("UNRESOLVED: {e}"),
+            ),
+        }
+        // Rendered only when set, like tls_ca_file: an absent proxy has no key to write back.
+        // `SocksProxy`'s Display is the canonical token, so this re-parses to the same value -
+        // which `render_is_idempotent_through_a_resolve` depends on.
+        if let Some(proxy) = &b.proxy {
+            kv(&mut s, "proxy", str_val(&proxy.to_string()));
+        }
     }
     kv(&mut s, "connect_timeout_secs", b.connect_timeout_secs);
     kv(&mut s, "reconnect_base_secs", b.reconnect_base_secs);
     kv(&mut s, "reconnect_max_secs", b.reconnect_max_secs);
     kv(&mut s, "rfc1918_is_local", b.rfc1918_is_local);
     kv(&mut s, "allow_remote_cleartext", b.allow_remote_cleartext);
-    kv(
-        &mut s,
-        "tls",
-        str_val(match b.tls {
-            None => "auto",
-            Some(true) => "yes",
-            Some(false) => "no",
-        }),
-    );
-    kv(
-        &mut s,
-        "tls_roots",
-        str_val(match b.tls_roots {
-            crate::backend::TlsRoots::Native => "native",
-            crate::backend::TlsRoots::Webpki => "webpki",
-        }),
-    );
-    kv(
-        &mut s,
-        "tls_insecure_skip_verify",
-        b.tls_insecure_skip_verify,
-    );
-    if let Some(ca) = &b.tls_ca_file {
-        kv(&mut s, "tls_ca_file", path_val(ca));
+    #[cfg(feature = "zcash")]
+    {
+        kv(
+            &mut s,
+            "tls",
+            str_val(match b.tls {
+                None => "auto",
+                Some(true) => "yes",
+                Some(false) => "no",
+            }),
+        );
+        kv(
+            &mut s,
+            "tls_roots",
+            str_val(match b.tls_roots {
+                crate::backend::TlsRoots::Native => "native",
+                crate::backend::TlsRoots::Webpki => "webpki",
+            }),
+        );
+        kv(
+            &mut s,
+            "tls_insecure_skip_verify",
+            b.tls_insecure_skip_verify,
+        );
+        if let Some(ca) = &b.tls_ca_file {
+            kv(&mut s, "tls_ca_file", path_val(ca));
+        }
+        if !b.tls_pins.is_empty() {
+            let pins: Vec<String> = b.tls_pins.iter().map(|p| p.to_string()).collect();
+            kv(&mut s, "tls_pinned_sha256", list_val(&pins));
+        }
+        kv(
+            &mut s,
+            "assume_transparent_in_compact_blocks",
+            b.assume_transparent_in_compact_blocks,
+        );
     }
-    if !b.tls_pins.is_empty() {
-        let pins: Vec<String> = b.tls_pins.iter().map(|p| p.to_string()).collect();
-        kv(&mut s, "tls_pinned_sha256", list_val(&pins));
-    }
-    kv(
-        &mut s,
-        "assume_transparent_in_compact_blocks",
-        b.assume_transparent_in_compact_blocks,
-    );
 
-    table(&mut s, "zebra");
-    if let Some(cookie) = &config.zebra.rpc_cookie {
-        kv(&mut s, "rpc_cookie", path_val(cookie));
+    #[cfg(feature = "zcash")]
+    {
+        table(&mut s, "zebra");
+        if let Some(cookie) = &config.zebra.rpc_cookie {
+            kv(&mut s, "rpc_cookie", path_val(cookie));
+        }
+        redacted_pair(
+            &mut s,
+            &["rpc_user", "rpc_password"],
+            config.zebra.rpc_user.is_some() || config.zebra.rpc_password.is_some(),
+        );
     }
-    redacted_pair(
-        &mut s,
-        &["rpc_user", "rpc_password"],
-        config.zebra.rpc_user.is_some() || config.zebra.rpc_password.is_some(),
-    );
 
     // `[bitcoind]` mirrors `[backend]` + `[zebra]` for bitcoin wallets: the global default
     // upstream (rendered like `[backend] server` - always, with the resolved endpoint as a
@@ -322,45 +334,48 @@ pub fn render(config: &AppConfig) -> String {
     kv(&mut s, "interval_secs", config.sync.interval_secs);
     kv(&mut s, "rebroadcast_secs", config.sync.rebroadcast_secs);
 
-    table(&mut s, "spend");
-    kv(
-        &mut s,
-        "trusted_confirmations",
-        config.spend.trusted_confirmations,
-    );
-    kv(
-        &mut s,
-        "untrusted_confirmations",
-        config.spend.untrusted_confirmations,
-    );
-    kv(
-        &mut s,
-        "trust_own_transactions",
-        config.spend.trust_own_transactions,
-    );
-    // The `Debug` spelling is the config spelling (`SendPrivacy::parse` accepts exactly these),
-    // so the rendered value round-trips.
-    kv(
-        &mut s,
-        "privacy_policy",
-        str_val(&format!("{:?}", config.spend.privacy)),
-    );
-    kv(
-        &mut s,
-        "orchard_action_limit",
-        config.spend.orchard_action_limit,
-    );
-    kv(&mut s, "cache_proving_key", config.spend.cache_proving_key);
-    kv(&mut s, "pipeline_proving", config.spend.pipeline_proving);
-    kv(&mut s, "target_note_count", config.spend.target_note_count);
-    kv(
-        &mut s,
-        "min_split_output_value",
-        config.spend.min_split_output_value,
-    );
+    #[cfg(feature = "zcash")]
+    {
+        table(&mut s, "spend");
+        kv(
+            &mut s,
+            "trusted_confirmations",
+            config.spend.trusted_confirmations,
+        );
+        kv(
+            &mut s,
+            "untrusted_confirmations",
+            config.spend.untrusted_confirmations,
+        );
+        kv(
+            &mut s,
+            "trust_own_transactions",
+            config.spend.trust_own_transactions,
+        );
+        // The `Debug` spelling is the config spelling (`SendPrivacy::parse` accepts exactly these),
+        // so the rendered value round-trips.
+        kv(
+            &mut s,
+            "privacy_policy",
+            str_val(&format!("{:?}", config.spend.privacy)),
+        );
+        kv(
+            &mut s,
+            "orchard_action_limit",
+            config.spend.orchard_action_limit,
+        );
+        kv(&mut s, "cache_proving_key", config.spend.cache_proving_key);
+        kv(&mut s, "pipeline_proving", config.spend.pipeline_proving);
+        kv(&mut s, "target_note_count", config.spend.target_note_count);
+        kv(
+            &mut s,
+            "min_split_output_value",
+            config.spend.min_split_output_value,
+        );
 
-    table(&mut s, "pools");
-    pools_keys(&mut s, &config.pools);
+        table(&mut s, "pools");
+        pools_keys(&mut s, &config.pools);
+    }
 
     table(&mut s, "health");
     kv(&mut s, "enabled", config.health.enabled);
@@ -373,16 +388,19 @@ pub fn render(config: &AppConfig) -> String {
     );
     kv(&mut s, "max_scan_lag", config.health.max_scan_lag);
 
-    table(&mut s, "fleet");
-    // First, because every other key here is inert without it.
-    kv(&mut s, "enabled", config.fleet.enabled);
-    // Rendered as absolute paths, as resolved: the config accepts either, and an operator
-    // reading "which directory is this daemon actually watching for wallet manifests" wants the
-    // answer, not the datadir-relative form they may have written.
-    kv(&mut s, "manifest_dir", path_val(&config.fleet.manifest_dir));
-    kv(&mut s, "dir", path_val(&config.fleet.dir));
-    kv(&mut s, "shard_size", config.fleet.shard_size);
-    kv(&mut s, "cohort_depth", config.fleet.cohort_depth);
+    #[cfg(feature = "zcash")]
+    {
+        table(&mut s, "fleet");
+        // First, because every other key here is inert without it.
+        kv(&mut s, "enabled", config.fleet.enabled);
+        // Rendered as absolute paths, as resolved: the config accepts either, and an operator
+        // reading "which directory is this daemon actually watching for wallet manifests" wants the
+        // answer, not the datadir-relative form they may have written.
+        kv(&mut s, "manifest_dir", path_val(&config.fleet.manifest_dir));
+        kv(&mut s, "dir", path_val(&config.fleet.dir));
+        kv(&mut s, "shard_size", config.fleet.shard_size);
+        kv(&mut s, "cohort_depth", config.fleet.cohort_depth);
+    }
 
     table(&mut s, "log");
     kv(&mut s, "level", str_val(&config.log.level));
@@ -392,10 +410,10 @@ pub fn render(config: &AppConfig) -> String {
     // its own rather than depending on the reader to apply the `[pools]` defaults above.
     for (name, w) in &config.wallets {
         table(&mut s, &format!("wallets.{name}"));
-        // `coin` renders only when it is not the default, so a Zcash-only config's output is
-        // byte-stable across the key's existence - and a non-Zcash wallet's entry names the
-        // engine serving it.
-        if w.coin != crate::coin::Coin::Zcash {
+        // `coin` renders only when it is not the build's default, so a single-engine config's
+        // output is byte-stable across the key's existence - and a wallet served by the other
+        // engine names it.
+        if w.coin != crate::coin::Coin::DEFAULT {
             kv(&mut s, "coin", str_val(w.coin.name()));
         }
         kv(&mut s, "dir", path_val(&w.dir));
@@ -442,89 +460,96 @@ pub fn render(config: &AppConfig) -> String {
             }
         }
         // The remaining per-wallet keys configure the Zcash engine and are refused by
-        // `resolve` on any other wallet, so rendering them there would emit a config
-        // `config check` rejects - the idempotence contract forbids that.
-        if w.coin != crate::coin::Coin::Zcash {
-            continue;
-        }
-        // Endpoint overrides are rendered only when this wallet actually sets them: an absent
-        // key means "falls back to [backend]", which is what the omission says.
-        let bo = &w.backend;
-        if let Some(server) = &bo.server {
-            match crate::backend::resolve_for_wallet(config, w) {
-                Ok(resolved) => kv_note(&mut s, "server", str_val(server), &resolved.describe()),
-                Err(e) => kv_note(
-                    &mut s,
-                    "server",
-                    str_val(server),
-                    &format!("UNRESOLVED: {e}"),
-                ),
+        // `resolve` on any other wallet - and by every wallet in a build without that engine,
+        // which is why the whole tail rides the gate - so rendering them there would emit a
+        // config `config check` rejects, which the idempotence contract forbids.
+        #[cfg(feature = "zcash")]
+        {
+            if w.coin != crate::coin::Coin::Zcash {
+                continue;
             }
-        }
-        if let Some(tls) = bo.tls {
+            // Endpoint overrides are rendered only when this wallet actually sets them: an absent
+            // key means "falls back to [backend]", which is what the omission says.
+            let bo = &w.backend;
+            if let Some(server) = &bo.server {
+                match crate::backend::resolve_for_wallet(config, w) {
+                    Ok(resolved) => {
+                        kv_note(&mut s, "server", str_val(server), &resolved.describe())
+                    }
+                    Err(e) => kv_note(
+                        &mut s,
+                        "server",
+                        str_val(server),
+                        &format!("UNRESOLVED: {e}"),
+                    ),
+                }
+            }
+            if let Some(tls) = bo.tls {
+                kv(
+                    &mut s,
+                    "tls",
+                    str_val(match tls {
+                        None => "auto",
+                        Some(true) => "yes",
+                        Some(false) => "no",
+                    }),
+                );
+            }
+            if let Some(roots) = bo.tls_roots {
+                kv(
+                    &mut s,
+                    "tls_roots",
+                    str_val(match roots {
+                        crate::backend::TlsRoots::Native => "native",
+                        crate::backend::TlsRoots::Webpki => "webpki",
+                    }),
+                );
+            }
+            if let Some(skip) = bo.tls_insecure_skip_verify {
+                kv(&mut s, "tls_insecure_skip_verify", skip);
+            }
+            if let Some(ca) = &bo.tls_ca_file {
+                kv(&mut s, "tls_ca_file", path_val(ca));
+            }
+            if let Some(pins) = &bo.tls_pins {
+                let pins: Vec<String> = pins.iter().map(|p| p.to_string()).collect();
+                kv(&mut s, "tls_pinned_sha256", list_val(&pins));
+            }
+            if let Some(assume) = bo.assume_transparent_in_compact_blocks {
+                kv(&mut s, "assume_transparent_in_compact_blocks", assume);
+            }
+            kv(&mut s, "pools", list_val(&w.pools.names()));
             kv(
                 &mut s,
-                "tls",
-                str_val(match tls {
-                    None => "auto",
-                    Some(true) => "yes",
-                    Some(false) => "no",
-                }),
+                "default_receivers",
+                list_val(&w.default_receivers.names()),
             );
-        }
-        if let Some(roots) = bo.tls_roots {
+            kv(&mut s, "transparent", w.transparent_enabled);
+            kv(&mut s, "transparent_default", w.transparent_default);
+            kv(&mut s, "transparent_gap_limit", w.transparent_gap_limit);
             kv(
                 &mut s,
-                "tls_roots",
-                str_val(match roots {
-                    crate::backend::TlsRoots::Native => "native",
-                    crate::backend::TlsRoots::Webpki => "webpki",
-                }),
+                "transparent_initial_scan",
+                w.transparent_initial_scan,
+            );
+            kv(
+                &mut s,
+                "transparent_allow_beyond_recovery_window",
+                w.transparent_allow_beyond_recovery_window,
+            );
+            kv(
+                &mut s,
+                "transparent_gap_warn_threshold",
+                w.transparent_gap_warn_threshold,
             );
         }
-        if let Some(skip) = bo.tls_insecure_skip_verify {
-            kv(&mut s, "tls_insecure_skip_verify", skip);
-        }
-        if let Some(ca) = &bo.tls_ca_file {
-            kv(&mut s, "tls_ca_file", path_val(ca));
-        }
-        if let Some(pins) = &bo.tls_pins {
-            let pins: Vec<String> = pins.iter().map(|p| p.to_string()).collect();
-            kv(&mut s, "tls_pinned_sha256", list_val(&pins));
-        }
-        if let Some(assume) = bo.assume_transparent_in_compact_blocks {
-            kv(&mut s, "assume_transparent_in_compact_blocks", assume);
-        }
-        kv(&mut s, "pools", list_val(&w.pools.names()));
-        kv(
-            &mut s,
-            "default_receivers",
-            list_val(&w.default_receivers.names()),
-        );
-        kv(&mut s, "transparent", w.transparent_enabled);
-        kv(&mut s, "transparent_default", w.transparent_default);
-        kv(&mut s, "transparent_gap_limit", w.transparent_gap_limit);
-        kv(
-            &mut s,
-            "transparent_initial_scan",
-            w.transparent_initial_scan,
-        );
-        kv(
-            &mut s,
-            "transparent_allow_beyond_recovery_window",
-            w.transparent_allow_beyond_recovery_window,
-        );
-        kv(
-            &mut s,
-            "transparent_gap_warn_threshold",
-            w.transparent_gap_warn_threshold,
-        );
     }
     s
 }
 
 /// The `[pools]` keys, shared by the global table (per-wallet entries spell the same settings
 /// under `[wallets.<name>]`, where the key for the pool list is `pools` rather than `enabled`).
+#[cfg(feature = "zcash")]
 fn pools_keys(s: &mut String, pools: &crate::config::PoolsConfig) {
     kv(s, "enabled", list_val(&pools.enabled.names()));
     kv(
@@ -658,6 +683,7 @@ mod tests {
     ///
     /// Deliberately a secret-free config: redacted keys are emitted as comments, so a config
     /// carrying credentials cannot round-trip by construction (see the module docs).
+    #[cfg(feature = "zcash")]
     #[test]
     fn render_is_idempotent_through_a_resolve() {
         let dir = tempfile::tempdir().unwrap();
@@ -699,7 +725,7 @@ mod tests {
     /// Zcash-engine keys (`resolve` refuses them there, and the idempotence contract forbids
     /// emitting a config `config check` rejects), and still round-trips byte-identically.
     #[test]
-    #[cfg(feature = "bitcoin")]
+    #[cfg(all(feature = "zcash", feature = "bitcoin"))]
     fn a_bitcoin_wallet_renders_without_zcash_engine_keys_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let first = render(&resolve_from(
@@ -905,6 +931,7 @@ mod tests {
 
     /// Every value the file left unset appears, filled in by this build - the whole point of the
     /// command, and what makes a cross-version diff meaningful.
+    #[cfg(feature = "zcash")]
     #[test]
     fn defaults_the_file_never_mentions_are_rendered() {
         let dir = tempfile::tempdir().unwrap();
@@ -930,6 +957,7 @@ mod tests {
 
     /// Credentials are named, never printed - `zecd config show` output is the kind of thing
     /// that gets pasted into an issue, and the RPC password is spend authority.
+    #[cfg(feature = "zcash")]
     #[test]
     fn secrets_are_redacted() {
         let dir = tempfile::tempdir().unwrap();
@@ -955,7 +983,7 @@ mod tests {
 
     /// A wallet entry stands on its own: every pool setting appears resolved under the wallet,
     /// so reading it never means mentally applying the global `[pools]` defaults.
-
+    #[cfg(feature = "zcash")]
     #[test]
     fn per_wallet_backend_overrides_render_and_re_resolve() {
         // The renderer's schema contract on the per-wallet endpoint keys: what it emits must be
@@ -1002,6 +1030,7 @@ mod tests {
         assert_eq!(out, render(&resolve_from(&out, dir.path())));
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn wallet_entries_carry_their_resolved_pool_settings() {
         let dir = tempfile::tempdir().unwrap();

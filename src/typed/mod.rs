@@ -197,11 +197,27 @@ mod tests {
         assert_eq!(fee.blocks, 3);
         assert_eq!(c.estimate_fee().await.unwrap().zatoshis(), 1000);
         assert!(c.get_mempool_info().await.unwrap().loaded);
-        let v = c
-            .validate_address("tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86")
-            .await
-            .unwrap();
-        assert!(v.isvalid);
+        // `validateaddress` is in the shared dialect, and each engine parses against its own
+        // network. The Zcash handler answers a Zcash address without needing a wallet at all
+        // (the wallet lookup it makes is best-effort); a build without that engine routes the
+        // method to the stub, which resolves the wallet first - so a walletless node answers
+        // -18, the same ordering every wallet-touching method gives.
+        #[cfg(feature = "zcash")]
+        {
+            let v = c
+                .validate_address("tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86")
+                .await
+                .unwrap();
+            assert!(v.isvalid);
+        }
+        #[cfg(not(feature = "zcash"))]
+        {
+            let err = c
+                .validate_address("tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86")
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Some(crate::error::codes::RPC_WALLET_NOT_FOUND));
+        }
 
         // Server-side errors come back as ClientError::Rpc with the wire code intact.
         let err = c
@@ -209,15 +225,23 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some(crate::error::codes::RPC_INVALID_PARAMETER));
+        // A wallet-touching method resolves the wallet before anything else, so a walletless
+        // node answers -18 whichever engine would have served it: `getbalance` is in the
+        // shared dialect, and the stub arm that stands in for the absent Zcash engine keeps
+        // that ordering rather than answering method-not-found first.
         let err = c.get_balance(None).await.unwrap_err();
         assert_eq!(err.code(), Some(crate::error::codes::RPC_WALLET_NOT_FOUND));
         // z_waitforoperation resolves the wallet before parsing the opid, so the walletless
-        // state surfaces -18 here (the malformed-opid -8 is pinned by the HTTP tests).
+        // state surfaces -18 here (the malformed-opid -8 is pinned by the HTTP tests). Without
+        // the engine that serves it, the method does not exist at all.
         let err = c
             .z_wait_for_operation("not-an-opid", Some(0))
             .await
             .unwrap_err();
+        #[cfg(feature = "zcash")]
         assert_eq!(err.code(), Some(crate::error::codes::RPC_WALLET_NOT_FOUND));
+        #[cfg(not(feature = "zcash"))]
+        assert_eq!(err.code(), Some(crate::error::codes::RPC_METHOD_NOT_FOUND));
     }
 
     /// Trailing omitted arguments vanish; interior ones become explicit nulls.

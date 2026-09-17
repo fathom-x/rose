@@ -25,7 +25,7 @@ tokio = { version = "1.21", features = ["rt-multi-thread", "macros", "fs", "sign
 axum = { version = "0.7", features = ["json"], optional = true }
 hyper = { version = "1", features = ["client", "http1"] }
 http-body-util = "0.1"
-bytes = "1"
+bytes = { version = "1", optional = true }
 futures-util = "0.3"
 
 # Serialization. `arbitrary_precision` is REQUIRED: bitcoind emits amounts as JSON numbers
@@ -49,12 +49,12 @@ hmac = "0.12"
 sha2 = "0.10"
 # hash160 (= ripemd160(sha256)) for transparent-script address extraction in
 # `getrawtransaction`; already in the tree via the zcash crates.
-ripemd = "0.1"
+ripemd = { version = "0.1", optional = true }
 # `signmessage`/`verifymessage` sign the double-SHA256 message hash with the transparent
 # address's secp256k1 key and recover the signer's pubkey. The `recovery` feature provides the
 # recoverable-ECDSA API (compact 65-byte header+sig, as zcashd/zallet produce). Already in the
 # tree via the zcash crates; matches zallet's pin.
-secp256k1 = { version = "0.29", features = ["recovery"] }
+secp256k1 = { version = "0.29", features = ["recovery"], optional = true }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 hex = "0.4"
 
@@ -67,19 +67,19 @@ secrecy = "0.8"
 # `zcash_client_backend::proto` exposes and the zebra backend constructs (and that
 # `sync/engine.rs` serializes to the on-disk block cache). `hyper-util`'s legacy client is the
 # HTTP/1.1 client behind the zebra JSON-RPC backend.
-prost = "0.14"
+prost = { version = "0.14", optional = true }
 # lightwalletd transport. `tls-ring` makes tonic select the `ring` rustls crypto provider for
 # its own ClientConfig (tonic 0.14 does this internally - no CryptoProvider::install_default
 # needed); keep it the *only* rustls provider feature, or tonic's auto-selection breaks.
 # `tls-native-roots` lets us trust the OS store (and SSL_CERT_FILE), which `tls-webpki-roots`
 # alone does not.
-tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-native-roots", "tls-webpki-roots"] }
+tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-native-roots", "tls-webpki-roots"], optional = true }
 # The rustls that tonic already dials with (via tokio-rustls), pulled in directly only for the
 # `ServerCertVerifier` impl behind `[backend] tls_insecure_skip_verify`. `default-features =
 # false` is load-bearing: rustls' defaults enable `aws_lc_rs` (and `prefer-post-quantum`, which
 # implies it), which would land a second crypto provider in the tree and break tonic's
 # auto-selection. `ring` matches tonic's `tls-ring`.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 # SOCKS5 client for `[backend] proxy`. Deliberately a *transport-only* crate (futures-util,
 # thiserror, tokio): it carries no rustls, so it cannot land a second crypto provider and break
@@ -96,36 +96,36 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # `circuit` exposes `orchard::circuit::{ProvingKey, VerifyingKey}` so we can build the Orchard
 # proving key once at startup and reuse it for every send (the PCZT prove path), instead of
 # librustzcash's fused builder which rebuilds it per transaction.
-orchard = { version = "0.15", default-features = false, features = ["circuit"] }
-zcash_address = "0.13"
+orchard = { version = "0.15", default-features = false, features = ["circuit"], optional = true }
+zcash_address = { version = "0.13", optional = true }
 # `CompactSize` builds the length-prefixed preimage for the `signmessage`/`verifymessage`
 # message hash (magic + message, each CompactSize-prefixed, double-SHA256), byte-identical to
 # zcashd's `rpc/misc.cpp` and zallet.
-zcash_encoding = "0.4"
+zcash_encoding = { version = "0.4", optional = true }
 # `transparent-inputs` lets transparent receivers surface in getrawtransaction/getaddressinfo
 # and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
-zcash_client_backend = { version = "0.24.0", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"] }
-zcash_client_sqlite = { version = "0.22.0", features = ["unstable", "orchard", "serde", "transparent-inputs"] }
-zcash_keys = { version = "0.16", features = ["unstable", "orchard"] }
-zcash_primitives = "0.30"
-zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
-zcash_protocol = { version = "0.10", features = ["local-consensus"] }
-zcash_transparent = "0.10"
+zcash_client_backend = { version = "0.24.0", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"], optional = true }
+zcash_client_sqlite = { version = "0.22.0", features = ["unstable", "orchard", "serde", "transparent-inputs"], optional = true }
+zcash_keys = { version = "0.16", features = ["unstable", "orchard"], optional = true }
+zcash_primitives = { version = "0.30", optional = true }
+zcash_proofs = { version = "0.30", features = ["bundled-prover"], optional = true }
+zcash_protocol = { version = "0.10", features = ["local-consensus"], optional = true }
+zcash_transparent = { version = "0.10", optional = true }
 # Script asm rendering + standard-script solver for `getrawtransaction` (already in the
 # tree via zcash_transparent; same crate Zallet uses for this).
-zcash_script = "0.4.5"
-sapling = { package = "sapling-crypto", version = "0.7" }
+zcash_script = { version = "0.4.5", optional = true }
+sapling = { package = "sapling-crypto", version = "0.7", optional = true }
 # `NonEmpty` is the shape librustzcash's proposal API speaks (`ShieldedInputs::from_parts`,
 # `Proposal` steps); needed by the hand-built z_mergetoaddress proposals. Same version the
 # librustzcash workspace pins, so the types unify.
-nonempty = "0.11"
+nonempty = { version = "0.11", optional = true }
 # PCZT roles (Prover/Signer) for the cached-proving-key send path. Versions track the
 # zcash_client_backend `pczt` feature's own pin (0.9.3).
-pczt = { version = "0.9.3", default-features = false, features = ["prover", "signer", "orchard", "sapling"] }
-zip32 = "0.2"
-zip321 = "0.9"
+pczt = { version = "0.9.3", default-features = false, features = ["prover", "signer", "orchard", "sapling"], optional = true }
+zip32 = { version = "0.2", optional = true }
+zip321 = { version = "0.9", optional = true }
 libc = "0.2.186"
 # Single-instance guard: an advisory exclusive lock on `<datadir>/.lock` so two zecd processes
 # can't operate on the same data directory at once (mirrors zallet / zcashd). Linux only needs
@@ -176,29 +176,59 @@ mimalloc = { version = "0.1", optional = true }
 
 [features]
 # The binary's full surface, on by default so `cargo build`/`cargo test` and the release
-# images are unchanged. A library consumer builds with `default-features = false` for the
-# embeddable node (`crate::node`) plus the CLI cores, without axum or clap in the tree.
-default = ["server", "cli"]
+# images are unchanged: the HTTP transports, the CLI, and the Zcash wallet engine. A library
+# consumer builds with `default-features = false` plus the engine(s) it wants for the
+# embeddable node (`crate::node`) and the CLI cores, without axum or clap in the tree.
+default = ["server", "cli", "zcash"]
 # The HTTP transports: the axum JSON-RPC server (`server::run`) and the health server.
 server = ["dep:axum"]
 # The clap CLI surface (`config::Cli`, the subcommand shells) and `daemon::init_tracing`.
 cli = ["dep:clap", "dep:tracing-subscriber"]
-# NB tonic/lightwalletd is deliberately NOT feature-gated (a zebra-only consumer still compiles
-# the gRPC stack): the TLS value types on `BackendConfig` and the `Lwd` variants in
-# `chain::AnySource` and its stream enums couple it into config/chain, so carving it out is its
-# own project.
+# A coin is an engine, and an engine is a feature. At least one of `zcash`/`bitcoin` must be
+# on (`lib.rs` refuses to build otherwise); a build carrying one engine refuses the other's
+# `coin` at config resolve ("unsupported coin ... (this build supports: ...)", derived from
+# `coin::Coin::SUPPORTED`) and the other's config sections as unknown fields. Both gates stay
+# cheap only while the engine-boundary rule holds: no engine crate type in a shared
+# signature, config struct, or cross-coin enum - each engine joins the shared shell at the two
+# sanctioned seams (`wallet::CoinWallet` and the RPC handlers), everything else lives under
+# its own directory (`wallet/`+`sync/`+`chain/` for Zcash, `src/btc/` for Bitcoin). The
+# tonic/lightwalletd transport used to be the cautionary precedent for that rule (its types
+# had reached `BackendConfig`, so it could not be gated); it now rides the `zcash` gate, and
+# the TLS value types it left on the shared config (`backend::TlsRoots`, `CertFingerprint`,
+# `TlsOptions`) are zecd-owned and stay in the ungated half of `backend.rs`.
 #
-# The general rule that NB is the cautionary precedent for: a dependency stays gateable only
-# while its types stay out of the shared layer. Keeping the wallet-side crates out of the
-# config structs, the RPC handler signatures, and the registry enum is what makes the existing
-# `server`/`cli` gates cheap, and it is why `librustzcash` types are confined to `wallet/`,
-# `sync/` and `chain/` rather than threaded through `config.rs` and `rpc/`.
+# The librustzcash-backed Zcash wallet engine: `wallet/`, `sync/`, `chain/` (zebra JSON-RPC and
+# lightwalletd gRPC upstreams), `fleet`, the `z_*` RPCs, `node::Node::send`. On by default. A
+# build without it is a bitcoin-only zecd and carries no Zcash crate at all - the `features`
+# CI job asserts that with `cargo tree`.
+zcash = [
+    "dep:orchard",
+    "dep:sapling",
+    "dep:pczt",
+    "dep:nonempty",
+    "dep:zcash_proofs",
+    "dep:zcash_client_sqlite",
+    "dep:zcash_client_backend",
+    "dep:zcash_primitives",
+    "dep:zcash_keys",
+    "dep:zcash_address",
+    "dep:zcash_protocol",
+    "dep:zcash_transparent",
+    "dep:zcash_script",
+    "dep:zcash_encoding",
+    "dep:zip32",
+    "dep:zip321",
+    "dep:ripemd",
+    "dep:bytes",
+    "dep:secp256k1",
+    "dep:tonic",
+    "dep:prost",
+    "dep:rustls",
+]
 # The BDK-backed Bitcoin wallet engine (`src/btc/`), off by default: a default build is
 # byte-identical to a pre-BDK one and `coin = "bitcoin"` in a config is refused at resolve
-# ("this build supports: zcash"). The gate stays cheap only while the engine-boundary rule
-# holds: no `bdk_wallet` type in a shared signature, config struct, or cross-coin enum -
-# the engine joins the shared shell at the two sanctioned seams (`wallet::CoinWallet` and
-# the RPC handlers), everything else lives in `src/btc/`.
+# ("this build supports: zcash"). Alone (`--no-default-features --features bitcoin,server,cli`)
+# it is the bitcoin-only zecd.
 bitcoin = ["dep:bdk_wallet", "dep:bdk_bitcoind_rpc", "dep:bdk_kyoto", "dep:hyper-rustls", "dep:tokio-tungstenite"]
 # Use mimalloc as the global allocator. Off by default; the musl release images opt in.
 mimalloc = ["dep:mimalloc"]

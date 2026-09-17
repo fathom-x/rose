@@ -5,10 +5,15 @@ use serde_json::{json, Value};
 use crate::amount::zats_to_value;
 use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
+#[cfg(feature = "zcash")]
 use crate::state::AppState;
 
 /// `validateaddress <address>` - network-aware validity verdict for any Zcash address kind,
 /// with an `isvalid_orchard` extension flagging Orchard-receiver capability.
+///
+/// The Zcash engine's; a Bitcoin wallet is answered by `btc_methods`, which parses against its
+/// own network.
+#[cfg(feature = "zcash")]
 pub(crate) fn validateaddress(
     state: &AppState,
     wallet: Option<&str>,

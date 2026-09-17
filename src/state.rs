@@ -37,6 +37,7 @@ pub struct AppState {
     /// shard and start serving it without a restart. `None` when this node has no fleet
     /// configured, which is every pre-fleet deployment - the management RPCs then say so rather
     /// than pretending to work.
+    #[cfg(feature = "zcash")]
     pub fleet: Option<Arc<crate::fleet::FleetManager>>,
 }
 

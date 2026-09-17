@@ -569,8 +569,12 @@ jobs:
           mkdir -p ~/bitcoin-core
           tar -xzf "$tarball" -C ~/bitcoin-core --strip-components=1
 
-      - name: Build zecd with the bitcoin engine
-        run: cargo build --locked --features bitcoin --bin zecd
+      # The bitcoin-only binary, not a both-engines one: these suites drive a Bitcoin wallet
+      # end to end, so running them against the build a bitcoin-only deployment actually ships
+      # is what proves that shape works. The both-engines shape is covered by the `features`
+      # job's `cargo test --features bitcoin` and by the Docker smoke checks.
+      - name: Build the bitcoin-only zecd
+        run: cargo build --locked --no-default-features --features bitcoin,server,cli --bin zecd
 
       - name: Run the Bitcoin e2es
         working-directory: regtest-harness

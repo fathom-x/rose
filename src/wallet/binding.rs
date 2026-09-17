@@ -266,7 +266,7 @@ mod tests {
             &kp,
             Passphrase::from("correct horse battery".to_string()),
             &mnemonic,
-            BlockHeight::from_u32(1),
+            1,
             net,
             &ufvk,
         )

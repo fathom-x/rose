@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+#[cfg(feature = "zcash")]
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
@@ -12,10 +13,12 @@ use anyhow::Context;
 #[cfg(feature = "cli")]
 use clap::Parser;
 use serde::Deserialize;
+#[cfg(feature = "zcash")]
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 
 use crate::coin::{Coin, CoinNetwork};
 use crate::network::ZNetwork;
+#[cfg(feature = "zcash")]
 use crate::pools::{Receiver, ReceiverSet};
 
 /// Default chain upstream: a local zebrad's JSON-RPC ("full mode"). Public keeps the bare
@@ -132,6 +135,7 @@ pub struct AppConfig {
     pub default_wallet: String,
     pub wallets: BTreeMap<String, WalletEntry>,
     pub backend: BackendConfig,
+    #[cfg(feature = "zcash")]
     pub zebra: ZebraConfig,
     /// `[bitcoind]` credentials for bitcoin wallets' upstream (the BDK engine's full mode).
     #[cfg(feature = "bitcoin")]
@@ -145,13 +149,16 @@ pub struct AppConfig {
     pub rpc: RpcConfig,
     pub keys: KeysConfig,
     pub sync: SyncConfig,
+    #[cfg(feature = "zcash")]
     pub spend: SpendConfig,
     /// Global default enabled pools / UA receivers, applied to wallets that don't override them
     /// (including the implicit default wallet that has no `[wallets.<name>]` entry).
+    #[cfg(feature = "zcash")]
     pub pools: PoolsConfig,
     pub health: HealthConfig,
     pub log: LogConfig,
     /// `[fleet]` - monitoring many watch-only wallets in this one daemon.
+    #[cfg(feature = "zcash")]
     pub fleet: FleetConfig,
 }
 
@@ -186,6 +193,7 @@ pub const DEFAULT_FLEET_COHORT_DEPTH: u32 = 10_000;
 ///
 /// The fleet is **additive**: disabled (the default) none of this runs, and `[wallets.<name>]`
 /// entries keep behaving exactly as they always have.
+#[cfg(feature = "zcash")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetConfig {
     /// Run the fleet at all (`[fleet] enabled`, default `false`).
@@ -206,6 +214,7 @@ pub struct FleetConfig {
     pub cohort_depth: u32,
 }
 
+#[cfg(feature = "zcash")]
 impl Default for FleetConfig {
     fn default() -> Self {
         FleetConfig {
@@ -222,21 +231,25 @@ impl Default for FleetConfig {
 /// receivers the Unified Addresses it hands out include by default. A default receiver may never
 /// name a pool that isn't enabled (validated at startup). Per-wallet `[wallets.<name>]` entries
 /// can override either field; this is the global default.
+#[cfg(feature = "zcash")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolsConfig {
     /// Shielded pools the wallet receives into and spends from.
     pub enabled: ReceiverSet,
     /// Receivers included in the UAs handed out by `getnewaddress` when no per-call override is
     /// given. Always a subset of `enabled`.
+    #[cfg(feature = "zcash")]
     pub default_receivers: ReceiverSet,
     /// Whether the wallet may hand out bare transparent (`t1...`/`tm...`) receiving addresses - via
     /// `getnewaddress "" "transparent"`, and (when `transparent_default`) as the no-argument
     /// default. Off preserves zecd's shielded-only behaviour: `address_type = "transparent"` is
     /// rejected `-8`. Received transparent UTXOs are spendable only by auto-shielding them into a
     /// shielded send.
+    #[cfg(feature = "zcash")]
     pub transparent_enabled: bool,
     /// Whether a no-argument `getnewaddress` returns a bare transparent address instead of a
     /// Unified Address. Requires `transparent_enabled` (validated at parse time).
+    #[cfg(feature = "zcash")]
     pub transparent_default: bool,
     /// The **external** transparent gap limit: how far past the last *funded* receiving address a
     /// stateless restore keeps scanning the address index before giving up. Sized to the maximum
@@ -244,6 +257,7 @@ pub struct PoolsConfig {
     /// rebuilt (stateless) wallet rediscover transparent funds across sparsely-funded
     /// pre-generated addresses, at the cost of more address-index queries per restore/scan. Only
     /// meaningful when `transparent_enabled`.
+    #[cfg(feature = "zcash")]
     pub transparent_gap_limit: u32,
     /// **Initial scan depth.** On startup/restore, pre-expose external transparent indices
     /// `0..transparent_initial_scan` so the wallet scans *all* of them for receives - independent
@@ -253,6 +267,7 @@ pub struct PoolsConfig {
     /// does *not* want a 10 000-deep sliding window past every funded address). `0` (the default)
     /// means no pre-exposure - discovery is bounded by `gap_limit` alone. Only meaningful when
     /// `transparent_enabled`.
+    #[cfg(feature = "zcash")]
     pub transparent_initial_scan: u32,
     /// Whether `getnewaddress "" "transparent"` may keep issuing receiving addresses **past** the
     /// recovery window (`transparent_gap_limit` consecutive unfunded addresses, plus the
@@ -260,12 +275,14 @@ pub struct PoolsConfig {
     /// (the default) zecd issues beyond it anyway, logging a loud warning that funds received at
     /// such an address may be unrecoverable from seed. Set `false` to instead fail the call with an
     /// actionable error. Only meaningful when `transparent_enabled`.
+    #[cfg(feature = "zcash")]
     pub transparent_allow_beyond_recovery_window: bool,
     /// Warn (once per `getnewaddress`) when fewer than this many transparent address slots remain
     /// inside the recovery window before generation would hit the gap limit. Lets an operator widen
     /// `transparent_gap_limit`/`transparent_initial_scan` (or fund a lower index) before addresses
     /// start landing outside the window. `0` warns only on actual exhaustion. Only meaningful when
     /// `transparent_enabled`.
+    #[cfg(feature = "zcash")]
     pub transparent_gap_warn_threshold: u32,
 }
 
@@ -307,6 +324,7 @@ pub const DEFAULT_TRANSPARENT_ALLOW_BEYOND: bool = true;
 /// Default for `transparent_gap_warn_threshold`: warn once the last few in-window slots remain.
 pub const DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD: u32 = 5;
 
+#[cfg(feature = "zcash")]
 impl Default for PoolsConfig {
     fn default() -> Self {
         // Preserves zecd's historical behaviour: Orchard-only receiving, no transparent.
@@ -417,22 +435,30 @@ pub struct WalletEntry {
     /// This wallet's overrides of the global `[backend]` endpoint settings.
     pub backend: WalletBackendOverride,
     /// Shielded pools this wallet receives into and spends from (resolved per wallet).
+    #[cfg(feature = "zcash")]
     pub pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses (a subset of `pools`).
+    #[cfg(feature = "zcash")]
     pub default_receivers: ReceiverSet,
     /// Whether this wallet may hand out bare transparent receiving addresses (resolved per wallet).
+    #[cfg(feature = "zcash")]
     pub transparent_enabled: bool,
     /// Whether a no-argument `getnewaddress` on this wallet returns a bare transparent address.
+    #[cfg(feature = "zcash")]
     pub transparent_default: bool,
     /// This wallet's external transparent gap limit (see [`PoolsConfig::transparent_gap_limit`]).
+    #[cfg(feature = "zcash")]
     pub transparent_gap_limit: u32,
     /// This wallet's initial transparent scan depth (see [`PoolsConfig::transparent_initial_scan`]).
+    #[cfg(feature = "zcash")]
     pub transparent_initial_scan: u32,
     /// Whether this wallet may issue transparent addresses past the recovery window
     /// (see [`PoolsConfig::transparent_allow_beyond_recovery_window`]).
+    #[cfg(feature = "zcash")]
     pub transparent_allow_beyond_recovery_window: bool,
     /// This wallet's remaining-slot warning threshold
     /// (see [`PoolsConfig::transparent_gap_warn_threshold`]).
+    #[cfg(feature = "zcash")]
     pub transparent_gap_warn_threshold: u32,
     /// How far below the chain tip `init` anchors this wallet's birthday when freshly
     /// generated (resolved per wallet: the wallet's own key, else the global
@@ -455,6 +481,7 @@ impl WalletEntry {
     /// Unwrapped at the call site rather than stored bare, so the daemon-global
     /// `config.network` and a wallet's own chain stay distinguishable: the reads that mean
     /// "this deployment" keep using the former, and the per-wallet ones go through here.
+    #[cfg(feature = "zcash")]
     pub fn zcash_network(&self) -> ZNetwork {
         match self.chain {
             CoinNetwork::Zcash(network) => network,
@@ -474,6 +501,7 @@ impl WalletEntry {
     pub fn bitcoin_network(&self) -> crate::coin::BitcoinNetwork {
         match self.chain {
             CoinNetwork::Bitcoin(network) => network,
+            #[cfg(feature = "zcash")]
             CoinNetwork::Zcash(_) => {
                 panic!("bitcoin_network() on a Zcash wallet entry (caller must branch on coin)")
             }
@@ -879,6 +907,7 @@ impl Default for MempoolConfig {
 /// `[zebra]` - credentials for the `zebra://host:port` endpoint (direct-to-zebrad mode).
 /// A cookie file wins over user/password, and nothing set means no auth (zebrad with
 /// `enable_cookie_auth = false`).
+#[cfg(feature = "zcash")]
 #[derive(Debug, Clone, Default)]
 pub struct ZebraConfig {
     pub rpc_user: Option<String>,
@@ -886,6 +915,7 @@ pub struct ZebraConfig {
     pub rpc_cookie: Option<PathBuf>,
 }
 
+#[cfg(feature = "zcash")]
 impl ZebraConfig {
     pub fn auth(&self) -> crate::chain::zebra::ZebraAuth {
         crate::chain::zebra::ZebraAuth {
@@ -982,6 +1012,7 @@ pub struct SyncConfig {
 /// `trusted_confirmations`/`untrusted_confirmations`): how deep an output must be before
 /// the wallet treats it as spendable, which also anchors `getbalance`/`getbalances`/
 /// `getwalletinfo` and the sync engine's spend proposals.
+#[cfg(feature = "zcash")]
 #[derive(Debug, Clone)]
 pub struct SpendConfig {
     /// Confirmations before the wallet's *own* outputs (change) are spendable. Default 3.
@@ -1039,6 +1070,7 @@ pub struct SpendConfig {
     pub min_split_output_value: u64,
 }
 
+#[cfg(feature = "zcash")]
 impl Default for SpendConfig {
     fn default() -> Self {
         Self {
@@ -1055,6 +1087,7 @@ impl Default for SpendConfig {
     }
 }
 
+#[cfg(feature = "zcash")]
 impl SpendConfig {
     /// Reject change-splitting settings the send path could not use.
     ///
@@ -1099,6 +1132,7 @@ pub const DEFAULT_MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000;
 /// `AllowRevealedSenders` < `AllowFullyTransparent`. Unlike zcashd's policy lattice the ladder is
 /// linear, so each rung implies everything below it (`AllowRevealedSenders` here permits
 /// transparent recipients too, where zcashd keeps senders and recipients orthogonal).
+#[cfg(feature = "zcash")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendPrivacy {
     /// Only fully-shielded transactions confined to a **single** shielded value pool: no
@@ -1134,6 +1168,7 @@ pub enum SendPrivacy {
     AllowFullyTransparent,
 }
 
+#[cfg(feature = "zcash")]
 impl SendPrivacy {
     fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
@@ -1189,6 +1224,7 @@ impl SendPrivacy {
     }
 }
 
+#[cfg(feature = "zcash")]
 impl SpendConfig {
     /// Build the [`ConfirmationsPolicy`] this configuration describes. Values are clamped
     /// to at least 1 (a shielded note is never spendable unmined); trusted exceeding
@@ -1229,6 +1265,7 @@ struct ConfigFile {
     #[serde(default)]
     wallets: BTreeMap<String, WalletFile>,
     backend: Option<BackendFile>,
+    #[cfg(feature = "zcash")]
     zebra: Option<ZebraFile>,
     /// `[bitcoind]` exists only in a build carrying the BDK engine; a default build refuses
     /// the section as an unknown field, consistent with `coin = "bitcoin"` being refused.
@@ -1243,13 +1280,17 @@ struct ConfigFile {
     rpc: Option<RpcFile>,
     keys: Option<KeysFile>,
     sync: Option<SyncFile>,
+    #[cfg(feature = "zcash")]
     spend: Option<SpendFile>,
+    #[cfg(feature = "zcash")]
     pools: Option<PoolsFile>,
     health: Option<HealthFile>,
     log: Option<LogFile>,
+    #[cfg(feature = "zcash")]
     fleet: Option<FleetFile>,
 }
 
+#[cfg(feature = "zcash")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FleetFile {
@@ -1354,6 +1395,7 @@ struct BackendFile {
     proxy: Option<String>,
 }
 
+#[cfg(feature = "zcash")]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ZebraFile {
@@ -1439,6 +1481,7 @@ struct SyncFile {
     rebroadcast_secs: Option<u64>,
 }
 
+#[cfg(feature = "zcash")]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpendFile {
@@ -1453,6 +1496,7 @@ struct SpendFile {
     min_split_output_value: Option<u64>,
 }
 
+#[cfg(feature = "zcash")]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PoolsFile {
@@ -2005,6 +2049,7 @@ impl AppConfig {
             .or_else(|| file.keys.as_ref().and_then(|k| k.keys_file.clone()));
 
         // Global pool defaults (`[pools]`), validated before any per-wallet override.
+        #[cfg(feature = "zcash")]
         let pools = resolve_global_pools(file.pools.as_ref())?;
 
         // The global `[keys] fresh_wallet_birthday_margin`, hoisted ahead of the wallet loop
@@ -2028,7 +2073,7 @@ impl AppConfig {
                 }
             });
             let coin = match &w.coin {
-                None => Coin::Zcash,
+                None => Coin::DEFAULT,
                 Some(token) => Coin::parse(token).ok_or_else(|| {
                     anyhow::anyhow!(
                         "unsupported coin {token:?} for wallet {name:?} (this build supports: {})",
@@ -2036,10 +2081,17 @@ impl AppConfig {
                     )
                 })?,
             };
+            // Whether this wallet is the Zcash engine's. Spelled as a bool rather than a
+            // comparison because `Coin::Zcash` does not exist in a bitcoin-only build, where
+            // every configured wallet is a Bitcoin one and the refusals below cover them all.
+            #[cfg(feature = "zcash")]
+            let is_zcash = coin == Coin::Zcash;
+            #[cfg(not(feature = "zcash"))]
+            let is_zcash = false;
             // Every other per-wallet key is the Zcash engine's (pool selection, the
             // zebra/lightwalletd backend overrides). On a non-Zcash wallet a set key would be
             // silently ignored, which reads as configuration and isn't - refuse it instead.
-            if coin != Coin::Zcash {
+            if !is_zcash {
                 // `server` is legal on any coin - each engine resolves the token with its own
                 // grammar (`backend::resolve_for_wallet` for Zcash, `btc::chain` for Bitcoin),
                 // so a Zcash token on a bitcoin wallet is refused there, naming the grammar.
@@ -2084,7 +2136,7 @@ impl AppConfig {
             }
             // The mirror image: the Bitcoin engine's own knob is refused on a Zcash wallet,
             // naming the key that plays its role there.
-            if coin == Coin::Zcash && w.lookahead.is_some() {
+            if is_zcash && w.lookahead.is_some() {
                 anyhow::bail!(
                     "[wallets.{name}] lookahead does not apply to a zcash wallet (it configures \
                      the Bitcoin engine's address lookahead; a Zcash wallet's gap limit is \
@@ -2099,6 +2151,7 @@ impl AppConfig {
             }
             let dir = w.dir.clone().unwrap_or_else(|| wallet_dir(&datadir, name));
             let backend_override = resolve_wallet_backend(name, w)?;
+            #[cfg(feature = "zcash")]
             let (
                 enabled,
                 default_receivers,
@@ -2132,13 +2185,21 @@ impl AppConfig {
                     coin,
                     chain,
                     backend: backend_override,
+                    #[cfg(feature = "zcash")]
                     pools: enabled,
+                    #[cfg(feature = "zcash")]
                     default_receivers,
+                    #[cfg(feature = "zcash")]
                     transparent_enabled,
+                    #[cfg(feature = "zcash")]
                     transparent_default,
+                    #[cfg(feature = "zcash")]
                     transparent_gap_limit,
+                    #[cfg(feature = "zcash")]
                     transparent_initial_scan,
+                    #[cfg(feature = "zcash")]
                     transparent_allow_beyond_recovery_window,
+                    #[cfg(feature = "zcash")]
                     transparent_gap_warn_threshold,
                     fresh_wallet_birthday_margin: w
                         .fresh_wallet_birthday_margin
@@ -2153,17 +2214,25 @@ impl AppConfig {
             .or_insert_with(|| WalletEntry {
                 dir: wallet_dir(&datadir, &default_wallet),
                 keys_file: keys_file_global.clone(),
-                coin: Coin::Zcash,
-                chain: Coin::Zcash.chain(network),
+                coin: Coin::DEFAULT,
+                chain: Coin::DEFAULT.chain(network),
                 backend: WalletBackendOverride::default(),
+                #[cfg(feature = "zcash")]
                 pools: pools.enabled.clone(),
+                #[cfg(feature = "zcash")]
                 default_receivers: pools.default_receivers.clone(),
+                #[cfg(feature = "zcash")]
                 transparent_enabled: pools.transparent_enabled,
+                #[cfg(feature = "zcash")]
                 transparent_default: pools.transparent_default,
+                #[cfg(feature = "zcash")]
                 transparent_gap_limit: pools.transparent_gap_limit,
+                #[cfg(feature = "zcash")]
                 transparent_initial_scan: pools.transparent_initial_scan,
+                #[cfg(feature = "zcash")]
                 transparent_allow_beyond_recovery_window: pools
                     .transparent_allow_beyond_recovery_window,
+                #[cfg(feature = "zcash")]
                 transparent_gap_warn_threshold: pools.transparent_gap_warn_threshold,
                 fresh_wallet_birthday_margin: global_birthday_margin
                     .unwrap_or(crate::init::FRESH_WALLET_BIRTHDAY_MARGIN),
@@ -2185,6 +2254,43 @@ impl AppConfig {
             assume_transparent_in_compact_blocks: None,
             proxy: None,
         });
+        // `[backend]`'s endpoint half configures the Zcash upstream (a zebrad JSON-RPC or a
+        // lightwalletd), so a build without that engine refuses a set key naming it rather than
+        // carrying a value nothing will ever dial. The section itself stays legal on every
+        // build: its timing and locality keys are what both engines' reconnect and
+        // cleartext-credential policies read.
+        #[cfg(not(feature = "zcash"))]
+        {
+            let zcash_only: &[(&str, bool)] = &[
+                (
+                    "server (or --server)",
+                    cli.server.is_some() || backend_file.server.is_some(),
+                ),
+                ("tls", backend_file.tls.is_some()),
+                ("tls_roots", backend_file.tls_roots.is_some()),
+                (
+                    "tls_insecure_skip_verify",
+                    backend_file.tls_insecure_skip_verify.is_some(),
+                ),
+                ("tls_ca_file", backend_file.tls_ca_file.is_some()),
+                (
+                    "tls_pinned_sha256",
+                    backend_file.tls_pinned_sha256.is_some(),
+                ),
+                (
+                    "assume_transparent_in_compact_blocks",
+                    backend_file.assume_transparent_in_compact_blocks.is_some(),
+                ),
+                ("proxy", backend_file.proxy.is_some()),
+            ];
+            if let Some((key, _)) = zcash_only.iter().find(|(_, set)| *set) {
+                anyhow::bail!(
+                    "[backend] {key} configures the Zcash engine, which this build does not \
+                     carry (this build supports: {})",
+                    Coin::supported_names()
+                );
+            }
+        }
         let server = select_server_token(cli.server.clone(), backend_file.server);
         let reconnect_base_secs = backend_file.reconnect_base_secs.unwrap_or(1).max(1);
         let backend = BackendConfig {
@@ -2249,7 +2355,9 @@ impl AppConfig {
             }
         }
 
+        #[cfg(feature = "zcash")]
         let zebra_file = file.zebra.unwrap_or_default();
+        #[cfg(feature = "zcash")]
         let zebra = ZebraConfig {
             rpc_user: zebra_file.rpc_user,
             rpc_password: zebra_file.rpc_password,
@@ -2404,7 +2512,7 @@ impl AppConfig {
             bind,
             port: cli.rpc_port.or(rpc_file.port).unwrap_or(match network {
                 ZNetwork::Main => defaults.rpc_port_main,
-                ZNetwork::Test | ZNetwork::Regtest(_) => defaults.rpc_port_test,
+                ZNetwork::Test | ZNetwork::Regtest => defaults.rpc_port_test,
             }),
             user: cli.rpc_user.clone().or(rpc_file.user),
             password: cli
@@ -2465,7 +2573,9 @@ impl AppConfig {
             rebroadcast_secs: sync_file.rebroadcast_secs.unwrap_or(60).max(1),
         };
 
+        #[cfg(feature = "zcash")]
         let spend_file = file.spend.unwrap_or_default();
+        #[cfg(feature = "zcash")]
         let spend = SpendConfig {
             trusted_confirmations: spend_file.trusted_confirmations.unwrap_or(3),
             untrusted_confirmations: spend_file.untrusted_confirmations.unwrap_or(10),
@@ -2489,8 +2599,11 @@ impl AppConfig {
                 .unwrap_or(DEFAULT_MIN_SPLIT_OUTPUT_VALUE),
         };
         // Fail at startup, not on the first balance/send call.
-        spend.confirmations_policy()?;
-        spend.validate_change_splitting()?;
+        #[cfg(feature = "zcash")]
+        {
+            spend.confirmations_policy()?;
+            spend.validate_change_splitting()?;
+        }
 
         let health_file = file.health.unwrap_or(HealthFile {
             enabled: None,
@@ -2521,6 +2634,7 @@ impl AppConfig {
             max_scan_lag: health_file.max_scan_lag.unwrap_or(4),
         };
 
+        #[cfg(feature = "zcash")]
         let fleet_file = file.fleet.unwrap_or(FleetFile {
             enabled: None,
             manifest_dir: None,
@@ -2528,6 +2642,7 @@ impl AppConfig {
             shard_size: None,
             cohort_depth: None,
         });
+        #[cfg(feature = "zcash")]
         let fleet = FleetConfig {
             enabled: fleet_file.enabled.unwrap_or(false),
             manifest_dir: fleet_file
@@ -2544,6 +2659,7 @@ impl AppConfig {
                 .unwrap_or(DEFAULT_FLEET_COHORT_DEPTH),
         };
         // A shard is a scan domain: zero accounts per shard would mean no wallet is ever placed.
+        #[cfg(feature = "zcash")]
         if fleet.shard_size == 0 {
             anyhow::bail!("[fleet] shard_size must be at least 1");
         }
@@ -2577,6 +2693,7 @@ impl AppConfig {
             default_wallet,
             wallets,
             backend,
+            #[cfg(feature = "zcash")]
             zebra,
             #[cfg(feature = "bitcoin")]
             bitcoind,
@@ -2587,10 +2704,13 @@ impl AppConfig {
             rpc,
             keys,
             sync,
+            #[cfg(feature = "zcash")]
             spend,
+            #[cfg(feature = "zcash")]
             pools,
             health,
             log,
+            #[cfg(feature = "zcash")]
             fleet,
         })
     }
@@ -2730,6 +2850,7 @@ fn resolve_wallet_backend(name: &str, w: &WalletFile) -> anyhow::Result<WalletBa
     })
 }
 
+#[cfg(feature = "zcash")]
 fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig> {
     let enabled = match file.and_then(|f| f.enabled.as_deref()) {
         Some(tokens) => ReceiverSet::parse(tokens).context("[pools] enabled")?,
@@ -2782,6 +2903,7 @@ fn resolve_global_pools(file: Option<&PoolsFile>) -> anyhow::Result<PoolsConfig>
 /// bound here: a very wide window is an operator's (costly) choice, warned about loudly at actor
 /// spawn ([`TRANSPARENT_GAP_LIMIT_COSTLY`] / [`TRANSPARENT_GAP_LIMIT_SEVERE`]) rather than
 /// rejected.
+#[cfg(feature = "zcash")]
 fn validate_transparent_flags(
     ctx: &str,
     transparent_enabled: bool,
@@ -2803,6 +2925,7 @@ fn validate_transparent_flags(
 /// Resolve and validate one wallet's pools/receivers against the global defaults. A wallet that
 /// overrides `pools` but not `default_receivers` receives into all of its enabled pools by
 /// default; a wallet that overrides neither inherits the global defaults.
+#[cfg(feature = "zcash")]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn resolve_wallet_pools(
     name: &str,
@@ -2869,10 +2992,12 @@ fn resolve_wallet_pools(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "zcash")]
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn global_pools_default_to_orchard_only() {
         let p = resolve_global_pools(None).unwrap();
@@ -2882,6 +3007,7 @@ mod tests {
         assert_eq!(p.default_receivers, p.enabled);
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn global_default_receivers_default_to_enabled() {
         let f = PoolsFile {
@@ -2895,6 +3021,7 @@ mod tests {
         assert_eq!(p.default_receivers, p.enabled);
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn global_receivers_must_be_subset_of_enabled() {
         let f = PoolsFile {
@@ -2907,6 +3034,7 @@ mod tests {
         assert!(err.contains("sapling"), "{err}");
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn global_unknown_pool_is_rejected() {
         let f = PoolsFile {
@@ -2921,6 +3049,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn global_empty_enabled_is_rejected() {
         let f = PoolsFile {
@@ -2931,6 +3060,7 @@ mod tests {
         assert!(resolve_global_pools(Some(&f)).is_err());
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn wallet_inherits_global_when_unset() {
         let global = PoolsConfig {
@@ -2950,6 +3080,7 @@ mod tests {
         assert_eq!(receivers, global.default_receivers);
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn wallet_overriding_pools_defaults_receivers_to_its_enabled() {
         // A wallet that narrows its pools but doesn't set receivers must not inherit the global
@@ -2972,6 +3103,7 @@ mod tests {
         assert_eq!(receivers, enabled);
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn wallet_receivers_not_subset_of_enabled_is_rejected() {
         let global = PoolsConfig::default();
@@ -2993,6 +3125,7 @@ mod tests {
         assert!(err.contains("subset"), "{err}");
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn transparent_flags_and_gap_limit() {
         // Default: transparent off, gap limit at the zecd default.
@@ -3147,6 +3280,7 @@ mod tests {
         assert!(err.contains("at least 1"), "{err}");
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn spend_section_builds_policy_and_validates() {
         // Parses from TOML; explicit values land in the policy.
@@ -3193,6 +3327,7 @@ mod tests {
     /// balances needs a lower one, and the default is sized for mainnet-scale value. Both keys
     /// must also be *rejected* when unusable rather than reaching the send path, where they are
     /// unwrapped - a `target_note_count = 0` used to be a panic waiting for the first send.
+    #[cfg(feature = "zcash")]
     #[test]
     fn change_splitting_defaults_parses_and_rejects_unusable_values() {
         assert_eq!(SpendConfig::default().target_note_count, 4);
@@ -3232,6 +3367,7 @@ mod tests {
         assert!(no_floor.validate_change_splitting().is_ok());
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn orchard_action_limit_defaults_and_parses() {
         // Absent -> the Zallet-matching default of 50.
@@ -3244,6 +3380,7 @@ mod tests {
         assert_eq!(f.orchard_action_limit, Some(0));
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn pipeline_proving_defaults_off_and_parses() {
         // Absent -> off (the inline send path, byte-identical to today's behaviour).
@@ -3255,6 +3392,7 @@ mod tests {
         assert_eq!(f.pipeline_proving, Some(false));
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn trust_own_transactions_defaults_on_and_parses() {
         // Absent -> on: wallet-authored transactions are marked trusted at store time.
@@ -3267,6 +3405,7 @@ mod tests {
         assert_eq!(f.trust_own_transactions, Some(true));
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn fleet_defaults_off_and_parses() {
         // Absent -> off. The fleet is experimental and opt-in: a daemon that never mentions
@@ -3288,6 +3427,7 @@ mod tests {
         assert_eq!(f.cohort_depth, Some(500));
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn privacy_policy_parses_known_values_only() {
         assert_eq!(
@@ -3318,6 +3458,7 @@ mod tests {
         assert!(SendPrivacy::parse("fullprivacy").is_err());
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn allows_transparent_recipient_ladder() {
         // The three upper rungs permit a transparent recipient; the two private rungs reject it.
@@ -3330,6 +3471,7 @@ mod tests {
         assert!(SendPrivacy::AllowFullyTransparent.allows_transparent_recipient());
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn allows_transparent_inputs_ladder() {
         // Only the two top rungs permit funding a send from transparent UTXOs (revealing the
@@ -3394,6 +3536,7 @@ mod tests {
     /// The library entry point carries the proxy the same way the binary's flag does, and it
     /// reaches the `Server` a `NodeBuilder` would dial - so an embedded node is proxied on the
     /// same terms as the daemon.
+    #[cfg(feature = "zcash")]
     #[test]
     fn a_library_consumers_override_reaches_the_resolved_server() {
         let dir = tempfile::tempdir().unwrap();
@@ -3571,6 +3714,7 @@ mod tests {
         assert!(toml::from_str::<BackendFile>("bogus_key = 1").is_err());
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn zebra_section_parses_and_validates() {
         let f: ConfigFile = toml::from_str(
@@ -3928,6 +4072,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     #[cfg(feature = "cli")]
     fn every_resolved_wallet_is_a_zcash_wallet() {
@@ -3952,6 +4097,7 @@ mod tests {
     /// token is one error raised in `resolve` (so the daemon, `config check`, and the
     /// embedded facade refuse it identically), naming the wallet and this build's supported
     /// set. Whether `"bitcoin"` is in that set is a property of the build.
+    #[cfg(feature = "zcash")]
     #[test]
     #[cfg(feature = "cli")]
     fn the_coin_key_is_validated_in_resolve() {
@@ -4014,6 +4160,7 @@ mod tests {
     /// Bitcoin wallets ride (default testnet3), an unsupported token is refused naming the
     /// accepted set, and outside the test environment - where it would be silently inert -
     /// it is refused too. A build without the bitcoin engine refuses any set value.
+    #[cfg(feature = "zcash")]
     #[test]
     #[cfg(feature = "cli")]
     fn the_btc_testnet_key_is_validated_in_resolve() {
@@ -4115,6 +4262,7 @@ mod tests {
 
     /// The Bitcoin engine's `lookahead`: resolved per wallet with BDK's default, at least 1,
     /// and refused on a Zcash wallet naming the key that plays its role there.
+    #[cfg(feature = "zcash")]
     #[test]
     #[cfg(all(feature = "cli", feature = "bitcoin"))]
     fn lookahead_is_a_bitcoin_wallet_knob() {
@@ -4155,6 +4303,7 @@ mod tests {
         assert!(err.contains("transparent_gap_limit"), "{err}");
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     #[cfg(feature = "cli")]
     fn wallet_chain_is_derived_from_the_daemon_environment() {
@@ -4186,6 +4335,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     #[cfg(feature = "cli")]
     fn per_wallet_backend_overrides_fall_back_to_the_global_section() {
@@ -4426,10 +4576,16 @@ mod tests {
             .is_empty());
     }
 
+    /// The example and docker configs must deserialize (`deny_unknown_fields` catches typos and
+    /// drift as the schema evolves).
+    ///
+    /// These three select the Zcash engine - `zecd.example.toml` documents `[pools]` and
+    /// `[spend]`, the deploy pair set `[zebra]` - so they parse in a build that carries it and
+    /// are refused as unknown sections in one that does not, which is the doctrine and is
+    /// asserted from the other side in `tests/cli.rs`.
+    #[cfg(feature = "zcash")]
     #[test]
     fn shipped_configs_parse() {
-        // The example and docker configs must deserialize (deny_unknown_fields catches typos and
-        // drift as the schema evolves).
         toml::from_str::<ConfigFile>(include_str!("../zecd.example.toml"))
             .expect("zecd.example.toml");
         // What `zecd example-config` emits must be loadable by the same binary that emitted it.
@@ -4439,5 +4595,40 @@ mod tests {
             .expect("deploy/zecd.toml");
         toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.mainnet.toml"))
             .expect("deploy/zecd.mainnet.toml");
+    }
+
+    /// The Bitcoin deploy samples are the mirror image: they parse wherever the BDK engine is
+    /// compiled in, including a build with no Zcash engine at all.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn shipped_bitcoin_configs_parse() {
+        for (name, body) in [
+            (
+                "deploy/zecd.btc-mainnet.toml",
+                include_str!("../deploy/zecd.btc-mainnet.toml"),
+            ),
+            (
+                "deploy/zecd.btc-mainnet-view.toml",
+                include_str!("../deploy/zecd.btc-mainnet-view.toml"),
+            ),
+            (
+                "deploy/zecd.btc-testnet3.toml",
+                include_str!("../deploy/zecd.btc-testnet3.toml"),
+            ),
+            (
+                "deploy/zecd.btc-testnet4.toml",
+                include_str!("../deploy/zecd.btc-testnet4.toml"),
+            ),
+            (
+                "deploy/zecd.btc-testnet4-kyoto.toml",
+                include_str!("../deploy/zecd.btc-testnet4-kyoto.toml"),
+            ),
+            (
+                "deploy/zecd.btc-testnet4-view.toml",
+                include_str!("../deploy/zecd.btc-testnet4-view.toml"),
+            ),
+        ] {
+            toml::from_str::<ConfigFile>(body).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 }

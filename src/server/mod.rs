@@ -268,7 +268,9 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    #[cfg(feature = "zcash")]
+    use std::time::Duration;
+    use std::time::Instant;
 
     use axum::body::Body as AxumBody;
     use axum::http::Request;
@@ -321,6 +323,7 @@ mod tests {
                 assume_transparent_in_compact_blocks: false,
                 proxy: None,
             },
+            #[cfg(feature = "zcash")]
             zebra: Default::default(),
             #[cfg(feature = "bitcoin")]
             bitcoind: Default::default(),
@@ -328,6 +331,7 @@ mod tests {
             fees: Default::default(),
             #[cfg(feature = "bitcoin")]
             mempool: Default::default(),
+            #[cfg(feature = "zcash")]
             fleet: Default::default(),
             rpc: rpc.clone(),
             keys: KeysConfig {
@@ -341,7 +345,9 @@ mod tests {
                 interval_secs: 20,
                 rebroadcast_secs: 60,
             },
+            #[cfg(feature = "zcash")]
             spend: crate::config::SpendConfig::default(),
+            #[cfg(feature = "zcash")]
             pools: crate::config::PoolsConfig::default(),
             health: crate::config::HealthConfig {
                 enabled: false,
@@ -366,6 +372,7 @@ mod tests {
                 work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
                 active: crate::state::ActiveCommands::default(),
                 operations: Arc::new(crate::operations::OperationRegistry::new()),
+                #[cfg(feature = "zcash")]
                 fleet: None,
             },
         }
@@ -556,6 +563,7 @@ mod tests {
     /// integration polling `/wallet/w2` with `getblockcount` treats a not-yet-scanned deposit as
     /// confirmed. `getblockcount` reads only the published sync status, so no DB/network is
     /// involved (the other four chain-status RPCs thread the routed name identically).
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn getblockcount_honors_wallet_routing() {
         use crate::network::ZNetwork;
@@ -609,6 +617,7 @@ mod tests {
     /// wallet's view of the chain the way the actor's `update_status` does. `fully_scanned` is
     /// deliberately left `None` by callers: `best_block` then answers purely from the published
     /// status, keeping these tests off the wallet DB.
+    #[cfg(feature = "zcash")]
     fn state_publishing(
         status: crate::wallet::SyncStatus,
     ) -> (
@@ -627,6 +636,7 @@ mod tests {
     }
 
     /// One `waitfor*` call against `state`, returning the envelope's `result`.
+    #[cfg(feature = "zcash")]
     async fn wait_call(state: HttpState, body: &str) -> Value {
         let r = router(state)
             .oneshot(req(body, Some(("u", "p"))))
@@ -635,6 +645,7 @@ mod tests {
         body_json(r).await["result"].clone()
     }
 
+    #[cfg(feature = "zcash")]
     fn status_at(hash: &str) -> crate::wallet::SyncStatus {
         crate::wallet::SyncStatus {
             best_block_hash: Some(hash.to_string()),
@@ -646,6 +657,7 @@ mod tests {
     /// immediately, and a height it has not is waited on - with a timeout returning the current
     /// block rather than raising, exactly as Bitcoin Core does. (A timeout that errored would
     /// push callers straight back to the poll loops these RPCs replace.)
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn waitforblockheight_answers_now_when_reached_and_times_out_otherwise() {
         let hash = "ab".repeat(32);
@@ -679,6 +691,7 @@ mod tests {
     /// backstop re-check - that is what makes it a blocking question rather than a poll with
     /// extra steps. The publish lands well inside the backstop interval, so a wait that only
     /// woke on the backstop would blow the bound here.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn waitfornewblock_wakes_on_the_published_status() {
         let (state, tx) = state_publishing(status_at(&"ab".repeat(32)));
@@ -708,6 +721,7 @@ mod tests {
 
     /// `waitforblock` watches the tip for one specific hash: the wallet's current best block
     /// answers immediately, any other hash waits (here, out to its timeout).
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn waitforblock_matches_the_current_best_block() {
         let hash = "ab".repeat(32);
@@ -744,6 +758,7 @@ mod tests {
 
     /// Argument errors follow Bitcoin Core's taxonomy, and none of them may block: a bad
     /// argument must be rejected before the wait starts.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn waitfor_rpcs_reject_bad_arguments_without_waiting() {
         let (state, _tx) = state_publishing(status_at(&"ab".repeat(32)));
@@ -792,6 +807,7 @@ mod tests {
 
     /// A `waitfor*` call with no timeout must still end when the daemon is stopping - otherwise
     /// it pins a work-queue slot through graceful shutdown and holds the process open.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn waitfor_rpcs_return_on_shutdown() {
         let (state, _tx) = state_publishing(status_at(&"ab".repeat(32)));
@@ -809,6 +825,7 @@ mod tests {
     /// `z_getoperationstatus` poll loop. Everything it needs is offline - an inert test wallet
     /// handle (only its *name* is read) plus an operation the test itself gates - so the wait's
     /// semantics are pinned here rather than only in the regtest tier.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn z_waitforoperation_blocks_until_the_operation_finishes() {
         use crate::error::RpcError;
@@ -904,6 +921,7 @@ mod tests {
     /// `error` rather than as an error on this call. This is the distinction the `finished`
     /// flag exists to make unambiguous - "the wait gave up" and "the operation failed" are
     /// different outcomes and must not look alike.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn z_waitforoperation_reports_a_failed_operation_as_finished() {
         use crate::error::RpcError;
@@ -950,6 +968,7 @@ mod tests {
 
     /// The wait is wallet-scoped like the rest of the operation-tracking surface, and rejects
     /// an opid it has no operation for instead of blocking on it.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn z_waitforoperation_is_wallet_scoped_and_rejects_unknown_ids() {
         use crate::error::RpcError;
@@ -1066,6 +1085,7 @@ mod tests {
     /// The unsupported fee-shifting params must be rejected with -8 *before* any wallet
     /// access (these run against a registry with no wallets at all), so the guard can never
     /// be bypassed by wallet state.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn money_semantics_params_are_rejected_before_wallet_access() {
         use crate::error::codes::RPC_INVALID_PARAMETER;
@@ -1103,6 +1123,7 @@ mod tests {
         assert_eq!(code, Some(RPC_WALLET_NOT_FOUND as i64));
     }
 
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn parameter_validation_codes() {
         use crate::error::codes::{RPC_INVALID_ADDRESS_OR_KEY, RPC_INVALID_PARAMETER};
@@ -1125,6 +1146,7 @@ mod tests {
     /// Bitcoin Core's argument-error taxonomy: a missing required param is the help error (-1),
     /// a wrong-typed one is a type error (-3), and no handler ever emits -32602 (which Core
     /// reserves for framing). All of these fire before any wallet access.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn missing_and_wrong_typed_params_use_core_codes() {
         use crate::error::codes::{RPC_MISC_ERROR, RPC_TYPE_ERROR};
@@ -1190,6 +1212,7 @@ mod tests {
 
     /// The newer wallet methods are wired into dispatch: they must fail on the missing
     /// wallet / missing params - never with -32601 (method not found).
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn new_wallet_methods_are_dispatched() {
         use crate::error::codes::RPC_METHOD_NOT_FOUND;
@@ -1217,6 +1240,7 @@ mod tests {
     /// zecd is stateless: the off-chain label store is gone entirely, so the label-dedicated
     /// methods are not implemented at all and must surface as method-not-found (-32601), like any
     /// other unknown method - never reach a handler.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn label_methods_are_not_implemented() {
         use crate::error::codes::RPC_METHOD_NOT_FOUND;
@@ -1262,6 +1286,7 @@ mod tests {
     /// invalid input; address/scriptPubKey/isscript appear only when valid. Transparent
     /// addresses carry their real scriptPubKey (vectors shared with zallet, from zcashd
     /// qa/rpc-tests/disablewallet.py).
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn validateaddress_matches_bitcoind_shape() {
         async fn result_for(addr: &str) -> Value {

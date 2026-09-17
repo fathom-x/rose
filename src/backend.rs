@@ -15,20 +15,34 @@
 //!  * bare `host:port` - a lightwalletd endpoint; TLS decided by the locality heuristic
 //!    (loopback/private-network plaintext, public TLS), overridable via `[backend] tls`.
 
+#[cfg(feature = "zcash")]
 use std::borrow::Cow;
+#[cfg(feature = "zcash")]
 use std::sync::Arc;
+#[cfg(feature = "zcash")]
 use std::time::Duration;
 
 use anyhow::anyhow;
+#[cfg(feature = "zcash")]
+use anyhow::bail;
+#[cfg(feature = "zcash")]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+#[cfg(feature = "zcash")]
 use rustls::crypto::WebPkiSupportedAlgorithms;
+#[cfg(feature = "zcash")]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(feature = "zcash")]
 use rustls::{DigitallySignedStruct, SignatureScheme};
+#[cfg(feature = "zcash")]
 use tonic::transport::{Channel, ClientTlsConfig};
 
+#[cfg(feature = "zcash")]
 use crate::chain::lwd::LwdSource;
-use crate::chain::zebra::{host_is_local, CleartextPolicy, ZebraAuth, ZebraSource};
+#[cfg(feature = "zcash")]
+use crate::chain::zebra::{ZebraAuth, ZebraSource};
+#[cfg(feature = "zcash")]
 use crate::chain::AnySource;
+#[cfg(feature = "zcash")]
 use crate::network::ZNetwork;
 
 /// The default upstream's local zebrad JSON-RPC ports (the ports named by
@@ -40,7 +54,9 @@ pub const ZEBRA_RPC_PORT_MAIN: u16 = 8234;
 pub const ZEBRA_RPC_PORT_TEST: u16 = 18234;
 
 /// The `zecrocks` public lightwalletd preset.
+#[cfg(feature = "zcash")]
 const ZEC_ROCKS_MAINNET: (&str, u16) = ("zec.rocks", 443);
+#[cfg(feature = "zcash")]
 const ZEC_ROCKS_TESTNET: (&str, u16) = ("testnet.zec.rocks", 443);
 
 /// Which set of root certificates to trust for lightwalletd TLS connections.
@@ -97,6 +113,7 @@ impl CertFingerprint {
     }
 
     /// The fingerprint of a presented certificate.
+    #[cfg(feature = "zcash")]
     fn of(cert: &CertificateDer<'_>) -> CertFingerprint {
         use sha2::{Digest as _, Sha256};
         let mut out = [0u8; 32];
@@ -107,6 +124,7 @@ impl CertFingerprint {
     /// Constant-time equality. A pin comparison is not a secret-dependent operation in any
     /// obvious threat model (the fingerprint is public data), but the compare is free and this
     /// keeps it from becoming an oracle if a pin is ever derived from something private.
+    #[cfg(feature = "zcash")]
     fn matches(&self, other: &CertFingerprint) -> bool {
         use subtle::ConstantTimeEq as _;
         self.0.ct_eq(&other.0).into()
@@ -166,12 +184,14 @@ impl TlsOptions {
 /// Handshake *signatures* are still verified against the presented key (the standard shape for
 /// this verifier): that costs nothing, keeps the handshake internally consistent, and the
 /// authentication decision being bypassed lives entirely in `verify_server_cert`.
+#[cfg(feature = "zcash")]
 #[derive(Debug)]
 struct NoServerCertVerification {
     /// Signature algorithms used for the TLS 1.2/1.3 handshake-signature checks.
     algorithms: WebPkiSupportedAlgorithms,
 }
 
+#[cfg(feature = "zcash")]
 impl NoServerCertVerification {
     fn new() -> Self {
         // `ring`, matching tonic's `tls-ring` feature - the one crypto provider this build
@@ -184,6 +204,7 @@ impl NoServerCertVerification {
     }
 }
 
+#[cfg(feature = "zcash")]
 impl ServerCertVerifier for NoServerCertVerification {
     fn verify_server_cert(
         &self,
@@ -228,6 +249,7 @@ impl ServerCertVerifier for NoServerCertVerification {
 /// which is what makes a bare self-signed certificate usable without weakening it to
 /// `tls_insecure_skip_verify`. That difference is the point of the two knobs, so keep both
 /// paths.
+#[cfg(feature = "zcash")]
 #[derive(Debug)]
 struct PinnedServerCertVerification {
     /// Any one of these matching the presented leaf is accepted.
@@ -238,6 +260,7 @@ struct PinnedServerCertVerification {
     algorithms: WebPkiSupportedAlgorithms,
 }
 
+#[cfg(feature = "zcash")]
 impl PinnedServerCertVerification {
     /// Build the verifier, compiling `ca_pem` (when given) into the trust anchors the chain
     /// check runs against.
@@ -281,6 +304,7 @@ impl PinnedServerCertVerification {
     }
 }
 
+#[cfg(feature = "zcash")]
 impl ServerCertVerifier for PinnedServerCertVerification {
     fn verify_server_cert(
         &self,
@@ -332,6 +356,7 @@ impl ServerCertVerifier for PinnedServerCertVerification {
 }
 
 /// Parse the certificates out of a PEM bundle (`[backend] tls_ca_file`).
+#[cfg(feature = "zcash")]
 fn read_pem_certificates(pem: &[u8]) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     use rustls::pki_types::pem::PemObject as _;
     CertificateDer::pem_slice_iter(pem)
@@ -353,7 +378,201 @@ pub fn parse_tls_mode(s: &str) -> anyhow::Result<Option<bool>> {
     }
 }
 
+// The cleartext-credential gate and the host-locality helpers under it. They live on this
+// side of the file - the ungated, engine-independent half - because both engines dial a
+// plaintext local node over credentials: the Zcash side through `chain::zebra`, the Bitcoin
+// side through `btc::chain`. Neither the policy nor the address classification has anything
+// coin-specific in it, and `config check` reports the verdict offline from either.
+
+/// Policy for the plaintext zebra connection's cleartext-credential gate. The zebra RPC is
+/// plaintext HTTP, so putting the `Authorization` header on the wire to a host off the local
+/// machine risks leaking spend-authority credentials to an eavesdropper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleartextPolicy {
+    /// Treat private / non-globally-routable addresses (RFC1918 `10/172.16/192.168`, link-local,
+    /// CGNAT `100.64/10`, IPv6 unique-local `fc00::/7` and link-local `fe80::/10`) as "local", so
+    /// a credentialed connect to a container/LAN zebra is allowed without an override. Default
+    /// `true` (matches the self-hosted `zebra → zecd` Docker/LAN norm); set `false` for a strict
+    /// loopback-only posture. `[backend] rfc1918_is_local`.
+    pub rfc1918_is_local: bool,
+    /// Allow credentials over cleartext to *any* host, including globally-routable ones - the
+    /// escape hatch when the hop is secured out-of-band (SSH/WireGuard tunnel, private overlay).
+    /// Default `false`. `[backend] allow_remote_cleartext`.
+    pub allow_remote_cleartext: bool,
+}
+
+impl Default for CleartextPolicy {
+    fn default() -> Self {
+        CleartextPolicy {
+            rfc1918_is_local: true,
+            allow_remote_cleartext: false,
+        }
+    }
+}
+
+/// Parse `host` as an IP literal, accepting an IPv6 literal in URL bracket form (`[::1]`) as
+/// well as bare (`::1`). Returns `None` for a hostname (no DNS lookup - the gate fails closed).
+fn parse_host_ip(host: &str) -> Option<std::net::IpAddr> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse().ok()
+}
+
+/// Is `host` a loopback address (an IP literal that `is_loopback()`, or the name `localhost`)?
+/// Hostnames other than `localhost` are treated as non-loopback without a DNS lookup.
+#[cfg(feature = "zcash")]
+pub(crate) fn host_is_loopback(host: &str) -> bool {
+    match parse_host_ip(host) {
+        Some(ip) => ip.is_loopback(),
+        None => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// Does `host` sit on the local machine or a private / non-globally-routable network, keeping the
+/// plaintext zebra connection off the public internet? Loopback and `localhost` always qualify;
+/// private ranges qualify only when `rfc1918_is_local` is set (see [`CleartextPolicy`]). A
+/// globally-routable host never qualifies, so credentials there would cross the internet in the
+/// clear - that is what the gate refuses. A hostname other than `localhost` is treated as
+/// non-local (no DNS lookup - fail closed).
+pub(crate) fn host_is_local(host: &str, rfc1918_is_local: bool) -> bool {
+    match parse_host_ip(host) {
+        Some(ip) => ip.is_loopback() || (rfc1918_is_local && ip_is_private_network(ip)),
+        None => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// The cleartext-credential gate: refuse to put zebrad's `Authorization` header on a plaintext
+/// connection to a globally-routable host. `credentialed` says whether a header would be sent at
+/// all (chain data is public, so an unauthenticated remote connect is always allowed).
+///
+/// A free function rather than an inline check in [`ZebraClient::new`] because it decides purely
+/// from configuration - no DNS, no I/O - which lets `zecd config check` report the refusal before
+/// deployment instead of leaving the operator with a daemon that starts and then never syncs.
+#[cfg(feature = "zcash")]
+pub(crate) fn cleartext_gate(
+    host: &str,
+    credentialed: bool,
+    policy: CleartextPolicy,
+) -> anyhow::Result<()> {
+    if credentialed
+        && !host_is_local(host, policy.rfc1918_is_local)
+        && !policy.allow_remote_cleartext
+    {
+        bail!(
+            "refusing to send zebra RPC credentials in cleartext to the globally-routable \
+             host '{host}': the zebra connection is plaintext HTTP, so the Authorization \
+             header would cross the public internet in the clear. Point zecd at a loopback or \
+             private-network zebra (127.0.0.1/localhost, an RFC1918/container address), tunnel \
+             the RPC port over SSH/WireGuard and use the local end, or set `[backend] \
+             allow_remote_cleartext = true` if the hop is already secured."
+        );
+    }
+    Ok(())
+}
+
+/// Is `ip` in a private / non-globally-routable range (as opposed to loopback, handled by the
+/// caller, or a globally-routable public address)?
+fn ip_is_private_network(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_private_network(v4),
+        // An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) inherits the mapped v4's class.
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(mapped) => ipv4_is_private_network(mapped),
+            None => {
+                let seg0 = v6.segments()[0];
+                (seg0 & 0xfe00) == 0xfc00 // unique local fc00::/7
+                    || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
+            }
+        },
+    }
+}
+
+fn ipv4_is_private_network(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    ip.is_private()      // RFC1918 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local() // 169.254/16
+        // CGNAT 100.64.0.0/10 (RFC 6598) - non-globally-routable, not covered by is_private().
+        || (a == 100 && (64..=127).contains(&b))
+}
+
+/// The host-locality helpers above, which both engines' cleartext gates decide from. Their own
+/// test module rather than the file's main one, which the Zcash endpoint machinery gates.
+#[cfg(test)]
+mod locality_tests {
+    use super::*;
+
+    #[test]
+    fn host_is_local_classifies_private_and_public() {
+        // Loopback + private/non-routable ranges count as local when rfc1918_is_local is on.
+        for h in [
+            "127.0.0.1",
+            "localhost",
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.255",
+            "172.18.0.2", // a typical Docker user-bridge address
+            "192.168.1.2",
+            "169.254.7.7", // link-local
+            "100.64.0.1",  // CGNAT (RFC 6598)
+            "::1",
+            "[fc00::1]",       // IPv6 unique-local
+            "fe80::1",         // IPv6 link-local
+            "::ffff:10.0.0.5", // IPv4-mapped private v6
+        ] {
+            assert!(host_is_local(h, true), "{h} should be local");
+        }
+        // Globally-routable hosts, and hostnames other than `localhost`, are never local.
+        for h in [
+            "203.0.113.5", // TEST-NET-3, stands in for a public IP
+            "8.8.8.8",
+            "172.32.0.1",   // just outside the 172.16/12 block
+            "100.128.0.1",  // just outside CGNAT 100.64/10
+            "2606:4700::1", // public v6
+            "zebra.internal",
+            "example.com",
+        ] {
+            assert!(!host_is_local(h, true), "{h} should be non-local");
+        }
+        // With rfc1918_is_local off, only loopback stays local - private ranges are treated as
+        // remote (the strict posture).
+        assert!(host_is_local("127.0.0.1", false));
+        assert!(host_is_local("localhost", false));
+        assert!(!host_is_local("10.0.0.5", false));
+        assert!(!host_is_local("192.168.1.2", false));
+    }
+
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn host_is_loopback_classifies_local_and_remote() {
+        // Loopback IP literals (v4 whole /8, v6, and URL-bracketed v6) and the name `localhost`.
+        for h in [
+            "127.0.0.1",
+            "127.5.6.7",
+            "::1",
+            "[::1]",
+            "localhost",
+            "LocalHost",
+        ] {
+            assert!(host_is_loopback(h), "{h} should be loopback");
+        }
+        // Anything routable, or a hostname other than `localhost`, is treated as remote.
+        for h in [
+            "10.0.0.5",
+            "192.168.1.2",
+            "0.0.0.0",
+            "zebra.internal",
+            "example.com",
+        ] {
+            assert!(!host_is_loopback(h), "{h} should be non-loopback");
+        }
+    }
+}
+
 /// What protocol a resolved endpoint speaks.
+#[cfg(feature = "zcash")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerKind {
     /// A lightwalletd `CompactTxStreamer` gRPC endpoint ("light mode").
@@ -363,6 +582,7 @@ pub enum ServerKind {
 }
 
 /// A resolved upstream endpoint (local zebrad or lightwalletd).
+#[cfg(feature = "zcash")]
 #[derive(Clone, Debug)]
 pub struct Server {
     host: Cow<'static, str>,
@@ -390,6 +610,7 @@ pub struct Server {
     proxy: Option<crate::socks::SocksProxy>,
 }
 
+#[cfg(feature = "zcash")]
 impl Server {
     fn new(host: Cow<'static, str>, port: u16, kind: ServerKind, network: ZNetwork) -> Self {
         Server {
@@ -529,7 +750,7 @@ impl Server {
             }
             ServerKind::ZebraRpc => {
                 self.zebra_auth.validate()?;
-                crate::chain::zebra::cleartext_gate(
+                cleartext_gate(
                     &self.host,
                     self.zebra_auth.is_configured(),
                     self.cleartext_policy,
@@ -693,6 +914,7 @@ impl Server {
 /// `[zebra]` credentials, the locality/cleartext policy, the TLS options, and the transparent
 /// capability assertion. The daemon builds each wallet's endpoint this way, and `zecd config
 /// check` inspects the same value, so what the check reports is what the daemon would dial.
+#[cfg(feature = "zcash")]
 pub fn resolve_configured(config: &crate::config::AppConfig) -> anyhow::Result<Server> {
     let mut server = resolve(&config.backend.server, config.network)?;
     apply_zebra_auth(&mut server, &config.zebra.auth());
@@ -721,6 +943,7 @@ pub fn resolve_configured(config: &crate::config::AppConfig) -> anyhow::Result<S
 /// lightwalletd-backed watch-only replica. Every per-endpoint capability check (the
 /// lightwalletd transparent-capability probe, the cleartext gate) is already per-actor, so it
 /// follows the wallet's own server without further plumbing.
+#[cfg(feature = "zcash")]
 pub fn resolve_for_wallet(
     config: &crate::config::AppConfig,
     entry: &crate::config::WalletEntry,
@@ -759,6 +982,7 @@ pub fn resolve_for_wallet(
 /// Attach zebrad RPC credentials (the `[zebra]` config section) to the resolved endpoint.
 /// A no-op for a lightwalletd endpoint: lightwalletd has no client auth, and the zebra
 /// credentials must never ride to a foreign host.
+#[cfg(feature = "zcash")]
 pub fn apply_zebra_auth(server: &mut Server, auth: &ZebraAuth) {
     if server.kind == ServerKind::ZebraRpc {
         server.zebra_auth = auth.clone();
@@ -768,6 +992,7 @@ pub fn apply_zebra_auth(server: &mut Server, auth: &ZebraAuth) {
 /// Set the locality/cleartext policy on the resolved endpoint (`[backend] rfc1918_is_local` /
 /// `allow_remote_cleartext`). For zebra it gates credentials over the plaintext connection;
 /// for lightwalletd it gates plaintext (query privacy) toward non-local hosts.
+#[cfg(feature = "zcash")]
 pub fn apply_cleartext_policy(server: &mut Server, policy: CleartextPolicy) {
     server.cleartext_policy = policy;
 }
@@ -775,6 +1000,7 @@ pub fn apply_cleartext_policy(server: &mut Server, policy: CleartextPolicy) {
 /// Set the lightwalletd TLS options (the `[backend] tls*` keys) on the resolved endpoint. The
 /// scheme prefix wins over the configured `tls` mode (an explicit `https://`/`http://` already
 /// forced it at resolve time), so that one field is merged rather than overwritten.
+#[cfg(feature = "zcash")]
 pub fn apply_tls(server: &mut Server, opts: TlsOptions) {
     let scheme_forced = server.tls.force_tls;
     server.tls = opts;
@@ -786,6 +1012,7 @@ pub fn apply_tls(server: &mut Server, opts: TlsOptions) {
 /// Record the operator's assertion that this lightwalletd serves transparent data in compact
 /// blocks (`[backend] assume_transparent_in_compact_blocks`), overriding the connect-time
 /// capability probe. A no-op for a `zebra://` endpoint, whose block scan always covers it.
+#[cfg(feature = "zcash")]
 pub fn apply_transparent_capability_override(server: &mut Server, assume: bool) {
     if assume && server.kind != ServerKind::Lightwalletd {
         tracing::warn!(
@@ -801,17 +1028,19 @@ pub fn apply_transparent_capability_override(server: &mut Server, assume: bool) 
 ///
 /// Unlike the TLS and capability mutators this applies to *both* endpoint kinds - the point of
 /// the knob is that nothing zecd dials bypasses the proxy.
+#[cfg(feature = "zcash")]
 pub fn apply_proxy(server: &mut Server, proxy: Option<crate::socks::SocksProxy>) {
     server.proxy = proxy;
 }
 
 /// Resolve the configured `server` token into a single upstream endpoint. See the module doc
 /// for the accepted grammar.
+#[cfg(feature = "zcash")]
 pub fn resolve(server: &str, network: ZNetwork) -> anyhow::Result<Server> {
     if server == "zebra" {
         let port = match network {
             ZNetwork::Main => ZEBRA_RPC_PORT_MAIN,
-            ZNetwork::Test | ZNetwork::Regtest(_) => ZEBRA_RPC_PORT_TEST,
+            ZNetwork::Test | ZNetwork::Regtest => ZEBRA_RPC_PORT_TEST,
         };
         return Ok(Server::new(
             Cow::Borrowed("127.0.0.1"),
@@ -824,7 +1053,7 @@ pub fn resolve(server: &str, network: ZNetwork) -> anyhow::Result<Server> {
         let (host, port) = match network {
             ZNetwork::Main => ZEC_ROCKS_MAINNET,
             ZNetwork::Test => ZEC_ROCKS_TESTNET,
-            ZNetwork::Regtest(_) => {
+            ZNetwork::Regtest => {
                 return Err(anyhow!(
                     "the 'zecrocks' preset serves mainnet and testnet only (regtest needs a \
                      local upstream)"
@@ -871,7 +1100,7 @@ pub fn resolve(server: &str, network: ZNetwork) -> anyhow::Result<Server> {
     Ok(s)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "zcash"))]
 mod tests {
     use super::*;
 

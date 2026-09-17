@@ -2,6 +2,7 @@
 //! `zcash-devtool/src/commands/wallet/init.rs`.
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "zcash")]
 use std::time::Duration;
 
 use age::secrecy::ExposeSecret as _;
@@ -11,20 +12,27 @@ use secrecy::{SecretVec, Zeroize};
 use tokio::io::AsyncWriteExt as _;
 
 use tracing::warn;
+#[cfg(feature = "zcash")]
 use zcash_client_backend::data_api::{
     Account as _, AccountPurpose, AccountSource, WalletRead, WalletWrite,
 };
+#[cfg(feature = "zcash")]
 use zcash_keys::keys::UnifiedFullViewingKey;
+#[cfg(feature = "zcash")]
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
+#[cfg(feature = "zcash")]
 use crate::backend;
+#[cfg(feature = "zcash")]
 use crate::chain::ChainSource as _;
 use crate::config::{AppConfig, WalletEntry};
 #[cfg(feature = "cli")]
 use crate::config::{ExportUfvkArgs, ExportXpubArgs, InitArgs, RescanArgs};
 use crate::network::ZNetwork;
+#[cfg(feature = "zcash")]
 use crate::pools::{Receiver, ReceiverSet};
 use crate::wallet::keys;
+#[cfg(feature = "zcash")]
 use crate::wallet::open;
 use crate::wallet::store::{Passphrase, WalletStore};
 
@@ -50,6 +58,7 @@ pub const BTC_FRESH_WALLET_BIRTHDAY_MARGIN: u32 = 6;
 /// `fresh_wallet_birthday_margin` nor the global `[keys]` one is set.
 pub fn default_fresh_wallet_birthday_margin(coin: crate::coin::Coin) -> u32 {
     match coin {
+        #[cfg(feature = "zcash")]
         crate::coin::Coin::Zcash => FRESH_WALLET_BIRTHDAY_MARGIN,
         #[cfg(feature = "bitcoin")]
         crate::coin::Coin::Bitcoin => BTC_FRESH_WALLET_BIRTHDAY_MARGIN,
@@ -309,6 +318,7 @@ fn height_for_time(
 /// its credentials, cleartext policy, TLS and capability override applied - and read its
 /// chain tip. One connection, shared by every init-time need for the chain (the tip a fresh
 /// birthday anchors on, the tree state, a date search) and by `rescan --birthday <date>`.
+#[cfg(feature = "zcash")]
 async fn connect_zcash_upstream(
     config: &AppConfig,
     network: ZNetwork,
@@ -317,7 +327,7 @@ async fn connect_zcash_upstream(
     backend::apply_zebra_auth(&mut server, &config.zebra.auth());
     backend::apply_cleartext_policy(
         &mut server,
-        crate::chain::zebra::CleartextPolicy {
+        crate::backend::CleartextPolicy {
             rfc1918_is_local: config.backend.rfc1918_is_local,
             allow_remote_cleartext: config.backend.allow_remote_cleartext,
         },
@@ -346,6 +356,7 @@ async fn connect_zcash_upstream(
 
 /// [`HeightSearch`] driven against the Zcash upstream: the block time at each probed
 /// height comes from the tree state, one unary call both backends serve.
+#[cfg(feature = "zcash")]
 async fn zcash_height_for_date(
     client: &mut crate::chain::AnySource,
     chain_tip: u32,
@@ -366,6 +377,7 @@ async fn zcash_height_for_date(
 /// starts there - much faster than the old Sapling-activation default while never missing an
 /// Orchard note. A Sapling-enabled wallet must start at Sapling activation, where it could
 /// first hold notes.
+#[cfg(feature = "zcash")]
 fn restore_birthday_default(network: ZNetwork, pools: &ReceiverSet) -> (u32, &'static str) {
     let (upgrade, label) = if pools.contains(Receiver::Sapling) {
         (NetworkUpgrade::Sapling, "Sapling")
@@ -455,18 +467,26 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
         .unwrap_or_else(|| WalletEntry {
             dir: crate::config::wallet_dir(&config.datadir, wallet),
             keys_file: None,
-            coin: crate::coin::Coin::Zcash,
-            chain: crate::coin::Coin::Zcash.chain(config.network),
+            coin: crate::coin::Coin::DEFAULT,
+            chain: crate::coin::Coin::DEFAULT.chain(config.network),
             backend: Default::default(),
+            #[cfg(feature = "zcash")]
             pools: config.pools.enabled.clone(),
+            #[cfg(feature = "zcash")]
             default_receivers: config.pools.default_receivers.clone(),
+            #[cfg(feature = "zcash")]
             transparent_enabled: config.pools.transparent_enabled,
+            #[cfg(feature = "zcash")]
             transparent_default: config.pools.transparent_default,
+            #[cfg(feature = "zcash")]
             transparent_gap_limit: config.pools.transparent_gap_limit,
+            #[cfg(feature = "zcash")]
             transparent_initial_scan: config.pools.transparent_initial_scan,
+            #[cfg(feature = "zcash")]
             transparent_allow_beyond_recovery_window: config
                 .pools
                 .transparent_allow_beyond_recovery_window,
+            #[cfg(feature = "zcash")]
             transparent_gap_warn_threshold: config.pools.transparent_gap_warn_threshold,
             fresh_wallet_birthday_margin: config
                 .keys
@@ -647,15 +667,35 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     crate::migrate::migrate(config)?;
 
     let entry = resolve_wallet_entry(config, &wallet);
-    // A Bitcoin wallet takes the BDK engine's init path. Branch before any read that assumes
-    // a Zcash entry; the datadir lock and migration above cover both engines. Like the Zcash
-    // path, it dials its upstream (bitcoind) once - but only to anchor a freshly generated
-    // wallet's birthday just below the tip; a restore (SegWit-activation floor) or an
-    // explicit --birthday initializes fully offline.
-    #[cfg(feature = "bitcoin")]
-    if entry.coin == crate::coin::Coin::Bitcoin {
-        return init_bitcoin_wallet(config, entry, wallet, key, encryption, birthday_opt).await;
+    // Each engine initializes its own wallet from here: the datadir lock and the layout
+    // migration above cover both, and everything below the branch reads an entry only that
+    // engine can interpret. Both dial their upstream once to anchor a freshly generated
+    // wallet's birthday (the Zcash side on the tree state at `birthday - 1`, the Bitcoin side
+    // just below the tip); a restore or an explicit --birthday initializes offline.
+    match entry.coin {
+        #[cfg(feature = "zcash")]
+        crate::coin::Coin::Zcash => {
+            init_zcash_wallet(config, entry, wallet, key, encryption, birthday_opt).await
+        }
+        #[cfg(feature = "bitcoin")]
+        crate::coin::Coin::Bitcoin => {
+            init_bitcoin_wallet(config, entry, wallet, key, encryption, birthday_opt).await
+        }
     }
+}
+
+/// [`init_wallet`] for a Zcash wallet: the librustzcash account, its `keys.toml`, and the
+/// birthday anchored on the tree state at `birthday - 1`. Split out so the shared prelude
+/// above (the datadir lock, the layout migration, the entry lookup) runs for every coin.
+#[cfg(feature = "zcash")]
+async fn init_zcash_wallet(
+    config: &AppConfig,
+    entry: WalletEntry,
+    wallet: String,
+    key: InitKey,
+    encryption: EncryptionInput,
+    birthday_opt: Option<Birthday>,
+) -> anyhow::Result<InitOutcome> {
     let keys_path = entry.keys_path();
     let enabled_pools = entry.pools.clone();
     let birthday_margin = entry.fresh_wallet_birthday_margin;
@@ -849,14 +889,17 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     };
 
     match &at_rest {
-        AtRest::ViewOnly => {
-            WalletStore::init_view_only(&keys_path, birthday.height(), network, &pinned_ufvk)?
-        }
+        AtRest::ViewOnly => WalletStore::init_view_only(
+            &keys_path,
+            birthday.height().into(),
+            network,
+            &pinned_ufvk,
+        )?,
         AtRest::Passphrase(passphrase) => WalletStore::init_with_passphrase(
             &keys_path,
             passphrase.clone(),
             require_mnemonic(),
-            birthday.height(),
+            birthday.height().into(),
             network,
             &pinned_ufvk,
         )?,
@@ -864,7 +907,7 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
             &keys_path,
             recipients.iter().map(|r| r.as_ref() as _),
             require_mnemonic(),
-            birthday.height(),
+            birthday.height().into(),
             network,
             &pinned_ufvk,
         )?,
@@ -1324,7 +1367,7 @@ async fn init_bitcoin_wallet(
             }
         }
     };
-    let birthday = BlockHeight::from(resolved.height);
+    let birthday = resolved.height;
 
     std::fs::create_dir_all(&wallet_dir)?;
 
@@ -1350,7 +1393,7 @@ async fn init_bitcoin_wallet(
             wallet_dir,
             keys_path,
             network,
-            birthday: u32::from(birthday),
+            birthday,
             watch_only: true,
             encrypted: false,
             identity_path: None,
@@ -1423,7 +1466,7 @@ async fn init_bitcoin_wallet(
         wallet_dir,
         keys_path,
         network,
-        birthday: u32::from(birthday),
+        birthday,
         watch_only: false,
         encrypted: matches!(at_rest, AtRest::Passphrase(_)),
         identity_path: matches!(at_rest, AtRest::Identity(_)).then_some(identity_path),
@@ -1487,8 +1530,13 @@ pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<
 /// for scanning anyway) and never touches spending material.
 pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<String> {
     let entry = resolve_wallet_entry(config, wallet);
-    #[cfg(feature = "bitcoin")]
-    if entry.coin == crate::coin::Coin::Bitcoin {
+    // Without the engine every configured wallet is a Bitcoin wallet (`coin = "zcash"` is
+    // refused at config resolution), so the refusal below covers that build entirely.
+    #[cfg(feature = "zcash")]
+    let is_zcash = entry.coin == crate::coin::Coin::Zcash;
+    #[cfg(not(feature = "zcash"))]
+    let is_zcash = false;
+    if !is_zcash {
         return Err(anyhow!(
             "wallet '{}' is a Bitcoin wallet; a Unified Full Viewing Key is a Zcash key. Use \
              `zecd export-xpub` for its account xpub (and `init --xpub` on the watch-only \
@@ -1496,36 +1544,44 @@ pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<St
             wallet
         ));
     }
-    let keys_path = entry.keys_path();
-    let network = entry.zcash_network();
-    // Read-only and lock-free (it must run beside a live daemon), so it cannot migrate the
-    // layout - but it still reads a wallet database the daemon has not migrated yet.
-    let engine_dir = crate::migrate::engine_dir_for_reading(&entry);
-
-    if !WalletStore::exists(&keys_path) {
-        return Err(anyhow!(
-            "wallet '{}' is not initialized ({} missing)",
-            wallet,
-            keys_path.display()
-        ));
+    #[cfg(not(feature = "zcash"))]
+    {
+        let _ = entry;
+        unreachable!("a Zcash wallet cannot be configured without the engine")
     }
-    // The UFVK encoding is network-scoped; refuse a network flag that contradicts the wallet
-    // on disk rather than emit a key the watch-only side would reject.
-    let st = WalletStore::read(&keys_path)?;
-    ensure_store_matches(&st, wallet, network)?;
+    #[cfg(feature = "zcash")]
+    {
+        let keys_path = entry.keys_path();
+        let network = entry.zcash_network();
+        // Read-only and lock-free (it must run beside a live daemon), so it cannot migrate the
+        // layout - but it still reads a wallet database the daemon has not migrated yet.
+        let engine_dir = crate::migrate::engine_dir_for_reading(&entry);
 
-    let db = open::open_read(network, &engine_dir)?;
-    let account_id = *db
-        .get_account_ids()?
-        .first()
-        .ok_or_else(|| anyhow!("wallet has no accounts; run `init` first"))?;
-    let account = db
-        .get_account(account_id)?
-        .ok_or_else(|| anyhow!("selected account not found"))?;
-    let ufvk = account
-        .ufvk()
-        .ok_or_else(|| anyhow!("account has no unified full viewing key"))?;
-    Ok(ufvk.encode(&network))
+        if !WalletStore::exists(&keys_path) {
+            return Err(anyhow!(
+                "wallet '{}' is not initialized ({} missing)",
+                wallet,
+                keys_path.display()
+            ));
+        }
+        // The UFVK encoding is network-scoped; refuse a network flag that contradicts the wallet
+        // on disk rather than emit a key the watch-only side would reject.
+        let st = WalletStore::read(&keys_path)?;
+        ensure_store_matches(&st, wallet, network)?;
+
+        let db = open::open_read(network, &engine_dir)?;
+        let account_id = *db
+            .get_account_ids()?
+            .first()
+            .ok_or_else(|| anyhow!("wallet has no accounts; run `init` first"))?;
+        let account = db
+            .get_account(account_id)?
+            .ok_or_else(|| anyhow!("selected account not found"))?;
+        let ufvk = account
+            .ufvk()
+            .ok_or_else(|| anyhow!("account has no unified full viewing key"))?;
+        Ok(ufvk.encode(&network))
+    }
 }
 
 /// `zecd export-xpub`: print a Bitcoin wallet's account xpub with its key origin
@@ -1648,10 +1704,13 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
         Some(birthday) if entry.coin == crate::coin::Coin::Bitcoin => {
             Some(resolve_rescan_birthday_bitcoin(config, &entry, birthday).await?)
         }
+        #[cfg(feature = "zcash")]
         Some(birthday) => Some(resolve_rescan_birthday_zcash(config, &entry, birthday).await?),
+        #[cfg(not(feature = "zcash"))]
+        Some(_) => unreachable!("every wallet is a Bitcoin wallet without the Zcash engine"),
     };
     let confirm = |st: &WalletStore| -> anyhow::Result<bool> {
-        let recorded = u32::from(st.birthday);
+        let recorded = st.birthday;
         let from = match new_birthday {
             Some((height, _)) => format!("the new birthday {height} (moved from {recorded})"),
             None => format!("the wallet birthday ({recorded})"),
@@ -1689,38 +1748,29 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
         Ok(line.trim() == "yes")
     };
 
-    #[cfg(feature = "bitcoin")]
-    let removed = if entry.coin == crate::coin::Coin::Bitcoin {
-        rescan_bitcoin_wallet(
-            config.network,
-            &args.wallet,
-            // The lock (and the migration under it) are this wrapper's, taken above.
-            None,
-            &entry.keys_path(),
-            &entry.engine_dir(),
-            &crate::config::btc_kyoto_dir(&entry.dir),
-            confirm,
-        )?
-    } else {
-        rescan_wallet(
+    // Each engine deletes its own rebuildable state. The lock (and the migration under it) are
+    // this wrapper's, taken above, so both are passed `None` for it.
+    let removed = match entry.coin {
+        #[cfg(feature = "zcash")]
+        crate::coin::Coin::Zcash => rescan_wallet(
             entry.zcash_network(),
             &args.wallet,
             None,
             &entry.keys_path(),
             &entry.engine_dir(),
             confirm,
-        )?
+        )?,
+        #[cfg(feature = "bitcoin")]
+        crate::coin::Coin::Bitcoin => rescan_bitcoin_wallet(
+            config.network,
+            &args.wallet,
+            None,
+            &entry.keys_path(),
+            &entry.engine_dir(),
+            &crate::config::btc_kyoto_dir(&entry.dir),
+            confirm,
+        )?,
     };
-    #[cfg(not(feature = "bitcoin"))]
-    let removed = rescan_wallet(
-        entry.zcash_network(),
-        &args.wallet,
-        // The lock (and the migration under it) are this wrapper's, taken above.
-        None,
-        &entry.keys_path(),
-        &entry.engine_dir(),
-        confirm,
-    )?;
 
     if removed.is_empty() {
         eprintln!(
@@ -1737,14 +1787,14 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
         );
     }
     if let Some((height, time)) = new_birthday {
-        WalletStore::set_birthday(&entry.keys_path(), BlockHeight::from(height), time)?;
+        WalletStore::set_birthday(&entry.keys_path(), height, time)?;
         eprintln!("Wallet '{}' birthday set to {height}.", args.wallet);
     }
     let st = WalletStore::read(&entry.keys_path())?;
     eprintln!(
         "Start zecd and it will rebuild the account from keys.toml and rescan from birthday {} \
          (requires [keys] bootstrap_from_keys, which is on by default).{}",
-        u32::from(st.birthday),
+        st.birthday,
         if st.is_encrypted() {
             "\nThis wallet is passphrase-encrypted: the rebuild starts at the first \
              `walletpassphrase` after the daemon is up."
@@ -1759,6 +1809,7 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
 /// records: a height verbatim, a date by the same upstream block-time search `init` runs
 /// (dialing the configured backend once; refused on regtest, whose timestamps mean nothing).
 /// A Zcash wallet never keeps the date - the search answers exactly.
+#[cfg(feature = "zcash")]
 #[cfg(feature = "cli")]
 async fn resolve_rescan_birthday_zcash(
     config: &AppConfig,
@@ -1833,6 +1884,7 @@ async fn resolve_rescan_birthday_bitcoin(
 /// The only wallet that cannot be rebuilt is a watch-only `keys.toml` written before the pin
 /// existed and never opened by a daemon since (a start backfills it trust-on-first-use); there
 /// the recovery is still a fresh `init --ufvk`.
+#[cfg(feature = "zcash")]
 pub fn rescan_wallet(
     network: ZNetwork,
     wallet: &str,
@@ -1984,6 +2036,7 @@ fn remove_artifacts(dir: &Path, artifacts: &[&str]) -> anyhow::Result<Vec<String
 /// left over from a different wallet, or otherwise unexpected, and silently adding the
 /// operator's account beside it would let the daemon later serve the pre-existing (first)
 /// account's addresses. Fail loud and let the operator decide.
+#[cfg(feature = "zcash")]
 fn ensure_no_preexisting_account(
     db: &open::WriteDb,
     wallet: &str,
@@ -2027,6 +2080,7 @@ fn ensure_store_matches(
 /// holds spending keys, returning its name. Used by the `init` guard so a second spending
 /// wallet is refused before any work is done. The scope is `config.wallets` - exactly the set
 /// the daemon would load - so the two guards agree.
+#[cfg(feature = "zcash")]
 fn existing_spending_wallet(
     network: crate::network::ZNetwork,
     wallets: &std::collections::BTreeMap<String, WalletEntry>,
@@ -2045,6 +2099,7 @@ fn existing_spending_wallet(
 /// for `watch_only`). Best-effort: a wallet whose DB can't be read or has no account is treated
 /// as non-spending, so a single unreadable sibling never blocks `init` - the daemon's startup
 /// guard is the backstop.
+#[cfg(feature = "zcash")]
 fn wallet_has_spending_keys(network: crate::network::ZNetwork, engine_dir: &Path) -> bool {
     let Ok(db) = open::open_read(network, engine_dir) else {
         return false;
@@ -2113,6 +2168,7 @@ async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipie
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "zcash")]
     use zcash_client_backend::data_api::AccountBirthday;
 
     /// The whole offline Bitcoin init: no upstream is dialed, `keys.toml` and the wallet
@@ -2327,6 +2383,7 @@ mod tests {
     }
 
     /// The coin-specific key flags refuse the other coin's wallet, naming the right flag.
+    #[cfg(feature = "zcash")]
     #[cfg(all(feature = "bitcoin", feature = "cli"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn xpub_and_ufvk_flags_are_coin_specific() {
@@ -2921,6 +2978,7 @@ mod tests {
         assert_eq!(outcome.birthday, 50_000 - 2);
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn restore_birthday_default_is_pool_aware() {
         use crate::pools::{Receiver, ReceiverSet};
@@ -2963,17 +3021,23 @@ mod tests {
         assert!(validate_passphrase("a much longer passphrase").is_ok());
     }
 
+    #[cfg(feature = "zcash")]
     use std::collections::BTreeMap;
 
     use bip0039::{English, Mnemonic};
+    #[cfg(feature = "zcash")]
     use zcash_client_backend::data_api::chain::ChainState;
+    #[cfg(feature = "zcash")]
     use zcash_keys::keys::UnifiedSpendingKey;
+    #[cfg(feature = "zcash")]
     use zcash_primitives::block::BlockHash;
+    #[cfg(feature = "zcash")]
     use zcash_protocol::consensus::BlockHeight;
 
     use crate::network;
 
     /// The Orchard-only pool set these tests use (pool config is irrelevant to them).
+    #[cfg(feature = "zcash")]
     fn orchard_pools() -> crate::pools::ReceiverSet {
         crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard)
     }
@@ -2984,6 +3048,7 @@ mod tests {
         midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
         moment stage";
 
+    #[cfg(feature = "zcash")]
     fn test_seed() -> SecretVec<u8> {
         let mut seed = <Mnemonic<English>>::from_phrase(TEST_PHRASE)
             .unwrap()
@@ -2993,6 +3058,7 @@ mod tests {
         secret
     }
 
+    #[cfg(feature = "zcash")]
     fn genesis_birthday() -> AccountBirthday {
         AccountBirthday::from_parts(
             ChainState::empty(BlockHeight::from_u32(0), BlockHash([0u8; 32])),
@@ -3001,6 +3067,7 @@ mod tests {
     }
 
     /// The test seed's index-0 UFVK in its network-scoped encoding (what `init` pins).
+    #[cfg(feature = "zcash")]
     fn test_ufvk_encoded(net: crate::network::ZNetwork) -> String {
         crate::wallet::binding::seed_ufvk_encoded(
             net,
@@ -3013,6 +3080,7 @@ mod tests {
     /// Build a fully-initialized spending wallet (keys.toml with a seed + a seed-derived
     /// account) at `dir`, so both the `WalletStore::exists` gate and the DB account match a
     /// real `zecd init`.
+    #[cfg(feature = "zcash")]
     fn make_spending_wallet(dir: &Path) {
         let net = network::regtest();
         let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
@@ -3020,7 +3088,7 @@ mod tests {
             &crate::wallet::store::keys_path(dir),
             Passphrase::from("test-pass".to_string()),
             &mnemonic,
-            BlockHeight::from_u32(1),
+            1,
             net,
             &test_ufvk_encoded(net),
         )
@@ -3032,17 +3100,19 @@ mod tests {
 
     /// The engine directory inside a wallet directory - where the databases the helpers below
     /// build actually live (`keys.toml` stays at `dir` itself).
+    #[cfg(feature = "zcash")]
     fn engine_of(dir: &Path) -> PathBuf {
         crate::config::engine_dir(dir, crate::coin::Coin::Zcash)
     }
 
     /// Build a fully-initialized watch-only wallet (seedless keys.toml + a ViewOnly UFVK
     /// import) at `dir`.
+    #[cfg(feature = "zcash")]
     fn make_watch_only_wallet(dir: &Path) {
         let net = network::regtest();
         WalletStore::init_view_only(
             &crate::wallet::store::keys_path(dir),
-            BlockHeight::from_u32(1),
+            1,
             net,
             &test_ufvk_encoded(net),
         )
@@ -3072,6 +3142,7 @@ mod tests {
     /// The init-time data-directory guard: an account-bearing database refuses `init`, an
     /// empty (fresh) one passes. This is the check that keeps `zecd init` from absorbing a
     /// planted or leftover database's account as the wallet's own.
+    #[cfg(feature = "zcash")]
     #[test]
     fn init_refuses_a_database_that_already_has_an_account() {
         let net = network::regtest();
@@ -3093,6 +3164,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn spending_keys_detected_for_seed_wallet_not_watch_only() {
         let net = network::regtest();
@@ -3118,6 +3190,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn existing_spending_wallet_finds_the_other_spender() {
         let net = network::regtest();
@@ -3181,6 +3254,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn watch_only_siblings_do_not_count_as_spenders() {
         let net = network::regtest();
@@ -3231,6 +3305,7 @@ mod tests {
     /// database files (data.sqlite + the compact-block cache) and keeps `keys.toml` - the
     /// state the daemon's empty-datadir bootstrap path then rebuilds from - and it is
     /// idempotent (a second run finds nothing to delete and still succeeds).
+    #[cfg(feature = "zcash")]
     #[test]
     fn rescan_wipes_the_database_but_keeps_keys_toml() {
         let net = network::regtest();
@@ -3251,7 +3326,7 @@ mod tests {
             &engine,
             |st| {
                 // The confirmation sees the parsed store (the prompt shows its birthday).
-                assert_eq!(u32::from(st.birthday), 1);
+                assert_eq!(st.birthday, 1);
                 Ok(true)
             },
         )
@@ -3291,6 +3366,7 @@ mod tests {
     /// every startup verifies the account against. Before this, the documented recovery for a
     /// broken view-only database was deleting the directory and re-running `init --ufvk` by
     /// hand, which needed the key re-supplied out of band despite it already being on disk.
+    #[cfg(feature = "zcash")]
     #[test]
     fn rescan_rebuilds_a_watch_only_wallet_from_its_pinned_ufvk() {
         let net = network::regtest();
@@ -3316,13 +3392,14 @@ mod tests {
         // wallet that cannot be rebuilt at all, which is the state this path exists to avoid.
         let st = WalletStore::read(&keys_path).expect("keys.toml survives");
         assert_eq!(st.pinned_ufvk(), Some(pin_before.as_str()));
-        assert_eq!(u32::from(st.birthday), 1, "the birthday survives too");
+        assert_eq!(st.birthday, 1, "the birthday survives too");
         assert!(!st.has_seed(), "still watch-only");
     }
 
     /// `rescan`'s refusals: an uninitialized wallet (no keys.toml means no rebuild source), a
     /// watch-only wallet (no seed - the bootstrap path can't recreate a view-only account), a
     /// network mismatch, and a declined confirmation - each before anything is deleted.
+    #[cfg(feature = "zcash")]
     #[test]
     fn rescan_refuses_unrebuildable_wallets_and_declined_confirmation() {
         let net = network::regtest();
@@ -3425,8 +3502,7 @@ mod tests {
         )
         .unwrap()
         .export();
-        WalletStore::init_bitcoin_view_only(&keys_path, BlockHeight::from_u32(5), None, net, &xpub)
-            .unwrap();
+        WalletStore::init_bitcoin_view_only(&keys_path, 5, None, net, &xpub).unwrap();
         let engine = crate::config::engine_dir(dir.path(), crate::coin::Coin::Bitcoin);
         let kyoto = crate::config::btc_kyoto_dir(dir.path());
         drop(crate::btc::store::Persister::open(&engine).unwrap());
@@ -3442,7 +3518,7 @@ mod tests {
             &engine,
             &kyoto,
             |st| {
-                assert_eq!(u32::from(st.birthday), 5);
+                assert_eq!(st.birthday, 5);
                 Ok(true)
             },
         )
@@ -3490,7 +3566,7 @@ mod tests {
             &enc_keys,
             Passphrase::from("test-pass".to_string()),
             &mnemonic,
-            BlockHeight::from_u32(1),
+            1,
             None,
             net,
         )
@@ -3555,14 +3631,7 @@ mod tests {
         .export();
         let declined = tempfile::tempdir().unwrap();
         let declined_keys = keys_path(declined.path());
-        WalletStore::init_bitcoin_view_only(
-            &declined_keys,
-            BlockHeight::from_u32(1),
-            None,
-            net,
-            &xpub,
-        )
-        .unwrap();
+        WalletStore::init_bitcoin_view_only(&declined_keys, 1, None, net, &xpub).unwrap();
         let engine = engine_dir(declined.path(), crate::coin::Coin::Bitcoin);
         drop(Persister::open(&engine).unwrap());
         let err = rescan_bitcoin_wallet(
@@ -3620,12 +3689,12 @@ mod tests {
             .unwrap();
         assert!(!wallet_db_path(&engine).exists(), "database deleted");
         let st = WalletStore::read(&outcome.keys_path).unwrap();
-        assert_eq!(u32::from(st.birthday), 7);
+        assert_eq!(st.birthday, 7);
         assert_eq!(st.birthday_time, None);
         assert_eq!(st.pinned_xpub(), Some(xpub.as_str()), "the pin survives");
         rescan(&config, &args(None)).await.unwrap();
         assert_eq!(
-            u32::from(WalletStore::read(&outcome.keys_path).unwrap().birthday),
+            WalletStore::read(&outcome.keys_path).unwrap().birthday,
             7,
             "no --birthday, no change"
         );
@@ -3650,7 +3719,7 @@ mod tests {
             .unwrap();
         let st = WalletStore::read(&outcome.keys_path).unwrap();
         assert_eq!(
-            Some(u32::from(st.birthday)),
+            Some(st.birthday),
             crate::btc::kyoto::birthday_height_for_date(BitcoinNetwork::Testnet3, recent)
         );
         assert_eq!(
@@ -3662,7 +3731,7 @@ mod tests {
 
     /// `rescan --birthday <height>` through the command, Zcash side: offline, the database
     /// goes and the record moves; the encrypted seed is untouched.
-    #[cfg(feature = "cli")]
+    #[cfg(all(feature = "cli", feature = "zcash"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn rescan_birthday_rewrites_the_zcash_wallets_record() {
         use clap::Parser as _;
@@ -3690,7 +3759,7 @@ mod tests {
         .unwrap();
         assert!(!open::data_db_path(&engine_of(&wallet_dir)).exists());
         let st = WalletStore::read(&keys_path).unwrap();
-        assert_eq!(u32::from(st.birthday), 3);
+        assert_eq!(st.birthday, 3);
         assert!(
             st.has_seed() && st.is_encrypted(),
             "the seed record is untouched"

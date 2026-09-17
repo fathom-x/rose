@@ -29,7 +29,7 @@ use crate::btc::actor::{
 };
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
-use crate::rpc::wallet_methods::{check_balance_dummy, count_from_params, depth_param};
+use crate::rpc::params::{check_balance_dummy, count_from_params, depth_param};
 use crate::server::jsonrpc::RpcRequest;
 
 /// A non-negative depth argument (`minconf`, `maxconf`) with the Zcash handlers' error
@@ -822,6 +822,7 @@ mod tests {
             work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
+            #[cfg(feature = "zcash")]
             fleet: None,
         };
         let call = |method: &str, params: Vec<Value>| {

@@ -1,41 +1,71 @@
 //! Wallet management: the single-writer actor, the clonable handle used by RPC handlers,
 //! and the multiwallet registry.
+//!
+//! Two things here serve every coin and are not gated: the registry ([`CoinWallet`],
+//! [`WalletRegistry`]) - one of the two seams an engine joins the shared shell at - and the
+//! `keys.toml` store and seed keeper ([`store`], [`keys`]), since one BIP-39 seed serves a
+//! wallet's every coin. Everything else in this module is the Zcash engine's.
 
+#[cfg(feature = "zcash")]
 pub mod actor;
+#[cfg(feature = "zcash")]
 pub mod binding;
 pub mod keys;
+#[cfg(feature = "zcash")]
 pub mod open;
+#[cfg(feature = "zcash")]
 pub mod read;
+#[cfg(feature = "zcash")]
 pub mod shard;
 pub mod store;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "zcash"))]
 mod regtest_tests;
 
-use std::collections::{BTreeMap, HashMap};
+#[cfg(feature = "zcash")]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+#[cfg(feature = "zcash")]
 use std::path::PathBuf;
+#[cfg(feature = "zcash")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "zcash")]
 use tokio::sync::{mpsc, oneshot, watch};
+#[cfg(feature = "zcash")]
 use zcash_address::ZcashAddress;
+#[cfg(feature = "zcash")]
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
+#[cfg(feature = "zcash")]
 use zcash_client_backend::fees::StandardFeeRule;
+#[cfg(feature = "zcash")]
 use zcash_client_backend::proposal::Proposal;
+#[cfg(feature = "zcash")]
 use zcash_client_backend::wallet::WalletTransparentOutput;
+#[cfg(feature = "zcash")]
 use zcash_client_sqlite::{AccountUuid, ReceivedNoteId};
+#[cfg(feature = "zcash")]
 use zcash_protocol::memo::MemoBytes;
+#[cfg(feature = "zcash")]
 use zcash_protocol::{ShieldedPool, TxId};
+#[cfg(feature = "zcash")]
 use zcash_transparent::address::TransparentAddress;
+#[cfg(feature = "zcash")]
 use zip32::DiversifierIndex;
+#[cfg(feature = "zcash")]
 use zip321::TransactionRequest;
 
 use crate::coin::Coin;
+#[cfg(feature = "zcash")]
 use crate::config::SendPrivacy;
 use crate::error::RpcError;
+#[cfg(feature = "zcash")]
 use crate::network::ZNetwork;
-#[cfg(test)]
+#[cfg(all(test, feature = "zcash"))]
 use crate::pools::Receiver;
+#[cfg(feature = "zcash")]
 use crate::pools::ReceiverSet;
+#[cfg(feature = "zcash")]
 use crate::wallet::store::Passphrase;
 
 /// Transient, in-memory first-seen wall-clock times for **unmined** wallet transactions, keyed
@@ -45,6 +75,7 @@ use crate::wallet::store::Passphrase;
 /// clock when it first stores a tx from the mempool stream, and the history RPCs surface it as
 /// `time`/`timereceived` (Bitcoin Core's `nTimeReceived`) until a block time supersedes it. The
 /// actor prunes entries once their tx mines, so the map stays bounded by the unmined set.
+#[cfg(feature = "zcash")]
 pub type FirstSeen = Arc<Mutex<HashMap<String, i64>>>;
 
 /// Shared, independently-lockable custody of the decrypted seed (see [`keys::SeedKeeper`]).
@@ -52,10 +83,12 @@ pub type FirstSeen = Arc<Mutex<HashMap<String, i64>>>;
 /// directly from the [`WalletHandle`] - bypassing the actor's serialized command queue - so the
 /// seed can be zeroized promptly even while the actor is blocked proving a long send. `Arc<Mutex>`
 /// mirrors [`FirstSeen`]; the guarded operations are trivial and never `.await` while held.
+#[cfg(feature = "zcash")]
 pub type SharedSeed = Arc<Mutex<keys::SeedKeeper>>;
 
 /// Connection state to lightwalletd, surfaced for monitoring (e.g. to distinguish "all
 /// upstreams down" from "still syncing" on `/readyz`).
+#[cfg(feature = "zcash")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConnState {
     /// No usable client: every configured upstream is currently unreachable.
@@ -67,6 +100,7 @@ pub enum ConnState {
     Ready,
 }
 
+#[cfg(feature = "zcash")]
 impl ConnState {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -78,6 +112,7 @@ impl ConnState {
 }
 
 /// A snapshot of sync state, published by the actor and read by blockchain/wallet RPCs.
+#[cfg(feature = "zcash")]
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct SyncStatus {
@@ -177,6 +212,7 @@ pub struct SyncStatus {
     pub transparent_recovery_horizon: Option<u32>,
 }
 
+#[cfg(feature = "zcash")]
 impl SyncStatus {
     /// Confirmations for a transaction mined at `mined_height`, anchored to the wallet's
     /// fully-scanned height - the same height `getblockcount` reports - so the classic
@@ -193,6 +229,7 @@ impl SyncStatus {
 /// Raw transaction bytes plus the mined height reported by lightwalletd (when the tx was
 /// fetched remotely; `None` for unmined txs and for locally-stored copies, whose height the
 /// caller already knows from the wallet DB).
+#[cfg(feature = "zcash")]
 #[derive(Clone, Debug)]
 pub struct RawTx {
     pub data: Vec<u8>,
@@ -202,6 +239,7 @@ pub struct RawTx {
 /// What kind of receiving address `getnewaddress` (and `z_getaddressforaccount`) should derive.
 /// Resolved at the RPC layer from the `address_type` / `receiver_types` argument and the wallet's
 /// configured defaults; the actor is the authority that turns it into an actual address.
+#[cfg(feature = "zcash")]
 #[derive(Debug, Clone)]
 pub enum ReceiverRequest {
     /// No per-call override: the wallet's configured default - a bare transparent address when
@@ -221,6 +259,7 @@ pub enum ReceiverRequest {
 /// it is reported at all: `getnewaddress` returns a bare string, so a caller reconciling its
 /// issued transparent range against the chain otherwise has no way to learn which index it was
 /// handed).
+#[cfg(feature = "zcash")]
 #[derive(Debug, Clone)]
 pub struct DerivedAddress {
     /// The encoded address (a Unified Address, or a bare `t1...`/`tm...` for a transparent request).
@@ -237,6 +276,7 @@ pub struct DerivedAddress {
 /// `fromaddress`. One source per send: transparent UTXOs and shielded notes are never mixed in
 /// one transaction, so a shortfall on the named source is `-6` rather than a silent top-up from
 /// the other pool.
+#[cfg(feature = "zcash")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SendSource {
     /// No source named (`sendtoaddress`/`sendmany`, which have no `fromaddress`): shielded notes
@@ -261,6 +301,7 @@ pub enum SendSource {
 }
 
 /// The source-address selector for `z_shieldcoinbase` (zcashd's `fromaddress` argument).
+#[cfg(feature = "zcash")]
 #[derive(Clone, Debug)]
 pub enum ShieldCoinbaseFrom {
     /// zcashd's `"*"`: sweep coinbase UTXOs from every transparent receiver the wallet has
@@ -276,6 +317,7 @@ pub enum ShieldCoinbaseFrom {
 /// coinbase UTXOs left *un*selected by the proposal's `limit`/block-space cap). The proposal is
 /// executed afterwards on a detached async operation, mirroring zcashd's flow: the selection is
 /// fixed at call time, the proving/broadcast happens under the returned opid.
+#[cfg(feature = "zcash")]
 pub struct ShieldCoinbasePlan {
     /// The shielding proposal (`propose_shielding_coinbase`: coinbase-only inputs, a single
     /// shielded payment of `input_total - fee`, **no change in any pool**).
@@ -292,6 +334,7 @@ pub struct ShieldCoinbasePlan {
 /// the RPC layer. One source **class** per merge: transparent UTXOs and shielded notes are never
 /// combined in one transaction (the same one-source-per-send invariant as [`SendSource`];
 /// consolidating both takes two calls).
+#[cfg(feature = "zcash")]
 #[derive(Clone, Debug)]
 pub enum MergeSource {
     /// Merge non-coinbase transparent UTXOs. `None` = `ANY_TADDR` (every wallet receiver);
@@ -308,6 +351,7 @@ pub enum MergeSource {
 /// Selection happens in the synchronous half (like [`ShieldCoinbasePlan`]), so the RPC's
 /// `merging*`/`remaining*` stats describe exactly what the operation will spend; a send racing
 /// the opid fails cleanly at execute.
+#[cfg(feature = "zcash")]
 pub enum MergeWork {
     /// A transparent-inputs → one-shielded-payment proposal (t→z merge), executed via the fused
     /// path like `z_shieldcoinbase` (no change in any pool; payment = inputs - fee).
@@ -330,6 +374,7 @@ pub enum MergeWork {
 /// (value pre-fee, like `shieldingValue`); `remaining*` are the eligible-but-unselected ones a
 /// follow-up call would merge. The inapplicable side is zero (a transparent-source merge has no
 /// note stats and vice versa).
+#[cfg(feature = "zcash")]
 pub struct MergePlan {
     pub work: MergeWork,
     pub merging_utxos: u64,
@@ -343,6 +388,7 @@ pub struct MergePlan {
 }
 
 /// Commands sent from RPC handlers to the per-wallet actor (the sole DB writer).
+#[cfg(feature = "zcash")]
 pub enum WalletCommand {
     GetNewAddress {
         /// Which account to derive for. A fleet shard's database holds one account per view
@@ -475,6 +521,7 @@ pub enum WalletCommand {
 /// A clonable, `Send + Sync` handle to one wallet. RPC handlers use it to issue writer
 /// commands (via the actor) and to read the published [`SyncStatus`]. Read-only queries are
 /// served directly from short-lived connections (see [`read`]).
+#[cfg(feature = "zcash")]
 #[derive(Clone)]
 pub struct WalletHandle {
     pub name: String,
@@ -509,6 +556,7 @@ pub struct WalletHandle {
     status_rx: watch::Receiver<SyncStatus>,
 }
 
+#[cfg(feature = "zcash")]
 impl WalletHandle {
     pub fn status(&self) -> SyncStatus {
         self.status_rx.borrow().clone()
@@ -837,6 +885,7 @@ impl WalletHandle {
 #[derive(Clone)]
 pub enum CoinWallet {
     /// A Zcash wallet, served by the librustzcash-backed actor.
+    #[cfg(feature = "zcash")]
     Zcash(WalletHandle),
     /// A Bitcoin wallet, served by the BDK-backed actor (`crate::btc`).
     #[cfg(feature = "bitcoin")]
@@ -847,6 +896,7 @@ impl CoinWallet {
     /// The coin this wallet serves.
     pub fn coin(&self) -> Coin {
         match self {
+            #[cfg(feature = "zcash")]
             CoinWallet::Zcash(_) => Coin::Zcash,
             #[cfg(feature = "bitcoin")]
             CoinWallet::Bitcoin(_) => Coin::Bitcoin,
@@ -856,6 +906,7 @@ impl CoinWallet {
     /// The wallet's name, as `/wallet/<name>` addresses it.
     pub fn name(&self) -> &str {
         match self {
+            #[cfg(feature = "zcash")]
             CoinWallet::Zcash(handle) => &handle.name,
             #[cfg(feature = "bitcoin")]
             CoinWallet::Bitcoin(handle) => &handle.name,
@@ -918,6 +969,7 @@ impl WalletRegistry {
     ///
     /// A **clone**, not a borrow: the registry changes at runtime (`createwallet`), so no
     /// caller may hold the lock across its work. See [`WalletRegistry`].
+    #[cfg(feature = "zcash")]
     pub fn get(&self, name: Option<&str>) -> Result<WalletHandle, RpcError> {
         match self.get_coin(name)? {
             CoinWallet::Zcash(handle) => Ok(handle),
@@ -943,6 +995,7 @@ impl WalletRegistry {
     ) -> Result<crate::btc::actor::BtcWalletHandle, RpcError> {
         match self.get_coin(name)? {
             CoinWallet::Bitcoin(handle) => Ok(handle),
+            #[cfg(feature = "zcash")]
             wallet @ CoinWallet::Zcash(_) => Err(RpcError::misc(format!(
                 "method not available for wallet '{}' (a Zcash wallet)",
                 wallet.name()
@@ -981,6 +1034,7 @@ impl WalletRegistry {
 }
 
 /// Construct a handle from its parts (used by the actor's `spawn`).
+#[cfg(feature = "zcash")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_handle(
     name: String,
@@ -1014,7 +1068,7 @@ pub(crate) fn make_handle(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "zcash"))]
 mod tests {
     use super::*;
     use std::time::Duration;

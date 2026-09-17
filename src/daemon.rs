@@ -193,6 +193,7 @@ fn upstream_summary(config: &AppConfig) -> String {
         .iter()
         .map(|(name, entry)| {
             let described = match entry.coin {
+                #[cfg(feature = "zcash")]
                 crate::coin::Coin::Zcash => {
                     crate::backend::resolve_for_wallet(config, entry).map(|s| s.describe())
                 }
@@ -302,14 +303,14 @@ mod tests {
     fn wallets(entries: &[(&str, bool)]) -> Vec<(String, crate::coin::Coin, bool)> {
         entries
             .iter()
-            .map(|(name, watch_only)| (name.to_string(), crate::coin::Coin::Zcash, *watch_only))
+            .map(|(name, watch_only)| (name.to_string(), crate::coin::Coin::DEFAULT, *watch_only))
             .collect()
     }
 
     /// The rule is per coin: one Zcash spender and one Bitcoin spender in the same process is
     /// one custody decision per chain, not a violation - while two spenders of the same coin
     /// still are, whichever coin it is.
-    #[cfg(feature = "bitcoin")]
+    #[cfg(all(feature = "zcash", feature = "bitcoin"))]
     #[test]
     fn one_spender_per_coin_is_allowed() {
         use crate::coin::Coin;
@@ -330,6 +331,7 @@ mod tests {
     /// The banner names each wallet's own upstream, resolved by its engine, instead of the
     /// Zcash `[backend] server` default - so a bitcoin-only daemon no longer announces a
     /// zebra it never dials, and a per-wallet override shows as what it resolves to.
+    #[cfg(feature = "zcash")]
     #[cfg(all(feature = "cli", feature = "server"))]
     #[test]
     fn banner_names_each_wallets_resolved_upstream() {

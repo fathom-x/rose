@@ -7,10 +7,15 @@
 use std::path::Path;
 
 use secrecy::{ExposeSecret, SecretVec};
+#[cfg(feature = "zcash")]
 use zcash_keys::keys::UnifiedSpendingKey;
 
+#[cfg(feature = "zcash")]
 use crate::error::RpcError;
 use crate::hardening;
+// `derive_usk` is the only non-test caller, but the shared seed-store tests below name it in
+// every build (a `keys.toml` records its wallet's network whichever engine reads it).
+#[cfg(any(test, feature = "zcash"))]
 use crate::network::ZNetwork;
 use crate::wallet::store::WalletStore;
 
@@ -86,6 +91,10 @@ impl SeedKeeper {
 
     /// Derive the Unified Spending Key for an account index, or return the bitcoind
     /// "unlock needed" error (-13) if the seed is not loaded.
+    ///
+    /// The one item here that is the Zcash engine's: the seed itself, and every other method
+    /// on this keeper, serves whichever coins the build carries.
+    #[cfg(feature = "zcash")]
     pub fn derive_usk(
         &self,
         network: ZNetwork,
@@ -207,7 +216,6 @@ pub fn pinned_ufvk(keys_path: &Path) -> anyhow::Result<Option<String>> {
 mod tests {
     use super::*;
     use bip0039::{English, Mnemonic};
-    use zcash_protocol::consensus::BlockHeight;
 
     use crate::wallet::store::WalletStore;
 
@@ -217,10 +225,12 @@ mod tests {
         midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
         moment stage";
 
+    #[cfg(feature = "zcash")]
     fn account_zero() -> zip32::AccountId {
         zip32::AccountId::try_from(0u32).unwrap()
     }
 
+    #[cfg(feature = "zcash")]
     fn test_seed_secret() -> SecretVec<u8> {
         let seed = <Mnemonic<English>>::from_phrase(PHRASE)
             .unwrap()
@@ -230,6 +240,7 @@ mod tests {
 
     /// A locked keeper holds no seed, so any key derivation is the bitcoind -13
     /// "unlock needed" error rather than a panic or a wrong key.
+    #[cfg(feature = "zcash")]
     #[test]
     fn locked_keeper_refuses_key_derivation_with_minus_13() {
         let keeper = SeedKeeper::locked();
@@ -249,6 +260,7 @@ mod tests {
     /// the same seed derives identical key material (determinism - a same-seed
     /// restore/watch-only pair must share an account), and locking drops the seed so
     /// derivation needs an unlock again.
+    #[cfg(feature = "zcash")]
     #[test]
     fn seed_keeper_unlock_derive_lock_cycle() {
         let acct = account_zero();
@@ -287,7 +299,7 @@ mod tests {
             &kp,
             std::iter::once(&recipient as &dyn age::Recipient),
             &mnemonic,
-            BlockHeight::from_u32(1),
+            1,
             ZNetwork::Test,
             "uviewtest1keystestplaceholder",
         )
@@ -347,7 +359,7 @@ mod tests {
             &kp,
             std::iter::once(&recipient as &dyn age::Recipient),
             &mnemonic,
-            BlockHeight::from_u32(1),
+            1,
             ZNetwork::Test,
             PIN,
         )

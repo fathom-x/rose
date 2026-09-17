@@ -8,7 +8,6 @@ use anyhow::anyhow;
 use bip0039::{English, Mnemonic};
 use secrecy::{ExposeSecret, SecretVec, Zeroize};
 use serde::{Deserialize, Serialize};
-use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
 use crate::network::ZNetwork;
 
@@ -26,10 +25,29 @@ pub fn keys_path(wallet_dir: &Path) -> PathBuf {
     wallet_dir.join(KEYS_FILE)
 }
 
+/// Orchard activation (NU5) per network - the birthday a hand-edited `keys.toml` with no
+/// recorded one falls back to (see [`WalletStore::read`]).
+///
+/// Local constants rather than `zcash_protocol`'s, because `keys.toml` is coin-agnostic and a
+/// build without the Zcash engine still has to read it. They are consensus history and cannot
+/// move; `nu5_fallback_matches_zcash_protocol` pins them against the protocol crate in a build
+/// that has it, the way `amount`'s own constants are pinned.
+fn nu5_activation(network: ZNetwork) -> u32 {
+    match network {
+        ZNetwork::Main => 1_687_104,
+        ZNetwork::Test => 1_842_420,
+        ZNetwork::Regtest => 1,
+    }
+}
+
 /// Parsed `keys.toml`.
 pub struct WalletStore {
     pub network: ZNetwork,
-    pub birthday: BlockHeight,
+    /// The block height the wallet's history starts at, as the file records it. A plain
+    /// height rather than an engine's block-height newtype: `keys.toml` is the one file in a
+    /// wallet directory that serves every coin (one BIP-39 seed, one file, a directory per
+    /// coin underneath it), so it must stay readable by a build carrying either engine.
+    pub birthday: u32,
     /// The operator's `--birthday` date (unix seconds of its UTC midnight), recorded only
     /// when `init` could not resolve it to a precise height - the kyoto date path, where
     /// resolution is offline against the shipped scan floor. The first sync finishes the
@@ -95,14 +113,14 @@ impl WalletStore {
         keys_path: &Path,
         recipients: impl Iterator<Item = &'a dyn age::Recipient>,
         mnemonic: &Mnemonic,
-        birthday: BlockHeight,
+        birthday: u32,
         network: ZNetwork,
         ufvk: &str,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
             mnemonic: Some(encrypt_mnemonic(recipients, mnemonic)?),
             network: Some(network.name().to_string()),
-            birthday: Some(u32::from(birthday)),
+            birthday: Some(birthday),
             birthday_time: None,
             encryption: None,
             ufvk: Some(ufvk.to_string()),
@@ -121,14 +139,14 @@ impl WalletStore {
         keys_path: &Path,
         recipients: impl Iterator<Item = &'a dyn age::Recipient>,
         mnemonic: &Mnemonic,
-        birthday: BlockHeight,
+        birthday: u32,
         birthday_time: Option<u64>,
         network: ZNetwork,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
             mnemonic: Some(encrypt_mnemonic(recipients, mnemonic)?),
             network: Some(network.name().to_string()),
-            birthday: Some(u32::from(birthday)),
+            birthday: Some(birthday),
             birthday_time,
             encryption: None,
             ufvk: None,
@@ -144,7 +162,7 @@ impl WalletStore {
         keys_path: &Path,
         passphrase: Passphrase,
         mnemonic: &Mnemonic,
-        birthday: BlockHeight,
+        birthday: u32,
         network: ZNetwork,
         ufvk: &str,
     ) -> anyhow::Result<()> {
@@ -154,7 +172,7 @@ impl WalletStore {
                 mnemonic.phrase(),
             )?),
             network: Some(network.name().to_string()),
-            birthday: Some(u32::from(birthday)),
+            birthday: Some(birthday),
             birthday_time: None,
             encryption: Some(ENC_PASSPHRASE.to_string()),
             ufvk: Some(ufvk.to_string()),
@@ -171,7 +189,7 @@ impl WalletStore {
         keys_path: &Path,
         passphrase: Passphrase,
         mnemonic: &Mnemonic,
-        birthday: BlockHeight,
+        birthday: u32,
         birthday_time: Option<u64>,
         network: ZNetwork,
     ) -> anyhow::Result<()> {
@@ -181,7 +199,7 @@ impl WalletStore {
                 mnemonic.phrase(),
             )?),
             network: Some(network.name().to_string()),
-            birthday: Some(u32::from(birthday)),
+            birthday: Some(birthday),
             birthday_time,
             encryption: Some(ENC_PASSPHRASE.to_string()),
             ufvk: None,
@@ -200,7 +218,7 @@ impl WalletStore {
     ///
     /// Nothing writes this to disk; it exists so the actor's startup path can stay one path
     /// rather than forking into a keyless copy of itself.
-    pub fn view_only_placeholder(network: ZNetwork, birthday: BlockHeight) -> Self {
+    pub fn view_only_placeholder(network: ZNetwork, birthday: u32) -> Self {
         WalletStore {
             network,
             birthday,
@@ -218,14 +236,14 @@ impl WalletStore {
     /// verifies that database account against. There is no spending material on disk at all.
     pub fn init_view_only(
         keys_path: &Path,
-        birthday: BlockHeight,
+        birthday: u32,
         network: ZNetwork,
         ufvk: &str,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
             mnemonic: None,
             network: Some(network.name().to_string()),
-            birthday: Some(u32::from(birthday)),
+            birthday: Some(birthday),
             birthday_time: None,
             encryption: None,
             ufvk: Some(ufvk.to_string()),
@@ -242,7 +260,7 @@ impl WalletStore {
     #[cfg(feature = "bitcoin")]
     pub fn init_bitcoin_view_only(
         keys_path: &Path,
-        birthday: BlockHeight,
+        birthday: u32,
         birthday_time: Option<u64>,
         network: ZNetwork,
         xpub: &str,
@@ -250,7 +268,7 @@ impl WalletStore {
         let encoding = StoreEncoding {
             mnemonic: None,
             network: Some(network.name().to_string()),
-            birthday: Some(u32::from(birthday)),
+            birthday: Some(birthday),
             birthday_time,
             encryption: None,
             ufvk: None,
@@ -282,7 +300,7 @@ impl WalletStore {
     /// starts, so it is the one record that has to change for a rescan from elsewhere.
     pub fn set_birthday(
         keys_path: &Path,
-        birthday: BlockHeight,
+        birthday: u32,
         birthday_time: Option<u64>,
     ) -> anyhow::Result<()> {
         let mut text = String::new();
@@ -290,7 +308,7 @@ impl WalletStore {
             .map_err(|e| anyhow!("opening {}: {e}", keys_path.display()))?
             .read_to_string(&mut text)?;
         let mut encoding: StoreEncoding = toml::from_str(&text)?;
-        encoding.birthday = Some(u32::from(birthday));
+        encoding.birthday = Some(birthday);
         encoding.birthday_time = birthday_time;
         write_keys_atomic(keys_path, &encoding, false)
     }
@@ -315,11 +333,7 @@ impl WalletStore {
         // wallet (zecd's default) can hold no notes before it - rather than the older, slower
         // Sapling-activation default. (Receiver-aware resolution lives in `init`, which knows the
         // wallet's enabled pools; this layer does not.)
-        let birthday = encoding.birthday.map(BlockHeight::from).unwrap_or_else(|| {
-            network
-                .activation_height(NetworkUpgrade::Nu5)
-                .expect("NU5 activation height is known")
-        });
+        let birthday = encoding.birthday.unwrap_or_else(|| nu5_activation(network));
 
         let encrypted = encoding.encryption.as_deref() == Some(ENC_PASSPHRASE);
 
@@ -515,7 +529,7 @@ mod tests {
             &kp,
             Passphrase::from("correct horse battery".to_string()),
             &mnemonic,
-            BlockHeight::from_u32(1),
+            1,
             ZNetwork::Test,
             UFVK,
         )
@@ -549,7 +563,7 @@ mod tests {
     fn view_only_wallet_stores_no_seed() {
         let dir = tempfile::tempdir().unwrap();
         let kp = keys_path(dir.path());
-        WalletStore::init_view_only(&kp, BlockHeight::from_u32(7), ZNetwork::Test, UFVK).unwrap();
+        WalletStore::init_view_only(&kp, 7, ZNetwork::Test, UFVK).unwrap();
         let st = WalletStore::read(&kp).unwrap();
         assert_eq!(st.pinned_ufvk(), Some(UFVK));
         assert!(!st.has_seed(), "a watch-only wallet has no stored mnemonic");
@@ -558,7 +572,7 @@ mod tests {
             "no spending material, so nothing is passphrase-encrypted"
         );
         assert_eq!(st.network, ZNetwork::Test);
-        assert_eq!(u32::from(st.birthday), 7);
+        assert_eq!(st.birthday, 7);
         // Nothing to decrypt: the seed accessors yield None rather than erroring.
         let identity = age::x25519::Identity::generate();
         assert!(st
@@ -576,12 +590,7 @@ mod tests {
         let kp = keys_path(dir.path());
         std::fs::write(&kp, "network = \"main\"\n").unwrap();
         let st = WalletStore::read(&kp).unwrap();
-        assert_eq!(
-            st.birthday,
-            ZNetwork::Main
-                .activation_height(NetworkUpgrade::Nu5)
-                .expect("NU5 height")
-        );
+        assert_eq!(st.birthday, nu5_activation(ZNetwork::Main));
         // A pre-pin keys.toml reads back unpinned (the daemon backfills it at startup).
         assert_eq!(st.pinned_ufvk(), None);
     }
@@ -597,7 +606,7 @@ mod tests {
             &kp,
             std::iter::once(&recipient as &dyn age::Recipient),
             &mnemonic,
-            BlockHeight::from_u32(1),
+            1,
             ZNetwork::Test,
             UFVK,
         )
@@ -617,15 +626,8 @@ mod tests {
         let kp = keys_path(dir.path());
         let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
         let passphrase = || Passphrase::from("correct horse battery".to_string());
-        WalletStore::init_with_passphrase(
-            &kp,
-            passphrase(),
-            &mnemonic,
-            BlockHeight::from_u32(42),
-            ZNetwork::Test,
-            UFVK,
-        )
-        .unwrap();
+        WalletStore::init_with_passphrase(&kp, passphrase(), &mnemonic, 42, ZNetwork::Test, UFVK)
+            .unwrap();
         WalletStore::strip_pin_for_tests(&kp);
         assert_eq!(WalletStore::read(&kp).unwrap().pinned_ufvk(), None);
 
@@ -635,7 +637,7 @@ mod tests {
         // Everything else survived the rewrite: the ciphertext still decrypts, and the
         // metadata round-trips.
         assert!(st.is_encrypted());
-        assert_eq!(u32::from(st.birthday), 42);
+        assert_eq!(st.birthday, 42);
         assert!(st
             .decrypt_seed_with_passphrase(passphrase())
             .unwrap()
@@ -660,24 +662,42 @@ mod tests {
     fn set_birthday_rewrites_only_the_birthday() {
         let dir = tempfile::tempdir().unwrap();
         let kp = keys_path(dir.path());
-        WalletStore::init_view_only(&kp, BlockHeight::from_u32(100), ZNetwork::Main, "uviewTEST")
-            .unwrap();
-        WalletStore::set_birthday(&kp, BlockHeight::from_u32(43), Some(1_800_000_000)).unwrap();
+        WalletStore::init_view_only(&kp, 100, ZNetwork::Main, "uviewTEST").unwrap();
+        WalletStore::set_birthday(&kp, 43, Some(1_800_000_000)).unwrap();
         let st = WalletStore::read(&kp).unwrap();
-        assert_eq!(
-            (u32::from(st.birthday), st.birthday_time),
-            (43, Some(1_800_000_000))
-        );
+        assert_eq!((st.birthday, st.birthday_time), (43, Some(1_800_000_000)));
         assert_eq!(st.network, ZNetwork::Main);
         assert_eq!(st.pinned_ufvk(), Some("uviewTEST"));
         assert!(!st.has_seed());
-        WalletStore::set_birthday(&kp, BlockHeight::from_u32(42), None).unwrap();
+        WalletStore::set_birthday(&kp, 42, None).unwrap();
         let st = WalletStore::read(&kp).unwrap();
-        assert_eq!(u32::from(st.birthday), 42);
+        assert_eq!(st.birthday, 42);
         assert_eq!(st.birthday_time, None);
         assert_eq!(st.pinned_ufvk(), Some("uviewTEST"));
         assert!(!std::fs::read_to_string(&kp)
             .unwrap()
             .contains("birthday_time"));
+    }
+
+    /// The local NU5 heights `nu5_activation` falls back to are consensus history, but they
+    /// are written out here rather than read from `zcash_protocol` so a bitcoin-only build can
+    /// still read a `keys.toml`. Pin them against the protocol crate wherever it is present, so
+    /// a typo cannot sit undetected in the one path that invents a wallet's birthday.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn nu5_fallback_matches_zcash_protocol() {
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+
+        for network in [ZNetwork::Main, ZNetwork::Test, crate::network::regtest()] {
+            let upstream = network
+                .activation_height(NetworkUpgrade::Nu5)
+                .expect("NU5 activation height is known");
+            assert_eq!(
+                nu5_activation(network),
+                u32::from(upstream),
+                "the local NU5 fallback for {} has drifted from zcash_protocol",
+                network.name()
+            );
+        }
     }
 }

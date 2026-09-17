@@ -1006,7 +1006,7 @@ async fn spawn_inner(
             cfg.network,
             cfg.shard_members
                 .iter()
-                .map(|m| m.birthday)
+                .map(|m| u32::from(m.birthday))
                 .min()
                 .expect("a shard has at least one member"),
         )
@@ -1095,7 +1095,7 @@ async fn spawn_inner(
                     } else {
                         "spending (seed)"
                     },
-                    u32::from(st.birthday),
+                    st.birthday,
                     match (watch_only, encrypted) {
                         // A view-only rebuild needs no secret, so it proceeds as soon as the
                         // upstream is reachable.
@@ -1105,7 +1105,12 @@ async fn spawn_inner(
                         (false, false) => " once the seed is available",
                     }
                 );
-                (None, None, watch_only, Some((st.birthday, bootstrap_key)))
+                (
+                    None,
+                    None,
+                    watch_only,
+                    Some((st.birthday.into(), bootstrap_key)),
+                )
             }
         }
     };
@@ -1148,7 +1153,7 @@ async fn spawn_inner(
     // so it cannot auto-unlock - it starts locked and requires `walletpassphrase` (matching
     // Bitcoin Core's encrypted-wallet behavior). A watch-only wallet has no seed anywhere, so
     // the whole unlock machinery is moot for it.
-    let birthday = u32::from(st.birthday);
+    let birthday = st.birthday;
     let mut seed = SeedKeeper::locked();
     if watch_only {
         info!(

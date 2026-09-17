@@ -234,6 +234,7 @@ mod tests {
         std::fs::write(dir.join("blocks").join("1-aa.compact"), b"b").unwrap();
     }
 
+    #[cfg(feature = "zcash")]
     /// Assert a wallet is fully migrated: databases under `zec/lrz/`, `keys.toml` still at the
     /// root, and nothing librustzcash's left behind.
     fn assert_migrated(wallet_dir: &Path) {
@@ -260,6 +261,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn a_legacy_wallet_moves_into_its_engine_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -273,6 +275,7 @@ mod tests {
         assert_eq!(config.wallets["default"].engine_dir(), moved[0].to);
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn the_wal_sidecar_travels_with_its_database() {
         // A `-wal` holds committed-but-uncheckpointed transactions, so leaving it behind would
@@ -293,6 +296,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn migration_is_a_no_op_once_it_has_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -336,6 +340,7 @@ mod tests {
         assert!(!dir.path().join("default").join("zec").exists());
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn every_configured_wallet_moves() {
         let dir = tempfile::tempdir().unwrap();
@@ -351,6 +356,7 @@ mod tests {
     /// Unlike a layout change that relocated wallet directories, this one rearranges each
     /// wallet *inside* whatever directory the operator named - so an explicit `dir` is migrated
     /// like any other wallet rather than opted out.
+    #[cfg(feature = "zcash")]
     #[test]
     fn a_wallet_at_an_explicit_dir_is_migrated_in_place() {
         let dir = tempfile::tempdir().unwrap();
@@ -365,6 +371,7 @@ mod tests {
         assert_migrated(&elsewhere);
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn a_keys_file_mounted_outside_the_wallet_is_untouched() {
         let dir = tempfile::tempdir().unwrap();
@@ -381,6 +388,7 @@ mod tests {
         assert!(keys.is_file(), "the mounted keys file stays put");
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn the_same_artifact_in_both_places_is_refused_without_deleting_either() {
         let dir = tempfile::tempdir().unwrap();
@@ -403,6 +411,7 @@ mod tests {
     /// A crash mid-move leaves some artifacts at the root and some already moved. That is not
     /// the ambiguous case - each artifact is in exactly one place - so the next start finishes
     /// the job.
+    #[cfg(feature = "zcash")]
     #[test]
     fn an_interrupted_migration_resumes() {
         let dir = tempfile::tempdir().unwrap();

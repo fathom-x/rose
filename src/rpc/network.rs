@@ -7,11 +7,22 @@ use crate::error::RpcError;
 use crate::state::AppState;
 
 fn connected(state: &AppState) -> bool {
-    state
-        .registry
-        .get(None)
-        .map(|w| w.status().connected)
-        .unwrap_or(false)
+    // The Zcash upstream's connection state, which is what this dialect's `getnetworkinfo`
+    // reports. A Bitcoin default wallet has always read as disconnected here (`get` refused
+    // it); in a build with no Zcash engine every wallet is that case.
+    #[cfg(feature = "zcash")]
+    {
+        state
+            .registry
+            .get(None)
+            .map(|w| w.status().connected)
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "zcash"))]
+    {
+        let _ = state;
+        false
+    }
 }
 
 /// zecd's own version in Bitcoin Core's numeric encoding (major*10000 + minor*100 + patch),
@@ -62,6 +73,7 @@ pub(crate) fn getconnectioncount(state: &AppState) -> Result<Value, RpcError> {
 
 /// `getpeerinfo` - the active lightwalletd upstream as the single "peer", with its
 /// `conn_state` (down|syncing|ready) as an extension field.
+#[cfg(feature = "zcash")]
 pub(crate) fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
     // zecd's single "peer" is the active lightwalletd upstream. Report it (with its connection
     // state) when connected; otherwise an empty peer list, as bitcoind does with no peers.
@@ -81,6 +93,15 @@ pub(crate) fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
         // (which is `syncing` until the wallet is truly ready to serve full history).
         "syncing": st.scanning || st.pending_enhancements > 0,
     }]))
+}
+
+/// The peer list of a build with no Zcash engine: empty, as bitcoind reports with no peers.
+/// The "peer" this method describes is the lightwalletd upstream, which such a build has no
+/// way to dial; a Bitcoin wallet's own chain source is not one (kyoto peers with many, a
+/// bitcoind connection is not a peer at all), so inventing an entry would misreport it.
+#[cfg(not(feature = "zcash"))]
+pub(crate) fn getpeerinfo(_state: &AppState) -> Result<Value, RpcError> {
+    Ok(Value::Array(vec![]))
 }
 
 /// `ping` - liveness no-op (there is no P2P peer to ping).

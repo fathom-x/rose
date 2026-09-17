@@ -22,10 +22,13 @@ use tracing::{info, warn};
 
 use crate::config::{HealthConfig, ReadinessMode};
 use crate::state::AppState;
-use crate::wallet::{CoinWallet, SyncStatus};
+use crate::wallet::CoinWallet;
+#[cfg(feature = "zcash")]
+use crate::wallet::SyncStatus;
 
 /// Whether one wallet is ready to serve, per the configured readiness mode. The actor-liveness
 /// check is applied by the caller.
+#[cfg(feature = "zcash")]
 fn wallet_ready(st: &SyncStatus, cfg: &HealthConfig) -> bool {
     if !st.connected {
         return false;
@@ -148,6 +151,7 @@ struct Snapshot {
 /// Whether an encrypted wallet is currently locked (seed not loaded) - i.e. it needs a
 /// `walletpassphrase` before it can spend. `unlocked_until` is `Some(0)` for a locked
 /// encrypted wallet, a future unix time when unlocked, and `None` for unencrypted wallets.
+#[cfg(feature = "zcash")]
 fn is_locked(st: &crate::wallet::SyncStatus) -> bool {
     st.encrypted && st.unlocked_until == Some(0)
 }
@@ -157,7 +161,11 @@ fn snapshot(state: &AppState) -> Snapshot {
     let mut ready = !names.is_empty();
     let mut any_down = false;
     let mut any_actor_down = false;
+    // Both are the Zcash engine's signals - a wallet whose seed is locked, and one still
+    // draining the memo-enhancement backlog - so neither is ever set in a bitcoin-only build.
+    #[cfg_attr(not(feature = "zcash"), allow(unused_mut))]
     let mut any_locked = false;
+    #[cfg_attr(not(feature = "zcash"), allow(unused_mut))]
     let mut any_enhancing = false;
     let mut wallets = Map::new();
     for name in names {
@@ -165,15 +173,70 @@ fn snapshot(state: &AppState) -> Snapshot {
             continue;
         };
         let coin = wallet.coin().name();
-        // Infallible without the `bitcoin` feature (one variant); the second arm exists
-        // with it, so this stays a match rather than a `let` destructure.
-        #[allow(clippy::infallible_destructuring_match)]
-        let h = match wallet {
-            CoinWallet::Zcash(h) => h,
+        // Every loaded wallet is claimed by exactly one engine arm, and each arm folds its
+        // own verdict into `ready`. That is what keeps readiness fail-closed: a wallet no arm
+        // claimed would be reported ready with nothing checked - a fail-open,
+        // from when Bitcoin wallets were skipped outright.
+        match wallet {
+            #[cfg(feature = "zcash")]
+            CoinWallet::Zcash(h) => {
+                let st = h.status();
+                // A dead writer actor means sends/address-generation are broken even though reads
+                // still answer from the DB - so it must fail readiness, not silently report ready.
+                let actor_alive = h.actor_alive();
+                let w_ready = actor_alive && wallet_ready(&st, &state.config.health);
+                ready = ready && w_ready;
+                if matches!(st.conn_state, crate::wallet::ConnState::Down) {
+                    any_down = true;
+                }
+                if !actor_alive {
+                    any_actor_down = true;
+                }
+                // A locked wallet stays read-ready and syncs fine; it just can't spend. We surface
+                // it as a distinct signal (not a readiness failure) so an operator/controller can
+                // tell "needs walletpassphrase" apart from "still syncing" without breaking
+                // read-only or watch-only deployments that are legitimately ready while locked.
+                let locked = is_locked(&st);
+                if locked {
+                    any_locked = true;
+                }
+                // Block scan caught up to the tip, but the enhancement backlog hasn't drained yet.
+                if !st.scanning && st.pending_enhancements > 0 {
+                    any_enhancing = true;
+                }
+                // The block-height gap between the tip and the last fully-scanned height - the
+                // meaningful "how far behind" signal. Surfaced on every wallet regardless of the
+                // configured readiness mode, so an operator on `readiness = "connected"` (which reports
+                // ready before the scan finishes) can still see how stale the wallet's reads may be
+                //. `null` until both heights are known.
+                let scan_lag = match (st.chain_tip, st.fully_scanned) {
+                    (Some(tip), Some(scanned)) => Some(tip.saturating_sub(scanned)),
+                    _ => None,
+                };
+                wallets.insert(
+                    name,
+                    json!({
+                        "coin": coin,
+                        "connected": st.connected,
+                        "actor_alive": actor_alive,
+                        "server": st.server,
+                        "conn_state": st.conn_state.as_str(),
+                        "chain_tip": st.chain_tip,
+                        "fully_scanned": st.fully_scanned,
+                        "scan_lag": scan_lag,
+                        "birthday": st.birthday,
+                        "scan_progress": st.scan_progress,
+                        "scanning": st.scanning,
+                        "pending_enhancements": st.pending_enhancements,
+                        "enhanced_through": st.enhanced_through,
+                        "encrypted": st.encrypted,
+                        "locked": locked,
+                        "ready": w_ready,
+                    }),
+                );
+            }
             // A Bitcoin wallet reports through its own actor's status: its chain source's
-            // connection state and the wallet's applied height. Before this arm existed the
-            // Bitcoin wallets were skipped outright, so a bitcoin-only daemon reported ready
-            // with nothing checked - a fail-open.
+            // connection state and the wallet's applied height.
             #[cfg(feature = "bitcoin")]
             CoinWallet::Bitcoin(h) => {
                 use crate::btc::actor::BtcConnState;
@@ -210,64 +273,7 @@ fn snapshot(state: &AppState) -> Snapshot {
                         "ready": w_ready,
                     }),
                 );
-                continue;
             }
-        };
-        {
-            let st = h.status();
-            // A dead writer actor means sends/address-generation are broken even though reads
-            // still answer from the DB - so it must fail readiness, not silently report ready.
-            let actor_alive = h.actor_alive();
-            let w_ready = actor_alive && wallet_ready(&st, &state.config.health);
-            ready = ready && w_ready;
-            if matches!(st.conn_state, crate::wallet::ConnState::Down) {
-                any_down = true;
-            }
-            if !actor_alive {
-                any_actor_down = true;
-            }
-            // A locked wallet stays read-ready and syncs fine; it just can't spend. We surface
-            // it as a distinct signal (not a readiness failure) so an operator/controller can
-            // tell "needs walletpassphrase" apart from "still syncing" without breaking
-            // read-only or watch-only deployments that are legitimately ready while locked.
-            let locked = is_locked(&st);
-            if locked {
-                any_locked = true;
-            }
-            // Block scan caught up to the tip, but the enhancement backlog hasn't drained yet.
-            if !st.scanning && st.pending_enhancements > 0 {
-                any_enhancing = true;
-            }
-            // The block-height gap between the tip and the last fully-scanned height - the
-            // meaningful "how far behind" signal. Surfaced on every wallet regardless of the
-            // configured readiness mode, so an operator on `readiness = "connected"` (which reports
-            // ready before the scan finishes) can still see how stale the wallet's reads may be.
-            // `null` until both heights are known.
-            let scan_lag = match (st.chain_tip, st.fully_scanned) {
-                (Some(tip), Some(scanned)) => Some(tip.saturating_sub(scanned)),
-                _ => None,
-            };
-            wallets.insert(
-                name,
-                json!({
-                    "coin": coin,
-                    "connected": st.connected,
-                    "actor_alive": actor_alive,
-                    "server": st.server,
-                    "conn_state": st.conn_state.as_str(),
-                    "chain_tip": st.chain_tip,
-                    "fully_scanned": st.fully_scanned,
-                    "scan_lag": scan_lag,
-                    "birthday": st.birthday,
-                    "scan_progress": st.scan_progress,
-                    "scanning": st.scanning,
-                    "pending_enhancements": st.pending_enhancements,
-                    "enhanced_through": st.enhanced_through,
-                    "encrypted": st.encrypted,
-                    "locked": locked,
-                    "ready": w_ready,
-                }),
-            );
         }
     }
     Snapshot {
@@ -323,7 +329,7 @@ async fn status(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "zcash"))]
 mod tests {
     use super::{is_locked, wallet_ready};
     use crate::config::{HealthConfig, ReadinessMode};

@@ -1,13 +1,18 @@
 //! JSON-RPC method dispatch.
 
+#[cfg(feature = "zcash")]
 pub mod blockchain;
 #[cfg(feature = "bitcoin")]
 pub mod btc_methods;
 pub mod control;
 pub mod network;
+pub mod params;
+#[cfg(feature = "zcash")]
 pub mod rawtx;
+#[cfg(feature = "zcash")]
 pub mod signmessage;
 pub mod util;
+#[cfg(feature = "zcash")]
 pub mod wallet_methods;
 
 use serde_json::Value;
@@ -207,17 +212,23 @@ enum MethodCoins {
 /// `ZCASH_ONLY` to `ZCASH_AND_BITCOIN` alongside the handler branch that serves them.
 ///
 /// Kept in lockstep with [`ALL_METHODS`] by the `method_coins_table_matches_all_methods` test.
-const ZCASH_ONLY: &[Coin] = &[Coin::Zcash];
-/// The methods the BDK engine serves so far (in a build without the `bitcoin` feature this
-/// set is identical to [`ZCASH_ONLY`], so the table needs no cfg of its own).
+const ZCASH_ONLY: &[Coin] = &[
+    #[cfg(feature = "zcash")]
+    Coin::Zcash,
+];
+/// The methods both engines serve. Each element rides its engine's gate, so in a build
+/// carrying one engine this set is identical to that engine's own tier and the table above
+/// needs no cfg of its own.
 const ZCASH_AND_BITCOIN: &[Coin] = &[
+    #[cfg(feature = "zcash")]
     Coin::Zcash,
     #[cfg(feature = "bitcoin")]
     Coin::Bitcoin,
 ];
 /// Methods only the BDK engine serves (a descriptor wallet has descriptors; a Zcash account
 /// has viewing keys, exported offline by `export-ufvk`). Empty in a build without the
-/// feature, so the gate answers `-32601` everywhere, exactly as for an unknown method.
+/// feature, so the gate answers `-32601` everywhere, exactly as for an unknown method - which
+/// is equally how a build without `zcash` answers for everything in [`ZCASH_ONLY`].
 const BITCOIN_ONLY: &[Coin] = &[
     #[cfg(feature = "bitcoin")]
     Coin::Bitcoin,
@@ -411,19 +422,31 @@ async fn dispatch_zecd(
         "ping" => network::ping(),
 
         // Blockchain
+        #[cfg(feature = "zcash")]
         "getblockchaininfo" => blockchain::getblockchaininfo(state, wallet),
+        #[cfg(feature = "zcash")]
         "getblockcount" => blockchain::getblockcount(state, wallet),
+        #[cfg(feature = "zcash")]
         "getbestblockhash" => blockchain::getbestblockhash(state, wallet),
+        #[cfg(feature = "zcash")]
         "getblockhash" => blockchain::getblockhash(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "getblockheader" => blockchain::getblockheader(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "waitfornewblock" => blockchain::waitfornewblock(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "waitforblock" => blockchain::waitforblock(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "waitforblockheight" => blockchain::waitforblockheight(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "waitforsync" => blockchain::waitforsync(state, wallet, req).await,
 
         // Utility
+        #[cfg(feature = "zcash")]
         "validateaddress" => util::validateaddress(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "signmessage" => signmessage::signmessage(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "verifymessage" => signmessage::verifymessage(state, wallet, req),
         "settxfee" => util::settxfee(req),
         "estimatesmartfee" => util::estimatesmartfee(req),
@@ -431,47 +454,78 @@ async fn dispatch_zecd(
         "getmempoolinfo" => util::getmempoolinfo(),
 
         // Raw transactions (served via the wallet's lightwalletd connection)
+        #[cfg(feature = "zcash")]
         "getrawtransaction" => rawtx::getrawtransaction(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "sendrawtransaction" => rawtx::sendrawtransaction(state, wallet, req).await,
 
         // Wallet - reads
+        #[cfg(feature = "zcash")]
         "getbalance" => wallet_methods::getbalance(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "getbalances" => wallet_methods::getbalances(state, wallet),
+        #[cfg(feature = "zcash")]
         "getunconfirmedbalance" => wallet_methods::getunconfirmedbalance(state, wallet),
+        #[cfg(feature = "zcash")]
         "getwalletinfo" => wallet_methods::getwalletinfo(state, wallet),
+        #[cfg(feature = "zcash")]
         "getaddressinfo" => wallet_methods::getaddressinfo(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "listtransactions" => wallet_methods::listtransactions(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "z_listtransactions" => wallet_methods::z_listtransactions(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "listsinceblock" => wallet_methods::listsinceblock(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "gettransaction" => wallet_methods::gettransaction(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "listunspent" => wallet_methods::listunspent(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "getreceivedbyaddress" => wallet_methods::getreceivedbyaddress(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "listreceivedbyaddress" => wallet_methods::listreceivedbyaddress(state, wallet, req),
-        "listwallets" => wallet_methods::listwallets(state),
+        "listwallets" => control::listwallets(state),
+        #[cfg(feature = "zcash")]
         "listwalletdir" => wallet_methods::listwalletdir(state),
 
         // Wallet - management (fleet onboarding)
+        #[cfg(feature = "zcash")]
         "createwallet" => wallet_methods::createwallet(state, &req.params).await,
+        #[cfg(feature = "zcash")]
         "loadwallet" => wallet_methods::loadwallet(state, &req.params).await,
+        #[cfg(feature = "zcash")]
         "unloadwallet" => wallet_methods::unloadwallet(state, &req.params, wallet),
 
         // Wallet - writes / async
+        #[cfg(feature = "zcash")]
         "getnewaddress" => wallet_methods::getnewaddress(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "sendtoaddress" => wallet_methods::sendtoaddress(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "sendmany" => wallet_methods::sendmany(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "walletpassphrase" => wallet_methods::walletpassphrase(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "walletlock" => wallet_methods::walletlock(state, wallet).await,
 
         // Wallet - async operations (zcashd-style; the send itself runs on a background task)
+        #[cfg(feature = "zcash")]
         "z_sendmany" => wallet_methods::z_sendmany(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "z_shieldcoinbase" => wallet_methods::z_shieldcoinbase(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "z_mergetoaddress" => wallet_methods::z_mergetoaddress(state, wallet, req).await,
+        #[cfg(feature = "zcash")]
         "z_getoperationstatus" => wallet_methods::z_getoperationstatus(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "z_getoperationresult" => wallet_methods::z_getoperationresult(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "z_listoperationids" => wallet_methods::z_listoperationids(state, wallet, req),
+        #[cfg(feature = "zcash")]
         "z_waitforoperation" => wallet_methods::z_waitforoperation(state, wallet, req).await,
 
         // Wallet - address derivation (zcashd-style; exact-or-next diversified UA)
+        #[cfg(feature = "zcash")]
         "z_getaddressforaccount" => {
             wallet_methods::z_getaddressforaccount(state, wallet, req).await
         }
@@ -483,6 +537,32 @@ async fn dispatch_zecd(
         // so the dispatch table and `ALL_METHODS` stay in lockstep (the test scans them).
         "listdescriptors" => bitcoin_only_fallthrough(state, wallet, req),
         "abandontransaction" => bitcoin_only_fallthrough(state, wallet, req),
+
+        // Served by the Zcash engine, which this build does not carry. These are the
+        // shared-dialect methods a Bitcoin wallet *can* serve, so the wallet is resolved first
+        // and an unknown name still answers -18 - the ordering every handler gives it, and the
+        // one the coin gate above preserves by not erroring on an unresolvable wallet. A
+        // loaded Bitcoin wallet never reaches here; `btc_methods` answered above.
+        #[cfg(not(feature = "zcash"))]
+        "getblockcount"
+        | "getbestblockhash"
+        | "validateaddress"
+        | "sendrawtransaction"
+        | "getbalance"
+        | "getbalances"
+        | "getunconfirmedbalance"
+        | "getwalletinfo"
+        | "listtransactions"
+        | "gettransaction"
+        | "listunspent"
+        | "listreceivedbyaddress"
+        | "getaddressinfo"
+        | "getnewaddress"
+        | "sendtoaddress"
+        | "sendmany" => {
+            state.registry.get_coin(wallet)?;
+            Err(RpcError::method_not_found(&req.method))
+        }
 
         other => Err(RpcError::method_not_found(other)),
     }
@@ -565,10 +645,12 @@ mod tests {
 
     /// The data itself. The `z_*` surface must stay gated to Zcash (a new `z_*` method that
     /// forgets its restriction fails here), `All` is reserved for the wallet-independent
-    /// shell, and every wallet-touching method names Zcash among its coins (the dialect is
-    /// implemented there first; a Bitcoin-only method does not exist).
+    /// shell, and every wallet-touching method's coin set must be one of the three tier
+    /// consts rather than a literal - which is what makes the tiers, and therefore the engine
+    /// gates that empty them, the single place a method's coins are decided.
     #[test]
     fn method_coin_tiers_hold() {
+        #[cfg(feature = "zcash")]
         use crate::coin::Coin;
         // The registry operations (`listwalletdir`, `createwallet`, `loadwallet`,
         // `unloadwallet`) act on the set of wallets, not on one, so they sit in the shell too.
@@ -591,7 +673,7 @@ mod tests {
             if method.starts_with("z_") {
                 assert_eq!(
                     *coins,
-                    super::MethodCoins::Only(&[Coin::Zcash]),
+                    super::MethodCoins::Only(super::ZCASH_ONLY),
                     "{method} is a Zcash extension and must be gated to Zcash"
                 );
             }
@@ -612,6 +694,17 @@ mod tests {
                             "{method} is a descriptor-wallet method and must be gated to Bitcoin"
                         );
                     } else {
+                        // One of the tier consts, never a literal: each tier's elements ride
+                        // their engine's feature gate, so a method that spelled its own set
+                        // would keep naming an engine this build does not carry.
+                        assert!(
+                            [super::ZCASH_ONLY, super::ZCASH_AND_BITCOIN]
+                                .iter()
+                                .any(|tier| std::ptr::eq(*coins, *tier)),
+                            "{method}: a wallet-touching method names a tier const, not its own \
+                             coin set"
+                        );
+                        #[cfg(feature = "zcash")]
                         assert!(
                             coins.contains(&Coin::Zcash),
                             "{method}: every other wallet-touching method is served for Zcash"

@@ -959,7 +959,7 @@ async fn encrypted_wallet_unlock_lock_cycle() {
         &crate::wallet::store::keys_path(&wd),
         Passphrase::from("pw".to_string()),
         &mnemonic,
-        BlockHeight::from_u32(1),
+        1,
         net,
         &test_pinned_ufvk(net),
     )
@@ -1016,7 +1016,7 @@ async fn unencrypted_wallet_rejects_passphrase_rpcs() {
         &crate::wallet::store::keys_path(&wd),
         std::iter::once(&recipient as &dyn age::Recipient),
         &mnemonic,
-        BlockHeight::from_u32(1),
+        1,
         net,
         &test_pinned_ufvk(net),
     )
@@ -1062,7 +1062,7 @@ async fn watch_only_wallet_disables_spending_rpcs() {
     // view-only UFVK import (the UFVK derived from the committed test seed).
     WalletStore::init_view_only(
         &crate::wallet::store::keys_path(&wd),
-        BlockHeight::from_u32(1),
+        1,
         net,
         &test_pinned_ufvk(net),
     )
@@ -1173,7 +1173,7 @@ async fn startup_refuses_database_not_matching_pinned_ufvk() {
         &crate::wallet::store::keys_path(&wd),
         Passphrase::from("pw".to_string()),
         &mnemonic,
-        BlockHeight::from_u32(1),
+        1,
         net,
         &test_pinned_ufvk(net),
     )
@@ -1210,7 +1210,7 @@ async fn startup_backfills_pin_on_legacy_keys_toml() {
         &kp,
         Passphrase::from("pw".to_string()),
         &mnemonic,
-        BlockHeight::from_u32(1),
+        1,
         net,
         &test_pinned_ufvk(net),
     )
@@ -1256,7 +1256,7 @@ async fn unlock_refuses_seed_that_does_not_derive_the_account() {
         &kp,
         Passphrase::from("pw".to_string()),
         &mnemonic,
-        BlockHeight::from_u32(1),
+        1,
         net,
         &test_pinned_ufvk(net),
     )
@@ -1305,7 +1305,7 @@ async fn auto_unlock_refuses_foreign_database_at_startup() {
         &kp,
         std::iter::once(&recipient as &dyn age::Recipient),
         &mnemonic,
-        BlockHeight::from_u32(1),
+        1,
         net,
         &test_pinned_ufvk(net),
     )
@@ -1354,7 +1354,7 @@ async fn getrawtransaction_error_does_not_leak_upstream_endpoint() {
         &crate::wallet::store::keys_path(&wd),
         std::iter::once(&recipient as &dyn age::Recipient),
         &mnemonic,
-        BlockHeight::from_u32(1),
+        1,
         net,
         &test_pinned_ufvk(net),
     )

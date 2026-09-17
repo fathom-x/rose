@@ -79,10 +79,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-  # Library feature combinations: the crate is consumable with `default-features = false`
-  # (the embeddable node + CLI cores, no axum/clap), so every combination the gates create
-  # must stay warning-free and the library-only tests green. The default-features path is
-  # already covered by the `test` job above.
+  # Feature combinations. Two kinds of gate meet here: the transports (`server`, `cli`), which
+  # a library consumer drops with `default-features = false`, and the wallet engines (`zcash`,
+  # `bitcoin`), at least one of which every build must carry. Every combination they create
+  # must stay warning-free and its tests green. The default-features path is already covered by
+  # the `test` job above.
   features:
     runs-on: ubuntu-latest
     steps:
@@ -101,19 +102,42 @@ jobs:
       # that only one combination needs fails the job rather than review.
       - name: Clippy across feature combinations
         run: |
-          cargo clippy --all-targets --no-default-features -- -D warnings
-          cargo clippy --all-targets --no-default-features --features server -- -D warnings
-          cargo clippy --all-targets --no-default-features --features cli -- -D warnings
+          cargo clippy --all-targets --no-default-features --features zcash -- -D warnings
+          cargo clippy --all-targets --no-default-features --features zcash,server -- -D warnings
+          cargo clippy --all-targets --no-default-features --features zcash,cli -- -D warnings
           cargo clippy --all-targets --no-default-features --features bitcoin -- -D warnings
+          cargo clippy --all-targets --no-default-features --features bitcoin,server,cli -- -D warnings
           cargo clippy --all-targets --features bitcoin -- -D warnings
 
-      - name: Test library-only (no default features)
-        run: cargo test --no-default-features
+      - name: Test library-only (no transports, the Zcash engine alone)
+        run: cargo test --no-default-features --features zcash
 
-      # The BDK engine: default features plus the bitcoin wallet engine - the combination the
-      # engine-boundary rule exists for (an engine `use` that leaks into a default build, or a
-      # shared-layer item that only compiles with the engine present, fails here).
-      - name: Test with the bitcoin engine
+      # The bitcoin-only binary: the shape the `zcash` gate exists for. Its own `cargo test`
+      # because the shared shell answers differently there (a method the missing engine served
+      # reads as method-not-found, `config check` refuses that engine's keys), and those
+      # answers are what the gate is for.
+      - name: Test the bitcoin-only build
+        run: cargo test --no-default-features --features bitcoin,server,cli
+
+      # A bitcoin-only zecd must carry no Zcash crate at all - the whole point of making them
+      # optional. Compiling proves nothing here: an unused dependency still builds, ships in
+      # the binary, and lands in the licence bundle. `-e normal` excludes dev-dependencies,
+      # which are irrelevant to what a consumer links.
+      - name: A bitcoin-only build carries no Zcash crate
+        run: |
+          hits=$(cargo tree -e normal --no-default-features --features bitcoin,server,cli \
+              | grep -icE 'zcash|orchard|sapling|zip32|zip321|pczt|tonic|prost' || true)
+          if [ "$hits" != "0" ]; then
+            echo "::error::a bitcoin-only build pulled in $hits Zcash-side crate line(s):"
+            cargo tree -e normal --no-default-features --features bitcoin,server,cli \
+              | grep -iE 'zcash|orchard|sapling|zip32|zip321|pczt|tonic|prost'
+            exit 1
+          fi
+
+      # Both engines: the combination the engine-boundary rule exists for (an engine `use` that
+      # leaks into the other's build, or a shared-layer item that only compiles with one engine
+      # present, fails here).
+      - name: Test with both wallet engines
         run: cargo test --features bitcoin
 
   # Dependency policy: RustSec advisories (vulnerabilities AND unmaintained crates),
@@ -228,7 +252,10 @@ jobs:
       # depend on) and the full binary surface, since the gating bug lived in code reachable
       # from both.
       - name: Check the embeddable library for Windows
-        run: cargo check --lib --no-default-features --target x86_64-pc-windows-gnu
+        run: cargo check --lib --no-default-features --features zcash --target x86_64-pc-windows-gnu
+
+      - name: Check the bitcoin-only library for Windows
+        run: cargo check --lib --no-default-features --features bitcoin --target x86_64-pc-windows-gnu
 
       - name: Check with default features for Windows
         run: cargo check --all-targets --target x86_64-pc-windows-gnu
@@ -252,7 +279,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check the embeddable library
-        run: cargo check --lib --no-default-features
+        run: cargo check --lib --no-default-features --features zcash
+
+      - name: Check the bitcoin-only library
+        run: cargo check --lib --no-default-features --features bitcoin
 
       - name: Check with default features
         run: cargo check --all-targets

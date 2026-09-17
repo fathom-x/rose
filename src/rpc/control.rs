@@ -49,3 +49,12 @@ pub(crate) fn getrpcinfo(state: &AppState) -> Result<Value, RpcError> {
     // We log to stderr/tracing rather than a debug.log file, so logpath is empty.
     Ok(json!({ "active_commands": active, "logpath": "" }))
 }
+
+/// `listwallets` - the names of all loaded wallets (every `[wallets.<name>]` in the config).
+///
+/// Here rather than with the wallet handlers because it reads the registry's key set and
+/// touches no wallet: it is part of the wallet-independent shell every build serves, like the
+/// rest of this module.
+pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
+    Ok(json!(state.registry.names()))
+}

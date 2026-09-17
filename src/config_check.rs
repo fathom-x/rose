@@ -102,6 +102,7 @@ pub fn inspect(config: &AppConfig) -> Vec<Finding> {
     check_rpc(config, &mut findings);
     check_layout(config, &mut findings);
     check_paths(config, &mut findings);
+    #[cfg(feature = "zcash")]
     check_fleet(config, &mut findings);
 
     findings
@@ -113,6 +114,7 @@ pub fn inspect(config: &AppConfig) -> Vec<Finding> {
 /// disabled means wallets an operator provisioned are silently not being watched - the files
 /// look exactly the same either way, and nothing else in the daemon mentions them. That is the
 /// failure mode this whole key introduces, so it is worth naming precisely.
+#[cfg(feature = "zcash")]
 fn check_fleet(config: &AppConfig, findings: &mut Vec<Finding>) {
     let manifests = match crate::fleet::load_manifests(&config.fleet.manifest_dir) {
         // Only the count matters here; an unreadable individual manifest is reported by the
@@ -187,42 +189,49 @@ pub fn check(config: &AppConfig) -> CheckOutcome {
 /// network must pass. A refusal there is an error rather than a warning because the daemon
 /// would start and then fail every connect attempt forever - a wallet that can never sync.
 fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
-    let server = match crate::backend::resolve_configured(config) {
-        Ok(server) => server,
-        Err(e) => {
-            findings.push(Finding::error(format!("[backend] server: {e:#}")));
-            return;
+    // The `[backend]` endpoint is the Zcash upstream's; a build without that engine refuses
+    // every key of it at resolve, so there is nothing left of it to check. The block's value is
+    // whether that upstream is a lightwalletd, which the per-wallet checks below key off.
+    #[cfg(feature = "zcash")]
+    let lightwalletd = {
+        let server = match crate::backend::resolve_configured(config) {
+            Ok(server) => server,
+            Err(e) => {
+                findings.push(Finding::error(format!("[backend] server: {e:#}")));
+                return;
+            }
+        };
+        if let Err(e) = server.preflight() {
+            findings.push(Finding::error(format!("{e:#}")));
         }
-    };
-    if let Err(e) = server.preflight() {
-        findings.push(Finding::error(format!("{e:#}")));
-    }
 
-    let lightwalletd = server.kind() == crate::backend::ServerKind::Lightwalletd;
-    if config.backend.assume_transparent_in_compact_blocks && !lightwalletd {
-        findings.push(Finding::warning(
-            "[backend] assume_transparent_in_compact_blocks is set but the upstream is not a \
+        let is_lightwalletd = server.kind() == crate::backend::ServerKind::Lightwalletd;
+        if config.backend.assume_transparent_in_compact_blocks && !is_lightwalletd {
+            findings.push(Finding::warning(
+                "[backend] assume_transparent_in_compact_blocks is set but the upstream is not a \
              lightwalletd; it will be ignored (a zebra backend always covers transparent data)",
-        ));
-    }
-    // A proxy resolves and dials the destination itself, so a loopback destination names the
-    // *proxy's* own loopback - almost never what an operator pointing zecd at a local node
-    // meant. Warn rather than error: a proxy running on this same host is a legitimate setup.
-    if config.backend.proxy.is_some() && crate::chain::zebra::host_is_loopback(server.host()) {
-        findings.push(Finding::warning(format!(
-            "[backend] proxy is set, but the upstream host '{}' is loopback: the proxy will \
+            ));
+        }
+        // A proxy resolves and dials the destination itself, so a loopback destination names the
+        // *proxy's* own loopback - almost never what an operator pointing zecd at a local node
+        // meant. Warn rather than error: a proxy running on this same host is a legitimate setup.
+        if config.backend.proxy.is_some() && crate::backend::host_is_loopback(server.host()) {
+            findings.push(Finding::warning(format!(
+                "[backend] proxy is set, but the upstream host '{}' is loopback: the proxy will \
              dial its OWN loopback, not this machine's. Name the host as the proxy sees it, \
              or drop the proxy for a local upstream",
-            server.host()
-        )));
-    }
-    if config.backend.tls_insecure_skip_verify {
-        findings.push(Finding::warning(
-            "[backend] tls_insecure_skip_verify = true accepts any lightwalletd certificate: \
+                server.host()
+            )));
+        }
+        if config.backend.tls_insecure_skip_verify {
+            findings.push(Finding::warning(
+                "[backend] tls_insecure_skip_verify = true accepts any lightwalletd certificate: \
              the connection is encrypted but unauthenticated, so an on-path attacker can \
              impersonate the server. Prefer tls_pinned_sha256 for a self-signed certificate",
-        ));
-    }
+            ));
+        }
+        is_lightwalletd
+    };
 
     // The global `[bitcoind] server` default, when set, must parse even if no bitcoin wallet
     // currently uses it (the per-wallet resolve below only validates the effective token of
@@ -351,67 +360,74 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
             }
             continue;
         }
-        // A wallet that overrides the endpoint dials its own, so it gets its own resolve and
-        // preflight - and the per-wallet warnings below key off *its* backend kind, not the
-        // global one. A wallet with no overrides is the global endpoint already checked above.
-        let (lightwalletd, assume_transparent) = if wallet.backend.is_empty() {
-            (
-                lightwalletd,
-                config.backend.assume_transparent_in_compact_blocks,
-            )
-        } else {
-            match crate::backend::resolve_for_wallet(config, wallet) {
-                Ok(wallet_server) => {
-                    if let Err(e) = wallet_server.preflight() {
-                        findings.push(Finding::error(format!("[wallets.{name}] server: {e:#}")));
+        // Everything below is the Zcash engine's endpoint and pool configuration, so it rides
+        // the gate: in a bitcoin-only build the arm above has already claimed every wallet.
+        #[cfg(feature = "zcash")]
+        {
+            // A wallet that overrides the endpoint dials its own, so it gets its own resolve and
+            // preflight - and the per-wallet warnings below key off *its* backend kind, not the
+            // global one. A wallet with no overrides is the global endpoint already checked above.
+            let (lightwalletd, assume_transparent) = if wallet.backend.is_empty() {
+                (
+                    lightwalletd,
+                    config.backend.assume_transparent_in_compact_blocks,
+                )
+            } else {
+                match crate::backend::resolve_for_wallet(config, wallet) {
+                    Ok(wallet_server) => {
+                        if let Err(e) = wallet_server.preflight() {
+                            findings
+                                .push(Finding::error(format!("[wallets.{name}] server: {e:#}")));
+                        }
+                        (
+                            wallet_server.kind() == crate::backend::ServerKind::Lightwalletd,
+                            wallet
+                                .backend
+                                .effective(&config.backend)
+                                .assume_transparent_in_compact_blocks,
+                        )
                     }
-                    (
-                        wallet_server.kind() == crate::backend::ServerKind::Lightwalletd,
-                        wallet
-                            .backend
-                            .effective(&config.backend)
-                            .assume_transparent_in_compact_blocks,
-                    )
+                    Err(e) => {
+                        findings.push(Finding::error(format!("[wallets.{name}] server: {e:#}")));
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    findings.push(Finding::error(format!("[wallets.{name}] server: {e:#}")));
-                    continue;
-                }
+            };
+            if !wallet.transparent_enabled {
+                continue;
             }
-        };
-        if !wallet.transparent_enabled {
-            continue;
-        }
-        // The actor refuses to run a transparent-enabled wallet against a lightwalletd that
-        // does not advertise transparent data in compact blocks - and no released lightwalletd
-        // populates the advertisement, so in practice the assertion knob is required. Only a
-        // warning: whether a given server advertises it is a fact about the server, not the
-        // config, and this check never dials.
-        if lightwalletd && !assume_transparent {
-            findings.push(Finding::warning(format!(
+            // The actor refuses to run a transparent-enabled wallet against a lightwalletd that
+            // does not advertise transparent data in compact blocks - and no released lightwalletd
+            // populates the advertisement, so in practice the assertion knob is required. Only a
+            // warning: whether a given server advertises it is a fact about the server, not the
+            // config, and this check never dials.
+            if lightwalletd && !assume_transparent {
+                findings.push(Finding::warning(format!(
                 "wallet '{name}' has [pools] transparent = true against a lightwalletd upstream: \
                  the wallet refuses to run unless the server advertises that it serves \
                  transparent data in compact blocks, and no released lightwalletd populates that \
                  advertisement yet. Set [backend] assume_transparent_in_compact_blocks = true to \
                  assert it, or point [backend] server at your own zebra"
             )));
-        }
-        if lightwalletd
-            && (wallet.transparent_initial_scan >= LIGHT_TRANSPARENT_ADDR_WARN
-                || wallet.transparent_gap_limit >= LIGHT_TRANSPARENT_ADDR_WARN)
-        {
-            findings.push(Finding::warning(format!(
+            }
+            if lightwalletd
+                && (wallet.transparent_initial_scan >= LIGHT_TRANSPARENT_ADDR_WARN
+                    || wallet.transparent_gap_limit >= LIGHT_TRANSPARENT_ADDR_WARN)
+            {
+                findings.push(Finding::warning(format!(
                 "wallet '{name}': transparent_initial_scan = {} / transparent_gap_limit = {} on a \
                  lightwalletd backend - spend detection queries each funded address separately, \
                  one remote round trip apiece. Running your own zebra (server = \"zebra\") is \
                  recommended at this scale",
                 wallet.transparent_initial_scan, wallet.transparent_gap_limit,
             )));
+            }
         }
     }
 }
 
 /// Mirrors `daemon.rs`'s per-wallet lightwalletd scale warning.
+#[cfg(feature = "zcash")]
 const LIGHT_TRANSPARENT_ADDR_WARN: u32 = 1_000;
 
 /// The RPC surface: the credentials must be usable, and a bare password must not be about to
@@ -463,6 +479,7 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
     // file's parent, and each wallet directory) on startup, so warning about it would be a
     // claim of failure that never happens. What a missing datadir really implies - no wallet
     // there yet - is covered precisely by the per-wallet check below.
+    #[cfg(feature = "zcash")]
     if let Some(cookie) = &config.zebra.rpc_cookie {
         if !cookie.exists() {
             findings.push(Finding::warning(format!(
@@ -492,6 +509,7 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
         // Recording a transparent receive re-derives the whole gap window, so a wide window is
         // a per-receive cost, not just a restore-scan depth. The actor logs this at spawn; here
         // it is worth catching before the config reaches a host at all.
+        #[cfg(feature = "zcash")]
         if wallet.transparent_enabled {
             if wallet.transparent_gap_limit > crate::config::TRANSPARENT_GAP_LIMIT_SEVERE {
                 findings.push(Finding::warning(format!(
@@ -686,6 +704,7 @@ mod tests {
     /// Manifests present with the fleet disabled is the failure mode `[fleet] enabled`
     /// introduces: the files look identical either way, and nothing else in the daemon mentions
     /// them, so an operator who provisioned wallets sees them silently unwatched.
+    #[cfg(feature = "zcash")]
     #[test]
     fn manifests_with_the_fleet_disabled_are_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -729,6 +748,7 @@ mod tests {
     }
 
     /// Enabling it warns once, where an operator checking a config before deploying sees it.
+    #[cfg(feature = "zcash")]
     #[test]
     fn enabling_the_fleet_warns_that_it_is_experimental() {
         let dir = tempfile::tempdir().unwrap();
@@ -811,6 +831,7 @@ mod tests {
 
     /// The same database in both places stops the daemon, so it is an error here too - and
     /// `check` is the command an operator runs to find out why.
+    #[cfg(feature = "zcash")]
     #[test]
     fn the_same_database_in_both_layouts_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -878,6 +899,7 @@ mod tests {
     /// A credentialed `zebra://` endpoint on a public host is refused by the cleartext gate at
     /// connect. The daemon would start and then never sync, so the check reports it as an error
     /// - the case this command exists to catch before a deployment, not after.
+    #[cfg(feature = "zcash")]
     #[test]
     fn credentialed_zebra_over_the_public_internet_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -917,6 +939,7 @@ mod tests {
     /// A transparent-enabled wallet on a lightwalletd upstream refuses to run unless the
     /// capability is asserted - the single most likely way a light-mode transparent deployment
     /// fails, and invisible in the config file itself.
+    #[cfg(feature = "zcash")]
     #[test]
     fn transparent_on_lightwalletd_warns_without_the_capability_assertion() {
         let dir = tempfile::tempdir().unwrap();
@@ -949,6 +972,7 @@ mod tests {
 
     /// The gap-limit width that stalled a real restore is warned about here too, so it can be
     /// caught before the config ships rather than in the actor's startup log afterwards.
+    #[cfg(feature = "zcash")]
     #[test]
     fn a_pathological_transparent_gap_limit_warns() {
         let dir = tempfile::tempdir().unwrap();
@@ -992,6 +1016,7 @@ mod tests {
 
     /// What `check` prints as the effective settings is exactly what `config show` prints -
     /// one renderer, so the two commands can never describe the same config differently.
+    #[cfg(feature = "zcash")]
     #[test]
     fn the_summary_is_the_config_show_rendering() {
         let dir = tempfile::tempdir().unwrap();
@@ -1059,7 +1084,7 @@ mod tests {
     /// node has a mempool), and named on a network with no public instance it never starts.
     /// Both are warnings naming the wallet or the knob; a kyoto wallet on a served network,
     /// or one with an override, is clean.
-    #[cfg(feature = "bitcoin")]
+    #[cfg(all(feature = "zcash", feature = "bitcoin"))]
     #[test]
     fn a_mempool_feed_that_would_not_run_is_reported() {
         let dir = tempfile::tempdir().unwrap();

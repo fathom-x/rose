@@ -327,6 +327,7 @@ fn unknown_allowed_method_fails_startup() {
 
 /// A default receiver that names a pool the wallet doesn't enable is a startup error, caught at
 /// config parse before any network/wallet I/O.
+#[cfg(feature = "zcash")]
 #[test]
 fn default_receivers_not_subset_of_pools_fails_startup() {
     let dir = tempfile::tempdir().unwrap();
@@ -357,6 +358,7 @@ fn default_receivers_not_subset_of_pools_fails_startup() {
 }
 
 /// An unknown pool name in `[pools]` is rejected at startup.
+#[cfg(feature = "zcash")]
 #[test]
 fn unknown_pool_name_fails_startup() {
     let dir = tempfile::tempdir().unwrap();
@@ -388,6 +390,7 @@ fn unknown_pool_name_fails_startup() {
 
 /// A malformed `--ufvk` fails fast and offline: the key is parsed before any upstream
 /// connection (so no server is contacted for a key that can never import).
+#[cfg(feature = "zcash")]
 #[test]
 fn init_with_invalid_ufvk_fails_before_any_network_io() {
     let dir = tempfile::tempdir().unwrap();
@@ -453,6 +456,7 @@ fn init_ufvk_conflicts_with_restore_and_encrypt() {
 }
 
 /// `export-ufvk` refuses cleanly when the wallet does not exist (nothing to export).
+#[cfg(feature = "zcash")]
 #[test]
 fn export_ufvk_requires_an_initialized_wallet() {
     let dir = tempfile::tempdir().unwrap();
@@ -515,6 +519,7 @@ fn init_refuses_when_datadir_is_already_locked() {
 /// The read-only `export-ufvk` is deliberately exempt from the datadir lock (it only reads the
 /// wallet DB, so it is safe to run alongside a live daemon). Even with the lock held, it must get
 /// past the guard and fail on its own "not initialized" check - never on "already running".
+#[cfg(feature = "zcash")]
 #[test]
 fn export_ufvk_is_not_blocked_by_the_datadir_lock() {
     let dir = tempfile::tempdir().unwrap();
@@ -872,6 +877,7 @@ fn stdout_of(out: &Output) -> String {
 /// The happy path: a config this build accepts exits 0 and reports the settings it resolves
 /// to - including the ones the file never mentions, which is what makes the command useful
 /// across an upgrade or a rollback (every unset key takes the *binary's* default).
+#[cfg(feature = "zcash")]
 #[test]
 fn config_check_accepts_a_valid_config_and_prints_the_effective_settings() {
     let dir = tempfile::tempdir().unwrap();
@@ -1060,6 +1066,7 @@ fn config_check_strict_fails_on_warnings_alone() {
 
 /// A valid proxy resolves, is reported as an effective setting, and is named on the endpoint
 /// description - so an operator can confirm at a glance that their traffic is being routed.
+#[cfg(feature = "zcash")]
 #[test]
 fn config_check_accepts_a_socks_proxy_and_reports_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -1090,6 +1097,7 @@ fn config_check_accepts_a_socks_proxy_and_reports_it() {
 
 /// A malformed proxy is a startup failure, not a silent direct dial - and the error names the
 /// key so the operator knows which line to fix.
+#[cfg(feature = "zcash")]
 #[test]
 fn config_check_rejects_a_malformed_proxy_and_names_the_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -1113,6 +1121,7 @@ fn config_check_rejects_a_malformed_proxy_and_names_the_key() {
 
 /// A proxy pointed at a loopback upstream names the *proxy's* loopback, which is almost never
 /// what was meant - a warning, so `--strict` fails on it while a normal run still starts.
+#[cfg(feature = "zcash")]
 #[test]
 fn config_check_warns_when_a_proxy_is_pointed_at_a_loopback_upstream() {
     let dir = tempfile::tempdir().unwrap();
@@ -1273,6 +1282,7 @@ fn config_show(conf: &std::path::Path) -> Output {
 /// The end-to-end property, run through the real binary: what `config show` prints is a config
 /// zecd itself accepts, and feeding it back produces the same thing. That is what makes the
 /// output safe to capture before an upgrade and diff against the new build's.
+#[cfg(feature = "zcash")]
 #[test]
 fn config_show_output_is_a_config_zecd_accepts_and_reproduces() {
     let dir = tempfile::tempdir().unwrap();
@@ -1374,7 +1384,22 @@ fn repo_file(rel: &str) -> std::path::PathBuf {
 /// Every one of these ships the `CHANGE-ME` placeholder password, so as written each is refused
 /// on every network and each is valid once `ZECD_RPC_PASSWORD` supplies the one value the
 /// operator is told to change - both halves asserted below.
-const SAMPLE_CONFIGS: [&str; 3] = [
+/// The Zcash samples (`zecd.example.toml`, the zecd side of `deploy/docker-compose*.yml`).
+/// They select the librustzcash engine - the example documents `[pools]` and `[spend]`, the
+/// deploy pair set `[zebra]` - so they are shipped-and-valid only for a build carrying the
+/// `zcash` feature, exactly as the Bitcoin samples below need theirs;
+/// `the_zcash_sample_configs_need_the_engine_they_select` asserts the other side.
+#[cfg(feature = "zcash")]
+fn zcash_sample_configs() -> &'static [&'static str] {
+    &ZCASH_SAMPLE_CONFIGS
+}
+
+#[cfg(not(feature = "zcash"))]
+fn zcash_sample_configs() -> &'static [&'static str] {
+    &[]
+}
+
+const ZCASH_SAMPLE_CONFIGS: [&str; 3] = [
     "zecd.example.toml",
     "deploy/zecd.toml",
     "deploy/zecd.mainnet.toml",
@@ -1408,7 +1433,7 @@ const BITCOIN_SAMPLE_CONFIGS: [&str; 6] = [
 
 /// Every sample config, for whichever engines this build carries.
 fn shipped_sample_configs() -> Vec<&'static str> {
-    SAMPLE_CONFIGS
+    zcash_sample_configs()
         .iter()
         .chain(bitcoin_sample_configs())
         .copied()
@@ -1460,6 +1485,36 @@ fn the_shipped_samples_are_refused_only_for_their_placeholder_password() {
     }
 }
 
+/// The other side of `zcash_sample_configs`, and the mirror of the Bitcoin one below: these
+/// samples select the librustzcash engine, so a bitcoin-only build must refuse them. The
+/// refusal comes from a section that is `cfg`-gated out of the config schema and so trips
+/// `deny_unknown_fields` at parse - before `coin` reaches the doctrine check in `resolve`.
+/// Assert the message names one of those sections, or the doctrine check itself: "unknown
+/// field" alone would also pass for a sample that had rotted onto a genuinely retired key.
+#[cfg(not(feature = "zcash"))]
+#[test]
+fn the_zcash_sample_configs_need_the_engine_they_select() {
+    for rel in ZCASH_SAMPLE_CONFIGS {
+        let out = config_check(&repo_file(rel), &[]);
+        assert!(
+            !out.status.success(),
+            "{rel} selects the librustzcash engine; a build without it must refuse the file:\n{}",
+            stdout_of(&out)
+        );
+        let stderr = stderr_of(&out);
+        let refused_for_missing_engine = stderr.contains("unknown field `zebra`")
+            || stderr.contains("unknown field `pools`")
+            || stderr.contains("unknown field `spend`")
+            || stderr.contains("unknown field `fleet`")
+            || stderr.contains("configures the Zcash engine")
+            || stderr.contains("unsupported coin \"zcash\"");
+        assert!(
+            refused_for_missing_engine,
+            "{rel} was refused for some reason other than the missing engine: {stderr}"
+        );
+    }
+}
+
 /// The other side of `bitcoin_sample_configs`. The Bitcoin dev-stack samples select an engine
 /// a default build does not carry, so that build must refuse them - and each file's header
 /// tells the operator that running `config check` on it is the probe for whether a given
@@ -1479,13 +1534,13 @@ fn the_bitcoin_sample_configs_need_the_engine_they_select() {
             stdout_of(&out)
         );
         let stderr = stderr_of(&out);
-        // A default build refuses a bitcoin sample for the missing engine one of four ways:
-        // the `[bitcoind]` section trips deny_unknown_fields at parse (the full-node samples),
-        // as does the engine-only `[mempool]` section (the testnet4 kyoto view sample, which
-        // opts into the p2p feed); for a kyoto sample with neither, since kyoto needs no
-        // credentials, `btc_testnet` is refused at resolve behind the feature; and a mainnet
-        // kyoto sample, which has none of those keys, reaches the coin doctrine check itself,
-        // which names the engines this build carries.
+        // A build without the engine refuses a bitcoin sample for the missing engine one of
+        // four ways: the `[bitcoind]` section trips deny_unknown_fields at parse (the
+        // full-node samples), as does the engine-only `[mempool]` section (the testnet4 kyoto
+        // view sample, which opts into the p2p feed); for a kyoto sample with neither, since
+        // kyoto needs no credentials, `btc_testnet` is refused at resolve behind the feature;
+        // and a mainnet kyoto sample, which has none of those keys, reaches the coin doctrine
+        // check itself, which names the engines this build carries.
         let refused_for_missing_engine = stderr.contains("unknown field `bitcoind`")
             || stderr.contains("unknown field `mempool`")
             || stderr.contains("requires a zecd build with the `bitcoin` feature")
@@ -1598,12 +1653,14 @@ fn init_creates_wallet_and_refuses_reinit() {
     );
 }
 
+#[cfg(feature = "zcash")]
 /// The committed testnet development mnemonic (valueless TAZ only), used here as
 /// a fixed key source so the derivations below are reproducible.
 const TEST_MNEMONIC: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
     midnight culture idea mountain fame park social drip bid doctor scatter glance defy moment \
     stage";
 
+#[cfg(feature = "zcash")]
 /// A second valid BIP-39 phrase (the canonical all-`abandon` test vector), for the
 /// wrong-wallet case: it derives a real but different account.
 const OTHER_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
@@ -1613,6 +1670,7 @@ const OTHER_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon ab
 /// Run `derive-address` with the mnemonic supplied out of band (`ZECD_MNEMONIC`), returning the
 /// finished output. The datadir is a fresh temp dir that stays empty: the point of the command is
 /// that it needs neither a wallet nor a chain.
+#[cfg(feature = "zcash")]
 fn derive_from_mnemonic(datadir: &std::path::Path, extra: &[&str]) -> Output {
     run_with_timeout(
         {
@@ -1632,6 +1690,7 @@ fn derive_from_mnemonic(datadir: &std::path::Path, extra: &[&str]) -> Output {
     )
 }
 
+#[cfg(feature = "zcash")]
 fn stdout_lines(out: &Output) -> Vec<String> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -1642,6 +1701,7 @@ fn stdout_lines(out: &Output) -> Vec<String> {
 /// The core promise: an address from a mnemonic with no chain, no wallet database, and no
 /// daemon - the datadir is left completely empty - and stdout carries nothing but the address,
 /// so it substitutes straight into a command.
+#[cfg(feature = "zcash")]
 #[test]
 fn derive_address_works_offline_from_a_mnemonic() {
     let dir = tempfile::tempdir().unwrap();
@@ -1675,6 +1735,7 @@ fn derive_address_works_offline_from_a_mnemonic() {
 
 /// The phrase can also arrive on stdin, so a cold/air-gapped operator never puts it in a file or
 /// an environment variable.
+#[cfg(feature = "zcash")]
 #[test]
 fn derive_address_reads_the_mnemonic_from_stdin() {
     use std::io::Write as _;
@@ -1704,6 +1765,7 @@ fn derive_address_reads_the_mnemonic_from_stdin() {
 
 /// `--count` pre-provisions a batch: one address per line, all distinct, at consecutive indices
 /// starting from `--index`. `--address-type transparent` covers the exchange/miner case.
+#[cfg(feature = "zcash")]
 #[test]
 fn derive_address_emits_a_batch_of_transparent_addresses() {
     let dir = tempfile::tempdir().unwrap();
@@ -1737,6 +1799,7 @@ fn derive_address_emits_a_batch_of_transparent_addresses() {
 
 /// `--json` reports the derivation machine-readably, including the account UFVK - the offline
 /// equivalent of `export-ufvk`, which needs a wallet database.
+#[cfg(feature = "zcash")]
 #[test]
 fn derive_address_json_reports_the_key_and_indices() {
     let dir = tempfile::tempdir().unwrap();
@@ -1760,6 +1823,7 @@ fn derive_address_json_reports_the_key_and_indices() {
 /// no seed, no passphrase, and no wallet database - and it agrees with the mnemonic that wallet
 /// was created from. Naming the wallet *and* supplying the mnemonic checks the two against each
 /// other, which is how an operator confirms a `keys.toml` before trusting it with deposits.
+#[cfg(feature = "zcash")]
 #[test]
 fn derive_address_reads_a_keys_file_and_verifies_it_against_the_mnemonic() {
     let dir = tempfile::tempdir().unwrap();
@@ -1856,6 +1920,7 @@ fn derive_address_reads_a_keys_file_and_verifies_it_against_the_mnemonic() {
 
 /// A wallet on another network must not be re-encoded onto the flags' network, and an
 /// uninitialized wallet says how to derive without one.
+#[cfg(feature = "zcash")]
 #[test]
 fn derive_address_refuses_a_mismatched_or_missing_keys_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -1931,6 +1996,7 @@ fn help_lists_derive_address_subcommand() {
 /// therefore fails the command, even when deriving from a mnemonic that needs nothing from it.
 /// The documented way to derive with no deployment context is to bypass the file and name the
 /// network explicitly; this pins both halves.
+#[cfg(feature = "zcash")]
 #[test]
 fn derive_address_follows_the_config_file_and_can_bypass_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -2008,6 +2074,7 @@ fn derive_address_follows_the_config_file_and_can_bypass_it() {
 /// untouched: no lock file, no cookie, no wallet database. That last part is what makes it
 /// safe to run against a live deployment, and what lets a caller ask for the tip *before* any
 /// wallet exists.
+#[cfg(feature = "zcash")]
 #[test]
 fn chain_info_fails_on_an_unreachable_upstream_and_writes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2048,6 +2115,7 @@ fn chain_info_fails_on_an_unreachable_upstream_and_writes_nothing() {
 
 /// Global flags parse on either side of the subcommand (every top-level flag is
 /// `global = true`), so a caller can write them in whichever order they think of them.
+#[cfg(feature = "zcash")]
 #[test]
 fn chain_info_accepts_global_flags_on_either_side() {
     for args in [
@@ -2075,43 +2143,63 @@ fn chain_info_accepts_global_flags_on_either_side() {
     }
 }
 
-/// The `coin` key against this binary. Without the `bitcoin` feature, `coin = "bitcoin"` is
-/// refused at resolve with the doctrine error ("this build supports: zcash") - reported by
-/// `config check` exactly as the daemon would report it. With the feature, the same config
-/// passes and the effective settings name the coin for that wallet only.
+/// The `coin` key against this binary, from both sides. A coin whose engine this build does
+/// not carry is refused at resolve with the doctrine error naming the ones it does - reported
+/// by `config check` exactly as the daemon would report it - and a coin it does carry passes,
+/// with the effective settings naming it for that wallet only. Both halves run in every build,
+/// so whichever engine is missing is the one under test.
 #[test]
 fn config_check_reports_the_coin_key_per_build() {
     let dir = tempfile::tempdir().unwrap();
     let conf = dir.path().join("zecd.toml");
-    std::fs::write(
-        &conf,
-        format!(
-            "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n\
-             [wallets.btc]\ncoin = \"bitcoin\"\n",
-            dir.path()
-        ),
-    )
-    .unwrap();
+    // The coin an entry gets when it names none - the build's first engine. `config show`
+    // omits the key for exactly that coin, so a single-engine config's output is byte-stable
+    // across the key's existence.
+    let default_coin = if cfg!(feature = "zcash") {
+        "zcash"
+    } else {
+        "bitcoin"
+    };
+    // `served` says whether this build carries the engine for `coin`. Accepted: `config check`
+    // passes and the effective settings name the coin, unless it is the default one. Refused:
+    // the doctrine error naming what this build does serve.
+    let check_coin = |coin: &str, served: bool| {
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n\
+                 [wallets.w]\ncoin = \"{coin}\"\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+        let out = config_check(&conf, &[]);
+        if served {
+            assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+            let stdout = stdout_of(&out);
+            let section = stdout
+                .split("[wallets.w]")
+                .nth(1)
+                .map(|rest| rest.split("[wallets.").next().unwrap())
+                .expect("wallet section rendered");
+            assert_eq!(
+                section.contains(&format!("coin = \"{coin}\"")),
+                coin != default_coin,
+                "{stdout}"
+            );
+        } else {
+            assert!(!out.status.success(), "must refuse a coin it cannot serve");
+            let stderr = stderr_of(&out);
+            assert!(
+                stderr.contains(&format!("unsupported coin \"{coin}\"")),
+                "{stderr}"
+            );
+            assert!(stderr.contains("this build supports: "), "{stderr}");
+        }
+    };
 
-    let out = config_check(&conf, &[]);
-    #[cfg(not(feature = "bitcoin"))]
-    {
-        assert!(!out.status.success(), "must refuse without the feature");
-        let stderr = stderr_of(&out);
-        assert!(stderr.contains("unsupported coin \"bitcoin\""), "{stderr}");
-        assert!(stderr.contains("this build supports: zcash"), "{stderr}");
-    }
-    #[cfg(feature = "bitcoin")]
-    {
-        assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-        let stdout = stdout_of(&out);
-        let btc_section = stdout
-            .split("[wallets.btc]")
-            .nth(1)
-            .map(|rest| rest.split("[wallets.").next().unwrap())
-            .expect("bitcoin wallet section rendered");
-        assert!(btc_section.contains("coin = \"bitcoin\""), "{stdout}");
-    }
+    check_coin("zcash", cfg!(feature = "zcash"));
+    check_coin("bitcoin", cfg!(feature = "bitcoin"));
 
     // An unknown coin token is the same refusal on every build.
     std::fs::write(

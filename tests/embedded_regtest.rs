@@ -17,6 +17,10 @@
 //! `ZECD_REGTEST_NU63_HEIGHT`, so the two sides agree pre-NU6.3 (the harness's NU6.3-active
 //! chains cover ironwood; this test is about the embedding seam, not the pool).
 
+// The embedded path under test is the Zcash engine's (`init_wallet` over librustzcash, a
+// zebrad upstream, `zip321` sends), so the whole file rides the `zcash` gate.
+#![cfg(feature = "zcash")]
+
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};

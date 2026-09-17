@@ -16,21 +16,30 @@
 //! A multi-thread tokio runtime is required: the scan and proving paths use
 //! `tokio::task::block_in_place`, which panics on a current-thread runtime.
 
+#[cfg(feature = "zcash")]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, error, info, warn};
+#[cfg(feature = "zcash")]
+use tracing::debug;
+use tracing::{error, info, warn};
+#[cfg(feature = "zcash")]
 use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
+#[cfg(feature = "zcash")]
 use anyhow::Context as _;
 
+#[cfg(feature = "zcash")]
 use crate::backend;
+#[cfg(feature = "zcash")]
 use crate::chain;
 use crate::config::{self, AppConfig};
 use crate::error::RpcError;
 use crate::state::AppState;
+#[cfg(feature = "zcash")]
 use crate::wallet::actor::{self, ActorConfig};
+#[cfg(feature = "zcash")]
 use crate::wallet::binding;
 use crate::wallet::store::WalletStore;
 use crate::wallet::{CoinWallet, WalletRegistry};
@@ -60,6 +69,7 @@ impl NodeBuilder {
         // every network. Shared with `zecd config check`, which reports the same refusal
         // without starting anything.
         config::reject_placeholder_password(&self.config)?;
+        #[cfg(feature = "zcash")]
         actor::install_panic_hook();
         Ok(PreparedNode {
             config: Arc::new(self.config),
@@ -76,6 +86,7 @@ impl NodeBuilder {
 /// How many of the configured Zcash wallets are initialized (`keys.toml` present) and so
 /// will actually be spawned - the gate for the background proving-key build, which only a
 /// Zcash send can ever consume. Bitcoin wallets never count, whatever the build.
+#[cfg(feature = "zcash")]
 fn zcash_wallets_to_spawn(config: &AppConfig) -> usize {
     config
         .wallets
@@ -144,6 +155,7 @@ impl PreparedNode {
         // bitcoin-only daemon used to pay ~4s of CPU and hold two proving keys for sends it
         // could never make. The handle still exists in that case, so the lazy first-send
         // build stays the fallback for any wallet that does get spawned.
+        #[cfg(feature = "zcash")]
         let orchard_keys = if config.spend.cache_proving_key {
             // Also build the PostNu6_3 (Ironwood) proving key when this network can activate
             // NU6.3, so post-NU6.3 sends prove the Ironwood bundle from the cache instead of
@@ -178,10 +190,12 @@ impl PreparedNode {
         // The upstream connections this daemon holds, keyed by endpoint - see the hub comment in
         // the wallet loop below. A wallet joins an existing hub when its resolved endpoint matches
         // one already dialed, so the common single-backend deployment holds exactly one.
+        #[cfg(feature = "zcash")]
         let mut hubs: HashMap<String, Arc<chain::hub::ChainHub>> = HashMap::new();
 
         // Validated at config load; re-derive once rather than carrying a second copy. Shared
         // by the configured wallets and the fleet's shards.
+        #[cfg(feature = "zcash")]
         let confirmations_policy = match config.spend.confirmations_policy() {
             Ok(policy) => policy,
             Err(e) => {
@@ -251,108 +265,113 @@ impl PreparedNode {
                 }
                 continue;
             }
-            let server = match backend::resolve_for_wallet(&config, entry) {
-                Ok(server) => server,
-                Err(e) => {
-                    stop_actors(&shutdown_tx, actor_tasks).await;
-                    return Err(e);
-                }
-            };
-            // One shared upstream per distinct endpoint (`chain::hub`). Wallets used to dial
-            // individually, so a daemon's upstream load - connections, chain-tip polls and, worst,
-            // the 2s mempool poll - scaled with the wallet count rather than with the chain.
-            // Wallets resolve their own endpoint (a `[wallets.<name>]` may override the global
-            // `[backend]`), so the hubs are keyed by that endpoint: every wallet agreeing on the
-            // dial shares one connection, and a wallet pointed somewhere else gets its own.
-            let hub = Arc::clone(hubs.entry(server.connection_key()).or_insert_with(|| {
-                chain::hub::ChainHub::new(
-                    server.clone(),
-                    Duration::from_secs(config.backend.connect_timeout_secs),
-                )
-            }));
-            // Transparent *receives* now ride the block scan on both backends, so a large address
-            // set no longer means per-block polling. What stays per-address is spend detection:
-            // librustzcash emits one `TransactionsInvolvingAddress` request per funded address, and
-            // on a light backend each is a remote round trip rather than a local index lookup. A
-            // wallet holding many funded transparent addresses is therefore still better served by
-            // a local zebra - worth saying once at startup, before the scan begins.
-            const LIGHT_TRANSPARENT_ADDR_WARN: u32 = 1_000;
-            if server.kind() == backend::ServerKind::Lightwalletd
-                && entry.transparent_enabled
-                && (entry.transparent_initial_scan >= LIGHT_TRANSPARENT_ADDR_WARN
-                    || entry.transparent_gap_limit >= LIGHT_TRANSPARENT_ADDR_WARN)
+            // Everything below is the Zcash actor's bring-up; in a bitcoin-only build the arm
+            // above has already claimed every configured wallet.
+            #[cfg(feature = "zcash")]
             {
-                // This runs before the wallet's actor (and its `wallet` span) exists, so the
-                // wallet identity is a field here rather than span context.
-                tracing::warn!(
-                    wallet = %name,
-                    "transparent_initial_scan = {} / transparent_gap_limit = {} on a \
-                     lightwalletd backend: spend detection queries each funded address separately, \
-                     one remote round trip apiece. Running your own zebra (server = \"zebra\") is \
-                     recommended at this scale",
-                    entry.transparent_initial_scan,
-                    entry.transparent_gap_limit,
-                );
-            }
-            let actor_cfg = ActorConfig {
-                name: name.clone(),
-                // The wallet's own chain rather than the daemon-global network: the actor is
-                // configured entirely from its entry, so nothing below this point reads
-                // `config` again.
-                network: entry.zcash_network(),
-                engine_dir: entry.engine_dir(),
-                keys_path: keys_path.clone(),
-                hub: Arc::clone(&hub),
-                sync_interval: Duration::from_secs(config.sync.interval_secs),
-                rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
-                reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
-                reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
-                age_identity: config.keys.age_identity.clone(),
-                auto_unlock: config.keys.auto_unlock,
-                bootstrap: config.keys.bootstrap_from_keys,
-                confirmations_policy,
-                orchard_action_limit: config.spend.orchard_action_limit,
-                target_note_count: config.spend.target_note_count,
-                min_split_output_value: config.spend.min_split_output_value,
-                orchard_keys: orchard_keys.clone(),
-                pipeline_proving: config.spend.pipeline_proving,
-                trust_own_transactions: config.spend.trust_own_transactions,
-                enabled_pools: entry.pools.clone(),
-                default_receivers: entry.default_receivers.clone(),
-                transparent_enabled: entry.transparent_enabled,
-                transparent_default: entry.transparent_default,
-                transparent_gap_limit: entry.transparent_gap_limit,
-                transparent_initial_scan: entry.transparent_initial_scan,
-                transparent_allow_beyond_recovery_window: entry
-                    .transparent_allow_beyond_recovery_window,
-                transparent_gap_warn_threshold: entry.transparent_gap_warn_threshold,
-                // Configured wallets are conventional single-wallet actors; the fleet's shard
-                // actors are spawned separately below.
-                shard_members: Vec::new(),
-                shutdown: shutdown_tx.subscribe(),
-            };
-            match actor::spawn(actor_cfg).await {
-                Ok((handle, task)) => {
-                    let watch_only = handle.status().watch_only;
-                    info!(
-                        "loaded wallet '{}'{}",
-                        name,
-                        if watch_only { " (watch-only)" } else { "" }
+                let server = match backend::resolve_for_wallet(&config, entry) {
+                    Ok(server) => server,
+                    Err(e) => {
+                        stop_actors(&shutdown_tx, actor_tasks).await;
+                        return Err(e);
+                    }
+                };
+                // One shared upstream per distinct endpoint (`chain::hub`). Wallets used to dial
+                // individually, so a daemon's upstream load - connections, chain-tip polls and, worst,
+                // the 2s mempool poll - scaled with the wallet count rather than with the chain.
+                // Wallets resolve their own endpoint (a `[wallets.<name>]` may override the global
+                // `[backend]`), so the hubs are keyed by that endpoint: every wallet agreeing on the
+                // dial shares one connection, and a wallet pointed somewhere else gets its own.
+                let hub = Arc::clone(hubs.entry(server.connection_key()).or_insert_with(|| {
+                    chain::hub::ChainHub::new(
+                        server.clone(),
+                        Duration::from_secs(config.backend.connect_timeout_secs),
+                    )
+                }));
+                // Transparent *receives* now ride the block scan on both backends, so a large address
+                // set no longer means per-block polling. What stays per-address is spend detection:
+                // librustzcash emits one `TransactionsInvolvingAddress` request per funded address, and
+                // on a light backend each is a remote round trip rather than a local index lookup. A
+                // wallet holding many funded transparent addresses is therefore still better served by
+                // a local zebra - worth saying once at startup, before the scan begins.
+                const LIGHT_TRANSPARENT_ADDR_WARN: u32 = 1_000;
+                if server.kind() == backend::ServerKind::Lightwalletd
+                    && entry.transparent_enabled
+                    && (entry.transparent_initial_scan >= LIGHT_TRANSPARENT_ADDR_WARN
+                        || entry.transparent_gap_limit >= LIGHT_TRANSPARENT_ADDR_WARN)
+                {
+                    // This runs before the wallet's actor (and its `wallet` span) exists, so the
+                    // wallet identity is a field here rather than span context.
+                    tracing::warn!(
+                        wallet = %name,
+                        "transparent_initial_scan = {} / transparent_gap_limit = {} on a \
+                         lightwalletd backend: spend detection queries each funded address separately, \
+                         one remote round trip apiece. Running your own zebra (server = \"zebra\") is \
+                         recommended at this scale",
+                        entry.transparent_initial_scan,
+                        entry.transparent_gap_limit,
                     );
-                    loaded.push((name.clone(), entry.coin, watch_only));
-                    registry.insert(CoinWallet::Zcash(handle));
-                    actor_tasks.push((name.clone(), task));
                 }
-                // A failed account-to-keys binding check is evidence the wallet database (or
-                // keys.toml) was replaced, so it is fatal for the whole node, like the
-                // single-spending-wallet invariant: zecd won't quietly keep serving the other
-                // wallets while one of them shows signs of tampering. Any other per-wallet
-                // startup failure (unreadable database, missing files) skips just that wallet.
-                Err(e) if e.downcast_ref::<binding::BindingMismatch>().is_some() => {
-                    stop_actors(&shutdown_tx, actor_tasks).await;
-                    return Err(e);
+                let actor_cfg = ActorConfig {
+                    name: name.clone(),
+                    // The wallet's own chain rather than the daemon-global network: the actor is
+                    // configured entirely from its entry, so nothing below this point reads
+                    // `config` again.
+                    network: entry.zcash_network(),
+                    engine_dir: entry.engine_dir(),
+                    keys_path: keys_path.clone(),
+                    hub: Arc::clone(&hub),
+                    sync_interval: Duration::from_secs(config.sync.interval_secs),
+                    rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
+                    reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
+                    reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
+                    age_identity: config.keys.age_identity.clone(),
+                    auto_unlock: config.keys.auto_unlock,
+                    bootstrap: config.keys.bootstrap_from_keys,
+                    confirmations_policy,
+                    orchard_action_limit: config.spend.orchard_action_limit,
+                    target_note_count: config.spend.target_note_count,
+                    min_split_output_value: config.spend.min_split_output_value,
+                    orchard_keys: orchard_keys.clone(),
+                    pipeline_proving: config.spend.pipeline_proving,
+                    trust_own_transactions: config.spend.trust_own_transactions,
+                    enabled_pools: entry.pools.clone(),
+                    default_receivers: entry.default_receivers.clone(),
+                    transparent_enabled: entry.transparent_enabled,
+                    transparent_default: entry.transparent_default,
+                    transparent_gap_limit: entry.transparent_gap_limit,
+                    transparent_initial_scan: entry.transparent_initial_scan,
+                    transparent_allow_beyond_recovery_window: entry
+                        .transparent_allow_beyond_recovery_window,
+                    transparent_gap_warn_threshold: entry.transparent_gap_warn_threshold,
+                    // Configured wallets are conventional single-wallet actors; the fleet's shard
+                    // actors are spawned separately below.
+                    shard_members: Vec::new(),
+                    shutdown: shutdown_tx.subscribe(),
+                };
+                match actor::spawn(actor_cfg).await {
+                    Ok((handle, task)) => {
+                        let watch_only = handle.status().watch_only;
+                        info!(
+                            "loaded wallet '{}'{}",
+                            name,
+                            if watch_only { " (watch-only)" } else { "" }
+                        );
+                        loaded.push((name.clone(), entry.coin, watch_only));
+                        registry.insert(CoinWallet::Zcash(handle));
+                        actor_tasks.push((name.clone(), task));
+                    }
+                    // A failed account-to-keys binding check is evidence the wallet database (or
+                    // keys.toml) was replaced, so it is fatal for the whole node, like the
+                    // single-spending-wallet invariant: zecd won't quietly keep serving the other
+                    // wallets while one of them shows signs of tampering. Any other per-wallet
+                    // startup failure (unreadable database, missing files) skips just that wallet.
+                    Err(e) if e.downcast_ref::<binding::BindingMismatch>().is_some() => {
+                        stop_actors(&shutdown_tx, actor_tasks).await;
+                        return Err(e);
+                    }
+                    Err(e) => error!("failed to start wallet '{}': {e}", name),
                 }
-                Err(e) => error!("failed to start wallet '{}': {e}", name),
             }
         }
 
@@ -360,6 +379,7 @@ impl PreparedNode {
         // per-wallet `[backend]` override and ride the daemon's global endpoint - sharing a hub
         // with any configured wallet that resolves to the same place. Constructing it is free
         // when there is no fleet: a hub does not dial until something acquires a source.
+        #[cfg(feature = "zcash")]
         let fleet_hub = {
             let server = match backend::resolve_configured(&config) {
                 Ok(server) => server,
@@ -379,6 +399,7 @@ impl PreparedNode {
         // The fleet: many watch-only wallets scanned in a handful of shards rather than one
         // actor apiece. Additive - with no manifests present this does nothing, and the
         // `[wallets.<name>]` actors above are untouched.
+        #[cfg(feature = "zcash")]
         let fleet = match spawn_fleet(
             &config,
             &fleet_hub,
@@ -424,6 +445,7 @@ impl PreparedNode {
             work_queue: Arc::new(tokio::sync::Semaphore::new(config.rpc.work_queue)),
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
+            #[cfg(feature = "zcash")]
             fleet: fleet.clone(),
         };
 
@@ -444,6 +466,7 @@ impl PreparedNode {
 /// than from the config file, so onboarding does not mean editing config.
 ///
 /// Additive: with no manifests present this returns 0 without touching anything.
+#[cfg(feature = "zcash")]
 #[allow(clippy::too_many_arguments)]
 async fn spawn_fleet(
     config: &AppConfig,
@@ -604,6 +627,7 @@ async fn spawn_fleet(
 }
 
 /// How many shards the manager currently tracks (for the startup line).
+#[cfg(feature = "zcash")]
 fn shard_count(manager: &crate::fleet::FleetManager) -> usize {
     manager.shards()
 }
@@ -687,7 +711,7 @@ fn spawn_bitcoin_wallet(
         endpoint: Some(endpoint),
         fees: config.fees.clone(),
         mempool: config.mempool.clone(),
-        birthday: u32::from(store.birthday),
+        birthday: store.birthday,
         birthday_time: store.birthday_time,
         lookahead: entry.lookahead,
         sync_interval: Duration::from_secs(config.sync.interval_secs),
@@ -701,6 +725,7 @@ fn spawn_bitcoin_wallet(
 /// wallet's configured confirmations policy, its configured `[spend] privacy_policy`, and no
 /// named funding source. `SendOptions::default()` is therefore the plain "pay this request"
 /// call, and each field is the in-process spelling of one `z_sendmany` argument.
+#[cfg(feature = "zcash")]
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct SendOptions {
@@ -788,6 +813,7 @@ impl Node {
     /// Errors are the RPC errors, unchanged - `-18` for an unknown wallet, `-6` for
     /// insufficient funds, `-4` for a policy refusal - so an embedder branching on
     /// [`RpcError::code`] reads the same codes an HTTP caller does.
+    #[cfg(feature = "zcash")]
     pub async fn send(
         &self,
         wallet: Option<&str>,
@@ -840,7 +866,9 @@ impl Node {
         // by the fleet manager, not by this list. They must be awaited too, or the process could
         // exit with one of them mid-write - the exact thing awaiting the boot-time actors exists
         // to prevent.
+        #[cfg_attr(not(feature = "zcash"), allow(unused_mut))]
         let mut tasks = self.actor_tasks;
+        #[cfg(feature = "zcash")]
         if let Some(fleet) = &self.state.fleet {
             tasks.extend(fleet.take_tasks());
         }
@@ -896,6 +924,7 @@ pub(crate) mod testutil {
             work_queue: Arc::new(tokio::sync::Semaphore::new(16)),
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
+            #[cfg(feature = "zcash")]
             fleet: None,
         })
     }
@@ -941,6 +970,7 @@ pub(crate) mod testutil {
                 assume_transparent_in_compact_blocks: false,
                 proxy: None,
             },
+            #[cfg(feature = "zcash")]
             zebra: Default::default(),
             #[cfg(feature = "bitcoin")]
             bitcoind: Default::default(),
@@ -948,6 +978,7 @@ pub(crate) mod testutil {
             fees: Default::default(),
             #[cfg(feature = "bitcoin")]
             mempool: Default::default(),
+            #[cfg(feature = "zcash")]
             fleet: Default::default(),
             rpc,
             keys: KeysConfig {
@@ -961,7 +992,9 @@ pub(crate) mod testutil {
                 interval_secs: 20,
                 rebroadcast_secs: 60,
             },
+            #[cfg(feature = "zcash")]
             spend: crate::config::SpendConfig::default(),
+            #[cfg(feature = "zcash")]
             pools: crate::config::PoolsConfig::default(),
             health: crate::config::HealthConfig {
                 enabled: false,
@@ -1042,6 +1075,7 @@ mod tests {
     /// `send` resolves its wallet through the same registry lookup dispatch uses, so an unknown
     /// or absent wallet is the identical `-18` a `z_sendmany` over the wire would return -
     /// rather than a panic, or a different error taxonomy for the in-process seam.
+    #[cfg(feature = "zcash")]
     #[tokio::test]
     async fn send_resolves_wallets_exactly_as_dispatch_does() {
         let node = test_node();

@@ -16,7 +16,11 @@ use crate::network::ZNetwork;
 /// The coin a wallet serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Coin {
-    /// Zcash.
+    /// Zcash, served by the librustzcash-backed engine (`crate::wallet`/`crate::sync`/
+    /// `crate::chain`). The variant exists only in a build carrying the `zcash` feature, so a
+    /// bitcoin-only build's `SUPPORTED` set - and every error message derived from it - names
+    /// bitcoin alone.
+    #[cfg(feature = "zcash")]
     Zcash,
     /// Bitcoin, served by the BDK-backed engine (`crate::btc`). The variant exists only in a
     /// build carrying the `bitcoin` feature, so a default build's `SUPPORTED` set - and every
@@ -28,14 +32,25 @@ pub enum Coin {
 impl Coin {
     /// Every coin zecd serves, in the order error messages list them.
     pub const SUPPORTED: &'static [Coin] = &[
+        #[cfg(feature = "zcash")]
         Coin::Zcash,
         #[cfg(feature = "bitcoin")]
         Coin::Bitcoin,
     ];
 
+    /// The coin a wallet serves when its entry names none - the build's first engine, which is
+    /// Zcash wherever that engine is compiled in and Bitcoin in a bitcoin-only build.
+    ///
+    /// Derived from [`Coin::SUPPORTED`] rather than written down, so the implicit `default`
+    /// wallet (and every internal fallback that used to spell `Coin::Zcash`) resolves to an
+    /// engine this build actually has. `lib.rs` refuses a build with no engine at all, so the
+    /// index is always in bounds.
+    pub const DEFAULT: Coin = Coin::SUPPORTED[0];
+
     /// The lower-case token form: `"zcash"`.
     pub fn name(self) -> &'static str {
         match self {
+            #[cfg(feature = "zcash")]
             Coin::Zcash => "zcash",
             #[cfg(feature = "bitcoin")]
             Coin::Bitcoin => "bitcoin",
@@ -45,6 +60,7 @@ impl Coin {
     /// The display name used in wire-visible messages, e.g. `"Invalid Zcash address"`.
     pub fn display_name(self) -> &'static str {
         match self {
+            #[cfg(feature = "zcash")]
             Coin::Zcash => "Zcash",
             #[cfg(feature = "bitcoin")]
             Coin::Bitcoin => "Bitcoin",
@@ -64,6 +80,7 @@ impl Coin {
     /// changing a coin's directory name is a data migration ([`crate::migrate`]), not a rename.
     pub fn data_dir(self) -> &'static str {
         match self {
+            #[cfg(feature = "zcash")]
             Coin::Zcash => "zec",
             #[cfg(feature = "bitcoin")]
             Coin::Bitcoin => "btc",
@@ -85,6 +102,7 @@ impl Coin {
     /// Frozen once shipped, exactly like [`Coin::data_dir`].
     pub fn engine_dir(self) -> &'static str {
         match self {
+            #[cfg(feature = "zcash")]
             Coin::Zcash => "lrz",
             #[cfg(feature = "bitcoin")]
             Coin::Bitcoin => "bdk",
@@ -131,6 +149,7 @@ impl Coin {
     #[cfg(feature = "bitcoin")]
     pub fn chain_with(self, env: ZNetwork, btc_testnet: BitcoinTestnet) -> CoinNetwork {
         match self {
+            #[cfg(feature = "zcash")]
             Coin::Zcash => CoinNetwork::Zcash(env),
             Coin::Bitcoin => {
                 CoinNetwork::Bitcoin(BitcoinNetwork::from_environment(env, btc_testnet))
@@ -148,6 +167,7 @@ impl Coin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoinNetwork {
     /// A Zcash chain (mainnet, testnet, or a local regtest chain).
+    #[cfg(feature = "zcash")]
     Zcash(ZNetwork),
     /// A Bitcoin chain (mainnet, one of the two public testnets, or a local regtest chain).
     #[cfg(feature = "bitcoin")]
@@ -158,6 +178,7 @@ impl CoinNetwork {
     /// The coin this chain belongs to.
     pub fn coin(self) -> Coin {
         match self {
+            #[cfg(feature = "zcash")]
             CoinNetwork::Zcash(_) => Coin::Zcash,
             #[cfg(feature = "bitcoin")]
             CoinNetwork::Bitcoin(_) => Coin::Bitcoin,
@@ -200,7 +221,7 @@ impl BitcoinNetwork {
                 BitcoinTestnet::Testnet3 => BitcoinNetwork::Testnet3,
                 BitcoinTestnet::Testnet4 => BitcoinNetwork::Testnet4,
             },
-            ZNetwork::Regtest(_) => BitcoinNetwork::Regtest,
+            ZNetwork::Regtest => BitcoinNetwork::Regtest,
         }
     }
 
@@ -264,24 +285,28 @@ impl BitcoinTestnet {
 mod tests {
     use super::*;
 
+    /// `SUPPORTED` is the one source the `coin` key's parse, its "this build supports: ..."
+    /// refusal and the implicit wallet's [`Coin::DEFAULT`] all derive from, so pin it to the
+    /// engines this build actually carries - in both directions, so neither a missing engine
+    /// nor a phantom one can go unnoticed.
     #[test]
-    fn zcash_is_always_supported() {
-        assert_eq!(Coin::parse("zcash"), Some(Coin::Zcash));
+    fn supported_lists_exactly_the_compiled_engines() {
+        assert_eq!(Coin::parse("zcash").is_some(), cfg!(feature = "zcash"));
+        assert_eq!(Coin::parse("bitcoin").is_some(), cfg!(feature = "bitcoin"));
         assert_eq!(Coin::parse("zzz"), None);
         assert_eq!(Coin::parse("ZCASH"), None, "tokens are case-sensitive");
-        #[cfg(not(feature = "bitcoin"))]
-        assert_eq!(Coin::supported_names(), "zcash");
-        #[cfg(feature = "bitcoin")]
-        assert_eq!(Coin::supported_names(), "zcash, bitcoin");
-    }
 
-    /// A default build must keep refusing the bitcoin token: the `coin` key's error message
-    /// ("this build supports: ...") is derived from `SUPPORTED`, and the feature is the only
-    /// thing that widens it.
-    #[cfg(not(feature = "bitcoin"))]
-    #[test]
-    fn bitcoin_is_not_supported_without_the_feature() {
-        assert_eq!(Coin::parse("bitcoin"), None);
+        let expected: Vec<&str> = [
+            cfg!(feature = "zcash").then_some("zcash"),
+            cfg!(feature = "bitcoin").then_some("bitcoin"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        assert!(!expected.is_empty(), "a build carries at least one engine");
+        assert_eq!(Coin::supported_names(), expected.join(", "));
+        assert_eq!(Coin::SUPPORTED.len(), expected.len());
+        assert_eq!(Coin::DEFAULT, Coin::SUPPORTED[0]);
     }
 
     #[cfg(feature = "bitcoin")]
@@ -317,6 +342,7 @@ mod tests {
                 CoinNetwork::Bitcoin(BitcoinNetwork::Regtest)
             );
             // A Zcash chain never consults the Bitcoin testnet selection.
+            #[cfg(feature = "zcash")]
             assert_eq!(
                 Coin::Zcash.chain_with(ZNetwork::Test, testnet),
                 CoinNetwork::Zcash(ZNetwork::Test)
@@ -346,6 +372,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn zcash_chain_derivation_is_identity_for_all_environments() {
         for env in [ZNetwork::Main, ZNetwork::Test, crate::network::regtest()] {
@@ -360,8 +387,11 @@ mod tests {
     /// rather than leaving it to whoever edits the match arms.
     #[test]
     fn directory_names_are_frozen_and_distinct() {
-        assert_eq!(Coin::Zcash.data_dir(), "zec");
-        assert_eq!(Coin::Zcash.engine_dir(), "lrz");
+        #[cfg(feature = "zcash")]
+        {
+            assert_eq!(Coin::Zcash.data_dir(), "zec");
+            assert_eq!(Coin::Zcash.engine_dir(), "lrz");
+        }
         #[cfg(feature = "bitcoin")]
         {
             assert_eq!(Coin::Bitcoin.data_dir(), "btc");

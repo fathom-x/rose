@@ -62,9 +62,30 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Init(args)) => zecd::init::run(&config, args).await,
         Some(Command::ExportUfvk(args)) => zecd::init::export_ufvk(&config, args),
         Some(Command::ExportXpub(args)) => zecd::init::export_xpub(&config, args),
+        // `derive-address` and `chain info` are the Zcash engine's (offline address derivation,
+        // a lightwalletd/zebra probe). They stay in the subcommand list in every build - so
+        // `zecd --help` names one surface - and refuse at runtime where the engine is absent,
+        // the way `export-xpub` refuses a Zcash wallet.
+        #[cfg(feature = "zcash")]
         Some(Command::DeriveAddress(args)) => zecd::derive_address::run(&config, args),
+        #[cfg(not(feature = "zcash"))]
+        Some(Command::DeriveAddress(_)) => Err(unsupported_without_zcash("derive-address")),
         Some(Command::Rescan(args)) => zecd::init::rescan(&config, args).await,
+        #[cfg(feature = "zcash")]
         Some(Command::ChainInfo(args)) => zecd::chain_probe::run(&config, args).await,
+        #[cfg(not(feature = "zcash"))]
+        Some(Command::ChainInfo(_)) => Err(unsupported_without_zcash("chain-info")),
         _ => daemon::run(config).await,
     }
+}
+
+/// The refusal a Zcash-only subcommand gives in a build without that engine: the same shape as
+/// the wrong-coin refusals in `init`, naming what this build does serve.
+#[cfg(not(feature = "zcash"))]
+fn unsupported_without_zcash(command: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`zecd {command}` needs the Zcash engine, which this build does not carry (this build \
+         supports: {})",
+        zecd::coin::Coin::supported_names()
+    )
 }

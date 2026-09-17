@@ -8,9 +8,11 @@
 //! bifurcating every signature.
 
 use anyhow::anyhow;
+#[cfg(feature = "zcash")]
 use zcash_protocol::consensus::{
     BlockHeight, NetworkType, NetworkUpgrade, Parameters, MAIN_NETWORK, TEST_NETWORK,
 };
+#[cfg(feature = "zcash")]
 use zcash_protocol::local_consensus::LocalNetwork;
 
 /// The network `zecd` is configured for. `Copy` so it threads by value through the wallet
@@ -21,8 +23,12 @@ pub enum ZNetwork {
     Main,
     /// The public testnet.
     Test,
-    /// A local regtest chain; activation heights are carried by the inner [`LocalNetwork`].
-    Regtest(LocalNetwork),
+    /// A local regtest chain. Its Zcash activation heights are *derived*, not carried: the
+    /// [`Parameters`] impl reads them from [`regtest_local`], which exists only in a build
+    /// with the Zcash engine. Keeping the payload out of the variant is what lets this enum -
+    /// the daemon's network environment, which every coin's wallets are placed in - stay
+    /// spellable without `zcash_protocol`.
+    Regtest,
 }
 
 impl ZNetwork {
@@ -32,7 +38,7 @@ impl ZNetwork {
         match self {
             ZNetwork::Main => "main",
             ZNetwork::Test => "test",
-            ZNetwork::Regtest(_) => "regtest",
+            ZNetwork::Regtest => "regtest",
         }
     }
 
@@ -49,16 +55,17 @@ impl ZNetwork {
     /// Whether this is a regtest network. Used to gate developer-only RPCs (e.g. `stop`) so
     /// they can't be invoked against a live mainnet/testnet daemon over RPC.
     pub fn is_regtest(&self) -> bool {
-        matches!(self, ZNetwork::Regtest(_))
+        matches!(self, ZNetwork::Regtest)
     }
 }
 
+#[cfg(feature = "zcash")]
 impl Parameters for ZNetwork {
     fn network_type(&self) -> NetworkType {
         match self {
             ZNetwork::Main => MAIN_NETWORK.network_type(),
             ZNetwork::Test => TEST_NETWORK.network_type(),
-            ZNetwork::Regtest(local) => local.network_type(),
+            ZNetwork::Regtest => regtest_local().network_type(),
         }
     }
 
@@ -66,18 +73,44 @@ impl Parameters for ZNetwork {
         match self {
             ZNetwork::Main => MAIN_NETWORK.activation_height(nu),
             ZNetwork::Test => TEST_NETWORK.activation_height(nu),
-            ZNetwork::Regtest(local) => local.activation_height(nu),
+            ZNetwork::Regtest => regtest_local().activation_height(nu),
         }
     }
 }
 
-/// A regtest network matching the chain the regtest harness runs: NU5 (Orchard) and NU6 active
+/// The regtest network environment.
+///
+/// Its Zcash activation schedule is [`regtest_local`]'s; this constructor calls it eagerly in a
+/// build with the engine so a set-but-unparseable `ZECD_REGTEST_NU63_HEIGHT` still fails here,
+/// at config resolution, rather than at the first scan (see the panic that function documents).
+pub fn regtest() -> ZNetwork {
+    #[cfg(feature = "zcash")]
+    {
+        let _ = regtest_local();
+    }
+    ZNetwork::Regtest
+}
+
+/// The activation schedule of the chain the regtest harness runs: NU5 (Orchard) and NU6 active
 /// from height 1, then NU6.1/NU6.2 a few blocks in (their activation block needs ZIP-271 lockbox
 /// disbursements, so they can't start at genesis). Orchard is active for the entire chain.
+///
+/// Resolved once per process and cached: [`Parameters::activation_height`] is on the per-block
+/// scan path, and the schedule cannot change under a running daemon (its one input is an
+/// environment variable, which nothing in this tree mutates in-process). A test that needs a
+/// different `ZECD_REGTEST_NU63_HEIGHT` therefore has to run in its own process.
 // `zcash_unstable` is a librustzcash RUSTFLAGS cfg (nu7/zfuture). We don't set it, but the
 // gated fields are kept so this literal stays valid if someone builds with those NUs enabled.
+#[cfg(feature = "zcash")]
 #[allow(unexpected_cfgs)]
-pub fn regtest() -> ZNetwork {
+pub fn regtest_local() -> &'static LocalNetwork {
+    static REGTEST: std::sync::OnceLock<LocalNetwork> = std::sync::OnceLock::new();
+    REGTEST.get_or_init(build_regtest_local)
+}
+
+#[cfg(feature = "zcash")]
+#[allow(unexpected_cfgs)]
+fn build_regtest_local() -> LocalNetwork {
     let h = Some(BlockHeight::from_u32(1));
     // NU6.1/NU6.2 activate a few blocks in, not at genesis: NU6.1's activation block must carry
     // ZIP-271 lockbox disbursements, which require a deferred pool that only accrues once NU6 is
@@ -106,7 +139,7 @@ pub fn regtest() -> ZNetwork {
         )),
         Err(_) => None,
     };
-    ZNetwork::Regtest(LocalNetwork {
+    LocalNetwork {
         overwinter: h,
         sapling: h,
         blossom: h,
@@ -121,7 +154,7 @@ pub fn regtest() -> ZNetwork {
         nu7: nu62,
         #[cfg(zcash_unstable = "zfuture")]
         z_future: nu62,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +178,7 @@ mod tests {
     /// ironwood back to "never activates": zecd derives activation purely from these heights
     /// (`is_nu_active(Nu6_3, ..)`), and with no height every mainnet send would keep building
     /// legacy Orchard-V2 output - wrong pool, no error.
+    #[cfg(feature = "zcash")]
     #[test]
     fn nu6_3_is_scheduled_on_mainnet_and_testnet() {
         for net in [ZNetwork::Main, ZNetwork::Test] {
@@ -157,6 +191,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "zcash")]
     #[test]
     fn regtest_has_orchard_active_from_genesis() {
         let net = regtest();

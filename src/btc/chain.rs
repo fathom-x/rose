@@ -41,7 +41,7 @@ use anyhow::{anyhow, bail, Context as _};
 use bdk_bitcoind_rpc::bitcoincore_rpc::{self, RpcApi as _};
 use bdk_wallet::bitcoin::{FeeRate, Transaction, Txid};
 
-use crate::chain::zebra::{host_is_local, CleartextPolicy};
+use crate::backend::{host_is_local, CleartextPolicy};
 use crate::coin::BitcoinNetwork;
 
 /// bitcoind's standard JSON-RPC ports, per network. Unlike zebra (which ships with RPC

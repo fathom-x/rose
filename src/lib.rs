@@ -79,7 +79,13 @@
 //! Cargo features: `server` (the axum JSON-RPC + health servers) and `cli` (the clap
 //! surface, the printing subcommand shells, and `daemon::init_tracing`); both are default so
 //! the binary and release images are unchanged, and a library consumer builds with
-//! `default-features = false`. A multi-thread tokio runtime is required (the scan and
+//! `default-features = false` plus whichever engine it wants. The wallet engines are features
+//! too - `zcash` (default, the librustzcash stack: [`wallet`], [`sync`], [`chain`], [`fleet`],
+//! the `z_*` RPCs and [`node::Node::send`] with its `zip321` parameter) and `bitcoin` (the
+//! BDK stack, [`btc`]) - and **at least one must be enabled**, or the crate refuses to build.
+//! A build without `zcash` carries no Zcash crate at all: the items named above are absent,
+//! and a `coin = "zcash"` wallet is refused at config resolution, exactly as a build without
+//! `bitcoin` refuses `coin = "bitcoin"`. A multi-thread tokio runtime is required (the scan and
 //! proving paths use `block_in_place`), and the node deliberately never installs process-wide
 //! policy: tracing subscribers, panic behavior beyond an idempotent hook, and
 //! [`hardening::harden_process`] (core-dump/ptrace lockdown) stay the binary's business.
@@ -153,29 +159,45 @@
 //! Watch-only replicas are unrestricted either way and can be loaded anywhere, including
 //! alongside the spender they mirror.
 
+// A coin is an engine, and an engine is a cargo feature: `zcash` (the default) and `bitcoin`.
+// A build carrying neither has no wallet engine at all - no coin it could serve, no wallet it
+// could open - so it is refused here rather than left to fail as a pile of unresolved names.
+#[cfg(not(any(feature = "zcash", feature = "bitcoin")))]
+compile_error!(
+    "zecd needs at least one wallet engine: enable the `zcash` feature (on by default), the \
+     `bitcoin` feature, or both"
+);
+
 // Re-exports of the third-party types that appear on the supported surface, so an embedder
 // depends on the same versions zecd does rather than pinning them independently - where a
 // mismatch surfaces as a type error naming two identical-looking paths. `zip321` and `TxId`
-// are `node::Node::send`'s parameter and return types.
+// are `node::Node::send`'s parameter and return types, so both ride the `zcash` gate with it.
+#[cfg(feature = "zcash")]
 pub use zcash_protocol::TxId;
+#[cfg(feature = "zcash")]
 pub use zip321;
 
+#[cfg(feature = "zcash")]
 pub mod address;
 pub mod amount;
 pub mod backend;
 pub mod backoff;
 #[cfg(feature = "bitcoin")]
 pub mod btc;
+#[cfg(feature = "zcash")]
 pub mod chain;
+#[cfg(feature = "zcash")]
 pub mod chain_probe;
 pub mod coin;
 pub mod config;
 pub mod config_check;
 pub mod config_show;
 pub mod daemon;
+#[cfg(feature = "zcash")]
 pub mod derive_address;
 pub mod error;
 pub mod example_config;
+#[cfg(feature = "zcash")]
 pub mod fleet;
 pub mod hardening;
 #[cfg(feature = "server")]
@@ -187,12 +209,14 @@ pub mod migrate;
 pub mod network;
 pub mod node;
 pub mod operations;
+#[cfg(feature = "zcash")]
 pub mod pools;
 pub mod progress;
 pub mod rpc;
 pub mod server;
 pub mod socks;
 pub mod state;
+#[cfg(feature = "zcash")]
 pub mod sync;
 pub mod typed;
 pub mod wallet;

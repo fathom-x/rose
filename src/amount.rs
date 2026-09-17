@@ -660,6 +660,7 @@ mod tests {
     /// The local constants are coin-neutral, but they must still be numerically identical to
     /// the Zcash ones - the whole decoupling rests on the two chains sharing this scale and cap.
     /// Cross-checked here, in test code, so production stays free of the engine's types.
+    #[cfg(feature = "zcash")]
     #[test]
     fn local_constants_match_zcash_protocol() {
         assert_eq!(COIN, zcash_protocol::value::COIN);

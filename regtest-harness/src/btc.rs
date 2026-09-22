@@ -15,9 +15,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::{pick_port, zecd_bin};
 
@@ -316,6 +319,110 @@ impl BitcoinD {
     }
 }
 
+/// A fault-injecting relay between a zecd and its bitcoind's JSON-RPC port, for the one
+/// send outcome no signal can reach: a **transport failure at the broadcast itself**. A
+/// SIGSTOP hangs every call, so the sync pass detects the outage first and the send is
+/// refused up front (`-4`, no upstream) before it reaches the broadcast; a kill races the
+/// next sync pass the same way. This relay forwards every request byte for byte, except
+/// that while [`RpcProxy::drop_method`] names one it closes the connection on any request
+/// whose body names that method, without answering: the node never sees the request and
+/// the client gets a broken socket - a failure with no verdict - while every other call
+/// (the sync pass, the mempool pass, the redial) keeps working. One HTTP request per
+/// read, framed by `Content-Length`, which is how both `bitcoincore-rpc` and Core's HTTP
+/// server speak.
+pub struct RpcProxy {
+    pub port: u16,
+    dropped: Arc<Mutex<Option<String>>>,
+}
+
+impl RpcProxy {
+    /// Listen on a picked loopback port and forward to bitcoind's RPC at `upstream_port`.
+    pub async fn start(upstream_port: u16) -> RpcProxy {
+        let port = pick_port().expect("pick proxy port");
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("bind the rpc proxy");
+        let dropped: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let rule = dropped.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((client, _)) = listener.accept().await else {
+                    return;
+                };
+                let rule = rule.clone();
+                tokio::spawn(async move {
+                    let _ = relay_rpc(client, upstream_port, rule).await;
+                });
+            }
+        });
+        RpcProxy { port, dropped }
+    }
+
+    /// From now on, drop (close without answering) every request naming `method`;
+    /// `None` restores full forwarding. Takes effect on the next request.
+    pub fn drop_method(&self, method: Option<&str>) {
+        *self.dropped.lock().unwrap() = method.map(str::to_string);
+    }
+}
+
+/// One proxied connection: request from the client, verdict, response from the node,
+/// repeated while the client keeps the connection open. Returning closes both sockets.
+async fn relay_rpc(
+    mut client: TcpStream,
+    upstream_port: u16,
+    rule: Arc<Mutex<Option<String>>>,
+) -> std::io::Result<()> {
+    let mut upstream = TcpStream::connect(("127.0.0.1", upstream_port)).await?;
+    loop {
+        let Some(request) = read_http_message(&mut client).await? else {
+            return Ok(());
+        };
+        let dropped = rule
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|m| String::from_utf8_lossy(&request).contains(&format!("\"{m}\"")));
+        if dropped {
+            return Ok(());
+        }
+        upstream.write_all(&request).await?;
+        let Some(response) = read_http_message(&mut upstream).await? else {
+            return Ok(());
+        };
+        client.write_all(&response).await?;
+    }
+}
+
+/// Read one HTTP message (headers plus a `Content-Length` body) off `stream`; `None` on a
+/// clean EOF before any byte.
+async fn read_http_message(stream: &mut TcpStream) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut byte = [0u8; 1];
+    let header_end = loop {
+        if stream.read(&mut byte).await? == 0 {
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Err(std::io::ErrorKind::UnexpectedEof.into())
+            };
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break buf.len();
+        }
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+    let length = headers
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await?;
+    buf.extend_from_slice(&body);
+    Ok(Some(buf))
+}
+
 /// Which chain source the zecd under test dials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BtcBackend {
@@ -387,19 +494,50 @@ impl ZecdBtc {
         wallet_extra: &str,
         global_extra: &str,
     ) -> ZecdBtc {
-        std::fs::create_dir_all(&datadir).unwrap();
-        let conf = datadir.join("zecd.toml");
         let server = match backend {
             BtcBackend::Bitcoind => format!("bitcoind://127.0.0.1:{}", node.rpc_port),
             BtcBackend::Kyoto => format!("kyoto://127.0.0.1:{}", node.p2p_port),
         };
+        Self::prepare_at(
+            datadir,
+            &server,
+            backend == BtcBackend::Bitcoind,
+            wallets,
+            wallet_extra,
+            global_extra,
+        )
+    }
+
+    /// The bitcoind backend dialed at an explicit RPC port rather than the node's own - an
+    /// [`RpcProxy`] standing between the two. Credentials are the node's.
+    pub fn prepare_bitcoind_at(datadir: PathBuf, rpc_port: u16, wallets: &[&str]) -> ZecdBtc {
+        Self::prepare_at(
+            datadir,
+            &format!("bitcoind://127.0.0.1:{rpc_port}"),
+            true,
+            wallets,
+            "",
+            "",
+        )
+    }
+
+    fn prepare_at(
+        datadir: PathBuf,
+        server: &str,
+        bitcoind_credentials: bool,
+        wallets: &[&str],
+        wallet_extra: &str,
+        global_extra: &str,
+    ) -> ZecdBtc {
+        std::fs::create_dir_all(&datadir).unwrap();
+        let conf = datadir.join("zecd.toml");
         let mut text = format!("default_wallet = \"{}\"\n", wallets[0]);
         for wallet in wallets {
             text.push_str(&format!(
                 "[wallets.{wallet}]\ncoin = \"bitcoin\"\nserver = \"{server}\"\n{wallet_extra}\n"
             ));
         }
-        if backend == BtcBackend::Bitcoind {
+        if bitcoind_credentials {
             text.push_str("[bitcoind]\nrpc_user = \"harness\"\nrpc_password = \"harness\"\n");
         }
         text.push_str(global_extra);

@@ -26,13 +26,21 @@
 //! ([`classify_rejection`]); over kyoto it re-announces detached, since a peer that already
 //! has the transaction never asks for it and the wait must not hold the actor.
 //!
-//! A kyoto broadcast that no peer requests within the light client's timeout is **recorded
-//! anyway** and the send returns its txid ([`Relay::Queued`]): the light client holds the
-//! transaction queued and will relay it to the next peer, so dropping the record would leave
-//! the wallet's view behind the world's - a retry could then double-spend the same inputs,
-//! which is unrecoverable, where a recorded send that never relays merely holds its inputs
-//! until `abandontransaction` releases them (recoverable). That is Bitcoin Core's order of
-//! operations too: commit to the wallet, then relay.
+//! A send is **committed before it is relayed** ([`BtcActor::commit_before_relay`], then
+//! [`BtcActor::relay_committed`]): the signed transaction is applied at 0-conf and persisted
+//! before a byte of it goes to the upstream, so a crash between the two leaves a wallet that
+//! knows its inputs are spent rather than one that double-spends them on the next send -
+//! Bitcoin Core's `CommitTransaction` order. The record then follows the relay's verdict:
+//! rejected by the node, a transaction the wallet funded is withdrawn (the same bytes can
+//! never be accepted, the inputs are released, the node's error passes through - except a
+//! `-27` already-in-chain, which only says the scan is behind); no verdict at all (a transport failure)
+//! or a kyoto announcement no peer requests within the light client's timeout
+//! ([`Relay::Queued`]), and it **stands** with the txid returned and a WARN, because the
+//! bytes may well still relay (the light client holds a queued transaction for the next
+//! peer; the rebroadcast pass resubmits at each new tip and reconnect), and dropping the
+//! record would leave the wallet's view behind the world's - a retry could then double-spend
+//! the same inputs, which is unrecoverable, where a recorded send that never relays merely
+//! holds its inputs until `abandontransaction` releases them (recoverable).
 //!
 //! The spend path derives its signers from the seed **per send** (a throwaway in-memory
 //! signing wallet over the private BIP 84 descriptors - `keys::signing_wallet`), so no
@@ -2195,21 +2203,11 @@ impl BtcActor {
                     && !self.feed_held.contains(*txid)
             })
             .map(|(txid, tx)| {
-                // An input funded by a wallet transaction the wallet holds unconfirmed (an
-                // own chain of sends) is a dependency; one funded by a transaction the
-                // wallet does not hold at all - every input of a received payment - makes
-                // the node's missing-inputs verdict unreadable (see `Parents::Foreign`).
-                let mut parents = Parents::Confirmed;
-                for input in &tx.input {
-                    let parent = input.previous_output.txid;
-                    if unconfirmed.contains_key(&parent) {
-                        parents = Parents::WaitsOnOwn;
-                        break;
-                    }
-                    if self.wallet.get_tx(parent).is_none() {
-                        parents = Parents::Foreign;
-                    }
-                }
+                let parents = classify_parents(
+                    tx,
+                    |parent| unconfirmed.contains_key(&parent),
+                    |parent| self.wallet.get_tx(parent).is_some(),
+                );
                 RebroadcastCandidate {
                     tx: tx.clone(),
                     txid: *txid,
@@ -2606,13 +2604,16 @@ impl BtcActor {
         );
     }
 
-    /// Map a broadcast failure onto the RPC vocabulary. A rejection passes the node's own
-    /// verify-family code and message through (the node answered; retrying the same bytes
-    /// cannot succeed). A transport failure is `-4` - retry semantics, the opposite
-    /// instruction - and drops a bitcoind connection so the next operation redials with
-    /// backoff (the `Conn` convention); a kyoto connection is deliberately kept, since the
-    /// light client itself holds the still-queued transaction and tearing it down would
-    /// discard the pending relay.
+    /// Map a broadcast failure of a transaction the wallet holds **no record of** onto the
+    /// RPC vocabulary - the `sendrawtransaction` of a foreign transaction, the one relay
+    /// that has nothing to commit first. A rejection passes the node's own verify-family
+    /// code and message through (the node answered; retrying the same bytes cannot
+    /// succeed). A transport failure is `-4` - retry semantics, the opposite instruction -
+    /// and drops a bitcoind connection so the next operation redials with backoff (the
+    /// `Conn` convention); a kyoto connection is deliberately kept, since the light client
+    /// itself holds the still-queued transaction and tearing it down would discard the
+    /// pending relay. A wallet transaction takes [`Self::relay_committed`] instead, whose
+    /// transport arm keeps the record rather than erroring.
     fn broadcast_failure(&mut self, e: BroadcastError) -> RpcError {
         match e {
             BroadcastError::Rejected { code, message } => RpcError::new(code, message),
@@ -2623,12 +2624,176 @@ impl BtcActor {
                 RpcError::new(
                     codes::RPC_WALLET_ERROR,
                     format!(
-                        "broadcast failed before the upstream gave a verdict: {err:#}. The \
-                         transaction was not recorded (its inputs stay unlocked); retry \
+                        "broadcast failed before the upstream gave a verdict: {err:#}; retry \
                          once the upstream is reachable"
                     ),
                 )
             }
+        }
+    }
+
+    /// Commit a transaction to the wallet **before** it is relayed - Bitcoin Core's
+    /// `CommitTransaction` order, and the order the crash window demands: the record is on
+    /// disk (inputs locked, the transaction a rebroadcast candidate) before any byte of it
+    /// can reach the network, so a crash between the two leaves a wallet that knows about
+    /// its own send rather than one that will double-spend it. Relaying first, as this
+    /// used to, left exactly that window open, and over kyoto - no mempool pass at
+    /// reconnect to rediscover the send - nothing ever closed it.
+    ///
+    /// The apply is BDK's relevance-filtered one, so a foreign transaction stages nothing
+    /// and [`Commit::NotOurs`] comes back: there is nothing to commit, and the caller relays
+    /// it on the uncommitted path. A persist failure means the record is *not* on disk, so
+    /// nothing is relayed: the sighting is withdrawn in memory with an eviction stamped at
+    /// its own timestamp (BDK keeps a transaction canonical only while
+    /// `last_evicted < last_seen`, so the tie excludes it and the inputs are free again)
+    /// and the caller gets an actionable `-4`. The sighting's timestamp rides out on
+    /// [`Commit::Recorded`] so a later withdrawal can stamp its eviction no earlier than
+    /// the sighting - `SystemTime` is not monotonic, and an eviction one clock step
+    /// *before* the sighting would leave the record canonical.
+    fn commit_before_relay(
+        &mut self,
+        tx: &Arc<Transaction>,
+        what: &str,
+    ) -> Result<Commit, RpcError> {
+        let txid = tx.compute_txid();
+        // A resubmission of a transaction the wallet once evicted (abandoned, retired) must
+        // outrun that eviction, strictly - BDK keeps `last_evicted < last_seen` - or the
+        // sighting changes nothing and the relay would go out over a record the wallet
+        // still counts as withdrawn. The clock's second granularity makes "later" a floor,
+        // not a given.
+        let seen_at = match self.wallet.tx_graph().get_last_evicted(txid) {
+            Some(evicted_at) => unix_now().max(evicted_at + 1),
+            None => unix_now(),
+        };
+        self.wallet
+            .apply_unconfirmed_txs(vec![(Arc::clone(tx), seen_at)]);
+        if self.wallet.get_tx(txid).is_none() {
+            return Ok(Commit::NotOurs);
+        }
+        if let Err(e) = self.wallet.persist(&mut self.persister) {
+            self.wallet.apply_evicted_txs([(txid, seen_at)]);
+            error!(
+                %txid,
+                "failed to persist the wallet before relaying the {what}; nothing was \
+                 broadcast and the record was withdrawn: {e:#}"
+            );
+            return Err(RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                format!(
+                    "could not persist the wallet before relaying the transaction ({e:#}); \
+                     nothing was broadcast and its inputs stay unlocked - retry once the \
+                     wallet database is writable"
+                ),
+            ));
+        }
+        Ok(Commit::Recorded { seen_at })
+    }
+
+    /// Relay a transaction [`Self::commit_before_relay`] has recorded, and settle the record
+    /// on the outcome; the caller gets the txid and how the relay ended, since the record
+    /// stands in every `Ok` and only the log line differs. Relayed or queued (a kyoto
+    /// announcement no peer answered in time - [`Relay::Queued`]): the record stands.
+    /// **Transport** (no verdict): the bytes may or may not have reached the network, and
+    /// only the record can tell the wallet's next send that the inputs are spoken for, so
+    /// it **stands** - Core's posture, which logs the failed relay and keeps the
+    /// transaction for its resubmission loop - reported as [`RelayOutcome::Unrelayed`]
+    /// with a WARN; the rebroadcast pass resubmits it at the next tip or reconnect, and
+    /// `abandontransaction` releases the inputs if it never relays. A bitcoind connection
+    /// is dropped for redial, exactly as on the uncommitted path.
+    ///
+    /// **Rejected** (bitcoind only - kyoto has no verdicts): the node's own code and
+    /// message pass through, and the verdict is read the way the rebroadcast pass reads
+    /// it ([`classify_rejection`] over the transaction's [`Parents`]) before the record is
+    /// touched. A transaction the wallet funded - every own send, and a caller-built spend
+    /// of wallet outputs - is withdrawn through [`Self::retire`]: the same bytes can never
+    /// be accepted, so its inputs are freed for a differently built one. Two verdicts
+    /// leave the record standing: `-27` already-in-chain, which says the block is on its
+    /// way (a payment to this wallet mined ahead of its scan), and any verdict on a
+    /// transaction with **foreign** parents (a received payment relayed on the sender's
+    /// behalf), which proves nothing about it - it propagates on its own and is re-sighted
+    /// or retired by the scan, not by a relay it was never ours to make.
+    async fn relay_committed(
+        &mut self,
+        tx: &Transaction,
+        seen_at: u64,
+        what: &str,
+    ) -> Result<(Txid, RelayOutcome), RpcError> {
+        let txid = tx.compute_txid();
+        match self.upstream_broadcast(tx).await {
+            Ok(Relay::Relayed) => Ok((txid, RelayOutcome::Relayed)),
+            Ok(Relay::Queued) => {
+                self.note_queued(txid);
+                Ok((txid, RelayOutcome::Queued))
+            }
+            Err(BroadcastError::Rejected { code, message }) => {
+                let parents = classify_parents(
+                    tx,
+                    |parent| {
+                        self.wallet
+                            .get_tx(parent)
+                            .is_some_and(|wtx| !wtx.chain_position.is_confirmed())
+                    },
+                    |parent| self.wallet.get_tx(parent).is_some(),
+                );
+                let verdict = classify_rejection(code, &message, parents);
+                let withdraw =
+                    verdict != RebroadcastVerdict::AlreadyInChain && parents != Parents::Foreign;
+                if withdraw {
+                    warn!(
+                        %txid,
+                        code,
+                        ?verdict,
+                        "the upstream rejected the {what}: {message}; withdrawing the \
+                         record (its inputs are released)"
+                    );
+                    // No earlier than the sighting: BDK keeps a transaction canonical
+                    // while `last_evicted < last_seen`, and the clock may have stepped
+                    // back during the round trip.
+                    self.retire(
+                        vec![(txid, seen_at.max(unix_now()))],
+                        &format!("{what} rejected by the upstream"),
+                    );
+                } else {
+                    warn!(
+                        %txid,
+                        code,
+                        ?verdict,
+                        ?parents,
+                        "the upstream rejected the {what}: {message}; the record stands \
+                         (the verdict does not settle it - the scan will)"
+                    );
+                }
+                Err(RpcError::new(code, message))
+            }
+            Err(BroadcastError::Transport(err)) => {
+                if matches!(self.conn, Some(Conn::Bitcoind { .. })) {
+                    self.drop_conn();
+                }
+                warn!(
+                    %txid,
+                    "broadcast of the {what} failed before the upstream gave a verdict: \
+                     {err:#}; recorded at 0-conf anyway (its inputs are locked and it is \
+                     resubmitted at the next tip or reconnect) - `abandontransaction` \
+                     releases the inputs if it never relays"
+                );
+                Ok((txid, RelayOutcome::Unrelayed))
+            }
+        }
+    }
+
+    /// Relay a transaction the wallet holds **no fresh record of**: a caller-built foreign
+    /// transaction, or one already in the wallet (a resubmission), where the record is not
+    /// this relay's to settle. The outcome is reported as is: a queued kyoto announcement
+    /// is a success with a WARN, a failure goes through [`Self::broadcast_failure`].
+    async fn relay_uncommitted(&mut self, tx: &Transaction) -> Result<Txid, RpcError> {
+        let txid = tx.compute_txid();
+        match self.upstream_broadcast(tx).await {
+            Ok(Relay::Relayed) => Ok(txid),
+            Ok(Relay::Queued) => {
+                self.note_queued(txid);
+                Ok(txid)
+            }
+            Err(e) => Err(self.broadcast_failure(e)),
         }
     }
 
@@ -2740,26 +2905,43 @@ impl BtcActor {
                 "failed to finalize the transaction (signer did not complete all inputs)",
             ));
         }
-        let tx = psbt
-            .extract_tx()
-            .map_err(|e| RpcError::misc(format!("extract transaction: {e:?}")))?;
-        let txid = tx.compute_txid();
-        match self.upstream_broadcast(&tx).await {
-            Ok(Relay::Relayed) => {}
-            Ok(Relay::Queued) => self.note_queued(txid),
-            Err(e) => return Err(self.broadcast_failure(e)),
-        }
-        // Record our own send immediately (0-conf), which also locks its inputs against
-        // reuse by the next send's coin selection - a queued one too (module doc).
-        self.wallet
-            .apply_unconfirmed_txs(vec![(Arc::new(tx), unix_now())]);
-        self.persist("send");
-        info!(
-            %txid,
-            recipients = recipients.len(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "sent transaction"
+        let tx = Arc::new(
+            psbt.extract_tx()
+                .map_err(|e| RpcError::misc(format!("extract transaction: {e:?}")))?,
         );
+        // Commit, then relay (module doc): the send is on disk at 0-conf - its inputs
+        // locked against the next send's coin selection - before a byte of it can reach
+        // the network. An own send always spends wallet outputs, so `NotOurs` cannot
+        // happen here; treating it as recorded would relay without a record, which is the
+        // window this order exists to close.
+        let seen_at = match self.commit_before_relay(&tx, "send")? {
+            Commit::Recorded { seen_at } => seen_at,
+            Commit::NotOurs => {
+                return Err(RpcError::misc(
+                    "the built transaction is not recognized as a wallet transaction; \
+                     nothing was broadcast",
+                ))
+            }
+        };
+        let (txid, outcome) = self.relay_committed(&tx, seen_at, "send").await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            RelayOutcome::Relayed => info!(
+                %txid,
+                recipients = recipients.len(),
+                elapsed_ms,
+                "sent transaction"
+            ),
+            // Committed, not yet relayed: the WARN above says why. Not "sent" - an
+            // operator counting that line must not count these.
+            RelayOutcome::Queued | RelayOutcome::Unrelayed => info!(
+                %txid,
+                recipients = recipients.len(),
+                elapsed_ms,
+                relay = ?outcome,
+                "committed transaction; relay pending"
+            ),
+        }
         Ok(txid.to_string())
     }
 
@@ -2868,17 +3050,35 @@ impl BtcActor {
                 )
             })?;
         let txid = tx.compute_txid();
-        match self.upstream_broadcast(&tx).await {
-            Ok(Relay::Relayed) => {}
-            Ok(Relay::Queued) => self.note_queued(txid),
-            Err(e) => return Err(self.broadcast_failure(e)),
+        let tx = Arc::new(tx);
+        // A transaction the wallet holds **canonical** - a resubmission of an own send, or
+        // of a payment it received - has nothing to commit: relay it and report the
+        // verdict as is, leaving the record to the rebroadcast pass and the block scan (a
+        // `-27` on a confirmed transaction must not evict it). The canonical view, not the
+        // raw graph: an abandoned or retired transaction is in the graph too, and
+        // resubmitting one must re-canonicalize it first (below), or the node would hold a
+        // transaction whose inputs the wallet still counts as free.
+        if self.wallet.get_tx(txid).is_some() {
+            return self
+                .relay_uncommitted(&tx)
+                .await
+                .map(|txid| txid.to_string());
         }
-        // If the transaction touches this wallet, record it at 0-conf (the apply filters
-        // relevance itself, so a foreign transaction is a no-op).
-        self.wallet
-            .apply_unconfirmed_txs(vec![(Arc::new(tx), unix_now())]);
-        self.persist("broadcast");
-        Ok(txid.to_string())
+        // Otherwise commit first when it touches this wallet (the apply filters relevance
+        // itself; a fresh sighting outruns any earlier eviction), then relay - the same
+        // order as a send, for the same crash window. A foreign transaction has nothing to
+        // record and is relayed on the uncommitted path, whose failures are reported
+        // verbatim.
+        match self.commit_before_relay(&tx, "broadcast")? {
+            Commit::Recorded { seen_at } => self
+                .relay_committed(&tx, seen_at, "broadcast")
+                .await
+                .map(|(txid, _)| txid.to_string()),
+            Commit::NotOurs => self
+                .relay_uncommitted(&tx)
+                .await
+                .map(|txid| txid.to_string()),
+        }
     }
 
     /// `abandontransaction`: mark an unconfirmed wallet transaction and its unconfirmed
@@ -2978,6 +3178,26 @@ impl BtcActor {
     }
 }
 
+/// What [`BtcActor::commit_before_relay`] found: the transaction is the wallet's and is now
+/// on disk at 0-conf (sighted at `seen_at`, the floor for any later eviction stamp), or it
+/// touches nothing of the wallet's and there was nothing to record.
+enum Commit {
+    Recorded { seen_at: u64 },
+    NotOurs,
+}
+
+/// How [`BtcActor::relay_committed`] left a committed transaction. The record stands in
+/// every case; this is what the caller's log line says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayOutcome {
+    /// The upstream accepted it (bitcoind), or a peer fetched the announcement (kyoto).
+    Relayed,
+    /// Kyoto: no peer asked within the broadcast timeout; the light client holds it queued.
+    Queued,
+    /// No verdict at all (transport failure): the rebroadcast pass carries it from here.
+    Unrelayed,
+}
+
 /// What an upstream broadcast achieved, when it did not fail outright.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Relay {
@@ -3055,6 +3275,31 @@ fn classify_rejection(code: i32, message: &str, parents: Parents) -> Rebroadcast
         }
         _ => RebroadcastVerdict::Retry,
     }
+}
+
+/// What the wallet knows about the transactions `tx` spends: an input funded by a wallet
+/// transaction the wallet holds unconfirmed (an own chain of sends) is a dependency; one
+/// funded by a transaction the wallet does not hold at all - every input of a received
+/// payment - makes the node's missing-inputs verdict unreadable (see [`Parents::Foreign`]).
+/// `own_unconfirmed` answers the first question for a parent txid, `held` the second; the
+/// rebroadcast pass answers from the candidate set it already built, a single relay from
+/// the wallet's canonical view.
+fn classify_parents(
+    tx: &Transaction,
+    own_unconfirmed: impl Fn(Txid) -> bool,
+    held: impl Fn(Txid) -> bool,
+) -> Parents {
+    let mut parents = Parents::Confirmed;
+    for input in &tx.input {
+        let parent = input.previous_output.txid;
+        if own_unconfirmed(parent) {
+            return Parents::WaitsOnOwn;
+        }
+        if !held(parent) {
+            parents = Parents::Foreign;
+        }
+    }
+    parents
 }
 
 /// Order candidates so that no transaction precedes one it spends from (a stable
@@ -3401,6 +3646,80 @@ mod tests {
             .await
             .expect("actor exits on shutdown")
             .unwrap();
+    }
+
+    /// The commit-then-relay order withdraws a record with an eviction stamped at the
+    /// **same second** as the sighting - a persist failure before the relay, a node
+    /// rejection right after it - and that only works because BDK keeps an unconfirmed
+    /// transaction canonical strictly while `last_evicted < last_seen`: a tie excludes it.
+    /// If this starts failing, BDK changed the rule and `commit_before_relay` /
+    /// `relay_committed` must stamp the eviction one second past `seen_at` instead.
+    #[test]
+    fn an_eviction_at_the_sighting_timestamp_withdraws_the_record() {
+        use bdk_wallet::bitcoin::{absolute, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let mut wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .create_wallet_no_persist()
+        .unwrap();
+        let own = wallet.reveal_next_address(KeychainKind::External).address;
+        let receive = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_str(&"11".repeat(32)).unwrap(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000),
+                script_pubkey: own.script_pubkey(),
+            }],
+        };
+        let txid = receive.compute_txid();
+        let seen_at = 1_700_000_100;
+        wallet.apply_unconfirmed_txs([(receive, seen_at)]);
+        assert_eq!(
+            wallet.transactions().count(),
+            1,
+            "the sighting is canonical"
+        );
+        assert_eq!(wallet.balance().untrusted_pending.to_sat(), 5_000);
+
+        wallet.apply_evicted_txs([(txid, seen_at)]);
+        assert_eq!(
+            wallet.transactions().count(),
+            0,
+            "an eviction at the sighting's own timestamp withdraws it"
+        );
+        assert_eq!(wallet.balance().total().to_sat(), 0);
+        assert!(
+            wallet.list_unspent().next().is_none(),
+            "the withdrawn output is no longer spendable"
+        );
+
+        // And the other direction, which a resubmission of an abandoned transaction rides:
+        // a sighting at the eviction's own second changes nothing, one second past it
+        // re-canonicalizes - so `commit_before_relay` stamps at least `last_evicted + 1`.
+        let (tx, _) = wallet
+            .tx_graph()
+            .full_txs()
+            .next()
+            .map(|n| (n.tx.clone(), n.txid))
+            .unwrap();
+        wallet.apply_unconfirmed_txs([(tx.clone(), seen_at)]);
+        assert_eq!(wallet.transactions().count(), 0, "a tie stays evicted");
+        wallet.apply_unconfirmed_txs([(tx, seen_at + 1)]);
+        assert_eq!(
+            wallet.transactions().count(),
+            1,
+            "a sighting past the eviction re-canonicalizes"
+        );
+        assert_eq!(wallet.balance().untrusted_pending.to_sat(), 5_000);
     }
 
     /// A coinbase reward reports Core's `orphan`/`immature`/`generate` by depth, on every

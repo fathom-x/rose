@@ -485,8 +485,7 @@ async fn dispatch_zecd(
         #[cfg(feature = "zcash")]
         "listreceivedbyaddress" => wallet_methods::listreceivedbyaddress(state, wallet, req),
         "listwallets" => control::listwallets(state),
-        #[cfg(feature = "zcash")]
-        "listwalletdir" => wallet_methods::listwalletdir(state),
+        "listwalletdir" => control::listwalletdir(state),
 
         // Wallet - management (fleet onboarding)
         #[cfg(feature = "zcash")]

@@ -22,14 +22,14 @@ pub struct BalancesMine {
     pub coinbase: Amount,
 }
 
-/// One entry of `listwalletdir` (`rpc/wallet_methods.rs::listwalletdir`).
+/// One entry of `listwalletdir` (`rpc/control.rs::listwalletdir`).
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WalletDirEntry {
     pub name: String,
 }
 
-/// `listwalletdir` (`rpc/wallet_methods.rs::listwalletdir`).
+/// `listwalletdir` (`rpc/control.rs::listwalletdir`).
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WalletDir {
@@ -734,7 +734,7 @@ impl Client<'_> {
     }
 
     /// `listwalletdir`: the wallets available on disk, loaded or not
-    /// (`rpc/wallet_methods.rs::listwalletdir`).
+    /// (`rpc/control.rs::listwalletdir`).
     pub async fn list_wallet_dir(&self) -> Result<WalletDir, ClientError> {
         self.call_typed("listwalletdir", vec![]).await
     }

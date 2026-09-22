@@ -348,6 +348,66 @@ the risk Core documents for its own `abandontransaction`: a peer that already re
 bytes may relay them, and if the transaction confirms after all the block re-canonicalizes
 it (an eviction is not final).
 
+## Commit, then relay
+
+A send is recorded before it is relayed (`actor.rs::commit_before_relay`, then
+`relay_committed`): the signed transaction is applied at 0-conf and **persisted** before a
+byte of it goes to the upstream. It used to be the other way round - relay, then apply and
+persist - which left a window where a crash between the two produced a wallet that did not
+know its own send: the inputs looked unspent, the next send double-spent them, and over
+kyoto nothing ever closed it (bitcoind's mempool pass at reconnect rediscovers an own send;
+a filter client has no such pass). Bitcoin Core's `CommitTransaction` has the same order for
+the same reason. The record then follows the relay's verdict:
+
+- **Relayed**, or **queued** by the kyoto light client: the record stands; the txid is the
+  answer.
+- **Rejected** by the node (bitcoind only - kyoto has no verdicts): the node's own code and
+  message pass through, exactly as before, and the verdict is read the way the rebroadcast
+  pass reads it (`classify_rejection` over the transaction's `Parents`) before the record is
+  touched. A transaction the wallet funded - every own send, and a caller-built spend of
+  wallet outputs - is withdrawn through `retire` (an eviction plus its tombstone, in one
+  database transaction): the same bytes can never be accepted, so its inputs are free for a
+  differently built send. Two verdicts leave the record standing: `-27` already-in-chain,
+  which only says the scan is behind the block (a payment to this wallet mined before its
+  scan reached it), and any verdict on a transaction with foreign parents (a received
+  payment relayed on the sender's behalf), which proves nothing about it - it propagates on
+  its own, and the scan re-sights or retires it.
+- **No verdict** (a transport failure - the node hung up, the light client stopped): the
+  bytes may or may not have reached the network, and only the record can tell the wallet's
+  next send that the inputs are spoken for, so it **stands** and the txid is returned with a
+  WARN. That is Core's posture too (it logs the failed relay and keeps the transaction for
+  its resubmission loop); here the rebroadcast pass resubmits it at the next tip or
+  reconnect, and `abandontransaction` releases the inputs if it never relays. A bitcoind
+  connection is dropped for redial as before. The `-4` "retry" error is now reserved for a
+  send refused *before* anything is committed - no upstream connection, no seed, a persist
+  failure - and for the relay of a foreign transaction via `sendrawtransaction`, which the
+  wallet has nothing to commit for.
+- A **persist failure** before the relay withdraws the sighting in memory (an eviction
+  stamped at the sighting's own second - BDK keeps a transaction canonical only while
+  `last_evicted < last_seen`, pinned by
+  `actor.rs::an_eviction_at_the_sighting_timestamp_withdraws_the_record`) and answers `-4`
+  naming the cause; nothing was broadcast, so the inputs really are free.
+
+`sendrawtransaction` takes the same path when the hex is a wallet transaction the wallet
+does not hold **canonical**; one it does (a resubmission of an own send or a received
+payment) is relayed as is with the verdict reported verbatim, since a `-27` on a confirmed
+transaction must not evict it. The gate is the canonical view, not the raw graph: an
+abandoned or retired transaction is still in the graph, and resubmitting its bytes must
+re-canonicalize the record before the relay (a sighting stamped strictly past the
+eviction - `commit_before_relay` stamps at least `last_evicted + 1`, since the clock's
+second granularity makes "later" a floor rather than a given), or the node would hold a
+transaction whose inputs the wallet still counts as free. Every withdrawal stamps its
+eviction no earlier than the sighting it withdraws (`seen_at.max(now)`), because
+`SystemTime` can step backwards between the two reads.
+
+Live coverage is `regtest_btc_send_outcomes.rs` (the `btc-e2e` job), over the bitcoind
+backend: a send the node refuses (`-minrelaytxfee` above the send's rate) leaves balance,
+UTXO set and history untouched; a send whose broadcast dies without a verdict (the
+harness's `RpcProxy` drops exactly the `sendrawtransaction` request, so the sync pass and
+the redial keep working) returns its txid recorded, locks its input against a retry, and is
+resubmitted by the rebroadcast pass once the path clears; and an abandoned unrelayed send
+resubmitted through `sendrawtransaction` is canonical again before the node holds it.
+
 ## Send pricing and fee subtraction (Core's optional send parameters)
 
 `sendtoaddress`/`sendmany` honor Core's optional fee parameters, at Core's positions (which
@@ -567,7 +627,8 @@ would wedge every other command for that wallet, and the shutdown flush with the
   which is the unrecoverable outcome. Recording it makes the failure mode the recoverable
   one instead: the inputs stay locked until the transaction confirms or the operator
   releases them with `abandontransaction`. That is Core's order of operations (commit,
-  then relay). The `-4` "not recorded" error is reserved for a transport failure - the
-  light client itself having stopped, so nothing was queued.
+  then relay), and it is the order every send takes now - see "Commit, then relay"
+  below - so a transport failure (the light client itself having stopped) keeps the
+  record too, for the same reason.
 - **Tip block for the fee average (10s).** Falls back to the peers' relay floor alone, which
   is the same degradation path an outright fetch error takes.

@@ -95,8 +95,11 @@ services:
       - -addnode=50.116.43.120:48333
       - -addnode=45.94.168.5:48333
       - -addnode=89.58.9.219:48333
+      # ZMQ new-block notifications (Core's conventional port), for subscribers on the host.
+      - -zmqpubhashblock=tcp://0.0.0.0:28332
     ports:
       - "127.0.0.1:48332:48332" # JSON-RPC
+      - "127.0.0.1:28332:28332" # ZMQ hashblock, loopback only
       - "48333:48333" # P2P, public: inbound peers propagate our mined blocks (and BIP-157 clients)
     volumes:
       - bitcoind-testnet4-data:/home/bitcoin/.bitcoin

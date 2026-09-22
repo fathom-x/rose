@@ -58,3 +58,57 @@ pub(crate) fn getrpcinfo(state: &AppState) -> Result<Value, RpcError> {
 pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(state.registry.names()))
 }
+
+/// `listwalletdir` - the wallets available on disk, whether or not they are loaded.
+///
+/// Bitcoin Core's shape (`{"wallets": [{"name": ...}, ...]}`). For zecd this is the fleet's
+/// manifest directory: the wallets an operator has provisioned, which is what they reconcile
+/// against when a name is missing from `listwallets`. Configured `[wallets.<name>]` entries are
+/// listed too - they are equally "on disk available", and omitting them would make the two RPCs
+/// disagree for reasons that have nothing to do with the fleet.
+///
+/// zecd extension: a `warnings` array naming any manifest that could not be read. Those wallets
+/// are skipped at startup rather than taking the daemon down, so this is where an operator sees
+/// that a file they wrote is not being served - without it, a skipped wallet is indistinguishable
+/// from one that was never provisioned. Absent when there are none, so the Core-shaped response
+/// is unchanged for a healthy fleet.
+///
+/// Beside `listwallets` for the same reason it is: the configured-wallet half reads the
+/// config and touches no wallet, so every build serves it - a bitcoin-only zecd answered
+/// method-not-found here after the engine gate landed, which `conformance.py`'s shared
+/// "wallets" section (both coins) trips on. Only the fleet half, which is Zcash's, is gated.
+pub(crate) fn listwalletdir(state: &AppState) -> Result<Value, RpcError> {
+    let mut names: Vec<String> = state.config.wallets.keys().cloned().collect();
+    #[allow(unused_mut)]
+    let mut warnings: Vec<String> = Vec::new();
+    #[cfg(feature = "zcash")]
+    if let Some(fleet) = &state.fleet {
+        match crate::fleet::load_manifests(fleet.manifest_dir()) {
+            Ok((members, skipped)) => {
+                names.extend(members.into_iter().map(|m| m.name));
+                warnings.extend(
+                    skipped
+                        .into_iter()
+                        .map(|s| format!("{}: {}", s.path.display(), s.reason)),
+                );
+            }
+            // A manifest directory the daemon cannot read is an operator-visible problem, but it
+            // must not make listing the rest fail - that is exactly when this RPC is being used.
+            Err(e) => {
+                tracing::warn!("listwalletdir: reading the fleet manifests: {e:#}");
+                warnings.push(format!("{}: {e:#}", fleet.manifest_dir().display()));
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    let wallets: Vec<Value> = names
+        .into_iter()
+        .map(|name| json!({ "name": name }))
+        .collect();
+    let mut out = json!({ "wallets": wallets });
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
+}

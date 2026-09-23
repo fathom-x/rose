@@ -11,15 +11,55 @@ containerised zecd for a Bitcoin wallet needs an image built from source with
 `--features bitcoin`; none is shipped. So in every recipe below, **zecd runs on the host**
 from your own `cargo build --release --features bitcoin` and only the UI is containerised.
 
+## Config file, or pure environment
+
+`serve.py` can take every value from a mounted zecd config, from the environment, or a mix -
+each is resolved **flag > env > config > default**. So the image needs no config mounted at
+all: point `--conf` at a path that isn't there and it is skipped (not an error), and the only
+config-derived extras that fall away are the fee-preview tiers and the info panel's
+network/backend labels - moot for a view-only dashboard, whose send form is disabled anyway.
+
+| Value | Flag | Env | Config |
+|---|---|---|---|
+| RPC user | `--rpc-user` | `ZECD_RPC_USER` | `[rpc] user` |
+| RPC password | *(none - it's a secret)* | `ZECD_RPC_PASSWORD` | `[rpc] password` |
+| Upstream URL (whole) | `--rpc-url` | `ZECD_RPC_URL` | - |
+| Upstream host | `--rpc-host` | `ZECD_RPC_HOST` | `[rpc] bind` |
+| Upstream port | `--rpc-port` | `ZECD_RPC_PORT` | `[rpc] port` |
+| Upstream scheme | `--rpc-scheme` | `ZECD_RPC_SCHEME` | *(default `http`)* |
+
+Env-only, nothing mounted:
+
+```bash
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -e ZECD_RPC_USER=view \
+  -e ZECD_RPC_PASSWORD \
+  -e ZECD_RPC_HOST=zecd-btc \
+  -e ZECD_RPC_PORT=18232 \
+  -e ZECD_NETWORK=main \
+  -e ZECD_BACKEND=kyoto \
+  "$GUI_IMAGE" --bind 0.0.0.0
+```
+
+(`ZECD_NETWORK`/`ZECD_BACKEND` are optional - they only set the info panel's network/backend
+labels, the BTC/tBTC unit, and the fee source; the RPC works without them.)
+
+`ZECD_RPC_HOST`/`PORT`/`SCHEME` exist for callers that only have a **bare hostname** to hand in -
+e.g. an orchestrator service reference (`fromService`) that can't have `http://` or a port
+string-composed onto it in the deployment blueprint. Pass the reference as `ZECD_RPC_HOST` and
+the port/scheme as literals; the proxy assembles `scheme://host:port`. When `ZECD_RPC_URL` (or
+`--rpc-url`) is set it wins and the parts are ignored.
+
 ## The address problem, and `--rpc-url`
 
-`serve.py` reads credentials *and* the upstream address from the mounted zecd config. The
-credentials travel into a container fine; the address does not. `[rpc] bind` is `127.0.0.1`,
+When you *do* mount a config, `serve.py` reads credentials *and* the upstream address from it.
+The credentials travel into a container fine; the address does not. `[rpc] bind` is `127.0.0.1`,
 which inside a container is the container's own loopback, so an unmodified run reaches
 nothing and every call returns 502.
 
 `--rpc-url` (env: `ZECD_RPC_URL`) overrides the address alone, keeping the config's
-credentials. Two consequences worth knowing before you use it:
+credentials (or compose the address from `ZECD_RPC_HOST`/`PORT`/`SCHEME` as above). Two
+consequences worth knowing before you use `--rpc-url`:
 
 - **The host must listen past loopback.** A container reaches the host on the bridge
   interface, not `127.0.0.1`. On a laptop, `--rpcbind 0.0.0.0` publishes the RPC to your LAN
@@ -145,10 +185,28 @@ ZECD_RPC_PASSWORD=... python3 scripts/zecd-gui/serve.py --conf deploy/zecd.btc-t
 
 ### Environment Variables
 
+See the resolution table under "Config file, or pure environment" above for how these layer
+with the flags and the config.
+
 - `ZECD_RPC_PASSWORD` - The RPC password. Effectively required: the shipped configs carry a
   `CHANGE-ME` placeholder that zecd refuses to start on (every network) and that `serve.py`
   refuses for the same reason, so the daemon and the proxy each take the real value from this
   variable. It wins over `[rpc] password` in the file.
+- `ZECD_RPC_USER` - The RPC username, overriding `[rpc] user`. Lets the image run with no
+  config mounted (e.g. `view` for a watch-only wallet).
+- `ZECD_RPC_URL` - The whole upstream base URL, overriding the composed one; wins over the
+  host/port/scheme parts below.
+- `ZECD_RPC_HOST` / `ZECD_RPC_PORT` / `ZECD_RPC_SCHEME` - Compose the upstream URL from parts
+  when `ZECD_RPC_URL` is unset. `HOST` takes a bare hostname (an orchestrator service reference
+  that can't have a scheme composed onto it); `SCHEME` defaults to `http`. They fall back to
+  `[rpc] bind`/`port` from the config.
+- `ZECD_NETWORK` - The network label for the info panel (`main`/`test`/`testnet3`/`testnet4`).
+  Only cosmetic-ish: the page picks its unit from it (`BTC` on `main`/`mainnet`, else `tBTC`),
+  and it selects the per-network fee endpoints. Set it when running env-only, since no
+  Bitcoin-wallet RPC reports the network; falls back to `[btc_testnet]`/`network` from the config.
+- `ZECD_BACKEND` - `kyoto` or `bitcoind`, the chain backend the info panel shows and the fee
+  preview keys on (bitcoind's `estimatesmartfee` vs the `[fees]` oracle chain). Set it env-only;
+  falls back to detecting `kyoto` from the config's `server` token.
 
 ### Command-line Arguments
 
@@ -163,22 +221,28 @@ docker run zecd-gui \
 ```
 
 Full options:
-- `--conf PATH` - zecd config file (default: `/config/zecd.btc-testnet4.toml`)
+- `--conf PATH` - zecd config file (default: `/config/zecd.btc-testnet4.toml`); skipped, not an
+  error, when the path isn't present, so the image can run env-only
 - `--bind ADDR` - Server bind address (default: `0.0.0.0` in container)
 - `--port PORT` - Server port (default: `8080`)
 - `--wallet NAME` - Route RPC via `/wallet/<name>` (default: default wallet)
-- `--rpc-url URL` - zecd JSON-RPC address, overriding the config's `[rpc]` bind/port (env: `ZECD_RPC_URL`)
+- `--rpc-user NAME` - zecd RPC username, overriding `[rpc] user` (env: `ZECD_RPC_USER`)
+- `--rpc-url URL` - whole zecd JSON-RPC base URL, overriding the config's `[rpc]` bind/port (env: `ZECD_RPC_URL`)
+- `--rpc-host HOST` / `--rpc-port PORT` / `--rpc-scheme SCHEME` - compose the base URL from parts
+  when `--rpc-url` is unset (env: `ZECD_RPC_HOST`/`ZECD_RPC_PORT`/`ZECD_RPC_SCHEME`; scheme default `http`)
 - `--bitcoind-url URL` - bitcoind RPC for fee estimates (default: `http://127.0.0.1:48332`)
 
 ## Networking
 
-Whatever the topology, the rule is the same: the config supplies the credentials and
-`--rpc-url` supplies the address.
+Whatever the topology, the rule is the same: credentials come from the config or the env, and
+the upstream address from `--rpc-url` (or the `ZECD_RPC_HOST`/`PORT`/`SCHEME` parts, or the
+config's `[rpc]` bind/port).
 
-| Where zecd runs | `--rpc-url` | Also needed |
+| Where zecd runs | Address | Also needed |
 |---|---|---|
-| Host, UI in a container | `http://host.docker.internal:<rpc port>` | zecd `--rpcbind 0.0.0.0`; `--add-host host.docker.internal:host-gateway` on Linux |
-| A container on the same network | `http://<service name>:<rpc port>` | both on one Docker network; needs a `--features bitcoin` image (none published) |
+| Host, UI in a container | `--rpc-url http://host.docker.internal:<rpc port>` | zecd `--rpcbind 0.0.0.0`; `--add-host host.docker.internal:host-gateway` on Linux |
+| A container on the same network | `--rpc-url http://<service name>:<rpc port>` | both on one Docker network; needs a `--features bitcoin` image (none published) |
+| An orchestrator service ref (bare hostname) | `ZECD_RPC_HOST=<ref> ZECD_RPC_PORT=<port>` | no config mount needed; also set `ZECD_RPC_USER`/`ZECD_RPC_PASSWORD` |
 | Host, UI also on the host | omit it | nothing - the config's `127.0.0.1` is already right |
 | Host, UI in a container on the host network (mainnet) | omit it | `network_mode: host`, UI `--bind 127.0.0.1`; zecd stays on loopback |
 

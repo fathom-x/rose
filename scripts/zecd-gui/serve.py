@@ -7,16 +7,24 @@ business living in browser JS. This server closes both gaps the way every bitcoi
 dashboard does: it serves the static page AND forwards POST /rpc to zecd with the
 credentials injected server-side, so the page and the RPC share one origin.
 
-Stdlib only, no dependencies. Credentials and the upstream port are read from the
-zecd config file itself (default: deploy/zecd.btc-testnet4.toml), so there is no
-second copy of the password to keep in sync; ZECD_RPC_PASSWORD in the environment
-wins over the file, with the same precedence zecd gives it.
+Stdlib only, no dependencies. Every value can come from a zecd config file (default:
+deploy/zecd.btc-testnet4.toml) OR from the environment, so the image can run with no
+config mounted at all. Each is resolved flag > env > config > default: the user via
+--rpc-user / ZECD_RPC_USER / [rpc] user, and the password via ZECD_RPC_PASSWORD /
+[rpc] password (no flag - a secret has no business on a command line), matching the
+precedence zecd itself gives ZECD_RPC_PASSWORD over the file. When --conf points at a
+file that is not present, it is skipped rather than an error. The two config-derived
+values the page actually uses - the network (picks the BTC/tBTC unit) and the backend
+(picks the fee source) - then come from ZECD_NETWORK and ZECD_BACKEND (kyoto|bitcoind);
+the fee-preview tiers fall back to their per-network defaults.
 
-The config's [rpc] bind/port also name the upstream, which is correct whenever this
-proxy runs beside the daemon. It is wrong from inside a container: 127.0.0.1 there is
-the container's own loopback, and a compose sibling is reached by service name. So
---rpc-url (env: ZECD_RPC_URL) overrides the host and port while still taking the
-credentials from the config - the two are separable, and only the address changes.
+The upstream address is likewise separable from the credentials. --rpc-url (env:
+ZECD_RPC_URL) gives the whole base URL - correct for reaching a host zecd from a
+container or a compose sibling by service name, where the config's own 127.0.0.1
+[rpc] bind is the container's own loopback. When it is unset the base URL is composed
+from parts: --rpc-host / ZECD_RPC_HOST (a bare hostname - e.g. an orchestrator service
+reference that cannot have a scheme string-composed onto it), --rpc-port / ZECD_RPC_PORT,
+and --rpc-scheme / ZECD_RPC_SCHEME (default http), each falling back to [rpc] bind/port.
 
 Usage, from the repository root:
 
@@ -26,6 +34,10 @@ Usage, from the repository root:
 
     # from a container, against a zecd on the host (macOS/Windows Docker Desktop)
     python3 scripts/zecd-gui/serve.py --rpc-url http://host.docker.internal:48242
+
+    # no config mounted: user, password and upstream all from the environment
+    ZECD_RPC_USER=view ZECD_RPC_PASSWORD=... ZECD_RPC_HOST=zecd-btc ZECD_RPC_PORT=18232 \
+        python3 scripts/zecd-gui/serve.py
 
 Then open http://127.0.0.1:8080/.
 """
@@ -113,15 +125,18 @@ def read_config(conf_path):
         return data
 
 
-def read_rpc_config(conf_path):
-    """The [rpc] bind/port/user/password zecd exposes its own RPC on."""
-    rpc = read_config(conf_path).get("rpc", {})
-    return {
-        "bind": rpc.get("bind", "127.0.0.1"),
-        "port": rpc.get("port", 8232),
-        "user": rpc.get("user", ""),
-        "password": rpc.get("password", ""),
-    }
+def load_config(conf_path):
+    """(config dict, label) for `conf_path`, tolerating a missing file.
+
+    The image bakes no config and can run purely from environment variables (user, password,
+    host, port), so a `--conf` that isn't mounted is not an error - it just means every value
+    comes from the environment and the config-derived extras (the fee-preview tiers, the info
+    panel's network/backend labels) fall back to their defaults. A config that IS present is
+    read as before. The label is what the banner and /info report as the config source.
+    """
+    if conf_path and Path(conf_path).exists():
+        return read_config(conf_path), os.path.basename(conf_path)
+    return {}, "(none)"
 
 
 # The built-in per-network endpoints of each HTTP fee tier, mirroring src/btc/fees.rs. A
@@ -404,12 +419,36 @@ def main():
     ap.add_argument("--port", type=int, default=8080, help="port to serve the UI on")
     ap.add_argument("--wallet", default="", help="route RPCs via /wallet/<name> (empty = default wallet)")
     ap.add_argument(
+        "--rpc-user",
+        default="",
+        help="zecd RPC username, overriding [rpc] user from the config. Env: ZECD_RPC_USER. "
+             "(The password has no flag - it is a secret; set it via ZECD_RPC_PASSWORD or the "
+             "config.)",
+    )
+    ap.add_argument(
         "--rpc-url",
         default="",
         help="zecd JSON-RPC base URL, overriding [rpc] bind/port from the config (e.g. "
              "http://host.docker.internal:48242 to reach a host zecd from a container, or "
              "http://zecd:18232 for a compose sibling). Credentials still come from the "
-             "config. Env: ZECD_RPC_URL",
+             "config/env. Env: ZECD_RPC_URL",
+    )
+    ap.add_argument(
+        "--rpc-host",
+        default="",
+        help="zecd RPC host, used to compose the base URL when --rpc-url/ZECD_RPC_URL is unset. "
+             "Takes a bare hostname (e.g. an orchestrator's service reference that cannot have a "
+             "scheme composed onto it). Env: ZECD_RPC_HOST",
+    )
+    ap.add_argument(
+        "--rpc-port",
+        default="",
+        help="zecd RPC port for the composed base URL (with --rpc-host). Env: ZECD_RPC_PORT",
+    )
+    ap.add_argument(
+        "--rpc-scheme",
+        default="",
+        help="scheme for the composed base URL (with --rpc-host); default http. Env: ZECD_RPC_SCHEME",
     )
     ap.add_argument(
         "--bitcoind-url",
@@ -425,29 +464,44 @@ def main():
     args = ap.parse_args()
 
     sys.stdout.reconfigure(line_buffering=True)  # banner shows when piped to a service log
-    rpc = read_rpc_config(args.conf)
-    # Same precedence as zecd itself: ZECD_RPC_PASSWORD wins over [rpc] password in the
-    # file, so a daemon started with the env var and a config carrying only CHANGE-ME
-    # shares the one credential with this proxy.
-    password = os.environ.get("ZECD_RPC_PASSWORD") or rpc["password"]
-    if not rpc["user"] or not password:
-        sys.exit(f"no RPC password: set ZECD_RPC_PASSWORD or [rpc] password in {args.conf}")
+
+    # The config is optional: the image bakes none and can run purely from the environment.
+    # A present config still supplies [rpc] and the fee/info extras; an absent one just means
+    # every value below falls back to its env var (or default).
+    config, conf_label = load_config(args.conf)
+    rpc = config.get("rpc", {})
+
+    # Precedence for each value: explicit flag, then env, then the config, then a default -
+    # matching how zecd itself lets ZECD_RPC_PASSWORD win over the file. The password keeps its
+    # env-over-file rule and has no flag (a secret has no business on a command line).
+    user = args.rpc_user or os.environ.get("ZECD_RPC_USER") or rpc.get("user", "")
+    password = os.environ.get("ZECD_RPC_PASSWORD") or rpc.get("password", "")
+    if not user or not password:
+        sys.exit("no RPC credentials: set ZECD_RPC_USER and ZECD_RPC_PASSWORD (or [rpc] "
+                 f"user/password in a mounted --conf; this run read {conf_label})")
     # The shipped configs carry a placeholder that zecd itself refuses to start on (every
     # network), so a proxy holding it can only ever fail auth: say so up front, the same way.
     if password.strip().lower() == "change-me":
-        sys.exit(f"[rpc] password in {args.conf} is still the CHANGE-ME placeholder; zecd "
-                 "refuses to start on it - set ZECD_RPC_PASSWORD to the password the daemon runs with")
-    # Where zecd listens. The config's own [rpc] bind/port is right whenever this proxy runs
-    # beside the daemon, and wrong from inside a container - 127.0.0.1 there is the container's
-    # loopback, not the host's. --rpc-url (or ZECD_RPC_URL) replaces just the address; the
-    # credentials above still come from the config, which is the half a container can share.
-    base = args.rpc_url or os.environ.get("ZECD_RPC_URL") or f"http://{rpc['bind']}:{rpc['port']}"
+        sys.exit("[rpc] password is still the CHANGE-ME placeholder; zecd refuses to start on "
+                 "it - set ZECD_RPC_PASSWORD to the password the daemon runs with")
+
+    # Where zecd listens. --rpc-url (or ZECD_RPC_URL) gives the whole base URL; otherwise it is
+    # composed from host/port/scheme parts, each with the same flag > env > config > default
+    # precedence. The parts exist for callers that have only a bare hostname to hand in - e.g. an
+    # orchestrator service reference that cannot have a scheme/port string-composed onto it in the
+    # deployment blueprint - so ZECD_RPC_HOST takes that reference and ZECD_RPC_PORT/SCHEME the
+    # literals. The config's own [rpc] bind/port is the fallback (right when the proxy runs beside
+    # the daemon; wrong from a container, where 127.0.0.1 is the container's own loopback).
+    base = args.rpc_url or os.environ.get("ZECD_RPC_URL")
+    if not base:
+        host = args.rpc_host or os.environ.get("ZECD_RPC_HOST") or rpc.get("bind", "127.0.0.1")
+        port = args.rpc_port or os.environ.get("ZECD_RPC_PORT") or rpc.get("port", 8232)
+        scheme = (args.rpc_scheme or os.environ.get("ZECD_RPC_SCHEME") or "http").rstrip(":/")
+        base = f"{scheme}://{host}:{port}"
     path = f"/wallet/{args.wallet}" if args.wallet else "/"
     Handler.upstream_url = base.rstrip("/") + path
-    token = base64.b64encode(f"{rpc['user']}:{password}".encode()).decode()
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
     Handler.auth_header = f"Basic {token}"
-
-    config = read_config(args.conf)
 
     # Optional: the fee estimate comes straight from bitcoind (zecd exposes none),
     # using the [bitcoind] user/password in the same config. Skipped if absent.
@@ -457,22 +511,31 @@ def main():
         bd_token = base64.b64encode(f"{bd['rpc_user']}:{bd['rpc_password']}".encode()).decode()
         Handler.bitcoind_auth = f"Basic {bd_token}"
 
-    # Which configuration the page is looking at, so it can say so. The backend is read
-    # from the wallet's `server` token (nested under tomllib, flat "wallets.<name>" under
-    # the fallback parser), else the global [bitcoind] server, else the built-in default.
+    # Which configuration the page is looking at, so it can say so. These feed the header AND
+    # two behaviours in index.html: the network picks the unit label (BTC on mainnet, else tBTC)
+    # and the backend picks the fee-rate source. Neither is exposed by a Bitcoin-wallet RPC, so
+    # when no config is mounted they come from ZECD_NETWORK / ZECD_BACKEND instead - the same
+    # values the config would have supplied. Precedence: env, then the config, then a default.
     wallet_name = args.wallet or config.get("default_wallet", "default")
     wallet_cfg = config.get("wallets", {}).get(wallet_name) or config.get(f"wallets.{wallet_name}") or {}
     srv = wallet_cfg.get("server") or bd.get("server")
-    backend = "kyoto" if (srv or "").lower().startswith("kyoto") else "bitcoind"
-    net = config.get("btc_testnet") or config.get("network") or "?"
+    # Backend: read from the wallet's `server` token (nested under tomllib, flat
+    # "wallets.<name>" under the fallback parser), else the global [bitcoind] server, else the
+    # built-in default - unless ZECD_BACKEND overrides it (kyoto|bitcoind; anything else ignored).
+    backend_env = (os.environ.get("ZECD_BACKEND") or "").strip().lower()
+    if backend_env in ("kyoto", "bitcoind"):
+        backend = backend_env
+    else:
+        backend = "kyoto" if (srv or "").lower().startswith("kyoto") else "bitcoind"
+    net = os.environ.get("ZECD_NETWORK") or config.get("btc_testnet") or config.get("network") or "?"
     Handler.backend = backend
     Handler.fee_tiers = kyoto_fee_tiers(config, net)
     Handler.info_json = json.dumps({
-        "conf": os.path.basename(args.conf),
+        "conf": conf_label,
         "network": net,
         "wallet": wallet_name,
         "backend": backend,
-        "server": srv or "bitcoind (default)",
+        "server": srv or (f"{backend} (env)" if backend_env in ("kyoto", "bitcoind") else "bitcoind (default)"),
     }).encode()
 
     server = http.server.ThreadingHTTPServer((args.bind, args.port), Handler)
@@ -480,7 +543,8 @@ def main():
         watch_and_reexec(sorted(UI_DIR.glob("*.py")))
         print(f"reload: watching {UI_DIR} (index.html is read per request; a .py change re-execs)")
     print(f"UI:   http://{args.bind}:{args.port}/")
-    print(f"zecd: {Handler.upstream_url}  (credentials from {args.conf})")
+    cred_src = "environment" if os.environ.get("ZECD_RPC_PASSWORD") else conf_label
+    print(f"zecd: {Handler.upstream_url}  (user={user!r}, credentials from {cred_src})")
     if backend == "kyoto":
         # The chain zecd would walk, annotated where this page differs from it: it can query
         # the HTTP oracles but not kyoto's peers, and a source with no instance on this
@@ -499,7 +563,7 @@ def main():
         print(f"fee:  {chain or '(no sources)'}  (the [fees] chain zecd walks at send time)")
     else:
         print(f"fee:  {Handler.bitcoind_url or '(no [bitcoind] creds; fee estimate disabled)'}")
-    print(f"cfg:  {os.path.basename(args.conf)}  net={net}  wallet={wallet_name}  backend={backend}")
+    print(f"cfg:  {conf_label}  net={net}  wallet={wallet_name}  backend={backend}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

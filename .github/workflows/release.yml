@@ -2,8 +2,10 @@ name: Release
 
 # Tag-driven release tier: pushing a `v*` tag builds the release artifacts for both Linux
 # targets and attaches them to a *draft* GitHub release (a human reviews and publishes),
-# pushes Docker images to GHCR tagged with the semver version, and publishes the crate to
-# crates.io. Note the asymmetry: the GitHub release waits for a human, but the GHCR images and
+# pushes the zecd binary Docker images to GHCR (amd64 + arm64) tagged with the semver version,
+# and publishes the crate to crates.io. The wallet-dashboard image is a separate, much cheaper
+# build in its own workflow (.github/workflows/docker-gui.yml), which the same `v*` tag also
+# triggers. Note the asymmetry: the GitHub release waits for a human, but the GHCR images and
 # the crates.io version go out on the tag push and cannot be recalled (only overwritten and
 # yanked respectively), so the tag is the point of no return, not the publish button.
 #

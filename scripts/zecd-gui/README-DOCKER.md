@@ -76,6 +76,30 @@ wallet: `zecd export-xpub --wallet btc` on the spender, `zecd init --xpub <key>`
 dashboard runs. The page reads `getwalletinfo.private_keys_enabled`, announces the
 watch-only wallet at the top, and disables its send form.
 
+### The published image
+
+The `Docker GUI` workflow (`.github/workflows/docker-gui.yml`) publishes this dashboard to GHCR
+(multi-arch amd64+arm64), so you can pull it instead of building. Three ways to trigger it:
+a `gui-v*` tag (e.g. `git tag gui-v0.0.0-test <sha> && git push origin gui-v0.0.0-test`)
+publishes just the GUI and works from any branch; a real `v*` release tag ships it alongside a
+release; and once the workflow is on the default branch, Actions -> Docker GUI -> Run workflow
+(give it a version) does it on demand. The name is the main image's name with a `-gui` suffix, derived from the repository
+the workflow runs in: `ghcr.io/fathom-x/rose-gui` from this development tree, and
+`ghcr.io/zecrocks/zecd-gui` from the public `zecrocks/zecd` tree it is released from. Use a
+version tag, not a moving `latest` (none is published). Point `$GUI_IMAGE` at whichever applies
+and the commands below run unchanged:
+
+```bash
+GUI_IMAGE=ghcr.io/zecrocks/zecd-gui:<version>    # or ...rose-gui:<version> from this tree
+docker pull "$GUI_IMAGE"
+```
+
+Everything below that says `zecd-gui` (a locally-built tag) works the same against the pulled
+image - substitute `"$GUI_IMAGE"`. The compose stacks still build from
+`scripts/zecd-gui/Dockerfile` (the same Dockerfile the image is published from) so their
+`--reload` dev mount keeps working; to pull instead, replace a stack's `build:` block with
+`image: <that name>:<version>`.
+
 ### One-off container against a host zecd
 
 Publish the port on loopback (`-p 127.0.0.1:8080:8080`, as below and as the compose stacks
@@ -85,6 +109,17 @@ proxy itself refuses cross-origin browser requests and any method the page does 
 but neither is a substitute for not exposing it.
 
 ```bash
+# either pull the published image ($GUI_IMAGE from "The published image" above)...
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -e ZECD_RPC_PASSWORD \
+  -v $(pwd)/deploy:/config:ro \
+  --add-host host.docker.internal:host-gateway \
+  "$GUI_IMAGE" \
+  --conf /config/zecd.btc-testnet4-kyoto.toml \
+  --bind 0.0.0.0 \
+  --rpc-url http://host.docker.internal:48242
+
+# ...or build it locally
 cd scripts/zecd-gui
 docker build -t zecd-gui .
 docker run --rm -p 127.0.0.1:8080:8080 \

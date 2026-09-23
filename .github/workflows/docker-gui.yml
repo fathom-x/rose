@@ -1,0 +1,130 @@
+name: Docker GUI
+
+# Builds, smoke-tests, and publishes the wallet dashboard image (scripts/zecd-gui) to GHCR,
+# standalone.
+#
+# It is deliberately separate from release.yml AND from docker.yml (the zecd binary images): the
+# GUI is a pure-stdlib Python image over python:3.12-slim (nothing to compile), so it builds in
+# seconds, whereas both of those run the slow reproducible StageX/musl builds. Keeping the GUI
+# here means a GUI or README edit smoke-tests just this image, and never triggers those binary
+# builds - and you can publish just the GUI without dragging a whole release along.
+#
+# On a pull request touching scripts/zecd-gui/** the `smoke` job builds the image and runs it
+# (--help) as the PR-time proof that it still works; it does not push. Publishing is three ways:
+#   * a `gui-v*` tag (e.g. `gui-v0.0.0-test`) - the GUI-only route. release.yml listens on `v*`,
+#     which does NOT match `gui-v*`, so this publishes just the GUI and nothing else. Tag-driven
+#     runs use the workflow file at the tagged commit, so this works from any branch (no merge to
+#     the default branch required, unlike workflow_dispatch).
+#   * a real `v*` release tag - triggers BOTH workflows, so a release ships the GUI too (this
+#     pushes the image; release.yml pushes the binary images).
+#   * workflow_dispatch (with a version input) - the on-demand route once this file is on the
+#     default branch, which is where GitHub requires a workflow to be for the Run workflow button.
+#
+# The image name is `${{ github.repository }}-gui` - the main zecd image's name
+# (ghcr.io/${{ github.repository }}) plus a `-gui` suffix - so it lands under whichever repo the
+# workflow runs in: ghcr.io/fathom-x/rose-gui here, ghcr.io/zecrocks/zecd-gui on the
+# public release tree. One buildx job produces a multi-arch (amd64+arm64) image; emulation costs
+# nothing but a file copy since there is nothing to compile.
+
+on:
+  push:
+    # Tags only (no branches/paths): a `paths` filter here would also gate tag pushes, and a tag
+    # whose commit didn't touch scripts/zecd-gui/** would then fail to publish. Branch-push and
+    # PR smoke-testing rides the pull_request trigger below instead.
+    tags:
+      - "v*"        # real releases (also triggers release.yml)
+      - "gui-v*"    # GUI-only publish (release.yml does NOT match this)
+  pull_request:
+    paths:
+      - "scripts/zecd-gui/**"
+      - ".github/workflows/docker-gui.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version tag (with or without a leading v), e.g. 0.1.0 or 0.0.0-test"
+        required: true
+        default: "0.0.0-test"
+
+concurrency:
+  group: docker-gui-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # PR-time proof that the image still builds and starts. No config or upstream is mounted, so
+  # the server would 502 on RPC - but --help exercises the Python entrypoint (serve.py) and
+  # proves the image runs, which is all this smoke test needs. Does not push.
+  smoke:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the GUI image
+        run: docker build -t zecd-gui scripts/zecd-gui
+
+      - name: Run the GUI container
+        run: docker run --rm zecd-gui --help
+
+  # Resolve the version once so tag pushes and manual dispatch share one source of truth,
+  # mirroring release.yml's setup job. Publish path only (tag push / dispatch), never on a PR.
+  setup:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ inputs.version }}"
+          else
+            RAW="${GITHUB_REF_NAME}"
+          fi
+          RAW="${RAW#gui-}"           # strip the gui- prefix on a gui-v* tag
+          VERSION="${RAW#v}"          # then strip a leading v (v1.2.3 / gui-v1.2.3 / 1.2.3 all -> 1.2.3)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=${VERSION}"
+
+  publish:
+    needs: setup
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tag the image with the version the setup job resolved (from the tag or the dispatch
+      # input). Not docker/metadata-action's `type=semver`, which parses the git ref tag itself
+      # and cannot read a `gui-v*` tag (not valid semver) or a dispatch input (no tag at all) -
+      # the setup job already normalized all three cases to one clean version.
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}-gui
+          tags: |
+            type=raw,value=${{ needs.setup.outputs.version }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: scripts/zecd-gui
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=gui
+          cache-to: type=gha,mode=max,scope=gui

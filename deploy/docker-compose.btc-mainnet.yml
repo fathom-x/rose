@@ -144,11 +144,12 @@ services:
     # which this node's host is.
     #
     # The UI does not talk to bitcoind, so it neither depends on it nor joins its network.
-    # Liveness is the image's own HEALTHCHECK (Dockerfile.prod, urllib-based - the image
-    # has no curl, so a compose-level curl healthcheck would only ever report unhealthy).
+    # Liveness is the image's own HEALTHCHECK (see scripts/zecd-gui/Dockerfile, urllib-based -
+    # the image has no curl, so a compose-level curl healthcheck would only ever report
+    # unhealthy). The published image (ghcr.io/<repo>-gui) carries the same healthcheck; to
+    # pull it instead of building, replace this `build:` block with `image: ghcr.io/<repo>-gui:<ver>`.
     build:
       context: ../scripts/zecd-gui
-      dockerfile: Dockerfile.prod
     container_name: zecd-gui-mainnet
     restart: unless-stopped
     network_mode: host

@@ -1653,7 +1653,7 @@ fn init_creates_wallet_and_refuses_reinit() {
     );
 }
 
-#[cfg(feature = "zcash")]
+#[cfg(any(feature = "zcash", feature = "bitcoin"))]
 /// The committed testnet development mnemonic (valueless TAZ only), used here as
 /// a fixed key source so the derivations below are reproducible.
 const TEST_MNEMONIC: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
@@ -2218,4 +2218,150 @@ fn config_check_reports_the_coin_key_per_build() {
         "{}",
         stderr_of(&out)
     );
+}
+
+/// `derive-address` on a Bitcoin wallet: BIP 84 receiving addresses, offline, pinned to the
+/// BIP 84 specification's own test vector (the `abandon ... about` mnemonic's first two
+/// receiving addresses), so the ground truth is independent of zecd and of BDK. Then the
+/// same addresses from the exported account xpub, from an initialized watch-only wallet's
+/// pin, and the cross-check against it - with nothing but `keys.toml` and the wallet
+/// database ever written, and those only by `init`.
+#[cfg(feature = "bitcoin")]
+#[test]
+fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
+    const BIP84_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon \
+                                  abandon abandon abandon abandon about";
+    const BIP84_RECEIVE: [&str; 2] = [
+        "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
+        "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g",
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let datadir = dir.path().to_str().unwrap();
+    std::fs::write(
+        dir.path().join("zecd.toml"),
+        "network = \"main\"\n[wallets.default]\ncoin = \"bitcoin\"\n",
+    )
+    .unwrap();
+    let lines = |out: &Output| -> Vec<String> {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let out = zecd()
+        .args([
+            "--datadir",
+            datadir,
+            "derive-address",
+            "--mnemonic",
+            "--count",
+            "2",
+        ])
+        .env("ZECD_MNEMONIC", BIP84_MNEMONIC)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert_eq!(lines(&out), BIP84_RECEIVE);
+    // Offline and write-free: the config file is still the datadir's only entry.
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["zecd.toml"]);
+
+    // The JSON report carries the account key, and deriving from it gives the same
+    // addresses - the pre-provisioning route that never puts a seed on the box.
+    let out = zecd()
+        .args([
+            "--datadir",
+            datadir,
+            "derive-address",
+            "--mnemonic",
+            "--json",
+        ])
+        .env("ZECD_MNEMONIC", BIP84_MNEMONIC)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let xpub = report["xpub"].as_str().unwrap().to_string();
+    assert!(xpub.starts_with("[73c5da0a/84'/0'/0']xpub"), "{xpub}");
+    assert_eq!(report["addresses"][0]["address"], BIP84_RECEIVE[0]);
+    let out = zecd()
+        .args([
+            "--datadir",
+            datadir,
+            "derive-address",
+            "--xpub",
+            &xpub,
+            "--index",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert_eq!(lines(&out), [BIP84_RECEIVE[1]]);
+
+    // A watch-only wallet built from that key answers from its pin, and the mnemonic
+    // verifies against it; a different mnemonic is refused.
+    let out = zecd()
+        .args([
+            "--datadir",
+            datadir,
+            "init",
+            "--xpub",
+            &xpub,
+            "--birthday",
+            "900000",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let out = zecd()
+        .args(["--datadir", datadir, "derive-address", "--count", "2"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert_eq!(lines(&out), BIP84_RECEIVE);
+    let out = zecd()
+        .args([
+            "--datadir",
+            datadir,
+            "derive-address",
+            "--wallet",
+            "default",
+            "--mnemonic",
+        ])
+        .env("ZECD_MNEMONIC", BIP84_MNEMONIC)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("Verified"), "{}", stderr_of(&out));
+    let out = zecd()
+        .args([
+            "--datadir",
+            datadir,
+            "derive-address",
+            "--wallet",
+            "default",
+            "--mnemonic",
+        ])
+        .env("ZECD_MNEMONIC", TEST_MNEMONIC)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("does not match"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    // A Zcash viewing key is the wrong coin's key.
+    let out = zecd()
+        .args(["--datadir", datadir, "derive-address", "--ufvk", "uview1x"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("--xpub"), "{}", stderr_of(&out));
 }

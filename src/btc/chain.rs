@@ -485,10 +485,21 @@ impl BitcoindRpc {
     /// `FeeRate`, or `None` when the node has no estimate (fresh regtest chains, thin
     /// mempools). The estimate comes back in BTC/kvB; the ceiling division keeps the
     /// resulting whole-sat/vB rate at or above the node's, never below a min-relay boundary.
-    pub fn estimate_fee_rate_blocking(&self, target: u16) -> anyhow::Result<Option<FeeRate>> {
+    pub fn estimate_fee_rate_blocking(
+        &self,
+        target: u16,
+        conservative: Option<bool>,
+    ) -> anyhow::Result<Option<FeeRate>> {
+        let mode = conservative.map(|conservative| {
+            if conservative {
+                bitcoincore_rpc::json::EstimateMode::Conservative
+            } else {
+                bitcoincore_rpc::json::EstimateMode::Economical
+            }
+        });
         let res = self
             .client
-            .estimate_smart_fee(target, None)
+            .estimate_smart_fee(target, mode)
             .map_err(|e| anyhow!("estimatesmartfee: {e}"))?;
         Ok(res.fee_rate.map(|per_kvb| {
             let sat_per_vb = per_kvb.to_sat().div_ceil(1000).max(1);

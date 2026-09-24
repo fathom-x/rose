@@ -26,6 +26,7 @@
 pub mod actor;
 pub mod birthdays;
 pub mod chain;
+pub mod derive;
 pub mod fees;
 pub mod keys;
 pub mod kyoto;

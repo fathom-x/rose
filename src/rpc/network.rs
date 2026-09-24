@@ -45,8 +45,13 @@ fn version_number() -> u64 {
 /// `getnetworkinfo` - daemon version/identity in Bitcoin Core's shape; `connections` counts
 /// the single lightwalletd upstream (1 when connected, 0 otherwise).
 pub(crate) fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
-    let up = connected(state);
-    Ok(json!({
+    Ok(networkinfo_json(connected(state)))
+}
+
+/// The `getnetworkinfo` object, given whether the wallet's upstream is connected - shared
+/// with the Bitcoin engine's handler, so both report the same shape.
+pub(crate) fn networkinfo_json(up: bool) -> Value {
+    json!({
         "version": version_number(),
         "subversion": format!("/zecd:{}/", env!("CARGO_PKG_VERSION")),
         "protocolversion": 170100,
@@ -63,7 +68,7 @@ pub(crate) fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
         "incrementalfee": zats_to_value(1000),
         "localaddresses": [],
         "warnings": ""
-    }))
+    })
 }
 
 /// `getconnectioncount` - 1 while the lightwalletd upstream is reachable, else 0.

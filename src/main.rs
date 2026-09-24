@@ -66,16 +66,34 @@ async fn main() -> anyhow::Result<()> {
         // a lightwalletd/zebra probe). They stay in the subcommand list in every build - so
         // `zecd --help` names one surface - and refuse at runtime where the engine is absent,
         // the way `export-xpub` refuses a Zcash wallet.
-        #[cfg(feature = "zcash")]
-        Some(Command::DeriveAddress(args)) => zecd::derive_address::run(&config, args),
-        #[cfg(not(feature = "zcash"))]
-        Some(Command::DeriveAddress(_)) => Err(unsupported_without_zcash("derive-address")),
+        Some(Command::DeriveAddress(args)) => derive_address(&config, args),
         Some(Command::Rescan(args)) => zecd::init::rescan(&config, args).await,
         #[cfg(feature = "zcash")]
         Some(Command::ChainInfo(args)) => zecd::chain_probe::run(&config, args).await,
         #[cfg(not(feature = "zcash"))]
         Some(Command::ChainInfo(_)) => Err(unsupported_without_zcash("chain-info")),
         _ => daemon::run(config).await,
+    }
+}
+
+/// `derive-address` answers from the engine the wallet's coin names: BIP 84 for a Bitcoin
+/// wallet (`btc::derive`), Unified/transparent addresses for a Zcash one.
+fn derive_address(
+    config: &zecd::config::AppConfig,
+    args: &zecd::config::DeriveAddressArgs,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "bitcoin")]
+    if zecd::btc::derive::serves(config, args.wallet.as_deref()) {
+        return zecd::btc::derive::run(config, args);
+    }
+    #[cfg(feature = "zcash")]
+    {
+        zecd::derive_address::run(config, args)
+    }
+    #[cfg(not(feature = "zcash"))]
+    {
+        let _ = (config, args);
+        Err(unsupported_without_zcash("derive-address"))
     }
 }
 

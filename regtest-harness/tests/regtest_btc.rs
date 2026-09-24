@@ -504,15 +504,57 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     assert_eq!(info["ismine"], json!(true));
 
     // A multi-recipient send in one transaction fans out to one send entry per recipient.
+    // It also asks for `replaceable = false` (param 5), which is honored rather than ignored:
+    // every input carries the final-but-for-locktime sequence, where the default send above
+    // signalled BIP 125 - read off the node's own decoding of the raw transactions.
     let m1 = node.call("getnewaddress", json!([])).await.unwrap();
     let m2 = node.call("getnewaddress", json!([])).await.unwrap();
     let many_txid = zecd
         .call(
             "sendmany",
-            json!(["", {m1.as_str().unwrap(): 0.1, m2.as_str().unwrap(): 0.2}]),
+            json!(["", {m1.as_str().unwrap(): 0.1, m2.as_str().unwrap(): 0.2}, null, null, null, false]),
         )
         .await
         .expect("sendmany");
+    let sequences = |tx: &serde_json::Value| -> Vec<u64> {
+        tx["vin"]
+            .as_array()
+            .expect("vin")
+            .iter()
+            .map(|i| i["sequence"].as_u64().expect("sequence"))
+            .collect()
+    };
+    let many_raw = node
+        .call("getrawtransaction", json!([many_txid, true]))
+        .await
+        .expect("getrawtransaction sendmany");
+    assert!(
+        sequences(&many_raw).iter().all(|s| *s == 0xFFFF_FFFE),
+        "a replaceable=false send must not signal BIP 125: {many_raw}"
+    );
+    let unconfirmed = zecd
+        .call("gettransaction", json!([many_txid]))
+        .await
+        .expect("gettransaction unconfirmed sendmany");
+    assert_eq!(
+        unconfirmed["bip125-replaceable"],
+        json!("no"),
+        "{unconfirmed}"
+    );
+    // Already confirmed, and the node keeps no txindex: decode zecd's own copy of it.
+    let first_hex = zecd
+        .call("gettransaction", json!([send_txid]))
+        .await
+        .expect("gettransaction default send")["hex"]
+        .clone();
+    let first_raw = node
+        .call("decoderawtransaction", json!([first_hex]))
+        .await
+        .expect("decoderawtransaction default send");
+    assert!(
+        sequences(&first_raw).iter().all(|s| *s == 0xFFFF_FFFD),
+        "the default send signals BIP 125: {first_raw}"
+    );
     node.mine(1).await;
     zecd.wait_height(104).await;
     let many = zecd
@@ -536,14 +578,18 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     assert_ne!(details[0]["vout"], details[1]["vout"]);
 
     // An explicit fee_rate (param 9, sat/vB) prices the send verbatim: the node's own
-    // mempool entry proves the paid rate is the caller's number, not an estimate.
-    let rated_txid = zecd
+    // mempool entry proves the paid rate is the caller's number, not an estimate. It also
+    // asks for `verbose` (param 10): Core's {txid, fee_reason}, the reason naming the
+    // caller's own rate.
+    let rated = zecd
         .call(
             "sendtoaddress",
-            json!([miner_addr, 0.05, null, null, false, null, null, null, null, 25]),
+            json!([miner_addr, 0.05, null, null, false, null, null, null, null, 25, true]),
         )
         .await
         .expect("fee_rate send");
+    assert_eq!(rated["fee_reason"], json!("PayTxFee set"), "{rated}");
+    let rated_txid = rated["txid"].clone();
     let entry = node
         .call("getmempoolentry", json!([rated_txid]))
         .await

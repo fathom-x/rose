@@ -1259,6 +1259,22 @@ const FEE_MEDIAN_BLOCKS: u32 = 5;
 /// cheap insurance.
 const MARKET_LAG_BIAS_PERCENT: u64 = 20;
 
+/// How far the peers' BIP-133 feefilter may lift the estimate above the (biased) block
+/// median: a multiple of it. An honest node's mempool minimum sits *below* what blocks
+/// are paying - blocks take the top of the mempool, the filter reflects its bottom - so
+/// twice the median leaves every honest filter room while bounding what one stranger's
+/// claim can cost.
+const FEEFILTER_MEDIAN_MULTIPLE: u64 = 2;
+
+/// How far the feefilter is honored without corroboration, in sat/vB: always up to here,
+/// whatever the blocks say, and alone when no block median arrived. Without corroboration
+/// the filter is nothing but a peer's word; an honest one sits at the 1 sat/vB relay floor
+/// except while mempools are full, and a full mempool is exactly when blocks are there to
+/// be read. It is also what keeps a zero median - fee-less blocks, the norm on regtest and
+/// a quiet testnet - from capping the relay floor to nothing and building an unrelayable
+/// zero-fee transaction.
+const FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB: u32 = 10;
+
 /// A fee rate for a send, from the only signals a filter-based light client has.
 ///
 /// **This is not `estimatesmartfee` and does not predict confirmation time.** It is the
@@ -1270,14 +1286,17 @@ const MARKET_LAG_BIAS_PERCENT: u64 = 20;
 ///    coinbase rides the merkle root of a PoW-validated header - so unlike the feefilter a
 ///    peer cannot inflate one without mining, and the median blunts the single-block
 ///    outliers the upstream warns about; and
-///  * the maximum BIP-133 fee filter across connected peers, which is the floor for the
-///    transaction to propagate at all - and which IS a free, unverifiable peer claim.
+///  * the BIP-133 fee filter, the floor for the transaction to propagate - **capped**, see
+///    [`combine_fee_signals`]. `bip157` reports only the *maximum* filter across connected
+///    peers, so on a DNS-seeded wallet it is one stranger's free, unverifiable claim: left
+///    uncapped, a single peer advertising a huge filter priced the next send at the 2000
+///    sat/vB sanity ceiling. Capped, it can lift the estimate to at most the greater of
+///    [`FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB`] and [`FEEFILTER_MEDIAN_MULTIPLE`] times the
+///    median; a send that then undershoots that one peer's filter still propagates through
+///    any honest peer, which is all relay needs.
 ///
-/// Taking the max means the result is never below the relay floor, so a send does not
-/// silently fail to propagate. Neither signal is capped here: `do_send` passes every rate
-/// from every source through `fees::enforce_sanity_ceiling`, so a peer advertising an
-/// absurd feefilter turns into a refusal at that chokepoint rather than a payment. An
-/// explicit `fee_rate` argument on the send RPCs remains unimplemented.
+/// `do_send` still passes the result through `fees::enforce_sanity_ceiling`; that ceiling
+/// is now the backstop rather than the bound.
 pub async fn estimate_fee_rate(requester: Requester) -> anyhow::Result<Option<FeeRate>> {
     let tip = requester
         .chain_tip()
@@ -1315,18 +1334,46 @@ pub async fn estimate_fee_rate(requester: Requester) -> anyhow::Result<Option<Fe
             averages.push(rate);
         }
     }
-    let estimate = match median_fee_rate(&mut averages) {
-        Some(median) => bias_for_market_lag(median),
-        None => {
-            warn!(
-                "no peer served any of the last {FEE_MEDIAN_BLOCKS} blocks for a fee median \
-                 within {}s; falling back to the peers' relay floor alone",
-                FEE_BLOCK_TIMEOUT.as_secs()
-            );
-            floor
-        }
+    let median = median_fee_rate(&mut averages).map(bias_for_market_lag);
+    if median.is_none() {
+        warn!(
+            "no peer served any of the last {FEE_MEDIAN_BLOCKS} blocks for a fee median \
+             within {}s; falling back to the peers' relay floor alone (capped at \
+             {FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB} sat/vB)",
+            FEE_BLOCK_TIMEOUT.as_secs()
+        );
+    }
+    let (rate, capped) = combine_fee_signals(median, floor);
+    if capped {
+        warn!(
+            feefilter_sat_per_kwu = floor.to_sat_per_kwu(),
+            estimate_sat_per_kwu = rate.to_sat_per_kwu(),
+            "a peer's BIP-133 fee filter is far above what blocks are paying; not letting \
+             it set the fee (any honest peer relays at the estimate)"
+        );
+    }
+    Ok(Some(rate))
+}
+
+/// Combine the (biased) block median and the peers' maximum feefilter into the send's
+/// rate: the greater of the two, with the filter's contribution capped at the greater of
+/// [`FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB`] and [`FEEFILTER_MEDIAN_MULTIPLE`] times the
+/// median (the former alone when no median arrived). The flag reports whether the cap bit,
+/// for the caller's WARN.
+fn combine_fee_signals(median: Option<FeeRate>, feefilter: FeeRate) -> (FeeRate, bool) {
+    let uncorroborated = FeeRate::from_sat_per_vb_u32(FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB);
+    let cap = match median {
+        Some(median) => FeeRate::from_sat_per_kwu(
+            median
+                .to_sat_per_kwu()
+                .saturating_mul(FEEFILTER_MEDIAN_MULTIPLE),
+        )
+        .max(uncorroborated),
+        None => uncorroborated,
     };
-    Ok(Some(estimate.max(floor)))
+    let floor = feefilter.min(cap);
+    let rate = median.map_or(floor, |median| median.max(floor));
+    (rate, feefilter > cap)
 }
 
 /// The median of the collected block averages, or `None` when nothing arrived. Sorts in
@@ -1561,6 +1608,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn one_peers_feefilter_cannot_set_the_fee() {
+        let vb = FeeRate::from_sat_per_vb_u32;
+        // An honest filter under the median changes nothing; one between the median and
+        // the cap lifts the rate to it (the relay floor is honored).
+        assert_eq!(combine_fee_signals(Some(vb(10)), vb(1)), (vb(10), false));
+        assert_eq!(combine_fee_signals(Some(vb(10)), vb(15)), (vb(15), false));
+        assert_eq!(combine_fee_signals(Some(vb(10)), vb(20)), (vb(20), false));
+        // A stranger's 1999 sat/vB filter - the attack - lifts it to twice the median, not
+        // to the sanity ceiling.
+        assert_eq!(combine_fee_signals(Some(vb(10)), vb(1_999)), (vb(20), true));
+        // Fee-less blocks (regtest, a quiet testnet) average zero: the relay floor must
+        // survive that, or the send goes out at zero fee and nobody relays it. A modest
+        // filter is honored whatever the median; only past the uncorroborated bound does
+        // the median's multiple take over.
+        assert_eq!(combine_fee_signals(Some(vb(0)), vb(1)), (vb(1), false));
+        assert_eq!(combine_fee_signals(Some(vb(2)), vb(8)), (vb(8), false));
+        assert_eq!(
+            combine_fee_signals(Some(vb(0)), vb(1_999)),
+            (vb(FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB), true)
+        );
+        // No median to check against: the filter alone, bounded.
+        assert_eq!(combine_fee_signals(None, vb(3)), (vb(3), false));
+        assert_eq!(
+            combine_fee_signals(None, vb(1_999)),
+            (vb(FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB), true)
+        );
     }
 
     #[test]

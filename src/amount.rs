@@ -21,7 +21,7 @@ pub const COIN: u64 = 100_000_000;
 /// The supply cap in base units (21,000,000 ZEC). Bitcoin Core range-checks every parsed
 /// amount against its own cap in `AmountFromValue`, and the value matches; an amount above it
 /// cannot exist, so it is rejected at the RPC boundary rather than deeper in the wallet.
-const MAX_MONEY: u64 = 21_000_000 * COIN;
+pub const MAX_MONEY: u64 = 21_000_000 * COIN;
 
 /// Render an unsigned zatoshi amount as a JSON number with 8 decimal places.
 pub fn zats_to_value(zats: u64) -> Value {

@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::amount::{signed_zats_to_value, value_to_sat_per_kvb, value_to_zats, zats_to_value};
 use crate::btc::actor::{
-    BtcConnState, BtcReceipt, BtcSendOptions, BtcTxDetail, BtcTxRecord, BtcWalletHandle,
+    BtcConnState, BtcReceipt, BtcSendOptions, BtcSent, BtcTxDetail, BtcTxRecord, BtcWalletHandle,
 };
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
@@ -64,6 +64,11 @@ pub(crate) const BITCOIN_METHODS: &[&str] = &[
     "sendmany",
     "sendrawtransaction",
     "abandontransaction",
+    "getblockchaininfo",
+    "getnetworkinfo",
+    "estimatesmartfee",
+    "getreceivedbyaddress",
+    "listsinceblock",
 ];
 
 /// Route one request for a Bitcoin wallet. `None` = not a method this engine serves
@@ -92,8 +97,176 @@ pub(crate) async fn dispatch(
         "sendmany" => sendmany(handle, req).await,
         "sendrawtransaction" => sendrawtransaction(handle, req).await,
         "abandontransaction" => abandontransaction(handle, req).await,
+        "getblockchaininfo" => Ok(getblockchaininfo(handle)),
+        "getnetworkinfo" => Ok(crate::rpc::network::networkinfo_json(
+            handle.status().conn_state != BtcConnState::Down,
+        )),
+        "estimatesmartfee" => estimatesmartfee(handle, req).await,
+        "getreceivedbyaddress" => getreceivedbyaddress(handle, req).await,
+        "listsinceblock" => listsinceblock(handle, req).await,
         _ => return None,
     })
+}
+
+/// `getblockchaininfo` from the wallet's own chain view - the same authority
+/// `getblockcount`/`getbestblockhash` answer from, never a proxy of the node's tip. `chain` is
+/// Core's name (`main`, `test`, `testnet4`, `regtest`). The wallet does not track the node's
+/// header count or block times, so `headers` is its own height and there is no `time`/
+/// `mediantime`; `initialblockdownload`/`verificationprogress` follow the connection state
+/// (catching up to the source's tip, or at it).
+fn getblockchaininfo(handle: &BtcWalletHandle) -> Value {
+    let status = handle.status();
+    let syncing = status.conn_state != BtcConnState::Ready;
+    json!({
+        "chain": match handle.network {
+            BitcoinNetwork::Main => "main",
+            BitcoinNetwork::Testnet3 => "test",
+            BitcoinNetwork::Testnet4 => "testnet4",
+            BitcoinNetwork::Regtest => "regtest",
+        },
+        "blocks": status.synced_height,
+        "headers": status.synced_height,
+        "bestblockhash": status.synced_hash,
+        "difficulty": 1.0,
+        "verificationprogress": if syncing { 0.0 } else { 1.0 },
+        "initialblockdownload": syncing,
+        "size_on_disk": 0,
+        "pruned": false,
+        "warnings": "",
+    })
+}
+
+/// `estimatesmartfee conf_target ( "estimate_mode" )` - Core's argument rules (a target in
+/// 1..=1008, else `-8`; `estimate_mode` one of `unset`/`economical`/`conservative`) over the
+/// wallet's backend: bitcoind's own estimator at the requested target and mode, or over
+/// kyoto the `[fees]` chain a send prices from (which answers one horizon, so the target is
+/// echoed rather than honored - the `source` extension says which answered). No estimate is
+/// Core's `errors` shape, not an RPC error.
+async fn estimatesmartfee(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    let target = match req.param(0) {
+        None | Some(Value::Null) => {
+            return Err(RpcError::missing_param(
+                "estimatesmartfee requires conf_target",
+            ))
+        }
+        Some(v) => v
+            .as_i64()
+            .ok_or_else(|| RpcError::type_error("conf_target must be an integer"))?,
+    };
+    let target = u16::try_from(target)
+        .ok()
+        .filter(|t| (1..=1008).contains(t))
+        .ok_or_else(|| {
+            RpcError::invalid_parameter("Invalid conf_target, must be between 1 and 1008")
+        })?;
+    let conservative = match req.param(1) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(mode)) => match mode.to_ascii_lowercase().as_str() {
+            "unset" | "" => None,
+            "economical" => Some(false),
+            "conservative" => Some(true),
+            _ => {
+                return Err(RpcError::invalid_parameter(
+                    "Invalid estimate_mode parameter",
+                ))
+            }
+        },
+        Some(_) => return Err(RpcError::type_error("estimate_mode must be a string")),
+    };
+    Ok(match handle.estimate_fee(target, conservative).await? {
+        Some((sat_per_kvb, source)) => json!({
+            "feerate": zats_to_value(sat_per_kvb),
+            "blocks": target,
+            "source": source,
+        }),
+        None => json!({
+            "errors": ["Insufficient data or no feerate found"],
+            "blocks": target,
+        }),
+    })
+}
+
+/// `getreceivedbyaddress "address" ( minconf include_immature_coinbase )` - Core's contract:
+/// an invalid address is `-5`, one the wallet does not own `-4` "Address not found in
+/// wallet", else the total received at `minconf` depth (default 1). Immature coinbase is
+/// withheld unless asked for, as in Core.
+async fn getreceivedbyaddress(
+    handle: &BtcWalletHandle,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let address = req.require_str(0, "getreceivedbyaddress requires an address")?;
+    let minconf = depth(req.param(1), "minconf", 1)?;
+    let include_immature = match req.param(2) {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(RpcError::type_error(
+                "include_immature_coinbase must be a boolean",
+            ))
+        }
+    };
+    let info = handle.address_info(address.to_string()).await?;
+    if !info.is_mine {
+        return Err(RpcError::wallet("Address not found in wallet"));
+    }
+    let total: u64 = handle
+        .received_by_address()
+        .await?
+        .into_iter()
+        .filter(|a| a.address == address)
+        .flat_map(|a| a.receipts)
+        .filter(|r| r.confirmations >= minconf && (include_immature || !r.immature))
+        .map(|r| r.amount_sat)
+        .sum();
+    Ok(zats_to_value(total))
+}
+
+/// `listsinceblock ( "blockhash" target_confirmations include_watchonly include_removed )`,
+/// Core's shape: `transactions` (the `listtransactions` entries
+/// of everything mined above `blockhash`, plus everything unconfirmed), `removed` (always
+/// empty: a reorged-away transaction is simply re-reported, or dropped from the wallet), and
+/// `lastblock`, the cursor for the next call. A malformed hash is `-5` "Block not found"; a
+/// well-formed one the wallet's chain does not hold reads as "since the beginning", so a
+/// poller feeding back a reorged-away cursor re-reads rather than wedging (the Zcash
+/// handler's rule). Core's later `include_change`/`label` are over the four-argument cap
+/// both engines share, so they are the arity error.
+async fn listsinceblock(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    let since = match req.param(0) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(hash)) if hash.is_empty() => None,
+        Some(Value::String(hash)) => Some(
+            bdk_wallet::bitcoin::BlockHash::from_str(hash)
+                .map_err(|_| RpcError::invalid_address_or_key("Block not found"))?,
+        ),
+        Some(_) => return Err(RpcError::type_error("blockhash must be a string")),
+    };
+    let target_confirmations = match req.param(1) {
+        None | Some(Value::Null) => 1u32,
+        Some(v) => match v.as_i64() {
+            Some(n) if (1..=i64::from(u32::MAX)).contains(&n) => n as u32,
+            _ => return Err(RpcError::invalid_parameter("Invalid parameter")),
+        },
+    };
+    let flag = |i: usize, name: &str| -> Result<bool, RpcError> {
+        match req.param(i) {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(_) => Err(RpcError::type_error(format!("{name} must be a boolean"))),
+        }
+    };
+    let _include_watchonly = flag(2, "include_watchonly")?;
+    let _include_removed = flag(3, "include_removed")?;
+    let since = handle.since_block(since, target_confirmations).await?;
+    let transactions: Vec<Value> = since
+        .records
+        .iter()
+        .flat_map(|e| e.details.iter().map(move |d| tx_entry_json(e, d)))
+        .collect();
+    Ok(json!({
+        "transactions": transactions,
+        "removed": [],
+        "lastblock": since.lastblock,
+    }))
 }
 
 fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
@@ -139,7 +312,7 @@ async fn getbalance(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value,
             .list_unspent()
             .await?
             .iter()
-            .filter(|u| u.confirmations >= minconf)
+            .filter(|u| !u.immature && u.confirmations >= minconf)
             .map(|u| u.amount_sat)
             .sum()
     };
@@ -168,7 +341,7 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
     // Core's txcount: every wallet transaction, visible history entry or not - counted,
     // not built.
     let txcount = handle.tx_count().await?;
-    Ok(json!({
+    let mut info = json!({
         "walletname": handle.name,
         "walletversion": 169900,
         "format": "sqlite",
@@ -179,8 +352,12 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         "keypoolsize": 1,
         "keypoolsize_hd_internal": 0,
         "paytxfee": zats_to_value(0),
+        // `private_keys_enabled` stays true for an encrypted wallet, as in Core: the keys
+        // exist, they are locked.
         "private_keys_enabled": handle.has_seed,
         "avoid_reuse": false,
+        // A descriptor wallet, as every Core wallet since 23 (`listdescriptors` serves it).
+        "descriptors": true,
         // Core's shape: `false`, or an object while a scan is running. The catch-up against
         // the upstream is the closest thing this wallet has to a rescan.
         "scanning": if status.conn_state == BtcConnState::Syncing {
@@ -225,29 +402,49 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         // (no feed configured for this wallet: the default, and always over bitcoind, which
         // has a mempool of its own), `connecting` (configured, socket down or not yet up),
         // or `connected`; the rest is present only when a feed is configured.
+        //
+        // `snapshot_applied` (a snapshot-taking P2P feed only) is whether the mempool view is
+        // established since the feed last connected - for a wallet started from an empty
+        // datadir, whether its own unconfirmed transactions from before have been found.
+        // Sends wait for it, so it is what a readiness check keys on before spending.
         "mempool_feed": match &status.mempool_feed {
             None => json!({ "state": "disabled" }),
-            Some(feed) => json!({
-                "state": if feed.connected { "connected" } else { "connecting" },
-                "source": feed.source,
-                "endpoint": feed.endpoint,
-                "last_delta": feed.last_delta,
-                "deltas": feed.deltas,
-                "matched": feed.matched,
-                "dropped": feed.dropped,
-            }),
+            Some(feed) => {
+                let mut obj = json!({
+                    "state": if feed.connected { "connected" } else { "connecting" },
+                    "source": feed.source,
+                    "endpoint": feed.endpoint,
+                    "last_delta": feed.last_delta,
+                    "deltas": feed.deltas,
+                    "matched": feed.matched,
+                    "dropped": feed.dropped,
+                });
+                if let Some(applied) = feed.snapshot_applied {
+                    obj["snapshot_applied"] = json!(applied);
+                }
+                obj
+            }
         },
         // zecd extension: which engine serves this wallet. The Zcash handler reports its own
         // extensions (pools, transparent) here; `coin` is the field a mixed-coin deployment
         // tells wallets apart by.
         "coin": "bitcoin",
-    }))
+    });
+    // Core reports `unlocked_until` only for an encrypted wallet, 0 while locked. A
+    // passphrase-encrypted Bitcoin wallet is always locked (no `walletpassphrase`).
+    if handle.encrypted {
+        info["unlocked_until"] = json!(0);
+    }
+    Ok(info)
 }
 
-/// `listunspent [minconf] [maxconf] [addresses] [include_unsafe]` - Bitcoin Core's argument
-/// shape, mirroring the Zcash handler's semantics: `minconf` defaults to **1**, so an
-/// unconfirmed receive is hidden until asked for with `listunspent 0` (exactly Core), and
-/// `safe` is confirmed-or-own-change.
+/// `listunspent [minconf] [maxconf] [addresses] [include_unsafe] [query_options]` - Bitcoin
+/// Core's argument shape, mirroring the Zcash handler's semantics: `minconf` defaults to
+/// **1**, so an unconfirmed receive is hidden until asked for with `listunspent 0` (exactly
+/// Core), and `safe` is confirmed-or-own-change. `query_options` takes Core's keys
+/// (`minimumAmount`, `maximumAmount`, `maximumCount`, `minimumSumAmount`,
+/// `include_immature_coinbase`); an unknown key is Core's `-3` "Unexpected key", never
+/// silently ignored.
 async fn listunspent(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
     let minconf = depth(req.param(0), "minconf", 1)?;
     let maxconf = depth(req.param(1), "maxconf", 9_999_999)?;
@@ -277,34 +474,107 @@ async fn listunspent(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err(RpcError::type_error("include_unsafe must be a boolean")),
     };
+    let query = UnspentQuery::parse(req.param(4))?;
     let utxos = handle.list_unspent().await?;
-    let entries: Vec<Value> = utxos
-        .into_iter()
-        .filter(|u| {
-            u.confirmations >= minconf
-                && u.confirmations <= maxconf
-                && (include_unsafe || u.trusted)
-                && filter
-                    .as_ref()
-                    .is_none_or(|f| u.address.as_ref().is_some_and(|a| f.contains(a)))
-        })
-        .map(|u| {
-            let mut obj = json!({
-                "txid": u.txid,
-                "vout": u.vout,
-                "amount": zats_to_value(u.amount_sat),
-                "confirmations": u.confirmations,
-                "spendable": handle.has_seed,
-                "solvable": true,
-                "safe": u.trusted,
-            });
-            if let Some(address) = u.address {
-                obj["address"] = Value::String(address);
-            }
-            obj
-        })
-        .collect();
+    let mut entries = Vec::new();
+    let mut sum: u64 = 0;
+    for u in utxos {
+        if !(u.confirmations >= minconf
+            && u.confirmations <= maxconf
+            && (include_unsafe || u.trusted)
+            && (query.include_immature_coinbase || !u.immature)
+            && u.amount_sat >= query.minimum_amount
+            && u.amount_sat <= query.maximum_amount
+            && filter
+                .as_ref()
+                .is_none_or(|f| u.address.as_ref().is_some_and(|a| f.contains(a))))
+        {
+            continue;
+        }
+        sum = sum.saturating_add(u.amount_sat);
+        let mut obj = json!({
+            "txid": u.txid,
+            "vout": u.vout,
+            "amount": zats_to_value(u.amount_sat),
+            "confirmations": u.confirmations,
+            "scriptPubKey": u.script_pubkey,
+            "spendable": handle.has_seed && !u.immature,
+            "solvable": true,
+            "safe": u.trusted,
+        });
+        if let Some(address) = u.address {
+            obj["address"] = Value::String(address);
+        }
+        if let Some(desc) = u.desc {
+            obj["desc"] = Value::String(desc);
+        }
+        entries.push(obj);
+        // Core stops at whichever limit is reached first.
+        if query.maximum_count.is_some_and(|max| entries.len() >= max)
+            || query.minimum_sum_amount.is_some_and(|min| sum >= min)
+        {
+            break;
+        }
+    }
     Ok(Value::Array(entries))
+}
+
+/// `listunspent`'s `query_options` object, in Core's vocabulary. Amounts are BTC values
+/// parsed like every amount (`-3` for a malformed one).
+struct UnspentQuery {
+    minimum_amount: u64,
+    maximum_amount: u64,
+    /// `None` = unlimited (Core's default, and what `0` means there too).
+    maximum_count: Option<usize>,
+    minimum_sum_amount: Option<u64>,
+    include_immature_coinbase: bool,
+}
+
+impl UnspentQuery {
+    fn parse(v: Option<&Value>) -> Result<Self, RpcError> {
+        let mut query = UnspentQuery {
+            minimum_amount: 0,
+            maximum_amount: u64::MAX,
+            maximum_count: None,
+            minimum_sum_amount: None,
+            include_immature_coinbase: false,
+        };
+        let map = match v {
+            None | Some(Value::Null) => return Ok(query),
+            Some(Value::Object(map)) => map,
+            Some(_) => return Err(RpcError::type_error("query_options must be an object")),
+        };
+        for (key, value) in map {
+            if value.is_null() {
+                continue;
+            }
+            match key.as_str() {
+                "minimumAmount" => query.minimum_amount = value_to_zats(value)?,
+                "maximumAmount" => query.maximum_amount = value_to_zats(value)?,
+                "minimumSumAmount" => query.minimum_sum_amount = Some(value_to_zats(value)?),
+                "maximumCount" => {
+                    let n = value
+                        .as_i64()
+                        .ok_or_else(|| RpcError::type_error("maximumCount must be an integer"))?;
+                    if n < 0 {
+                        return Err(RpcError::invalid_parameter(
+                            "Invalid parameter, maximumCount must be non-negative",
+                        ));
+                    }
+                    query.maximum_count = usize::try_from(n).ok().filter(|n| *n > 0);
+                }
+                "include_immature_coinbase" => {
+                    query.include_immature_coinbase = value.as_bool().ok_or_else(|| {
+                        RpcError::type_error("include_immature_coinbase must be a boolean")
+                    })?
+                }
+                other => {
+                    return Err(RpcError::type_error(format!("Unexpected key {other}")));
+                }
+            }
+        }
+        Ok(query)
+    }
 }
 
 /// Core's `bip125-replaceable` vocabulary: `"yes"` only while the transaction is both
@@ -390,6 +660,9 @@ async fn gettransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Va
     let Some(txid) = opt_str(req, 0) else {
         return Err(RpcError::invalid_parameter("txid is required"));
     };
+    // A malformed txid is Core's -8 (`ParseHashV`), as on `abandontransaction`; only a
+    // well-formed one the wallet does not hold is -5.
+    let txid = parse_txid(&txid)?.to_string();
     let entry = handle
         .get_transaction(txid.clone())
         .await?
@@ -459,7 +732,7 @@ async fn listreceivedbyaddress(
         }
         Some(_) => return Err(RpcError::type_error("address_filter must be a string")),
     };
-    let _include_immature_coinbase = flag(req.param(4), "include_immature_coinbase")?;
+    let include_immature_coinbase = flag(req.param(4), "include_immature_coinbase")?;
     let entries: Vec<Value> = handle
         .received_by_address()
         .await?
@@ -469,7 +742,9 @@ async fn listreceivedbyaddress(
             let counted: Vec<&BtcReceipt> = a
                 .receipts
                 .iter()
-                .filter(|r| r.confirmations >= minconf)
+                .filter(|r| {
+                    r.confirmations >= minconf && (include_immature_coinbase || !r.immature)
+                })
                 .collect();
             if counted.is_empty() && !include_empty {
                 return None;
@@ -558,11 +833,33 @@ async fn sendtoaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Val
     let options = BtcSendOptions {
         fee_rate_sat_per_kvb: parse_fee_rate(req.param(9))?,
         subtract_fee_from: if subtract { vec![0] } else { Vec::new() },
+        non_replaceable: !parse_replaceable(req.param(5))?,
     };
-    let txid = handle
+    // Param 10 (verbose) is validated before the send, so a malformed flag never moves funds.
+    let verbose = parse_verbose(req.param(10))?;
+    let sent = handle
         .send(vec![(addr.to_string(), amount)], options)
         .await?;
-    Ok(Value::String(txid))
+    Ok(send_result(sent, verbose))
+}
+
+/// Parse the optional `verbose` flag of the send methods (position 10 on `sendtoaddress`, 9
+/// on `sendmany`, Core's layouts).
+fn parse_verbose(v: Option<&Value>) -> Result<bool, RpcError> {
+    match v {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(RpcError::type_error("verbose must be a boolean")),
+    }
+}
+
+/// A send's answer: the bare txid, or Core's `{txid, fee_reason}` object under `verbose`.
+fn send_result(sent: BtcSent, verbose: bool) -> Value {
+    if verbose {
+        json!({"txid": sent.txid, "fee_reason": sent.fee_reason})
+    } else {
+        Value::String(sent.txid)
+    }
 }
 
 /// Parse an optional `fee_rate` parameter (sat/vB) into sat/kvB, `None` when disengaged.
@@ -586,6 +883,20 @@ fn parse_fee_rate(v: Option<&Value>) -> Result<Option<u64>, RpcError> {
             }
             Ok(Some(kvb))
         }
+    }
+}
+
+/// Parse the optional `replaceable` parameter (position 5 on both send methods): whether
+/// the send signals BIP 125 replaceability. Omitted or `null` is `true` - BDK's default,
+/// and Core's `-walletrbf` default. `false` is honored (every input gets a final-but-for-
+/// locktime `nSequence`), never ignored: a caller who asked for a non-replaceable send and
+/// got an RBF one would read `bip125-replaceable: "yes"` back on a transaction it meant
+/// the recipient to be able to trust at 0-conf.
+fn parse_replaceable(v: Option<&Value>) -> Result<bool, RpcError> {
+    match v {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(RpcError::type_error("replaceable must be a boolean")),
     }
 }
 
@@ -676,9 +987,11 @@ async fn sendmany(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, R
     let options = BtcSendOptions {
         fee_rate_sat_per_kvb: parse_fee_rate(req.param(8))?,
         subtract_fee_from,
+        non_replaceable: !parse_replaceable(req.param(5))?,
     };
-    let txid = handle.send(recipients, options).await?;
-    Ok(Value::String(txid))
+    let verbose = parse_verbose(req.param(9))?;
+    let sent = handle.send(recipients, options).await?;
+    Ok(send_result(sent, verbose))
 }
 
 async fn sendrawtransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
@@ -693,18 +1006,23 @@ async fn sendrawtransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Resul
 /// abandonment". The wallet-side rules, and the kyoto caveat (no mempool view to check
 /// against), are on `btc::actor::BtcActor::do_abandon`.
 async fn abandontransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
-    let txid = req.require_str(0, "txid is required")?;
+    let txid = parse_txid(req.require_str(0, "txid is required")?)?;
+    handle.abandon_transaction(txid).await?;
+    Ok(Value::Null)
+}
+
+/// A txid argument, with Core's `ParseHashV` messages and code (`-8`): the wrong length and
+/// non-hex are refused before anything looks the transaction up.
+fn parse_txid(txid: &str) -> Result<Txid, RpcError> {
     if txid.len() != 64 {
         return Err(RpcError::invalid_parameter(format!(
             "txid must be of length 64 (not {}, for '{txid}')",
             txid.len()
         )));
     }
-    let txid = Txid::from_str(txid).map_err(|_| {
+    Txid::from_str(txid).map_err(|_| {
         RpcError::invalid_parameter(format!("txid must be hexadecimal string (not '{txid}')"))
-    })?;
-    handle.abandon_transaction(txid).await?;
-    Ok(Value::Null)
+    })
 }
 
 async fn getaddressinfo(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
@@ -720,7 +1038,18 @@ async fn getaddressinfo(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Va
         "iswatchonly": false,
         "solvable": info.is_mine,
         "ischange": info.derivation.is_some_and(|(change, _)| change),
+        // Stateless: no labels, ever - but the field is Core's shape.
+        "labels": [],
     });
+    // The actor's parse already accepted it for this network, so this cannot fail.
+    if let Ok(parsed) = parse_address(&address, handle.network) {
+        address_fields(&parsed, &mut obj);
+    }
+    if let Some(key) = &info.key {
+        obj["pubkey"] = json!(key.pubkey);
+        obj["desc"] = json!(key.desc);
+        obj["hdmasterfingerprint"] = json!(key.fingerprint);
+    }
     if let Some((change, index)) = info.derivation {
         let coin_type = match handle.network {
             BitcoinNetwork::Main => 0,
@@ -741,11 +1070,54 @@ async fn validateaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<V
     let Some(address) = opt_str(req, 0) else {
         return Err(RpcError::invalid_parameter("address is required"));
     };
-    // The actor's parse enforces the wallet's own network, exactly what validateaddress
-    // answers; a parse failure is `isvalid: false`, never an error (Bitcoin Core's contract).
-    match handle.address_info(address.clone()).await {
-        Ok(_) => Ok(json!({ "isvalid": true, "address": address })),
-        Err(_) => Ok(json!({ "isvalid": false })),
+    // Valid means valid for the wallet's own network, exactly what Core answers; a parse
+    // failure is `isvalid: false` with Core's `error`/`error_locations`, never an RPC error.
+    // Pure address arithmetic - no wallet state is consulted, so the actor is not involved.
+    match parse_address(&address, handle.network) {
+        Ok(parsed) => {
+            let mut obj = json!({ "isvalid": true, "address": address });
+            address_fields(&parsed, &mut obj);
+            Ok(obj)
+        }
+        Err(error) => Ok(json!({ "isvalid": false, "error_locations": [], "error": error })),
+    }
+}
+
+/// Parse an address for the wallet's network, answering Core's `validateaddress` wording
+/// for the two ways it fails.
+fn parse_address(
+    address: &str,
+    network: BitcoinNetwork,
+) -> Result<bdk_wallet::bitcoin::Address, String> {
+    let unchecked = bdk_wallet::bitcoin::Address::from_str(address)
+        .map_err(|_| "Invalid or unsupported Segwit (Bech32) or Base58 encoding.".to_string())?;
+    unchecked
+        .require_network(crate::btc::keys::network(network))
+        .map_err(|_| "Invalid chain prefix".to_string())
+}
+
+/// The address-derived fields `validateaddress` and `getaddressinfo` share, Core's
+/// `DescribeAddress`: the script, and what kind of output it is.
+fn address_fields(address: &bdk_wallet::bitcoin::Address, obj: &mut Value) {
+    use bdk_wallet::bitcoin::AddressType;
+    let spk = address.script_pubkey();
+    obj["scriptPubKey"] = json!(spk.to_hex_string());
+    obj["isscript"] = json!(matches!(
+        address.address_type(),
+        Some(AddressType::P2sh | AddressType::P2wsh | AddressType::P2tr)
+    ));
+    match address.witness_program() {
+        Some(program) => {
+            obj["iswitness"] = json!(true);
+            obj["witness_version"] = json!(program.version().to_num());
+            obj["witness_program"] = json!(program
+                .program()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>());
+        }
+        None => obj["iswitness"] = json!(false),
     }
 }
 
@@ -798,6 +1170,7 @@ mod tests {
             network: entry.bitcoin_network(),
             seed: Some(bip84_seed()),
             wallet_holds_seed: true,
+            encrypted: false,
             imported_keys: None,
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
@@ -850,6 +1223,9 @@ mod tests {
             json!({ "height": 0, "time": null, "anchor": null })
         );
         assert_eq!(info["private_keys_enabled"], json!(true));
+        assert_eq!(info["descriptors"], json!(true));
+        // Unencrypted: Core omits `unlocked_until` entirely.
+        assert!(info.get("unlocked_until").is_none(), "{info}");
         assert_eq!(info["scanning"], json!(false));
         // The wallet's own chain view: a fresh wallet sits at its genesis checkpoint, and
         // getblockcount/getbestblockhash answer from the same authority.
@@ -1006,14 +1382,121 @@ mod tests {
         assert_eq!(addr_info["hdkeypath"], json!("m/84'/1'/0'/0/0"));
         assert_eq!(addr_info["address_index"], json!(0));
 
+        // Core's getaddressinfo fields for an own address: the script and output kind,
+        // the owning key (BIP 84 path in the inferred descriptor, with its checksum), and
+        // the stateless empty labels.
+        assert_eq!(addr_info["labels"], json!([]));
+        assert_eq!(addr_info["iswitness"], json!(true));
+        assert_eq!(addr_info["witness_version"], json!(0));
+        assert_eq!(addr_info["isscript"], json!(false));
+        let spk = addr_info["scriptPubKey"].as_str().unwrap();
+        assert!(spk.starts_with("0014") && spk.len() == 44, "{spk}");
+        assert_eq!(addr_info["witness_program"].as_str().unwrap(), &spk[4..]);
+        let desc = addr_info["desc"].as_str().unwrap();
+        let pubkey = addr_info["pubkey"].as_str().unwrap();
+        assert!(desc.starts_with("wpkh(["), "{desc}");
+        assert!(desc.contains("/84'/1'/0'/0/0]"), "{desc}");
+        assert!(desc.contains(pubkey), "{desc} vs {pubkey}");
+        assert!(
+            desc.contains(")#"),
+            "the descriptor carries its checksum: {desc}"
+        );
+
         let valid = call("validateaddress", vec![json!(address.clone())])
             .await
             .unwrap();
         assert_eq!(valid["isvalid"], json!(true));
+        assert_eq!(valid["scriptPubKey"], json!(spk));
+        assert_eq!(valid["iswitness"], json!(true));
         let invalid = call("validateaddress", vec![json!("not-an-address")])
             .await
             .unwrap();
         assert_eq!(invalid["isvalid"], json!(false));
+        assert!(invalid["error"].is_string(), "{invalid}");
+        assert_eq!(invalid["error_locations"], json!([]));
+        // A mainnet address on this testnet wallet is invalid, naming the chain.
+        let foreign = call(
+            "validateaddress",
+            vec![json!("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(foreign["isvalid"], json!(false));
+        assert_eq!(foreign["error"], json!("Invalid chain prefix"));
+
+        // gettransaction: a malformed txid is -8 (Core's ParseHashV), a well-formed
+        // unknown one -5.
+        let err = call("gettransaction", vec![json!("zz")]).await.unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        let err = call("gettransaction", vec![json!("00".repeat(32))])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
+
+        // The chain and network reads a Bitcoin wallet now serves, from its own view.
+        let chain = call("getblockchaininfo", vec![]).await.unwrap();
+        assert_eq!(chain["chain"], json!("test"));
+        assert_eq!(chain["blocks"], json!(0));
+        let net = call("getnetworkinfo", vec![]).await.unwrap();
+        assert_eq!(net["connections"], json!(0), "no upstream here: {net}");
+        // Nothing received, nothing since genesis, and the cursor is the wallet's tip.
+        assert_eq!(
+            call("getreceivedbyaddress", vec![json!(address.clone())])
+                .await
+                .unwrap()
+                .to_string(),
+            "0.00000000"
+        );
+        let err = call(
+            "getreceivedbyaddress",
+            vec![json!("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx")],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
+        let since = call("listsinceblock", vec![]).await.unwrap();
+        assert_eq!(since["transactions"], json!([]));
+        assert_eq!(since["removed"], json!([]));
+        assert_eq!(since["lastblock"], info["lastprocessedblock"]["hash"]);
+        let err = call("listsinceblock", vec![json!("nothex")])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
+        // estimatesmartfee validates Core's target range before needing an upstream.
+        let err = call("estimatesmartfee", vec![json!(0)]).await.unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        let err = call("estimatesmartfee", vec![json!(6), json!("fastest")])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+
+        // listunspent's query_options: unknown keys are refused, known ones accepted.
+        let err = call(
+            "listunspent",
+            vec![
+                json!(0),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!({"bogus": 1}),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_TYPE_ERROR);
+        let unspent = call(
+            "listunspent",
+            vec![
+                json!(0),
+                json!(null),
+                json!(null),
+                json!(null),
+                json!({"minimumAmount": 0.001, "maximumCount": 5}),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(unspent, json!([]));
 
         // The wallet-independent shell answers regardless of coin.
         assert_eq!(call("listwallets", vec![]).await.unwrap(), json!(["btc"]));
@@ -1021,7 +1504,7 @@ mod tests {
         // Everything the engine does not serve reads as method-not-found: a Zcash-dialect
         // node read, the passphrase surface, and a z_* extension alike.
         for gated in [
-            "getblockchaininfo",
+            "getrawtransaction",
             "signmessage",
             "z_sendmany",
             "walletpassphrase",

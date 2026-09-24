@@ -124,12 +124,20 @@ pub struct BtcUtxo {
     /// `getbalance` trusted-funds rule.
     pub trusted: bool,
     /// Whether the output is a coinbase reward (the wallet's address was a block's payout).
-    /// Never immature: `list_unspent` withholds a coinbase until it has
-    /// `COINBASE_MATURITY + 1` confirmations, exactly as Core's `listunspent` and depth-
-    /// filtered `getbalance` do - BDK's own `list_unspent` has no maturity filter, and
-    /// counting an unspendable reward as a spendable balance is a reporting
-    /// bug. `getbalances.mine.immature` is where the withheld value shows.
     pub coinbase: bool,
+    /// Whether it is a coinbase reward Core still calls immature (under
+    /// `COINBASE_MATURITY + 1` confirmations). Every reader withholds these unless asked -
+    /// `listunspent` and depth-filtered `getbalance` exactly as Core does (BDK's own
+    /// `list_unspent` has no maturity filter, and counting an unspendable reward as a
+    /// spendable balance is a reporting bug); `listunspent`'s
+    /// `include_immature_coinbase` query option is the one way to see them there.
+    /// `getbalances.mine.immature` is where their value shows.
+    pub immature: bool,
+    /// The output's script, hex (`listunspent.scriptPubKey`).
+    pub script_pubkey: String,
+    /// Core's inferred output descriptor for the wallet key that owns it, with its
+    /// checksum: `wpkh([fingerprint/84'/coin'/0'/keychain/index]pubkey)#checksum`.
+    pub desc: Option<String>,
 }
 
 /// What the engine knows about an address, for `getaddressinfo`-shaped reads.
@@ -139,6 +147,9 @@ pub struct BtcAddressInfo {
     /// `Some((change, index))` when the address is one of the wallet's own derived
     /// addresses: which keychain (change or external) and the derivation index.
     pub derivation: Option<(bool, u32)>,
+    /// The owning key, for an own address (`getaddressinfo`'s `pubkey`/`desc`/
+    /// `hdmasterfingerprint`).
+    pub key: Option<BtcKeyOrigin>,
 }
 
 /// One revealed external address with every output that ever paid it - the raw material of
@@ -160,6 +171,10 @@ pub struct BtcReceipt {
     pub amount_sat: u64,
     /// 0 while the paying transaction is unconfirmed.
     pub confirmations: u64,
+    /// A coinbase reward Core still calls immature (the same rule as `BtcUtxo::immature`):
+    /// withheld by `getreceivedbyaddress`/`listreceivedbyaddress` unless their
+    /// `include_immature_coinbase` argument asks for it, as in Core.
+    pub immature: bool,
 }
 
 /// One of the wallet's two public descriptors, Core's `listdescriptors` vocabulary.
@@ -295,6 +310,11 @@ pub struct MempoolFeedStatus {
     /// and were dropped - a count that grows steadily means the parser has drifted from
     /// the server's shape.
     pub dropped: u64,
+    /// For a feed that takes BIP 35 snapshots (`p2p` with `p2p_snapshot`): whether one has
+    /// been applied since the feed last (re)connected - for a wallet started from an empty
+    /// datadir, one fetched in full after the wallet reached tip. Sends wait for it (see
+    /// `BtcActor::send_gate`). `None` for a feed that takes none.
+    pub snapshot_applied: Option<bool>,
 }
 
 enum BtcCommand {
@@ -315,7 +335,7 @@ enum BtcCommand {
         /// `(address, amount in satoshis)` per recipient.
         recipients: Vec<(String, u64)>,
         options: BtcSendOptions,
-        reply: oneshot::Sender<Result<String, RpcError>>,
+        reply: oneshot::Sender<Result<BtcSent, RpcError>>,
     },
     Broadcast {
         hex: String,
@@ -346,6 +366,31 @@ enum BtcCommand {
     Descriptors {
         reply: oneshot::Sender<Result<Vec<BtcDescriptor>, RpcError>>,
     },
+    /// `listsinceblock`: every transaction mined above `since` (or unconfirmed), and the
+    /// cursor block `target_confirmations` deep.
+    SinceBlock {
+        since: Option<BlockHash>,
+        target_confirmations: u32,
+        reply: oneshot::Sender<Result<BtcSinceBlock, RpcError>>,
+    },
+    /// `estimatesmartfee`: the connected backend's fee rate for `target` blocks, with the
+    /// source that answered.
+    EstimateFee {
+        target: u16,
+        conservative: Option<bool>,
+        reply: oneshot::Sender<Result<Option<(u64, String)>, RpcError>>,
+    },
+}
+
+/// What `listsinceblock` reports: the transactions, oldest first, and the cursor to pass
+/// back next time.
+#[derive(Clone, Debug)]
+pub struct BtcSinceBlock {
+    pub records: Vec<BtcTxRecord>,
+    /// The hash of the block `target_confirmations` deep - or the wallet's earliest
+    /// checkpoint when the chain it holds is shallower (a lower cursor only re-reports,
+    /// never misses), the Zcash handler's rule.
+    pub lastblock: String,
 }
 
 /// Caller-supplied send options - the optional `sendtoaddress`/`sendmany` parameters the
@@ -364,6 +409,23 @@ pub struct BtcSendOptions {
     /// keys on output order, not the order the `subtractfeefrom` array listed them.
     /// Empty = the sender's change pays, as ever.
     pub subtract_fee_from: Vec<usize>,
+    /// Core's `replaceable = false`: build every input with `nSequence = 0xFFFFFFFE`
+    /// (locktime still enforced for anti-fee-sniping, no BIP 125 signal) instead of BDK's
+    /// RBF-signalling default. `false` - the `Default` - keeps that default, which is also
+    /// Core's own `-walletrbf` default.
+    pub non_replaceable: bool,
+}
+
+/// What a completed send reports: the txid, and Core's `fee_reason` - where the fee rate
+/// came from, the second half of `sendtoaddress`/`sendmany`'s `verbose` answer. Core's own
+/// strings where zecd prices the same way ("PayTxFee set" for an explicit `fee_rate`,
+/// "Fallback fee" for the test-network floor); otherwise the source that answered
+/// (`estimatesmartfee`, or a `[fees]` tier name on kyoto), since Core's estimator-horizon
+/// strings describe a computation zecd does not do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtcSent {
+    pub txid: String,
+    pub fee_reason: String,
 }
 
 /// A handle to a running Bitcoin wallet actor - the registry's
@@ -376,6 +438,9 @@ pub struct BtcWalletHandle {
     /// from an imported account xpub, so `getwalletinfo` reports `private_keys_enabled`
     /// (and `listunspent` its `spendable`) from the same signal the Zcash side does.
     pub has_seed: bool,
+    /// Whether the seed is passphrase-encrypted - and therefore locked, since nothing can
+    /// unlock a Bitcoin wallet (see [`BtcActorConfig::encrypted`]).
+    pub encrypted: bool,
     /// The recorded birthday height (`keys.toml`): where a rebuild scans from, and on kyoto
     /// what the recovery floor and anchor resolution are derived from.
     pub birthday: u32,
@@ -427,12 +492,13 @@ impl BtcWalletHandle {
             .await
     }
 
-    /// Build, sign, broadcast, and record a send paying `recipients`. Returns the txid.
+    /// Build, sign, broadcast, and record a send paying `recipients`. Returns the txid and
+    /// where the fee rate came from.
     pub async fn send(
         &self,
         recipients: Vec<(String, u64)>,
         options: BtcSendOptions,
-    ) -> Result<String, RpcError> {
+    ) -> Result<BtcSent, RpcError> {
         self.dispatch(|reply| BtcCommand::Send {
             recipients,
             options,
@@ -476,6 +542,36 @@ impl BtcWalletHandle {
     pub async fn get_transaction(&self, txid: String) -> Result<Option<BtcTxRecord>, RpcError> {
         self.dispatch(|reply| BtcCommand::GetTransaction { txid, reply })
             .await
+    }
+
+    /// `listsinceblock`'s data: the transactions above `since` and the next cursor.
+    pub async fn since_block(
+        &self,
+        since: Option<BlockHash>,
+        target_confirmations: u32,
+    ) -> Result<BtcSinceBlock, RpcError> {
+        self.dispatch(|reply| BtcCommand::SinceBlock {
+            since,
+            target_confirmations,
+            reply,
+        })
+        .await
+    }
+
+    /// `estimatesmartfee`'s data: a fee rate in sat/kvB for `target` blocks and the source
+    /// that answered, or `None` when the backend has no estimate. `conservative` is Core's
+    /// `estimate_mode` (bitcoind honors it; the kyoto fee chain has no modes).
+    pub async fn estimate_fee(
+        &self,
+        target: u16,
+        conservative: Option<bool>,
+    ) -> Result<Option<(u64, String)>, RpcError> {
+        self.dispatch(|reply| BtcCommand::EstimateFee {
+            target,
+            conservative,
+            reply,
+        })
+        .await
     }
 
     /// Every revealed receiving address with the outputs that paid it, ascending by index.
@@ -541,6 +637,12 @@ pub struct BtcActorConfig {
     /// absent for a passphrase-encrypted wallet at startup even though the wallet is a
     /// spender. Drives the handle's `has_seed` (and thus watch-only reporting).
     pub wallet_holds_seed: bool,
+    /// Whether that seed is passphrase-encrypted (`keys.toml`'s `encryption` marker). The
+    /// engine has no `walletpassphrase`, so such a wallet is locked for its whole life -
+    /// reported as encrypted and locked rather than as an ordinary spender that happens to
+    /// fail every send. `init --encrypt` refuses to create one now; this covers wallets
+    /// encrypted before that refusal existed.
+    pub encrypted: bool,
     /// A watch-only wallet's imported account keys (`keys.toml`'s `xpub` pin, parsed by the
     /// caller for the wallet's network). Plays the seed's role for everything but signing:
     /// creates a missing database and verifies an existing one's descriptors. `None` for a
@@ -589,6 +691,7 @@ pub fn spawn(
         network,
         seed,
         wallet_holds_seed: has_seed,
+        encrypted,
         imported_keys,
         endpoint,
         fees,
@@ -701,6 +804,7 @@ pub fn spawn(
     ));
     let span = info_span!("wallet", name = %name);
     let upstream = endpoint.as_ref().map(BtcEndpoint::describe);
+    let wallet_never_synced = wallet.latest_checkpoint().height() == 0;
     let actor = BtcActor {
         wallet,
         persister,
@@ -714,6 +818,14 @@ pub fn spawn(
         feed_status: None,
         feed_held: HashSet::new(),
         feed_pending_evictions: HashMap::new(),
+        feed_ready: false,
+        // A wallet that has never applied a block (its chain is the genesis checkpoint
+        // alone) knows none of its own history: an empty datadir, or one started over.
+        mempool_rebuild: if wallet_never_synced {
+            MempoolRebuild::AwaitingTip
+        } else {
+            MempoolRebuild::NotNeeded
+        },
         birthday,
         birthday_time,
         birthday_anchor,
@@ -742,6 +854,7 @@ pub fn spawn(
             name,
             network,
             has_seed,
+            encrypted,
             birthday,
             birthday_time: birthday_time
                 .or_else(|| crate::btc::birthdays::day_start_for_height(network, birthday)),
@@ -823,6 +936,13 @@ struct BtcActor {
     /// fact just confirmed. Settled by [`Self::settle_feed_evictions`]: still unconfirmed
     /// once the scan has caught up means genuinely evicted.
     feed_pending_evictions: HashMap<Txid, u64>,
+    /// Whether the mempool view is established: a snapshot-taking feed has applied a
+    /// snapshot that counts (see [`MempoolRebuild`]) since it last connected. Kyoto sends
+    /// wait on it ([`Self::send_gate`]); cleared whenever the feed (re)connects or drops.
+    feed_ready: bool,
+    /// Where a wallet that started with no history stands in rebuilding its view of its own
+    /// unconfirmed transactions.
+    mempool_rebuild: MempoolRebuild,
     birthday: u32,
     /// See [`BtcActorConfig::birthday_time`].
     birthday_time: Option<u64>,
@@ -1087,6 +1207,82 @@ fn tx_history(wallet: &Wallet, count: usize, skip: usize) -> Vec<BtcTxRecord> {
     out
 }
 
+/// Where a wallet that started with no history stands in rebuilding its view of its own
+/// unconfirmed transactions (see `BtcActor::maybe_request_mempool_rebuild`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MempoolRebuild {
+    /// The wallet had history at start (its own sends are on disk), or the rebuild is done.
+    NotNeeded,
+    /// Started with none; waiting to reach tip before asking.
+    AwaitingTip,
+    /// Asked the feed for a full snapshot at this instant.
+    Requested(Instant),
+}
+
+/// Warn, once at start, that a kyoto wallet has no feed that can rebuild its view of its own
+/// unconfirmed transactions - louder when it started with no history, which is exactly when
+/// that view is missing. Sends are not blocked: the operator chose to run without one.
+fn warn_no_mempool_view(rebuild: MempoolRebuild) {
+    if rebuild == MempoolRebuild::AwaitingTip {
+        warn!(
+            "this kyoto wallet started with no history and has no snapshot-taking mempool \
+             feed ([mempool] sources = [\"p2p\"] with p2p_snapshot = true): its own \
+             unconfirmed transactions from before are unknown until they confirm, and a send \
+             before then may double-spend them"
+        );
+    } else {
+        info!(
+            "no snapshot-taking mempool feed for this kyoto wallet; after a restart from an \
+             empty datadir, sends could not see its own earlier unconfirmed transactions"
+        );
+    }
+}
+
+/// `listsinceblock` over the wallet's own chain: every transaction mined strictly above
+/// `since` - or everything, when `since` is absent or names a block the wallet's chain does
+/// not hold (reorged away, or below its checkpoints: the Zcash handler's rule, so a poller
+/// feeding back a stale cursor re-reads rather than wedging) - plus every unconfirmed one,
+/// oldest first; and the cursor block `target_confirmations` deep.
+fn since_block(
+    wallet: &Wallet,
+    since: Option<BlockHash>,
+    target_confirmations: u32,
+) -> BtcSinceBlock {
+    let tip = wallet.local_chain().tip();
+    let since_height = since.and_then(|hash| {
+        tip.iter()
+            .find(|cp| cp.hash() == hash)
+            .map(|cp| cp.height())
+    });
+    let mut positioned: Vec<(u64, u64, Txid)> = wallet
+        .transactions()
+        .filter(|wtx| match &wtx.chain_position {
+            bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => {
+                since_height.is_none_or(|since| anchor.block_id.height > since)
+            }
+            bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => true,
+        })
+        .map(|wtx| {
+            let (sort_key, time, _) = tx_position(wallet, &wtx);
+            (sort_key, time, wtx.tx_node.txid)
+        })
+        .collect();
+    positioned.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let records = positioned
+        .into_iter()
+        .filter_map(|(_, _, txid)| wallet.get_tx(txid))
+        .map(|wtx| tx_entry(wallet, &wtx, false))
+        .filter(|record| !record.details.is_empty())
+        .collect();
+    let depth = target_confirmations.saturating_sub(1);
+    let lastblock = tip
+        .floor_at(tip.height().saturating_sub(depth))
+        .or_else(|| tip.iter().last())
+        .map(|cp| cp.hash().to_string())
+        .unwrap_or_else(|| "0".repeat(64));
+    BtcSinceBlock { records, lastblock }
+}
+
 impl BtcActor {
     async fn run(mut self) {
         match &self.endpoint {
@@ -1130,6 +1326,7 @@ impl BtcActor {
             } else {
                 false
             } || fed;
+            self.maybe_request_mempool_rebuild();
             // At a tip the wallet has not rebroadcast at: resubmit what the network may
             // have dropped. `at_tip` only survives a successful pass (an error drops the
             // connection and clears it), and the hash comparison makes a quiet tip free.
@@ -1242,10 +1439,26 @@ impl BtcActor {
                             // on mainnet, all read back on every load) and counted as work,
                             // skipping the sync interval for as long as the mempool churned.
                             // Only a transaction in the wallet's own graph can be retired.
+                            //
+                            // And never one the wallet funded. The emitter is seeded with
+                            // the wallet's unconfirmed set at connect, so a send whose
+                            // broadcast got no verdict - committed, never in the node's
+                            // mempool - reads as "evicted" on the first pass after the
+                            // redial, and retiring it released its inputs to the next send:
+                            // a double-spend of a transaction that may be on the network.
+                            // Core's wallet keeps an own transaction that left the mempool
+                            // (unconfirmed, inputs spent) until a conflict confirms or the
+                            // operator abandons it; here the rebroadcast pass resubmits it,
+                            // its verdicts retire a confirmed conflict, and
+                            // `abandontransaction` is the operator's release.
                             evicted_now = event
                                 .evicted
                                 .into_iter()
-                                .filter(|(txid, _)| self.wallet.tx_graph().get_tx(*txid).is_some())
+                                .filter(|(txid, _)| {
+                                    self.wallet.tx_graph().get_tx(*txid).is_some_and(|tx| {
+                                        self.wallet.sent_and_received(&tx).0 == Amount::ZERO
+                                    })
+                                })
                                 .collect();
                             Ok(0)
                         }
@@ -1587,6 +1800,7 @@ impl BtcActor {
                      for the network or mempool_space_url); running without the 0-conf feed"
                 );
             }
+            warn_no_mempool_view(self.mempool_rebuild);
             return;
         };
         let source = target.source();
@@ -1596,6 +1810,16 @@ impl BtcActor {
             %endpoint,
             "starting the mempool feed (0-conf receives)"
         );
+        let snapshots = matches!(
+            target,
+            crate::btc::mempool_feed::FeedTarget::Peer {
+                snapshot: Some(_),
+                ..
+            }
+        );
+        if !snapshots {
+            warn_no_mempool_view(self.mempool_rebuild);
+        }
         self.feed_status = Some(MempoolFeedStatus {
             source: source.as_str(),
             endpoint,
@@ -1604,6 +1828,7 @@ impl BtcActor {
             deltas: 0,
             matched: 0,
             dropped: 0,
+            snapshot_applied: snapshots.then_some(false),
         });
         self.feed = Some(MempoolFeed::start(
             target,
@@ -1626,6 +1851,9 @@ impl BtcActor {
     fn on_feed_event(&mut self, event: FeedEvent) -> bool {
         match event {
             FeedEvent::Connected => {
+                // A new connection's view starts over: sends wait for its first snapshot
+                // (requested at connect) rather than trusting the last link's.
+                self.set_feed_ready(false);
                 if let Some(status) = &mut self.feed_status {
                     status.connected = true;
                 }
@@ -1633,6 +1861,7 @@ impl BtcActor {
                 false
             }
             FeedEvent::Disconnected(_) => {
+                self.set_feed_ready(false);
                 if let Some(status) = &mut self.feed_status {
                     status.connected = false;
                 }
@@ -1640,7 +1869,7 @@ impl BtcActor {
                 false
             }
             FeedEvent::Delta(delta) => self.apply_feed_delta(delta),
-            FeedEvent::Snapshot(held) => self.apply_feed_snapshot(&held),
+            FeedEvent::Snapshot(snapshot) => self.apply_feed_snapshot(&snapshot),
         }
     }
 
@@ -1650,7 +1879,28 @@ impl BtcActor {
     /// mined transaction leaves the mempool too). And every unconfirmed wallet transaction
     /// the node does list is known held - the wallet's own sends included, which the
     /// rebroadcast pass then stops re-announcing. Never changes the wallet directly.
-    fn apply_feed_snapshot(&mut self, held: &HashSet<Txid>) -> bool {
+    fn apply_feed_snapshot(&mut self, snapshot: &crate::btc::mempool_feed::FeedSnapshot) -> bool {
+        let held = &snapshot.held;
+        // Whether this snapshot establishes the mempool view. For a wallet that started
+        // with no history only a full one requested once it had reached tip does: the
+        // transactions of an earlier snapshot were matched against a wallet that did not
+        // yet hold the outputs they spend, so its own earlier sends went unrecognized.
+        let counts = match self.mempool_rebuild {
+            MempoolRebuild::NotNeeded => true,
+            MempoolRebuild::AwaitingTip => false,
+            MempoolRebuild::Requested(at) => snapshot.full && snapshot.requested_at >= at,
+        };
+        if counts {
+            if self.mempool_rebuild != MempoolRebuild::NotNeeded {
+                info!(
+                    held = held.len(),
+                    "mempool view rebuilt: every transaction the node holds was matched \
+                     against the synced wallet; sends are open"
+                );
+                self.mempool_rebuild = MempoolRebuild::NotNeeded;
+            }
+            self.set_feed_ready(true);
+        }
         let now = unix_now();
         if let Some(status) = &mut self.feed_status {
             status.last_delta = Some(now);
@@ -1766,6 +2016,67 @@ impl BtcActor {
         }
         self.retire(evicted, "mempool feed eviction");
         true
+    }
+
+    /// Record whether the mempool view is established, mirrored into the feed status.
+    fn set_feed_ready(&mut self, ready: bool) {
+        self.feed_ready = ready;
+        if let Some(status) = &mut self.feed_status {
+            if status.snapshot_applied.is_some() {
+                status.snapshot_applied = Some(ready);
+            }
+        }
+    }
+
+    /// Once a wallet that started with no history reaches tip, ask the feed for a full
+    /// snapshot: every transaction the node holds, fetched again and matched against a
+    /// wallet that now holds its outputs - which is what makes its own unconfirmed sends
+    /// from before the restart visible. Once per actor life.
+    fn maybe_request_mempool_rebuild(&mut self) {
+        if self.mempool_rebuild != MempoolRebuild::AwaitingTip || !self.at_tip {
+            return;
+        }
+        let Some(feed) = &self.feed else {
+            return;
+        };
+        // Only a snapshot-taking feed can refetch.
+        if self
+            .feed_status
+            .as_ref()
+            .and_then(|s| s.snapshot_applied)
+            .is_none()
+        {
+            return;
+        }
+        info!(
+            "the wallet reached tip from an empty history; refetching the node's whole \
+             mempool to find its own unconfirmed transactions (sends wait for it)"
+        );
+        self.mempool_rebuild = MempoolRebuild::Requested(Instant::now());
+        feed.request_full_snapshot();
+    }
+
+    /// Whether a send may proceed. Over kyoto with a snapshot-taking feed, not until the
+    /// mempool view is established: a wallet rebuilt from an empty datadir does not know
+    /// its own unconfirmed sends from before (a light client sees them only once mined),
+    /// so their inputs look unspent and the next send could double-spend them.
+    fn send_gate(&self) -> Result<(), RpcError> {
+        if !matches!(self.conn, Some(Conn::Kyoto(_))) {
+            return Ok(());
+        }
+        let snapshots = self
+            .feed_status
+            .as_ref()
+            .is_some_and(|s| s.snapshot_applied.is_some());
+        if snapshots && !self.feed_ready {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "mempool view not yet established (waiting for the P2P feed's mempool \
+                 snapshot, so this wallet's own unconfirmed transactions are known before it \
+                 spends); retry shortly",
+            ));
+        }
+        Ok(())
     }
 
     fn publish_status(&self) {
@@ -2331,18 +2642,21 @@ impl BtcActor {
                 let utxos = self
                     .wallet
                     .list_unspent()
-                    .filter_map(|output| {
+                    .map(|output| {
                         let confirmations = match &output.chain_position {
                             bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => {
                                 u64::from(tip.saturating_sub(anchor.block_id.height)) + 1
                             }
                             bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => 0,
                         };
-                        if self.coinbase_immature(&output) {
-                            return None;
-                        }
+                        let immature = self.coinbase_immature(&output);
                         let coinbase = self.is_coinbase(output.outpoint.txid);
-                        Some(BtcUtxo {
+                        let desc = inferred_descriptor(
+                            &self.wallet,
+                            output.keychain,
+                            output.derivation_index,
+                        );
+                        BtcUtxo {
                             txid: output.outpoint.txid.to_string(),
                             vout: output.outpoint.vout,
                             amount_sat: output.txout.value.to_sat(),
@@ -2356,7 +2670,10 @@ impl BtcActor {
                             confirmations,
                             trusted: confirmations > 0 || own_txids.contains(&output.outpoint.txid),
                             coinbase,
-                        })
+                            immature,
+                            script_pubkey: output.txout.script_pubkey.to_hex_string(),
+                            desc,
+                        }
                     })
                     .collect();
                 let _ = reply.send(Ok(utxos));
@@ -2367,11 +2684,15 @@ impl BtcActor {
                 {
                     Ok(address) => {
                         let spk = address.script_pubkey();
+                        let derivation = self.wallet.derivation_of_spk(spk.clone());
                         Ok(BtcAddressInfo {
-                            is_mine: self.wallet.is_mine(spk.clone()),
-                            derivation: self.wallet.derivation_of_spk(spk).map(
-                                |(keychain, index)| (keychain == KeychainKind::Internal, index),
-                            ),
+                            is_mine: self.wallet.is_mine(spk),
+                            derivation: derivation.map(|(keychain, index)| {
+                                (keychain == KeychainKind::Internal, index)
+                            }),
+                            key: derivation.and_then(|(keychain, index)| {
+                                key_origin(&self.wallet, keychain, index)
+                            }),
                         })
                     }
                     Err(_) => Err(RpcError::invalid_address_or_key(format!(
@@ -2397,6 +2718,29 @@ impl BtcActor {
             }
             BtcCommand::ListTransactions { count, skip, reply } => {
                 let _ = reply.send(Ok(tx_history(&self.wallet, count, skip)));
+            }
+            BtcCommand::SinceBlock {
+                since,
+                target_confirmations,
+                reply,
+            } => {
+                let _ = reply.send(Ok(since_block(&self.wallet, since, target_confirmations)));
+            }
+            BtcCommand::EstimateFee {
+                target,
+                conservative,
+                reply,
+            } => {
+                let result = self
+                    .estimate_fee_at(target, conservative)
+                    .await
+                    .map(|answer| {
+                        answer.map(|(rate, source)| {
+                            (rate.to_sat_per_kwu().saturating_mul(4), source.to_string())
+                        })
+                    })
+                    .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")));
+                let _ = reply.send(result);
             }
             BtcCommand::TxCount { reply } => {
                 let _ = reply.send(Ok(self.wallet.transactions().count()));
@@ -2452,6 +2796,9 @@ impl BtcActor {
                 }
                 bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => 0,
             };
+            // Core's maturity rule (`coinbase_immature`): under COINBASE_MATURITY + 1 deep.
+            let immature =
+                wtx.tx_node.tx.is_coinbase() && confirmations <= u64::from(COINBASE_MATURITY);
             for txout in &wtx.tx_node.tx.output {
                 let Some((KeychainKind::External, index)) =
                     self.wallet.derivation_of_spk(txout.script_pubkey.clone())
@@ -2463,6 +2810,7 @@ impl BtcActor {
                         txid: txid.clone(),
                         amount_sat: txout.value.to_sat(),
                         confirmations,
+                        immature,
                     });
                 }
             }
@@ -2502,13 +2850,28 @@ impl BtcActor {
     /// Bitcoind answers with `estimatesmartfee`. Kyoto has no such call and answers with a
     /// far coarser signal - see [`KyotoConn::estimate_fee_rate`] - so the mainnet fallback
     /// rule below is doing more work on that backend than on this one.
-    async fn upstream_fee_rate(&mut self) -> anyhow::Result<Option<bdk_wallet::bitcoin::FeeRate>> {
+    /// The answer carries the name of the source that gave it, for `fee_reason`.
+    async fn upstream_fee_rate(
+        &mut self,
+    ) -> anyhow::Result<Option<(bdk_wallet::bitcoin::FeeRate, &'static str)>> {
+        self.estimate_fee_at(FEE_TARGET_BLOCKS, None).await
+    }
+
+    /// [`Self::upstream_fee_rate`] at a caller-chosen target - `estimatesmartfee`'s path.
+    /// Bitcoind estimates at `target` in the requested mode; the kyoto fee chain has no
+    /// notion of either (its oracles answer one horizon), so both are ignored there.
+    async fn estimate_fee_at(
+        &mut self,
+        target: u16,
+        conservative: Option<bool>,
+    ) -> anyhow::Result<Option<(bdk_wallet::bitcoin::FeeRate, &'static str)>> {
         let requester = match self.conn.as_ref() {
             // Blocking and synchronous: answer here, before any await exists.
             Some(Conn::Bitcoind { rpc, .. }) => {
                 return tokio::task::block_in_place(|| {
-                    rpc.estimate_fee_rate_blocking(FEE_TARGET_BLOCKS)
-                });
+                    rpc.estimate_fee_rate_blocking(target, conservative)
+                })
+                .map(|rate| rate.map(|rate| (rate, "estimatesmartfee")));
             }
             Some(Conn::Kyoto(kyoto)) => kyoto.requester(),
             None => return Err(anyhow::anyhow!("no upstream connection")),
@@ -2529,7 +2892,7 @@ impl BtcActor {
             match tier {
                 crate::btc::fees::FeeTier::Http { source, url } => {
                     match crate::btc::fees::http_fee_rate(source, &url).await {
-                        Ok(rate) => return Ok(Some(rate)),
+                        Ok(rate) => return Ok(Some((rate, source.as_str()))),
                         Err(e) => warn!(
                             source = source.as_str(),
                             %url,
@@ -2538,12 +2901,16 @@ impl BtcActor {
                     }
                 }
                 crate::btc::fees::FeeTier::PeerMedian => {
-                    let attempt = crate::btc::kyoto::estimate_fee_rate(requester.clone()).await;
+                    let attempt = crate::btc::kyoto::estimate_fee_rate(requester.clone())
+                        .await
+                        .map(|rate| {
+                            rate.map(|rate| (rate, crate::config::FeeSource::PeerMedian.as_str()))
+                        });
                     if i == last {
                         return attempt;
                     }
                     match attempt {
-                        Ok(Some(rate)) => return Ok(Some(rate)),
+                        Ok(Some(answer)) => return Ok(Some(answer)),
                         Ok(None) => warn!(
                             "the peer-derived fee median had no answer; falling through to the \
                              next fee source"
@@ -2783,16 +3150,12 @@ impl BtcActor {
 
     /// Relay a transaction the wallet holds **no fresh record of**: a caller-built foreign
     /// transaction, or one already in the wallet (a resubmission), where the record is not
-    /// this relay's to settle. The outcome is reported as is: a queued kyoto announcement
-    /// is a success with a WARN, a failure goes through [`Self::broadcast_failure`].
-    async fn relay_uncommitted(&mut self, tx: &Transaction) -> Result<Txid, RpcError> {
-        let txid = tx.compute_txid();
+    /// this relay's to settle. The outcome is reported as is - a queued kyoto announcement
+    /// comes back as [`Relay::Queued`] for the caller to answer - and a failure goes
+    /// through [`Self::broadcast_failure`].
+    async fn relay_uncommitted(&mut self, tx: &Transaction) -> Result<Relay, RpcError> {
         match self.upstream_broadcast(tx).await {
-            Ok(Relay::Relayed) => Ok(txid),
-            Ok(Relay::Queued) => {
-                self.note_queued(txid);
-                Ok(txid)
-            }
+            Ok(relay) => Ok(relay),
             Err(e) => Err(self.broadcast_failure(e)),
         }
     }
@@ -2801,7 +3164,7 @@ impl BtcActor {
         &mut self,
         recipients: Vec<(String, u64)>,
         options: BtcSendOptions,
-    ) -> Result<String, RpcError> {
+    ) -> Result<BtcSent, RpcError> {
         // Checked here but borrowed only at the signing step below: the fee and broadcast
         // calls take `&mut self`, so holding a `&self.seed` across them would not borrow-check.
         if self.seed.is_none() {
@@ -2820,6 +3183,10 @@ impl BtcActor {
                 },
             ));
         }
+        // Recipients first: pure checks, so a typo'd address or a bad amount is refused
+        // before the send costs a fee-oracle round trip on the single-writer actor, and
+        // answers the same `-5`/`-3` offline as online.
+        let parsed = parse_recipients(&recipients, self.wallet.network())?;
         if self.conn.is_none() {
             return Err(RpcError::new(
                 codes::RPC_WALLET_ERROR,
@@ -2827,6 +3194,7 @@ impl BtcActor {
                  once it is reachable",
             ));
         }
+        self.send_gate()?;
         // Fee rate: the caller's explicit `fee_rate` when given (no estimation dial at all -
         // on the kyoto backend this is the one way to price a send without trusting
         // mempool.space or the peers' coarse signals), else the upstream's estimate, or -
@@ -2842,15 +3210,18 @@ impl BtcActor {
             // how BDK prices every fee (against a rounded-up vsize the realized rate can
             // read fractionally under; the conservative satisfaction-weight estimate is
             // what covers relay floors in practice, same as the estimated-rate path).
-            Some(kvb) => Some(FeeRate::from_sat_per_kwu(kvb.div_ceil(4))),
+            Some(kvb) => Some((FeeRate::from_sat_per_kwu(kvb.div_ceil(4)), "PayTxFee set")),
             None => self
                 .upstream_fee_rate()
                 .await
                 .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?,
         };
-        let fee_rate = match fee_rate {
-            Some(rate) => crate::btc::fees::enforce_sanity_ceiling(rate)
-                .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?,
+        let (fee_rate, fee_reason) = match fee_rate {
+            Some((rate, reason)) => (
+                crate::btc::fees::enforce_sanity_ceiling(rate)
+                    .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?,
+                reason,
+            ),
             None if self.network == BitcoinNetwork::Main => {
                 return Err(RpcError::new(
                     codes::RPC_WALLET_ERROR,
@@ -2858,25 +3229,13 @@ impl BtcActor {
                      the node has fee data (or pass an explicit fee_rate)",
                 ))
             }
-            None => FeeRate::from_sat_per_vb_u32(1),
+            None => (FeeRate::from_sat_per_vb_u32(1), "Fallback fee"),
         };
-        let network = self.wallet.network();
-        let mut parsed = Vec::with_capacity(recipients.len());
-        for (addr, sats) in &recipients {
-            let address = Address::from_str(addr)
-                .and_then(|a| a.require_network(network))
-                .map_err(|_| {
-                    RpcError::invalid_address_or_key(format!("Invalid Bitcoin address: {addr}"))
-                })?;
-            if *sats == 0 {
-                // Core rejects a zero amount with -3 "Invalid amount", as the Zcash send does.
-                return Err(RpcError::type_error("Invalid amount"));
-            }
-            parsed.push((address, Amount::from_sat(*sats)));
-        }
-
         let started = Instant::now();
         let immature = self.immature_coinbase_outpoints();
+        let sequence = options
+            .non_replaceable
+            .then_some(bdk_wallet::bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF);
         let mut psbt = if options.subtract_fee_from.is_empty() {
             let mut builder = self.wallet.build_tx();
             builder.unspendable(immature);
@@ -2884,10 +3243,27 @@ impl BtcActor {
                 builder.add_recipient(address.script_pubkey(), *amount);
             }
             builder.fee_rate(fee_rate);
+            if let Some(sequence) = sequence {
+                builder.set_exact_sequence(sequence);
+            }
             builder.finish().map_err(map_create_tx_error)?
         } else {
-            self.build_subtract_fee_psbt(&parsed, &options.subtract_fee_from, fee_rate, immature)?
+            self.build_subtract_fee_psbt(
+                &parsed,
+                &options.subtract_fee_from,
+                fee_rate,
+                immature,
+                sequence,
+            )?
         };
+        // The absolute-fee cap (Core's `-maxtxfee`), checked on the built PSBT before a
+        // signer exists. The sanity ceiling bounds the *rate*; a large consolidation at a
+        // sane rate can still carry a surprising total, and this is the one number the
+        // operator actually pays.
+        let fee = psbt
+            .fee()
+            .map_err(|e| RpcError::misc(format!("compute the psbt fee: {e}")))?;
+        check_max_tx_fee(fee.to_sat(), self.fees.max_tx_fee_sat)?;
 
         // Signers are derived from the seed per send and dropped with this scope - the
         // custody model's spend half (the persisted wallet holds public descriptors only).
@@ -2942,7 +3318,10 @@ impl BtcActor {
                 "committed transaction; relay pending"
             ),
         }
-        Ok(txid.to_string())
+        Ok(BtcSent {
+            txid: txid.to_string(),
+            fee_reason: fee_reason.to_string(),
+        })
     }
 
     /// Build the PSBT for a subtract-fee send: the listed recipients pay the fee out of
@@ -2974,6 +3353,7 @@ impl BtcActor {
         subtract: &[usize],
         fee_rate: FeeRate,
         unspendable: Vec<OutPoint>,
+        sequence: Option<bdk_wallet::bitcoin::Sequence>,
     ) -> Result<Psbt, RpcError> {
         let inputs: Vec<OutPoint> = {
             let mut builder = self.wallet.build_tx();
@@ -3001,6 +3381,9 @@ impl BtcActor {
                 builder.add_recipient(address.script_pubkey(), *amount);
             }
             builder.fee_rate(fee_rate);
+            if let Some(sequence) = sequence {
+                builder.set_exact_sequence(sequence);
+            }
             match builder.finish() {
                 Ok(psbt) => {
                     let actual = psbt
@@ -3058,11 +3441,21 @@ impl BtcActor {
         // raw graph: an abandoned or retired transaction is in the graph too, and
         // resubmitting one must re-canonicalize it first (below), or the node would hold a
         // transaction whose inputs the wallet still counts as free.
+        //
+        // Unlike a send, `sendrawtransaction` answers a txid only once the transaction was
+        // actually relayed - Core never returns one without mempool acceptance, and a
+        // script reading success here would believe the network has it. A kyoto
+        // announcement no peer requested, or a bitcoind broadcast with no verdict, is `-25`
+        // naming what the wallet did with it. (A send returns its txid in those cases,
+        // because there the record is the product; here the relay is.)
         if self.wallet.get_tx(txid).is_some() {
-            return self
-                .relay_uncommitted(&tx)
-                .await
-                .map(|txid| txid.to_string());
+            return match self.relay_uncommitted(&tx).await? {
+                Relay::Relayed => Ok(txid.to_string()),
+                Relay::Queued => Err(not_relayed(
+                    txid,
+                    "the wallet already holds it and re-announces it at each new tip",
+                )),
+            };
         }
         // Otherwise commit first when it touches this wallet (the apply filters relevance
         // itself; a fresh sighting outruns any earlier eviction), then relay - the same
@@ -3070,14 +3463,32 @@ impl BtcActor {
         // record and is relayed on the uncommitted path, whose failures are reported
         // verbatim.
         match self.commit_before_relay(&tx, "broadcast")? {
-            Commit::Recorded { seen_at } => self
-                .relay_committed(&tx, seen_at, "broadcast")
-                .await
-                .map(|(txid, _)| txid.to_string()),
-            Commit::NotOurs => self
-                .relay_uncommitted(&tx)
-                .await
-                .map(|txid| txid.to_string()),
+            Commit::Recorded { seen_at } => {
+                match self.relay_committed(&tx, seen_at, "broadcast").await? {
+                    (txid, RelayOutcome::Relayed) => Ok(txid.to_string()),
+                    (txid, RelayOutcome::Queued | RelayOutcome::Unrelayed) => Err(not_relayed(
+                        txid,
+                        "it is recorded at 0-conf and resubmitted at each new tip; \
+                         `abandontransaction` releases its inputs if it never relays",
+                    )),
+                }
+            }
+            Commit::NotOurs => match self.relay_uncommitted(&tx).await? {
+                Relay::Relayed => Ok(txid.to_string()),
+                Relay::Queued => {
+                    // Nothing records a foreign transaction, so nothing would ever retry it
+                    // - but the light client's queue would announce it to the next peer
+                    // regardless, turning this error into a late, unannounced success.
+                    // Restarting the node discards the queue, which makes the answer true:
+                    // it was not relayed, and will not be.
+                    self.restart_light_client(txid, "a foreign transaction no peer requested");
+                    Err(not_relayed(
+                        txid,
+                        "the wallet does not record it, and the light client was restarted \
+                         so it is not announced later either; retry once peers are reachable",
+                    ))
+                }
+            },
         }
     }
 
@@ -3153,29 +3564,49 @@ impl BtcActor {
             descendants = abandoned.len() - 1,
             "abandoned an unconfirmed transaction; its inputs are released"
         );
-        if matches!(self.conn, Some(Conn::Kyoto(_))) {
-            // The light client's broadcast queue still holds the transaction; the only way
-            // to make it forget is a new node. A deliberate restart, like the birthday
-            // anchor's: no backoff, the next pass redials at once.
-            self.conn = None;
-            self.at_tip = false;
-            self.rebroadcast_tip = None;
-            self.node_mempool = None;
-            self.status_tx.send_replace(status_of(
-                &self.wallet,
-                BtcConnState::Syncing,
-                self.birthday_anchor.as_ref(),
-                self.birthday_block_time,
-                self.feed_status.as_ref(),
-            ));
-            info!(
-                %txid,
-                "restarting the light client so its broadcast queue forgets the abandoned \
-                 transaction; a peer that already received it may still relay it"
-            );
-        }
+        self.restart_light_client(txid, "an abandoned transaction");
         Ok(())
     }
+
+    /// Over kyoto, drop the light client so its broadcast queue forgets `txid`: `bip157`
+    /// re-announces a queued transaction to every peer that completes a handshake and has
+    /// no API to forget one, so a new node is the only way. A deliberate restart, like the
+    /// birthday anchor's: no backoff, the next pass redials at once from the wallet's own
+    /// checkpoint. A no-op over bitcoind, which queues nothing.
+    fn restart_light_client(&mut self, txid: Txid, what: &str) {
+        if !matches!(self.conn, Some(Conn::Kyoto(_))) {
+            return;
+        }
+        self.conn = None;
+        self.at_tip = false;
+        self.rebroadcast_tip = None;
+        self.node_mempool = None;
+        self.status_tx.send_replace(status_of(
+            &self.wallet,
+            BtcConnState::Syncing,
+            self.birthday_anchor.as_ref(),
+            self.birthday_block_time,
+            self.feed_status.as_ref(),
+        ));
+        info!(
+            %txid,
+            "restarting the light client so its broadcast queue forgets {what}; a peer that \
+             already received it may still relay it"
+        );
+    }
+}
+
+/// `sendrawtransaction`'s answer for a transaction that was not relayed: Core's `-25`
+/// (`RPC_VERIFY_ERROR`, what it answers for a broadcast that did not reach the mempool),
+/// saying what became of it.
+fn not_relayed(txid: Txid, fate: &str) -> RpcError {
+    RpcError::new(
+        RPC_VERIFY_ERROR,
+        format!(
+            "transaction {txid} was not relayed: no peer requested it within the broadcast \
+             timeout, or the node gave no verdict; {fate}"
+        ),
+    )
 }
 
 /// What [`BtcActor::commit_before_relay`] found: the transaction is the wallet's and is now
@@ -3364,6 +3795,123 @@ fn subtract_fee_from_amounts(
     Ok(out)
 }
 
+/// The wallet key at one derivation, in the forms Core reports it: the inferred
+/// single-key descriptor (`listunspent.desc`, `getaddressinfo.desc`) with its checksum, the
+/// compressed public key, and the master fingerprint.
+#[derive(Clone, Debug)]
+pub struct BtcKeyOrigin {
+    pub desc: String,
+    pub pubkey: String,
+    pub fingerprint: String,
+}
+
+/// Core's inferred descriptor for the wallet key at `keychain/index` - the single-key form
+/// Core's `listunspent.desc` carries: `wpkh([fingerprint/full/path]pubkey)` with its
+/// checksum. `None` only if the wallet's descriptor cannot be derived there (it always can
+/// for a BIP 84 wallet at a non-hardened index).
+fn inferred_descriptor(
+    wallet: &bdk_wallet::Wallet,
+    keychain: KeychainKind,
+    index: u32,
+) -> Option<String> {
+    key_origin(wallet, keychain, index).map(|origin| origin.desc)
+}
+
+/// [`inferred_descriptor`] plus the key parts it is built from.
+fn key_origin(
+    wallet: &bdk_wallet::Wallet,
+    keychain: KeychainKind,
+    index: u32,
+) -> Option<BtcKeyOrigin> {
+    use bdk_wallet::miniscript::descriptor::{Descriptor, DescriptorPublicKey};
+    use bdk_wallet::miniscript::ForEachKey as _;
+    let definite = wallet
+        .public_descriptor(keychain)
+        .at_derivation_index(index)
+        .ok()?;
+    let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::verification_only();
+    let mut key = None;
+    definite.for_each_key(|k| {
+        key = Some((
+            k.master_fingerprint(),
+            k.full_derivation_path(),
+            k.derive_public_key(&secp).ok(),
+        ));
+        true
+    });
+    let (fingerprint, Some(path), Some(pubkey)) = key? else {
+        return None;
+    };
+    let path = path.to_string();
+    let path = path.trim_start_matches('m').trim_start_matches('/');
+    // Parsed back so miniscript appends the checksum (and so a malformed string is `None`
+    // rather than a bad descriptor on the wire).
+    let desc = Descriptor::<DescriptorPublicKey>::from_str(&format!(
+        "wpkh([{fingerprint}/{path}]{pubkey})"
+    ))
+    .ok()?
+    .to_string();
+    Some(BtcKeyOrigin {
+        desc,
+        pubkey: pubkey.to_string(),
+        fingerprint: fingerprint.to_string(),
+    })
+}
+
+/// Parse a send's recipients against the wallet's network: `-5` for an address that does
+/// not parse or belongs to another network, `-3` for a zero amount (Core's "Invalid
+/// amount", as the Zcash send answers) and for a total above the supply cap.
+///
+/// The total check is what keeps the builder from panicking: each amount is already
+/// range-checked at the RPC boundary, but nothing bounded their *sum*, and BDK sums the
+/// recipients with `Amount`'s panicking `+` - so a `sendmany` of a few thousand
+/// max-value recipients (well under the request-body limit) killed the actor task, and
+/// with it every later command and the shutdown persist.
+fn parse_recipients(
+    recipients: &[(String, u64)],
+    network: bdk_wallet::bitcoin::Network,
+) -> Result<Vec<(Address, Amount)>, RpcError> {
+    let mut parsed = Vec::with_capacity(recipients.len());
+    let mut total: u64 = 0;
+    for (addr, sats) in recipients {
+        let address = Address::from_str(addr)
+            .and_then(|a| a.require_network(network))
+            .map_err(|_| {
+                RpcError::invalid_address_or_key(format!("Invalid Bitcoin address: {addr}"))
+            })?;
+        if *sats == 0 {
+            return Err(RpcError::type_error("Invalid amount"));
+        }
+        total = total
+            .checked_add(*sats)
+            .filter(|t| *t <= crate::amount::MAX_MONEY)
+            .ok_or_else(|| {
+                RpcError::type_error("Invalid amount: the recipients total more than 21000000 BTC")
+            })?;
+        parsed.push((address, Amount::from_sat(*sats)));
+    }
+    Ok(parsed)
+}
+
+/// Refuse a send whose absolute fee exceeds `[fees] max_tx_fee_sat` - Core's `-maxtxfee`,
+/// with Core's message and code (`-6`: Core's `SendMoney` surfaces every
+/// `CreateTransaction` failure, this one included, as `RPC_WALLET_INSUFFICIENT_FUNDS`).
+fn check_max_tx_fee(fee_sat: u64, max_sat: u64) -> Result<(), RpcError> {
+    if fee_sat > max_sat {
+        return Err(RpcError::new(
+            codes::RPC_WALLET_INSUFFICIENT_FUNDS,
+            format!(
+                "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate): the \
+                 transaction would pay {} BTC, above [fees] max_tx_fee_sat = {} BTC; nothing \
+                 was broadcast",
+                crate::amount::zats_to_value(fee_sat),
+                crate::amount::zats_to_value(max_sat),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Map BDK's transaction-build failure onto the Bitcoin Core error vocabulary: insufficient
 /// funds is `-6` with the amounts (self-diagnosing, like the Zcash `-6` enrichment),
 /// everything else `-4`.
@@ -3393,6 +3941,7 @@ mod tests {
             engine_dir: dir.join("btc").join("bdk"),
             network: BitcoinNetwork::Main,
             wallet_holds_seed: seed.is_some(),
+            encrypted: false,
             seed,
             imported_keys: None,
             endpoint: None,
@@ -3603,6 +4152,123 @@ mod tests {
         assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
     }
 
+    /// `listunspent.desc`/`getaddressinfo.desc` against the BIP 84 specification's own test
+    /// vector: the `abandon ... about` mnemonic's first receiving key, with its origin.
+    #[test]
+    fn inferred_descriptor_matches_the_bip84_test_vector() {
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Main).unwrap();
+        let wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .create_wallet_no_persist()
+        .unwrap();
+        let origin = key_origin(&wallet, KeychainKind::External, 0).unwrap();
+        assert_eq!(
+            origin.pubkey,
+            "0330d54fd0dd420a6e5f8d3624f5f3482cae350f79d5f0753bf5beef9c2d91af3c"
+        );
+        assert_eq!(origin.fingerprint, "73c5da0a");
+        let (body, checksum) = origin.desc.split_once('#').unwrap();
+        assert_eq!(
+            body,
+            "wpkh([73c5da0a/84'/0'/0'/0/0]\
+             0330d54fd0dd420a6e5f8d3624f5f3482cae350f79d5f0753bf5beef9c2d91af3c)"
+        );
+        assert_eq!(checksum.len(), 8);
+    }
+
+    /// The recipients' sum is bounded by the supply cap, including the exact-cap boundary
+    /// and a sum that would wrap `u64` - the case BDK's panicking `Amount` add would hit.
+    #[test]
+    fn recipients_total_is_bounded_by_the_supply_cap() {
+        let network = bdk_wallet::bitcoin::Network::Bitcoin;
+        let a = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string();
+        let max = crate::amount::MAX_MONEY;
+        assert_eq!(
+            parse_recipients(&[(a.clone(), max - 1), (a.clone(), 1)], network)
+                .unwrap()
+                .len(),
+            2
+        );
+        for recipients in [
+            vec![(a.clone(), max), (a.clone(), 1)],
+            vec![(a.clone(), u64::MAX), (a.clone(), u64::MAX)],
+        ] {
+            let err = parse_recipients(&recipients, network).unwrap_err();
+            assert_eq!(err.code, crate::error::codes::RPC_TYPE_ERROR);
+        }
+        // A testnet address on a mainnet wallet is -5, as Core answers.
+        let err = parse_recipients(
+            &[("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_string(), 1)],
+            network,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
+    }
+
+    /// The absolute-fee cap is inclusive (a fee exactly at the cap passes, as in Core) and
+    /// answers Core's `-maxtxfee` message and code.
+    #[test]
+    fn the_absolute_fee_cap_refuses_only_above_the_cap() {
+        assert!(check_max_tx_fee(10_000_000, 10_000_000).is_ok());
+        let err = check_max_tx_fee(10_000_001, 10_000_000).unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS);
+        assert!(err.message.contains("-maxtxfee"), "{}", err.message);
+        assert!(err.message.contains("0.10000001"), "{}", err.message);
+    }
+
+    /// `replaceable = false` rides on BDK's `set_exact_sequence`: the default build signals
+    /// BIP 125 on every input, the exact sequence `do_send` passes signals it on none (and
+    /// keeps the locktime enforced, so anti-fee-sniping still applies). Pins the BDK
+    /// behavior the RPC flag depends on.
+    #[test]
+    fn a_non_replaceable_send_signals_no_rbf() {
+        use bdk_wallet::bitcoin::{absolute, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let mut wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .create_wallet_no_persist()
+        .unwrap();
+        let own = wallet.reveal_next_address(KeychainKind::External).address;
+        let receive = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_str(&"22".repeat(32)).unwrap(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: own.script_pubkey(),
+            }],
+        };
+        wallet.apply_unconfirmed_txs([(receive, 1_700_000_000)]);
+        let build = |wallet: &mut Wallet, sequence: Option<Sequence>| {
+            let mut builder = wallet.build_tx();
+            builder.add_recipient(own.script_pubkey(), Amount::from_sat(10_000));
+            builder.fee_rate(FeeRate::from_sat_per_vb_u32(1));
+            if let Some(sequence) = sequence {
+                builder.set_exact_sequence(sequence);
+            }
+            builder.finish().unwrap().unsigned_tx
+        };
+        let default = build(&mut wallet, None);
+        assert!(default.is_explicitly_rbf());
+        let non_rbf = build(&mut wallet, Some(Sequence::ENABLE_LOCKTIME_NO_RBF));
+        assert!(!non_rbf.is_explicitly_rbf());
+        assert!(non_rbf
+            .input
+            .iter()
+            .all(|i| i.sequence.enables_absolute_lock_time()));
+    }
+
     /// A missing database with no seed is an error naming init, not a silently empty wallet.
     #[tokio::test(flavor = "multi_thread")]
     async fn missing_database_without_seed_fails_the_spawn() {
@@ -3634,6 +4300,40 @@ mod tests {
         assert!(err.message.contains("upstream"), "{}", err.message);
         let err = handle.broadcast("00".repeat(20)).await.unwrap_err();
         assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
+
+        // Recipients are validated before the upstream is needed, so a bad one answers the
+        // same offline as online: -5 for an address, -3 for a zero amount or a total past
+        // the supply cap. The last used to panic inside BDK's `Amount` sum and kill the
+        // actor, so the follow-up call proves it is still serving.
+        let good = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string();
+        let err = handle
+            .send(
+                vec![("bc1qnotanaddress".to_string(), 10_000)],
+                BtcSendOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_ADDRESS_OR_KEY);
+        let err = handle
+            .send(vec![(good.clone(), 0)], BtcSendOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_TYPE_ERROR);
+        let max = crate::amount::MAX_MONEY;
+        let err = handle
+            .send(
+                vec![(good.clone(), max), (good.clone(), max)],
+                BtcSendOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_TYPE_ERROR);
+        assert!(err.message.contains("total"), "{}", err.message);
+        let err = handle
+            .send(vec![(good, 10_000)], BtcSendOptions::default())
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("upstream"), "{}", err.message);
 
         // The graceful-shutdown path: flip the signal and the task ends.
         let dir2 = tempfile::tempdir().unwrap();

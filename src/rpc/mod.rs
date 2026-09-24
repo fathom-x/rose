@@ -240,12 +240,12 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("help", MethodCoins::All),
     ("getrpcinfo", MethodCoins::All),
     // Network
-    ("getnetworkinfo", MethodCoins::Only(ZCASH_ONLY)),
+    ("getnetworkinfo", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("getconnectioncount", MethodCoins::Only(ZCASH_ONLY)),
     ("getpeerinfo", MethodCoins::Only(ZCASH_ONLY)),
     ("ping", MethodCoins::All),
     // Blockchain
-    ("getblockchaininfo", MethodCoins::Only(ZCASH_ONLY)),
+    ("getblockchaininfo", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("getblockcount", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("getbestblockhash", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("getblockhash", MethodCoins::Only(ZCASH_ONLY)),
@@ -256,7 +256,7 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("waitforsync", MethodCoins::Only(ZCASH_ONLY)),
     // Utility
     ("validateaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
-    ("estimatesmartfee", MethodCoins::Only(ZCASH_ONLY)),
+    ("estimatesmartfee", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("estimatefee", MethodCoins::Only(ZCASH_ONLY)),
     ("getmempoolinfo", MethodCoins::Only(ZCASH_ONLY)),
     ("signmessage", MethodCoins::Only(ZCASH_ONLY)),
@@ -277,10 +277,10 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("listwallets", MethodCoins::All),
     ("listwalletdir", MethodCoins::All),
     ("listtransactions", MethodCoins::Only(ZCASH_AND_BITCOIN)),
-    ("listsinceblock", MethodCoins::Only(ZCASH_ONLY)),
+    ("listsinceblock", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("gettransaction", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("listunspent", MethodCoins::Only(ZCASH_AND_BITCOIN)),
-    ("getreceivedbyaddress", MethodCoins::Only(ZCASH_ONLY)),
+    ("getreceivedbyaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     (
         "listreceivedbyaddress",
         MethodCoins::Only(ZCASH_AND_BITCOIN),
@@ -543,7 +543,10 @@ async fn dispatch_zecd(
         // one the coin gate above preserves by not erroring on an unresolvable wallet. A
         // loaded Bitcoin wallet never reaches here; `btc_methods` answered above.
         #[cfg(not(feature = "zcash"))]
-        "getblockcount"
+        "getblockchaininfo"
+        | "getreceivedbyaddress"
+        | "listsinceblock"
+        | "getblockcount"
         | "getbestblockhash"
         | "validateaddress"
         | "sendrawtransaction"

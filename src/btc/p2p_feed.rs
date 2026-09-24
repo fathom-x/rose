@@ -58,10 +58,10 @@ use bdk_wallet::bitcoin::p2p::{Address, Magic, ServiceFlags};
 use bdk_wallet::bitcoin::Txid;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, trace};
 
-use super::mempool_feed::{FeedDelta, FeedEvent, FeedTx};
+use super::mempool_feed::{FeedDelta, FeedEvent, FeedSnapshot, FeedTx};
 use crate::coin::BitcoinNetwork;
 
 /// What the node sees us as. Bitcoin Core logs it; nothing else reads it.
@@ -93,6 +93,15 @@ const SILENCE_TIMEOUT: Duration = Duration::from_secs(300);
 const SNAPSHOT_WINDOW: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const SNAPSHOT_WINDOW: Duration = Duration::from_secs(2);
+
+/// The longest a snapshot waits, past its window, for the transactions it requested. A
+/// snapshot is delivered only once every transaction the request had to fetch arrived or
+/// was reported gone (`notfound`), so the actor has matched each before it acts on the
+/// snapshot; this bounds that wait against a node that never answers some request.
+#[cfg(not(test))]
+const SNAPSHOT_MAX_WAIT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+const SNAPSHOT_MAX_WAIT: Duration = Duration::from_secs(10);
 
 /// Announcements requested per `getdata`. Core caps a message at 50 000 entries; smaller
 /// batches keep the node's reply interleaved with new announcements rather than a snapshot's
@@ -226,14 +235,25 @@ fn announced_txids(inventory: &[Inventory]) -> Vec<Txid> {
         .collect()
 }
 
+/// A snapshot being collected.
+struct Collecting {
+    requested_at: Instant,
+    /// Every txid announced since the request.
+    collected: HashSet<Txid>,
+    /// Requested with `getdata` since, and neither delivered nor reported gone yet.
+    pending: HashSet<Txid>,
+    /// Whether nothing was known on the connection when it was requested, so every txid it
+    /// lists is fetched in full (see [`FeedSnapshot::full`]).
+    full: bool,
+}
+
 /// The connection's mutable state across messages.
 struct Session {
     magic: Magic,
     /// Txids requested on this connection (see [`KNOWN_CAP`]).
     known: HashSet<Txid>,
-    /// While a snapshot is being collected: when it was requested, and what has been
-    /// announced since.
-    snapshot: Option<(Instant, HashSet<Txid>)>,
+    /// While a snapshot is being collected.
+    snapshot: Option<Collecting>,
     last_ping: Option<u64>,
 }
 
@@ -246,15 +266,20 @@ impl Session {
         inventory: &[Inventory],
     ) -> anyhow::Result<()> {
         let txids = announced_txids(inventory);
-        if let Some((_, collected)) = &mut self.snapshot {
-            collected.extend(txids.iter().copied());
-        }
         if self.known.len() >= KNOWN_CAP {
             self.known.clear();
         }
-        let wanted: Vec<Inventory> = txids
-            .into_iter()
+        let wanted: Vec<Txid> = txids
+            .iter()
+            .copied()
             .filter(|txid| self.known.insert(*txid))
+            .collect();
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.collected.extend(txids.iter().copied());
+            snapshot.pending.extend(wanted.iter().copied());
+        }
+        let wanted: Vec<Inventory> = wanted
+            .into_iter()
             .map(Inventory::WitnessTransaction)
             .collect();
         trace!(
@@ -268,28 +293,62 @@ impl Session {
         Ok(())
     }
 
-    /// Ask the node for its whole mempool (BIP 35) and start collecting the answer.
+    /// Ask the node for its whole mempool (BIP 35) and start collecting the answer. `full`
+    /// first forgets what this connection already fetched, so the answer is fetched in its
+    /// entirety (see [`super::mempool_feed::MempoolFeed::request_full_snapshot`]); a request
+    /// on a connection that has fetched nothing yet is full by construction.
     async fn request_snapshot<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
+        full: bool,
     ) -> anyhow::Result<()> {
+        if full {
+            self.known.clear();
+        }
+        let full = self.known.is_empty();
         write_message(writer, self.magic, NetworkMessage::MemPool).await?;
-        self.snapshot = Some((Instant::now(), HashSet::new()));
-        debug!("p2p feed: requested the node's mempool");
+        self.snapshot = Some(Collecting {
+            requested_at: Instant::now(),
+            collected: HashSet::new(),
+            pending: HashSet::new(),
+            full,
+        });
+        debug!(full, "p2p feed: requested the node's mempool");
         Ok(())
     }
 
-    /// The finished snapshot, once its collection window has passed. Also trims `known` to
-    /// what the node still holds, so a later re-announcement of a returned transaction is
+    /// A requested transaction arrived, or the node reported it gone.
+    fn settled(&mut self, txid: &Txid) {
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.pending.remove(txid);
+        }
+    }
+
+    /// The finished snapshot, once its collection window has passed and every transaction
+    /// it requested has been delivered (or [`SNAPSHOT_MAX_WAIT`] ran out). Also trims `known`
+    /// to what the node still holds, so a later re-announcement of a returned transaction is
     /// fetched again rather than skipped as already seen.
-    fn take_snapshot(&mut self) -> Option<HashSet<Txid>> {
-        let done = matches!(&self.snapshot, Some((since, _)) if since.elapsed() >= SNAPSHOT_WINDOW);
+    fn take_snapshot(&mut self) -> Option<FeedSnapshot> {
+        let done = matches!(&self.snapshot, Some(s) if {
+            let age = s.requested_at.elapsed();
+            age >= SNAPSHOT_WINDOW && (s.pending.is_empty() || age >= SNAPSHOT_MAX_WAIT)
+        });
         if !done {
             return None;
         }
-        let (_, collected) = self.snapshot.take()?;
-        self.known.retain(|txid| collected.contains(txid));
-        Some(collected)
+        let snapshot = self.snapshot.take()?;
+        if !snapshot.pending.is_empty() {
+            debug!(
+                outstanding = snapshot.pending.len(),
+                "p2p feed: snapshot delivered with requests still unanswered"
+            );
+        }
+        self.known.retain(|txid| snapshot.collected.contains(txid));
+        Some(FeedSnapshot {
+            held: snapshot.collected,
+            full: snapshot.full,
+            requested_at: snapshot.requested_at,
+        })
     }
 }
 
@@ -301,8 +360,12 @@ pub async fn run_peer(
     network: BitcoinNetwork,
     snapshot: Option<Duration>,
     events: &mpsc::Sender<FeedEvent>,
+    refetch: &mut watch::Receiver<u64>,
 ) -> anyhow::Result<()> {
     let magic = magic(network);
+    // A refetch asked for before this connection existed is already served by it: the
+    // snapshot at connect fetches everything.
+    refetch.borrow_and_update();
     let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(peer))
         .await
         .map_err(|_| anyhow!("no connection to {peer} within {HANDSHAKE_TIMEOUT:?}"))?
@@ -374,7 +437,7 @@ pub async fn run_peer(
         last_ping: None,
     };
     if snapshot.is_some() {
-        session.request_snapshot(&mut writer).await?;
+        session.request_snapshot(&mut writer, true).await?;
     }
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // the first tick is immediate; the handshake just proved the link
@@ -408,6 +471,7 @@ pub async fn run_peer(
                         session.on_inv(&mut writer, &inventory).await?;
                     }
                     NetworkMessage::Tx(tx) => {
+                        session.settled(&tx.compute_txid());
                         let prevouts = vec![None; tx.input.len()];
                         let delta = FeedDelta {
                             sequence: None,
@@ -432,8 +496,12 @@ pub async fn run_peer(
                         }
                     }
                     // `notfound`: the transaction left the mempool between the announcement
-                    // and our request. Nothing to do - it was never applied.
-                    NetworkMessage::NotFound(_) => {}
+                    // and our request. Never applied; only a snapshot waiting on it cares.
+                    NetworkMessage::NotFound(gone) => {
+                        for txid in announced_txids(&gone) {
+                            session.settled(&txid);
+                        }
+                    }
                     // Headers, addresses, fee filters, compact-block negotiation, and
                     // whatever a newer node adds: not this client's business.
                     _ => {}
@@ -446,12 +514,24 @@ pub async fn run_peer(
             }
             _ = resnapshot.tick(), if snapshot.is_some() => {
                 if session.snapshot.is_none() {
-                    session.request_snapshot(&mut writer).await?;
+                    session.request_snapshot(&mut writer, false).await?;
                 }
+            }
+            // The actor asked for the whole mempool again (see
+            // `MempoolFeed::request_full_snapshot`). Replaces a periodic snapshot in flight.
+            changed = refetch.changed(), if snapshot.is_some() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                session.request_snapshot(&mut writer, true).await?;
             }
             _ = settle.tick() => {
                 if let Some(held) = session.take_snapshot() {
-                    debug!(held = held.len(), "p2p feed: mempool snapshot collected");
+                    debug!(
+                        held = held.held.len(),
+                        full = held.full,
+                        "p2p feed: mempool snapshot collected"
+                    );
                     if events.send(FeedEvent::Snapshot(held)).await.is_err() {
                         return Ok(());
                     }
@@ -623,16 +703,16 @@ pub(crate) mod tests {
                             if let Inventory::WitnessTransaction(txid)
                             | Inventory::Transaction(txid) = item
                             {
-                                if let Some(tx) = known.iter().find(|tx| tx.compute_txid() == txid)
+                                // As Core answers: the transaction, or a `notfound` (a
+                                // snapshot waits on every txid it requested).
+                                let reply = match known.iter().find(|tx| tx.compute_txid() == txid)
                                 {
-                                    write_message(
-                                        &mut writer,
-                                        magic,
-                                        NetworkMessage::Tx(tx.clone()),
-                                    )
-                                    .await
-                                    .unwrap();
-                                }
+                                    Some(tx) => NetworkMessage::Tx(tx.clone()),
+                                    None => NetworkMessage::NotFound(vec![
+                                        Inventory::WitnessTransaction(txid),
+                                    ]),
+                                };
+                                write_message(&mut writer, magic, reply).await.unwrap();
                             }
                         }
                     }

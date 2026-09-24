@@ -59,15 +59,20 @@ impl AccountKeys {
     pub fn from_seed(seed: &SecretVec<u8>, net: BitcoinNetwork) -> anyhow::Result<AccountKeys> {
         let network = network(net);
         let secp = Secp256k1::new();
-        let master = Xpriv::new_master(network, seed.expose_secret())
-            .context("derive BIP 32 master key from seed")?;
-        let fingerprint = master.fingerprint(&secp);
-        let account_xprv = master
-            .derive_priv(&secp, &bip84_account_path(net))
-            .context("derive BIP 84 account key")?;
+        let master = ErasedXpriv(
+            Xpriv::new_master(network, seed.expose_secret())
+                .context("derive BIP 32 master key from seed")?,
+        );
+        let fingerprint = master.0.fingerprint(&secp);
+        let account_xprv = ErasedXpriv(
+            master
+                .0
+                .derive_priv(&secp, &bip84_account_path(net))
+                .context("derive BIP 84 account key")?,
+        );
         Ok(AccountKeys {
             fingerprint,
-            account_xpub: Xpub::from_priv(&secp, &account_xprv),
+            account_xpub: Xpub::from_priv(&secp, &account_xprv.0),
             network,
         })
     }
@@ -202,6 +207,60 @@ impl AccountKeys {
     pub fn descriptor(&self, keychain: KeychainKind) -> Bip84Public<Xpub> {
         Bip84Public(self.account_xpub, self.fingerprint, keychain)
     }
+
+    /// The bech32 (P2WPKH) address at `keychain/index` below the account key - what the
+    /// wallet's descriptor yields at that derivation index, so external index `n` is the
+    /// address `getnewaddress` hands out `n`th and `getaddressinfo` reports as
+    /// `m/84'/coin'/0'/0/n`. Offline and seedless: public derivation from the account xpub.
+    /// `index` must be non-hardened (below 2^31), as descriptor wildcards are.
+    pub fn address(
+        &self,
+        keychain: KeychainKind,
+        index: u32,
+    ) -> anyhow::Result<bdk_wallet::bitcoin::Address> {
+        let branch = match keychain {
+            KeychainKind::External => 0,
+            KeychainKind::Internal => 1,
+        };
+        let path = [
+            ChildNumber::from_normal_idx(branch).expect("0 and 1 are in range"),
+            ChildNumber::from_normal_idx(index).map_err(|_| {
+                anyhow::anyhow!(
+                    "index {index} is out of range: address indices are non-hardened \
+                     (below 2^31)"
+                )
+            })?,
+        ];
+        let child = self
+            .account_xpub
+            .derive_pub(&Secp256k1::verification_only(), &path)
+            .context("derive the address key")?;
+        Ok(bdk_wallet::bitcoin::Address::p2wpkh(
+            &bdk_wallet::bitcoin::CompressedPublicKey(child.public_key),
+            self.network,
+        ))
+    }
+}
+
+/// An extended private key erased when it goes out of scope. `Xpriv` is a plain `Copy`
+/// value with no `Zeroize`, so the master and account keys derived here would otherwise
+/// linger on the stack after the seed that produced them (itself `SecretVec`-wrapped) is
+/// long gone. Best effort, as any stack wiping is: a copy the compiler made on its own
+/// cannot be reached, but the named values are overwritten with volatile writes.
+struct ErasedXpriv(Xpriv);
+
+impl Drop for ErasedXpriv {
+    fn drop(&mut self) {
+        self.0.private_key.non_secure_erase();
+        // SAFETY: a volatile write of a plain byte array into a field of `self`, which is
+        // valid and exclusively borrowed for the whole call.
+        unsafe {
+            std::ptr::write_volatile(
+                &mut self.0.chain_code,
+                bdk_wallet::bitcoin::bip32::ChainCode::from([0u8; 32]),
+            );
+        }
+    }
 }
 
 /// The BIP 84 account path for `net`: `84'/0'/0'` on mainnet, `84'/1'/0'` everywhere else.
@@ -230,11 +289,14 @@ pub fn signing_wallet(
 ) -> anyhow::Result<bdk_wallet::Wallet> {
     use bdk_wallet::template::Bip84;
     let network = network(net);
-    let master =
-        Xpriv::new_master(network, seed.expose_secret()).context("derive BIP 32 master key")?;
+    let master = ErasedXpriv(
+        Xpriv::new_master(network, seed.expose_secret()).context("derive BIP 32 master key")?,
+    );
+    // The templates take copies (`Xpriv` is `Copy`) and the signing wallet holds its own
+    // key material for the length of the send, beyond reach here; this local is erased.
     bdk_wallet::Wallet::create(
-        Bip84(master, KeychainKind::External),
-        Bip84(master, KeychainKind::Internal),
+        Bip84(master.0, KeychainKind::External),
+        Bip84(master.0, KeychainKind::Internal),
     )
     .network(network)
     .create_wallet_no_persist()

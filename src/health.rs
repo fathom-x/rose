@@ -250,6 +250,12 @@ fn snapshot(state: &AppState) -> Snapshot {
                 if !actor_alive {
                     any_actor_down = true;
                 }
+                // A passphrase-encrypted Bitcoin wallet is locked for good (the engine has
+                // no `walletpassphrase`); like a locked Zcash wallet it stays read-ready and
+                // raises the top-level `locked` flag.
+                if h.encrypted {
+                    any_locked = true;
+                }
                 wallets.insert(
                     name,
                     json!({
@@ -267,9 +273,8 @@ fn snapshot(state: &AppState) -> Snapshot {
                         "synced_hash": st.synced_hash,
                         "birthday": h.birthday,
                         "scanning": st.conn_state == BtcConnState::Syncing,
-                        // A watch-only (xpub) wallet holds no seed; nothing to lock.
-                        "encrypted": false,
-                        "locked": false,
+                        "encrypted": h.encrypted,
+                        "locked": h.encrypted,
                         "ready": w_ready,
                     }),
                 );

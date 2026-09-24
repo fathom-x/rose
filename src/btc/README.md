@@ -252,6 +252,27 @@ transaction it names (`Wallet::get_tx`) and is the only reader that serializes h
 `getwalletinfo.txcount` counts without building. `received_by_address` still walks every
 transaction once per call, bounded by the revealed address set.
 
+## Chain and fee reads, and the rest of Core's shapes
+
+A Bitcoin wallet answers the chain and fee reads a Core client polls, from the wallet's own
+state rather than a proxy of the node: `getblockchaininfo` (the wallet's checkpoint as
+`blocks`/`headers`/`bestblockhash`, `chain` in Core's names - `test` for testnet3 - and
+`initialblockdownload` while catching up; no `time`/`mediantime`, which the wallet does not
+track), `getnetworkinfo` (the Zcash handler's shape, `connections` from the chain source),
+`estimatesmartfee` (bitcoind's estimator at the requested target and mode; over kyoto the
+`[fees]` chain a send prices from, which answers one horizon, so the target is echoed; a
+`source` extension names who answered, and no estimate is Core's `errors` shape),
+`getreceivedbyaddress`, and `listsinceblock` (everything above the cursor block plus
+everything unconfirmed; a well-formed hash the wallet's chain does not hold reads as "from
+the start" so a reorged cursor re-reads rather than wedging, the Zcash handler's rule).
+`listunspent` carries `scriptPubKey` and Core's inferred `desc`
+(`wpkh([fingerprint/84'/coin'/0'/keychain/index]pubkey)#checksum`) and takes
+`query_options` (an unknown key is `-3`, never ignored); `getaddressinfo` adds `labels: []`,
+`pubkey`, `desc`, `hdmasterfingerprint` and the script fields `validateaddress` now reports
+too (`scriptPubKey`, `isscript`, `iswitness`, `witness_version`, `witness_program`, and
+`error`/`error_locations` for an invalid address); `getwalletinfo` says `descriptors: true`;
+and a malformed txid is `-8` on `gettransaction` as on `abandontransaction`.
+
 ## Rebroadcast of unconfirmed transactions
 
 A transaction the wallet holds can drop out of the network's view while the wallet's own
@@ -378,7 +399,12 @@ the same reason. The record then follows the relay's verdict:
   WARN. That is Core's posture too (it logs the failed relay and keeps the transaction for
   its resubmission loop); here the rebroadcast pass resubmits it at the next tip or
   reconnect, and `abandontransaction` releases the inputs if it never relays. A bitcoind
-  connection is dropped for redial as before. The `-4` "retry" error is now reserved for a
+  connection is dropped for redial as before - and the record survives the redial: the
+  emitter is seeded with the wallet's unconfirmed set, so the first mempool pass reports a
+  never-relayed send as "evicted", and the mempool pass **never retires a transaction the
+  wallet funded** on that report (it used to, freeing the inputs for a double-spend of a
+  transaction that may be on the network). Core keeps an own transaction that left the
+  mempool until a conflict confirms or the operator abandons it; so does zecd. The `-4` "retry" error is now reserved for a
   send refused *before* anything is committed - no upstream connection, no seed, a persist
   failure - and for the relay of a foreign transaction via `sendrawtransaction`, which the
   wallet has nothing to commit for.
@@ -388,8 +414,14 @@ the same reason. The record then follows the relay's verdict:
   `actor.rs::an_eviction_at_the_sighting_timestamp_withdraws_the_record`) and answers `-4`
   naming the cause; nothing was broadcast, so the inputs really are free.
 
-`sendrawtransaction` takes the same path when the hex is a wallet transaction the wallet
-does not hold **canonical**; one it does (a resubmission of an own send or a received
+`sendrawtransaction` differs from a send in its answer, not its record: it returns the
+txid only once the bytes were relayed, as Core never returns one without mempool
+acceptance. A kyoto announcement no peer requested, or a bitcoind broadcast with no
+verdict, is `-25` naming what became of the transaction - recorded and rebroadcast when it
+is the wallet's, and for a foreign one (nothing records it) the light client is restarted
+so its queue does not announce it later behind the error (`restart_light_client`, shared
+with `abandontransaction`). `sendrawtransaction` takes the send's commit path when the hex
+is a wallet transaction the wallet does not hold **canonical**; one it does (a resubmission of an own send or a received
 payment) is relayed as is with the verdict reported verbatim, since a `-27` on a confirmed
 transaction must not evict it. The gate is the canonical view, not the raw graph: an
 abandoned or retired transaction is still in the graph, and resubmitting its bytes must
@@ -406,7 +438,8 @@ UTXO set and history untouched; a send whose broadcast dies without a verdict (t
 harness's `RpcProxy` drops exactly the `sendrawtransaction` request, so the sync pass and
 the redial keep working) returns its txid recorded, locks its input against a retry, and is
 resubmitted by the rebroadcast pass once the path clears; and an abandoned unrelayed send
-resubmitted through `sendrawtransaction` is canonical again before the node holds it.
+resubmitted through `sendrawtransaction` is recorded again even while the path is down
+(answering `-25`), and relayed once it clears.
 
 ## Send pricing and fee subtraction (Core's optional send parameters)
 
@@ -436,13 +469,38 @@ differ between the two methods, as in Core):
   fixed point, accepting a changeless build whose fee overshoots by at most a dust bound
   (the no-fixed-point shape where BDK folds a sub-dust surplus into the fee, as Core
   does).
+- **`verbose`** (position 10 on `sendtoaddress`, 9 on `sendmany`) answers Core's
+  `{txid, fee_reason}`: Core's own strings where zecd prices the same way (`PayTxFee set`
+  for an explicit `fee_rate`, `Fallback fee` for the test-network floor), else the source
+  that answered (`estimatesmartfee`, or the `[fees]` tier name on kyoto) - Core's
+  estimator-horizon strings describe a computation zecd does not do.
+- **`replaceable`** (position 5 on both) is honored, not ignored: omitted or `true` keeps
+  BDK's BIP 125-signalling default (Core's `-walletrbf` default); `false` builds every input
+  with `nSequence = 0xFFFFFFFE`, locktime still enforced for anti-fee-sniping, and
+  `bip125-replaceable` reads back `"no"`.
+
+Two refusals bound every send before a signer exists, whatever priced it:
+
+- **The recipients' total** may not exceed the 21M BTC supply cap (`-3`, Core's "Invalid
+  amount"). Each amount is range-checked at the RPC boundary, but BDK sums the recipients
+  with `Amount`'s panicking `+`, so an unbounded `sendmany` total used to kill the actor.
+  Recipients are validated before the fee lookup, so a bad address costs no oracle round
+  trip and answers the same `-5` offline as online.
+- **The absolute fee** may not exceed `[fees] max_tx_fee_sat` (default 10,000,000 sat =
+  0.1 BTC, Core's `-maxtxfee` default), with Core's message and code (`-6`, as Core's
+  `SendMoney` surfaces every `CreateTransaction` failure). The rate ceiling bounds sat/vB;
+  a large consolidation at a sane rate can still carry a surprising total, and this is the
+  number the operator pays. Both backends, estimated and explicit rates alike.
 
 ## Not yet implemented
 
 Everything here is refused with a clear error rather than silently ignored or half-done:
 
-- **`walletpassphrase`** - a passphrase-encrypted bitcoin wallet cannot send yet (the seed
-  is only decrypted by the identity-file custody model at startup).
+- **`walletpassphrase`** - there is no unlock for a bitcoin wallet, so `zecd init --encrypt`
+  refuses a seed-holding one (it could never send or be rebuilt by `rescan`); the seed is
+  decrypted only by the identity-file custody model at startup. A wallet encrypted before
+  that refusal existed still starts locked and cannot send, and says so: `encrypted` and
+  `locked` on `/status`, `unlocked_until: 0` on `getwalletinfo`.
 - **Address types other than bech32** (BIP 84 is the engine's only derivation): issuance is
   bech32-only, and a restore of a seed whose history lives on BIP 44/49/86 derivations will
   not see those funds. Additional descriptor templates are the fix, once wanted.
@@ -489,6 +547,18 @@ Everything here is refused with a clear error rather than silently ignored or ha
   client of our own: `bip157` sends `relay: false` and drops transaction inventory, and its
   maintainer closed the request to expose relay (2140-dev/kyoto#220) suggesting a side-car;
   this is that side-car, on a connection of its own beside kyoto's.
+  **With snapshots on, kyoto sends wait for the mempool view** (`-4` until
+  `getwalletinfo.mempool_feed.snapshot_applied`, re-armed on every feed redial). The case
+  it exists for is a wallet started with no history - an empty datadir, a `rescan`, an
+  enclave whose rootfs is RAM: a filter client learns of its own earlier unconfirmed sends
+  only once they are mined, so their inputs look unspent and the next send could
+  double-spend them. The snapshot at connect cannot help, since its transactions were
+  matched against a wallet that did not yet hold the outputs they spend; so once that
+  wallet reaches tip it asks for a **full** snapshot (the connection forgets what it
+  already fetched and re-requests BIP 35), and only that one opens sends. A snapshot is
+  delivered only once every transaction it fetched has arrived or drawn a `notfound`, so
+  each was matched first. Without a snapshot-taking feed nothing is blocked - the actor
+  warns at start, loudly for a wallet with no history.
   **`"mempool_space"`**: the wallet holds one long-lived websocket to a
   mempool.space instance (`wss://mempool.space/api/v1/ws`, per-network paths like
   `/testnet4/api/v1/ws`, no key; `mempool_space_url` overrides it, `ws://` allowed for a
@@ -556,9 +626,10 @@ Everything here is refused with a clear error rather than silently ignored or ha
   birthday block's own time once the chain source answers, else the offline record - and
   the scan `anchor` once recorded), and `listdescriptors.timestamp` carries the same time
   as Core's rescan-from time.
-- **`derive-address`** refuses bitcoin wallets (naming what to do instead); a bitcoin
-  equivalent of offline address derivation is future work. `export-ufvk` refuses too,
-  pointing at `export-xpub`. (`rescan` covers bitcoin wallets since 2026-09-05: it deletes
+- **`derive-address`** derives BIP 84 receiving addresses offline (`btc/derive.rs`),
+  from the wallet's own public key material, `--mnemonic`, or `--xpub`; an index
+  past the wallet's `lookahead` is derived with a warning. `export-ufvk` refuses a bitcoin
+  wallet, pointing at `export-xpub`. (`rescan` covers bitcoin wallets since 2026-09-05: it deletes
   the BDK database and the kyoto cache, the next spawn rebuilds from the seed or the pinned
   xpub, and `--birthday` moves the recorded birthday first; a passphrase-encrypted bitcoin
   wallet is refused, since nothing could decrypt its seed to rebuild.)
@@ -598,10 +669,16 @@ config check` reports it rather than leaving the chain quietly shorter than it r
 `sources = ["peer_median"]` is the no-server posture outright. **Every rate from every
 source** - the caller's `fee_rate`, `estimatesmartfee`, either HTTP oracle, the kyoto
 signals - passes one shared sanity ceiling at
-the `do_send` chokepoint (`fees::enforce_sanity_ceiling`, 2000 sat/vB), so a dishonest
-feefilter or a broken oracle becomes a refusal naming the number, never a payment; the
-refusal deliberately also fires when the peers' *relay floor* exceeds the ceiling, since
-clamping below the floor would build a transaction no peer relays.
+the `do_send` chokepoint (`fees::enforce_sanity_ceiling`, 2000 sat/vB), so a dishonest signal or a
+broken oracle becomes a refusal naming the number, never a payment. The ceiling is the
+backstop; the peers' feefilter has a tighter bound of its own. `bip157` reports only the
+**maximum** filter across connected peers, so on a DNS-seeded wallet one stranger's free
+claim could otherwise price every send at the ceiling. The filter may therefore lift the
+estimate to at most the greater of 10 sat/vB and twice the (biased) block median - 10 sat/vB
+alone when no block median arrived (`kyoto.rs::combine_fee_signals`). The 10 sat/vB bound also
+keeps fee-less blocks (regtest, a quiet testnet: a zero median) from capping the relay floor to
+nothing. A send that undershoots one peer's inflated filter still propagates through any honest
+peer, which is all relay needs.
 
 Both fallback signals - the peers' BIP-133 feefilter and the tip-block average - are
 peer-supplied, which is the strongest reason to name a **trusted peer you control**

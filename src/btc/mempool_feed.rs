@@ -76,7 +76,7 @@ use bdk_wallet::bitcoin::{
 };
 use bdk_wallet::Wallet;
 use futures_util::{SinkExt as _, StreamExt as _};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn, Instrument as _};
@@ -538,9 +538,24 @@ pub enum FeedEvent {
     /// A wallet transaction the feed had reported held and that is missing here has left the
     /// node's mempool - the only eviction signal that source has, since Core never announces
     /// one. The websocket source never sends this (its `removed` deltas are explicit).
-    Snapshot(HashSet<Txid>),
+    Snapshot(FeedSnapshot),
     /// The socket is gone; the task is already backing off toward a redial.
     Disconnected(String),
+}
+
+/// One BIP 35 snapshot, delivered only once every transaction it had to fetch has arrived
+/// (or was reported gone), so each of them reached the actor as a delta first.
+#[derive(Debug)]
+pub struct FeedSnapshot {
+    /// Every txid the node listed.
+    pub held: HashSet<Txid>,
+    /// Whether every one of them was fetched in full on this request - a snapshot at
+    /// connect, or one [`MempoolFeed::request_full_snapshot`] asked for - as opposed to a
+    /// periodic one, which skips what the connection already delivered.
+    pub full: bool,
+    /// When it was requested. A full snapshot matched against the wallet only counts as a
+    /// complete view of the mempool if the wallet was itself complete (at tip) by then.
+    pub requested_at: std::time::Instant,
 }
 
 /// A running feed: the channel the socket task feeds, and the task itself, which dies with
@@ -551,6 +566,9 @@ pub struct MempoolFeed {
     pub endpoint: String,
     rx: mpsc::Receiver<FeedEvent>,
     task: JoinHandle<()>,
+    /// Bumped to ask the P2P source for a full snapshot (see
+    /// [`Self::request_full_snapshot`]); the websocket source ignores it.
+    refetch: watch::Sender<u64>,
 }
 
 impl MempoolFeed {
@@ -559,6 +577,7 @@ impl MempoolFeed {
     /// or awaits [`Self::next`].
     pub fn start(target: FeedTarget, reconnect_base: Duration, reconnect_max: Duration) -> Self {
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_BOUND);
+        let (refetch, mut refetch_rx) = watch::channel(0u64);
         let source = target.source();
         let endpoint = target.describe();
         let dial = endpoint.clone();
@@ -575,7 +594,16 @@ impl MempoolFeed {
                             peer,
                             network,
                             snapshot,
-                        } => super::p2p_feed::run_peer(*peer, *network, *snapshot, &tx).await,
+                        } => {
+                            super::p2p_feed::run_peer(
+                                *peer,
+                                *network,
+                                *snapshot,
+                                &tx,
+                                &mut refetch_rx,
+                            )
+                            .await
+                        }
                     };
                     if tx.is_closed() {
                         break;
@@ -612,7 +640,18 @@ impl MempoolFeed {
             endpoint,
             rx,
             task,
+            refetch,
         }
+    }
+
+    /// Ask the P2P source to refetch the node's whole mempool: forget which transactions
+    /// this connection already delivered and request a BIP 35 snapshot, so every
+    /// transaction the node holds arrives as a delta again. The actor asks once a wallet
+    /// built from an empty datadir reaches tip, when matching them can finally see which
+    /// ones spend its outputs. A no-op for the websocket source and for a P2P feed without
+    /// `p2p_snapshot`.
+    pub fn request_full_snapshot(&self) {
+        self.refetch.send_modify(|n| *n += 1);
     }
 
     /// The next event without waiting; `None` when there is none queued.
@@ -1276,6 +1315,8 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
+        // The connect snapshot fetched everything (nothing was known on a new connection).
+        assert!(snapshot.as_ref().unwrap().full);
         let mut got: Vec<Txid> = deltas
             .iter()
             .map(|d| d.added[0].tx.compute_txid())
@@ -1285,7 +1326,7 @@ mod tests {
         want.sort();
         assert_eq!(got, want);
         assert!(deltas.iter().all(|d| d.added[0].prevouts == vec![None]));
-        let snapshot = snapshot.unwrap();
+        let snapshot = snapshot.unwrap().held;
         assert!(snapshot.contains(&a_id));
         assert!(snapshot.contains(&stale));
         // The node closed: a disconnect, then the redial connects again (a redial that

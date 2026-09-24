@@ -20,6 +20,13 @@
 //!    case only a snapshot can settle: the node no longer lists it, the actor queues the
 //!    eviction, the next scan tip retires it, and the unconfirmed balance returns to zero
 //!    while the confirmed balance stands.
+//! 5. **Restarted from an empty datadir**, the wallet must still see its own unconfirmed send
+//!    from before: a light client learns of it only once it is mined, so until then its
+//!    inputs would look unspent and the next send could double-spend them. Sends wait
+//!    (`-4`) until `mempool_feed.snapshot_applied`; once the rebuilt wallet reaches tip it
+//!    asks for a full snapshot, the node's whole mempool is refetched and matched against a
+//!    wallet that now holds the spent outputs, and the earlier send is back at 0-conf - so
+//!    a second send finds only its change (`-6`) instead of reselecting its inputs.
 //!
 //! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
@@ -337,4 +344,66 @@ async fn btc_p2p_mempool_feed_gives_the_kyoto_wallet_zero_conf() {
     assert_eq!(feed["state"], json!("connected"), "{feed}");
     assert!(feed["matched"].as_u64() >= Some(3), "{feed}");
     assert_eq!(feed["dropped"], json!(0), "{feed}");
+
+    // 5. A send, then a restart from an empty datadir while it is still unconfirmed.
+    zecd.wait_wallet(
+        "btc",
+        "getwalletinfo",
+        json!([]),
+        "the mempool view is established",
+        |v| v["mempool_feed"]["snapshot_applied"] == json!(true),
+    )
+    .await;
+    // 0.6 needs both confirmed outputs (0.5 and 0.3), leaving only its change behind.
+    let spent = zecd
+        .call(
+            "sendtoaddress",
+            json!([miner_addr, 0.6, null, null, false, null, null, null, null, 5]),
+        )
+        .await
+        .expect("a send spending both confirmed outputs");
+    let spent = spent.as_str().expect("a txid").to_string();
+    node.wait_mempool_contains(&spent).await;
+    zecd.stop();
+    std::fs::remove_dir_all(dir.path().join("zecddata").join("btc").join("btc"))
+        .expect("wipe the wallet's engine state (keys.toml stays)");
+    zecd.start().await;
+    // Sends wait for the rebuilt view (whatever else refuses them first, it is -4).
+    let (code, msg) = zecd
+        .call(
+            "sendtoaddress",
+            json!([miner_addr, 0.1, null, null, false, null, null, null, null, 5]),
+        )
+        .await
+        .expect_err("no send before the mempool view is rebuilt");
+    assert_eq!(code, -4, "{msg}");
+    zecd.wait_height(height).await;
+    zecd.wait_wallet(
+        "btc",
+        "getwalletinfo",
+        json!([]),
+        "the mempool view is rebuilt after the empty-datadir restart",
+        |v| v["mempool_feed"]["snapshot_applied"] == json!(true),
+    )
+    .await;
+    let tx = zecd
+        .call("gettransaction", json!([spent]))
+        .await
+        .expect("the pre-restart send is a wallet transaction again");
+    assert_eq!(tx["confirmations"], json!(0), "{tx}");
+    let (code, msg) = zecd
+        .call(
+            "sendtoaddress",
+            json!([miner_addr, 0.3, null, null, false, null, null, null, null, 5]),
+        )
+        .await
+        .expect_err("the earlier send's inputs are not reselected");
+    assert_eq!(code, -6, "{msg}");
+    node.mine(1).await;
+    zecd.wait_height(height + 1).await;
+    let tx = zecd
+        .call("gettransaction", json!([spent]))
+        .await
+        .expect("the send confirmed");
+    assert_eq!(tx["confirmations"], json!(1), "{tx}");
 }

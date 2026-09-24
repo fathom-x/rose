@@ -188,6 +188,7 @@ pub fn render(config: &AppConfig) -> String {
             .map(|source| source.as_str().to_string())
             .collect();
         kv(&mut s, "sources", list_val(&sources));
+        kv(&mut s, "max_tx_fee_sat", config.fees.max_tx_fee_sat);
         for (key, source, configured) in [
             (
                 "mempool_space_url",

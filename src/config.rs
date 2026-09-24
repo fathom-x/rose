@@ -768,8 +768,13 @@ impl FeeSource {
     }
 }
 
+/// Default for `[fees] max_tx_fee_sat`: 0.1 BTC, Bitcoin Core's `DEFAULT_TRANSACTION_MAXFEE`.
+#[cfg(feature = "bitcoin")]
+pub const DEFAULT_MAX_TX_FEE_SAT: u64 = 10_000_000;
+
 /// `[fees]` - the kyoto backend's fee-oracle chain: which sources to ask, in what order, and
-/// (optionally) at which endpoints instead of the built-in public ones.
+/// (optionally) at which endpoints instead of the built-in public ones. Also the absolute
+/// fee cap every Bitcoin send honors, on both backends.
 ///
 /// The overrides are the answer to the privacy cost the chain otherwise carries: pointed at a
 /// self-hosted mempool.space or Esplora instance, the fee lookup goes to infrastructure the
@@ -791,6 +796,11 @@ pub struct FeesConfig {
     pub mempool_space_url: Option<String>,
     /// Full URL for the [`FeeSource::Esplora`] tier, same rule.
     pub esplora_url: Option<String>,
+    /// The largest absolute fee, in satoshis, any send may pay - Bitcoin Core's `-maxtxfee`,
+    /// with its default ([`DEFAULT_MAX_TX_FEE_SAT`]). Applies on both backends and to an
+    /// explicit `fee_rate` as much as an estimated one: the rate ceiling bounds sat/vB, and
+    /// a large consolidation at a sane rate can still carry a surprising total.
+    pub max_tx_fee_sat: u64,
 }
 
 #[cfg(feature = "bitcoin")]
@@ -800,6 +810,7 @@ impl Default for FeesConfig {
             sources: DEFAULT_FEE_SOURCES.to_vec(),
             mempool_space_url: None,
             esplora_url: None,
+            max_tx_fee_sat: DEFAULT_MAX_TX_FEE_SAT,
         }
     }
 }
@@ -1424,6 +1435,7 @@ struct FeesFile {
     sources: Option<Vec<String>>,
     mempool_space_url: Option<String>,
     esplora_url: Option<String>,
+    max_tx_fee_sat: Option<u64>,
 }
 
 #[cfg(feature = "bitcoin")]
@@ -1861,6 +1873,15 @@ pub struct DeriveAddressArgs {
     /// the wallet's `keys.toml`. Addresses are the same either way - only spending needs a seed.
     #[arg(long, value_name = "UFVK", conflicts_with_all = ["mnemonic", "mnemonic_file"])]
     pub ufvk: Option<String>,
+
+    /// Bitcoin wallets: derive from this account xpub (the `[fingerprint/84'/coin'/0']xpub...`
+    /// form `export-xpub` prints, or a bare xpub) instead of a mnemonic or the wallet itself.
+    #[arg(
+        long,
+        value_name = "XPUB",
+        conflicts_with_all = ["mnemonic", "mnemonic_file", "ufvk"]
+    )]
+    pub xpub: Option<String>,
 
     /// Which receivers to derive, in `getnewaddress`'s `address_type` syntax: `unified`
     /// (alias `default`) for the wallet's configured receivers, `transparent` for a bare
@@ -2411,10 +2432,21 @@ impl AppConfig {
                     crate::btc::fees::validate_endpoint_override(key, url)?;
                 }
             }
+            // Zero would refuse every send; Core refuses a zero -maxtxfee too. Beyond that the
+            // cap is the operator's to set - there is no upper bound, since "no cap" is just a
+            // large number.
+            let max_tx_fee_sat = fees_file.max_tx_fee_sat.unwrap_or(DEFAULT_MAX_TX_FEE_SAT);
+            if max_tx_fee_sat == 0 {
+                anyhow::bail!(
+                    "[fees] max_tx_fee_sat must be greater than 0 (it caps every send's \
+                     absolute fee; the default is {DEFAULT_MAX_TX_FEE_SAT} sat, 0.1 BTC)"
+                );
+            }
             FeesConfig {
                 sources,
                 mempool_space_url,
                 esplora_url,
+                max_tx_fee_sat,
             }
         };
 
@@ -4440,6 +4472,36 @@ mod tests {
         // Set but unnamed in `sources`: kept as configured (resolve records, it does not
         // second-guess), and simply never asked.
         assert!(cfg.fees.mempool_space_url.is_some());
+    }
+
+    #[cfg(all(feature = "cli", feature = "bitcoin"))]
+    #[test]
+    fn the_absolute_fee_cap_defaults_to_cores_and_refuses_zero() {
+        use clap::Parser as _;
+        let cli = Cli::parse_from(["zecd"]);
+        assert_eq!(
+            AppConfig::resolve(&cli).unwrap().fees.max_tx_fee_sat,
+            DEFAULT_MAX_TX_FEE_SAT
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        let resolve = |body: &str| {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            AppConfig::resolve(&cli)
+        };
+        assert_eq!(
+            resolve("[fees]\nmax_tx_fee_sat = 250000\n")
+                .unwrap()
+                .fees
+                .max_tx_fee_sat,
+            250_000
+        );
+        let err = resolve("[fees]\nmax_tx_fee_sat = 0\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_tx_fee_sat"), "{err}");
     }
 
     #[cfg(all(feature = "cli", feature = "bitcoin"))]

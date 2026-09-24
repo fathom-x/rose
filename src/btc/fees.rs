@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
 use bdk_wallet::bitcoin::FeeRate;
-use http_body_util::BodyExt as _;
+use http_body_util::{BodyExt as _, Limited};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tracing::debug;
@@ -319,14 +319,22 @@ async fn fetch(url: &str) -> anyhow::Result<Vec<u8>> {
     if !status.is_success() {
         return Err(anyhow!("{url} answered {status}"));
     }
-    let body = response
-        .into_body()
+    // Bounded by size, not only by the tier's timeout: a timeout bounds the body by
+    // bandwidth alone, and an answer is a few hundred bytes (Esplora's whole target table
+    // is about one KiB), so anything past the cap is not a fee estimate worth parsing.
+    let body = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
         .collect()
         .await
-        .with_context(|| format!("read the body of {url}"))?
+        .map_err(|e| anyhow!("read the body of {url}: {e}"))?
         .to_bytes();
     Ok(body.to_vec())
 }
+
+/// The largest fee-oracle response [`fetch`] reads. Generous against every known answer
+/// shape (mempool.space's recommended-fees object is ~100 bytes, Esplora's
+/// `/fee-estimates` table ~1 KiB) and small enough that a hostile or broken endpoint
+/// cannot make a send buffer megabytes.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -523,6 +531,16 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        // An answer past the body cap is refused while it is read, not parsed after being
+        // buffered whole - even one that would have parsed (a valid object padded with
+        // whitespace, which JSON ignores).
+        let padded = format!(
+            r#"{{"fastestFee":12,"halfHourFee":10,"hourFee":7{}}}"#,
+            " ".repeat(MAX_RESPONSE_BYTES)
+        );
+        let url = serve(200, Box::leak(padded.into_boxed_str())).await;
+        assert!(http_fee_rate(FeeSource::MempoolSpace, &url).await.is_err());
     }
 
     /// The one thing the offline tests cannot check: that each parser still matches what its

@@ -21,7 +21,9 @@
 //!
 //! Deleting the withdrawal in the rejection arm fails step 1; relaying before committing,
 //! or dropping the record on a transport failure, fails step 2; gating the resubmission on
-//! the raw graph rather than the canonical view fails step 3.
+//! the raw graph rather than the canonical view fails step 3. Step 3 also pins that a
+//! `sendrawtransaction` whose bytes reached no node answers `-25` rather than a txid (Core
+//! never returns one without mempool acceptance), while still re-recording the transaction.
 
 use serde_json::json;
 use zecd_regtest_harness::btc::{provisioned, BitcoinD, RpcProxy, ZecdBtc};
@@ -30,6 +32,33 @@ use zecd_regtest_harness::btc::{provisioned, BitcoinD, RpcProxy, ZecdBtc};
 /// (sat/vB), which keeps every send off the estimator and prices it exactly.
 fn send_params(to: &str, amount: f64, fee_rate: u32) -> serde_json::Value {
     json!([to, amount, null, null, false, null, null, null, null, fee_rate])
+}
+
+/// Call `method`, retrying while the wallet answers "no connection to the upstream". A
+/// broadcast with no verdict drops the bitcoind connection for a redial (the transport may
+/// be the problem), and while the proxy keeps dropping `sendrawtransaction` every redial's
+/// rebroadcast pass fails the same way and drops it again - so the wallet flaps between
+/// connected and not, and a call that needs the node lands in a connected window only
+/// sometimes. The refusal comes before coin selection, so it says nothing about what the
+/// test asserts; any other answer is returned for the caller to check.
+async fn call_when_connected(
+    zecd: &ZecdBtc,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, (i64, String)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match zecd.call(method, params.clone()).await {
+            Err((-4, msg)) if msg.contains("no connection to the upstream") => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{method}: the wallet never had its upstream connected: {msg}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -122,8 +151,7 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
         .await
         .expect("the unrelayed send is a wallet transaction");
     assert_eq!(tx["confirmations"], json!(0), "{tx}");
-    let (code, msg) = zecd
-        .call("sendtoaddress", send_params(&miner, 0.95, 10))
+    let (code, msg) = call_when_connected(&zecd, "sendtoaddress", send_params(&miner, 0.95, 10))
         .await
         .expect_err("the unrelayed send's input is locked against a retry");
     assert_eq!(code, -6, "{msg}");
@@ -179,9 +207,18 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
         .as_f64()
         .unwrap();
     assert_eq!(after_abandon, after_send, "abandoning released the input");
+    // Still no path to the node: sendrawtransaction does not answer a txid for bytes that
+    // reached no mempool (Core never does) - it is -25, and the record is re-committed all
+    // the same, so the input stays spent here while the rebroadcast pass carries it.
+    let (code, msg) = call_when_connected(&zecd, "sendrawtransaction", json!([hex]))
+        .await
+        .expect_err("an unrelayed sendrawtransaction is not a success");
+    assert_eq!(code, -25, "{msg}");
+    zecd.call("gettransaction", json!([txid2]))
+        .await
+        .expect("the unrelayed resubmission is recorded again");
     proxy.drop_method(None);
-    let relayed = zecd
-        .call("sendrawtransaction", json!([hex]))
+    let relayed = call_when_connected(&zecd, "sendrawtransaction", json!([hex]))
         .await
         .expect("resubmit the abandoned send's bytes");
     assert_eq!(relayed, json!(txid2));

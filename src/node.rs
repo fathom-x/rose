@@ -707,6 +707,7 @@ fn spawn_bitcoin_wallet(
         network: entry.bitcoin_network(),
         seed,
         wallet_holds_seed: store.has_seed(),
+        encrypted: store.has_seed() && store.is_encrypted(),
         imported_keys,
         endpoint: Some(endpoint),
         fees: config.fees.clone(),

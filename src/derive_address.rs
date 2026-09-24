@@ -228,6 +228,13 @@ pub fn run(config: &AppConfig, args: &DeriveAddressArgs) -> anyhow::Result<()> {
     if args.count == 0 {
         bail!("--count must be at least 1");
     }
+    if args.xpub.is_some() {
+        bail!(
+            "--xpub takes a Bitcoin account key, and this is a Zcash wallet; derive from its \
+             viewing key with --ufvk (as `zecd export-ufvk` prints), from --mnemonic, or from \
+             the wallet's keys.toml"
+        );
+    }
     // Resolve the key input up front - the mnemonic prompt is the shell's interactive I/O, so
     // it happens here and never inside `derive`.
     let key = if let Some(encoded) = &args.ufvk {
@@ -278,8 +285,8 @@ pub fn derive(config: &AppConfig, opts: DeriveOptions<'_>) -> anyhow::Result<Der
     #[cfg(feature = "bitcoin")]
     if entry.coin == crate::coin::Coin::Bitcoin {
         bail!(
-            "wallet '{}' is a Bitcoin wallet; `zecd derive-address` derives Zcash addresses \
-             (offline Bitcoin address derivation is not supported yet)",
+            "wallet '{}' is a Bitcoin wallet; this is the Zcash derivation (the CLI routes a \
+             Bitcoin wallet to `btc::derive`, which library callers use directly)",
             wallet
         );
     }

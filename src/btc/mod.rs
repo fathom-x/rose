@@ -28,6 +28,7 @@ pub mod ancestors;
 pub mod birthdays;
 pub mod chain;
 pub mod derive;
+pub mod fee_samples;
 pub mod fees;
 pub mod keys;
 pub mod kyoto;

@@ -70,7 +70,8 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _};
 use bdk_kyoto::bip157::{AddrV2, ServiceFlags};
@@ -83,6 +84,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::btc::fee_samples::{BlockSample, FeeSamples};
 use crate::coin::BitcoinNetwork;
 use crate::init::{HeightSearch, BIRTHDAY_DATE_MARGIN_SECS};
 
@@ -725,6 +727,7 @@ impl KyotoEndpoint {
             runtime: Some(runtime),
             birthday_time,
             tree_start,
+            fee_sampler: None,
         })
     }
 
@@ -1056,6 +1059,8 @@ pub struct KyotoConn {
     /// The height the header tree is anchored at (see [`KyotoEndpoint::scan_plan`]): what
     /// a later resolution on this connection can and cannot reach.
     tree_start: u32,
+    /// The background fee sampler, once an estimate armed it ([`Self::arm_fee_sampler`]).
+    fee_sampler: Option<JoinHandle<()>>,
 }
 
 impl KyotoConn {
@@ -1103,6 +1108,47 @@ impl KyotoConn {
     /// costs nothing.
     pub fn requester(&self) -> Requester {
         self.requester.clone()
+    }
+
+    /// Start the background fee sampler if it is not running: it keeps the last
+    /// [`crate::btc::fee_samples::CAPACITY`] blocks' samples in `samples`, one download per
+    /// new block, so an estimate reads the ring instead of fetching blocks on the send path.
+    /// The actor arms it on every estimate; it stops by itself [`FEE_SAMPLER_IDLE`] after
+    /// the last one, and with the connection.
+    pub fn arm_fee_sampler(&mut self, samples: SharedFeeSamples, network: BitcoinNetwork) {
+        // Arming is a use: the task's first idle check must not find the ring unread and
+        // exit before the estimate that armed it gets to mark it.
+        lock(&samples).mark_used(Instant::now());
+        if self
+            .fee_sampler
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        let requester = self.requester.clone();
+        self.fee_sampler = Some(runtime.spawn(async move {
+            debug!("fee sampler started");
+            loop {
+                let idle = lock(&samples)
+                    .last_used()
+                    .is_none_or(|used| used.elapsed() > FEE_SAMPLER_IDLE);
+                if idle {
+                    debug!("fee sampler stopped: no estimate for a day");
+                    return;
+                }
+                let depth = crate::btc::fee_samples::CAPACITY as u32;
+                if let Err(e) =
+                    refresh_fee_samples(&requester, &samples, network, depth, false).await
+                {
+                    debug!("fee sampler pass failed ({e:#}); retrying");
+                }
+                tokio::time::sleep(FEE_SAMPLER_POLL).await;
+            }
+        }));
     }
 
     /// Resolve the birthday anchor again against the node's headers - the actor's move
@@ -1247,103 +1293,101 @@ pub async fn tip_height(requester: Requester) -> anyhow::Result<u32> {
     Ok(tip.height)
 }
 
-/// How many recent blocks feed the fee median. Five blunts a single outlier block (the
-/// upstream's own caveat: averages are skewed by outliers, and one high-fee or empty block
-/// should not set the price) while capping the worst case at five concurrent block
-/// downloads, all bounded together by [`FEE_BLOCK_TIMEOUT`].
-const FEE_MEDIAN_BLOCKS: u32 = 5;
+/// How many recent blocks the estimate path makes sure the ring holds before it answers
+/// (see [`estimate_fee_rate`]): with the background sampler running these are already
+/// there, and on a cold start they are the only blocks a send waits for - five concurrent
+/// downloads, bounded together by [`FEE_BLOCK_TIMEOUT`].
+const FEE_FRESH_BLOCKS: u32 = 5;
 
-/// Upward bias, in percent, applied to the block-derived median. A block average is
-/// backward-looking and lags a rising market, so a slight overbid keeps a send from
-/// sitting unconfirmed in the first place - 20% of a sane fee is cheap insurance, and
-/// cheaper than the `bumpfee` that would otherwise follow.
-const MARKET_LAG_BIAS_PERCENT: u64 = 20;
+/// How often the background fee sampler looks for new blocks. Reading the tip is local to
+/// the light client; only a new block costs a download.
+const FEE_SAMPLER_POLL: Duration = Duration::from_secs(30);
 
-/// How far the peers' BIP-133 feefilter may lift the estimate above the (biased) block
-/// median: a multiple of it. An honest node's mempool minimum sits *below* what blocks
+/// How long the background fee sampler keeps running after the last estimate. A wallet that
+/// never prices a send (the view-only product) never starts it, and one that stops sending
+/// stops paying a block download every ten minutes a day later.
+const FEE_SAMPLER_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How far above the recent blocks an HTTP fee oracle may price a send before it is
+/// disbelieved: a multiple of the highest block average in the ring (see
+/// [`oracle_ceiling`]).
+const ORACLE_PLAUSIBLE_MULTIPLE: u64 = 4;
+
+/// The block-sample ring, shared between the actor (which keeps it across reconnects), the
+/// estimate path and the background sampler. Locked only between awaits.
+pub type SharedFeeSamples = Arc<Mutex<FeeSamples>>;
+
+/// How far the peers' BIP-133 feefilter may lift the estimate above the block-derived
+/// one: a multiple of it. An honest node's mempool minimum sits *below* what blocks
 /// are paying - blocks take the top of the mempool, the filter reflects its bottom - so
 /// twice the median leaves every honest filter room while bounding what one stranger's
 /// claim can cost.
 const FEEFILTER_MEDIAN_MULTIPLE: u64 = 2;
 
 /// How far the feefilter is honored without corroboration, in sat/vB: always up to here,
-/// whatever the blocks say, and alone when no block median arrived. Without corroboration
+/// whatever the blocks say, and alone when no block estimate arrived. Without corroboration
 /// the filter is nothing but a peer's word; an honest one sits at the 1 sat/vB relay floor
 /// except while mempools are full, and a full mempool is exactly when blocks are there to
-/// be read. It is also what keeps a zero median - fee-less blocks, the norm on regtest and
-/// a quiet testnet - from capping the relay floor to nothing and building an unrelayable
-/// zero-fee transaction.
+/// be read. It is also what keeps a floor-priced estimate - an idle market, the norm on
+/// regtest and a quiet testnet - from capping a busier peer's filter below what it relays.
 const FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB: u32 = 10;
 
 /// A fee rate for a send, from the only signals a filter-based light client has.
 ///
-/// **This is not `estimatesmartfee` and does not predict confirmation time.** It is the
+/// **This is not `estimatesmartfee`**, though it takes a confirmation target. It is the
 /// greater of:
 ///
-///  * the **median** of the last [`FEE_MEDIAN_BLOCKS`] blocks' average fee rates (each
-///    derived from the coinbase as `(output - subsidy) / weight`), biased up by
-///    [`MARKET_LAG_BIAS_PERCENT`]. The averages are anchored to header-committed data - a
+///  * the **block-derived estimate** ([`crate::btc::fee_samples`]): a recency-weighted
+///    quantile of recent blocks' average fee rates, one quantile per target, blended toward
+///    the relay floor unless recent blocks were full. The averages come from each block's
+///    coinbase (`(output - subsidy) / weight`) and are anchored to header-committed data - a
 ///    coinbase rides the merkle root of a PoW-validated header - so unlike the feefilter a
-///    peer cannot inflate one without mining, and the median blunts the single-block
-///    outliers the upstream warns about; and
+///    peer cannot inflate one without mining; and
 ///  * the BIP-133 fee filter, the floor for the transaction to propagate - **capped**, see
 ///    [`combine_fee_signals`]. `bip157` reports only the *maximum* filter across connected
 ///    peers, so on a DNS-seeded wallet it is one stranger's free, unverifiable claim: left
 ///    uncapped, a single peer advertising a huge filter priced the next send at the 2000
 ///    sat/vB sanity ceiling. Capped, it can lift the estimate to at most the greater of
 ///    [`FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB`] and [`FEEFILTER_MEDIAN_MULTIPLE`] times the
-///    median; a send that then undershoots that one peer's filter still propagates through
-///    any honest peer, which is all relay needs.
+///    estimate; a send that then undershoots that one peer's filter still propagates
+///    through any honest peer, which is all relay needs.
+///
+/// The samples come from `samples`, which the background sampler keeps warm; this call
+/// only fetches the last [`FEE_FRESH_BLOCKS`] blocks the ring lacks (all of them on a cold
+/// start, none once warm) and checks the rest against the header chain.
 ///
 /// `do_send` still passes the result through `fees::enforce_sanity_ceiling`; that ceiling
-/// is now the backstop rather than the bound.
-pub async fn estimate_fee_rate(requester: Requester) -> anyhow::Result<Option<FeeRate>> {
-    let tip = requester
-        .chain_tip()
-        .await
-        .map_err(|e| anyhow!("kyoto chain tip: {e}"))?;
+/// is the backstop rather than the bound.
+pub async fn estimate_fee_rate(
+    requester: Requester,
+    samples: SharedFeeSamples,
+    network: BitcoinNetwork,
+    target: u16,
+) -> anyhow::Result<Option<FeeRate>> {
+    lock(&samples).mark_used(Instant::now());
     let floor = requester
         .broadcast_min_feerate()
         .await
         .map_err(|e| anyhow!("kyoto broadcast fee filter: {e}"))?;
-    // Each average needs a *block* off the network, and the request carries no deadline of
-    // its own - so the fetches run concurrently, each under its own FEE_BLOCK_TIMEOUT (the
-    // batch's wall clock is one timeout, not five), and the median is taken over whatever
-    // arrived. The relay floor alone is a usable answer, so a quiet network degrades to it
-    // rather than hanging or failing the send.
-    let mut fetches = tokio::task::JoinSet::new();
-    let first = tip.height.saturating_sub(FEE_MEDIAN_BLOCKS - 1);
-    for height in first..=tip.height {
-        let requester = requester.clone();
-        fetches.spawn(async move {
-            tokio::time::timeout(FEE_BLOCK_TIMEOUT, async {
-                let header = requester.get_header(height).await.ok().flatten()?;
-                requester
-                    .average_fee_rate(header.header.block_hash())
-                    .await
-                    .ok()
-            })
-            .await
-            .ok()
-            .flatten()
-        });
-    }
-    let mut averages = Vec::new();
-    while let Some(joined) = fetches.join_next().await {
-        if let Ok(Some(rate)) = joined {
-            averages.push(rate);
-        }
-    }
-    let median = median_fee_rate(&mut averages).map(bias_for_market_lag);
-    if median.is_none() {
-        warn!(
-            "no peer served any of the last {FEE_MEDIAN_BLOCKS} blocks for a fee median \
+    let tip = refresh_fee_samples(&requester, &samples, network, FEE_FRESH_BLOCKS, true).await?;
+    let estimate = lock(&samples).estimate(tip, target);
+    match &estimate {
+        Some(e) => debug!(
+            target_blocks = target,
+            samples = e.samples,
+            congestion_percent = e.congestion_percent,
+            quantile_sat_per_kwu = e.quantile.to_sat_per_kwu(),
+            estimate_sat_per_kwu = e.rate.to_sat_per_kwu(),
+            "block-derived fee estimate"
+        ),
+        None => warn!(
+            "no peer served any of the last {FEE_FRESH_BLOCKS} blocks for a fee estimate \
              within {}s; falling back to the peers' relay floor alone (capped at \
              {FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB} sat/vB)",
             FEE_BLOCK_TIMEOUT.as_secs()
-        );
+        ),
     }
-    let (rate, capped) = combine_fee_signals(median, floor);
+    let (rate, capped) = combine_fee_signals(estimate.map(|e| e.rate), floor);
     if capped {
         warn!(
             feefilter_sat_per_kwu = floor.to_sat_per_kwu(),
@@ -1355,10 +1399,163 @@ pub async fn estimate_fee_rate(requester: Requester) -> anyhow::Result<Option<Fe
     Ok(Some(rate))
 }
 
-/// Combine the (biased) block median and the peers' maximum feefilter into the send's
+/// The most an HTTP fee oracle may answer before the wallet disbelieves it: the greater of
+/// [`ORACLE_PLAUSIBLE_MULTIPLE`] times the highest average fee rate among the ring's recent
+/// blocks and [`FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB`] (below which any answer passes,
+/// as a quiet chain's near-zero averages would otherwise refuse a sane oracle). `None` when
+/// no block could be read: then the sanity ceiling is the only bound, as before.
+///
+/// An oracle sees the mempool and the ring sees only blocks, so the check is deliberately
+/// loose: it catches an oracle that is broken or hostile - one that would price a send at
+/// many times what any recent block paid - not one that is a little ahead of the chain.
+pub async fn oracle_ceiling(
+    requester: Requester,
+    samples: SharedFeeSamples,
+    network: BitcoinNetwork,
+) -> anyhow::Result<Option<FeeRate>> {
+    lock(&samples).mark_used(Instant::now());
+    let tip = refresh_fee_samples(&requester, &samples, network, FEE_FRESH_BLOCKS, true).await?;
+    let highest = lock(&samples).highest_recent(tip);
+    Ok(highest.map(|rate| {
+        FeeRate::from_sat_per_kwu(
+            rate.to_sat_per_kwu()
+                .saturating_mul(ORACLE_PLAUSIBLE_MULTIPLE),
+        )
+        .max(FeeRate::from_sat_per_vb_u32(
+            FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB,
+        ))
+    }))
+}
+
+/// Bring the ring up to date with the header chain, answering the tip height: drop samples
+/// above the tip or whose block a reorg replaced (a header lookup is local), then fetch the
+/// blocks it lacks among the last `depth` - concurrently for the estimate path, whose wall
+/// clock is one [`FEE_BLOCK_TIMEOUT`], one at a time for the background sampler.
+async fn refresh_fee_samples(
+    requester: &Requester,
+    samples: &SharedFeeSamples,
+    network: BitcoinNetwork,
+    depth: u32,
+    concurrent: bool,
+) -> anyhow::Result<u32> {
+    let tip = requester
+        .chain_tip()
+        .await
+        .map_err(|e| anyhow!("kyoto chain tip: {e}"))?
+        .height;
+    let held = {
+        let mut ring = lock(samples);
+        ring.truncate_above(tip);
+        ring.heights()
+    };
+    for height in held {
+        let current = requester.get_header(height).await.ok().flatten();
+        let mut ring = lock(samples);
+        let stale = match (current, ring.get(height)) {
+            (Some(header), Some(sample)) => header.header.block_hash() != sample.hash,
+            (None, Some(_)) => true,
+            (_, None) => false,
+        };
+        if stale {
+            debug!(
+                height,
+                "a reorg replaced a fee-sample block; dropping its sample"
+            );
+            ring.remove(height);
+        }
+    }
+    let missing = lock(samples).missing(tip, depth);
+    if concurrent {
+        let mut fetches = tokio::task::JoinSet::new();
+        for height in missing {
+            let requester = requester.clone();
+            fetches.spawn(async move { fetch_block_sample(&requester, network, height).await });
+        }
+        while let Some(joined) = fetches.join_next().await {
+            if let Ok(Some((height, sample))) = joined {
+                lock(samples).insert(height, sample);
+            }
+        }
+    } else {
+        for height in missing {
+            if let Some((height, sample)) = fetch_block_sample(requester, network, height).await {
+                lock(samples).insert(height, sample);
+            }
+        }
+    }
+    Ok(tip)
+}
+
+/// One block's fee sample, fetched under [`FEE_BLOCK_TIMEOUT`]; `None` when no peer served
+/// it in time.
+async fn fetch_block_sample(
+    requester: &Requester,
+    network: BitcoinNetwork,
+    height: u32,
+) -> Option<(u32, BlockSample)> {
+    tokio::time::timeout(FEE_BLOCK_TIMEOUT, async {
+        let header = requester.get_header(height).await.ok().flatten()?;
+        let hash = header.header.block_hash();
+        let indexed = requester.get_block(hash).await.ok()?;
+        Some((height, block_sample(&indexed.block, hash, height, network)))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// A block's average fee rate and weight. The fee is the coinbase's claim above the
+/// subsidy - what `bip157`'s `average_fee_rate` computes, but on this network's halving
+/// schedule (regtest halves every 150 blocks, and the mainnet schedule there reads every
+/// block past 150 as fee-less at best).
+fn block_sample(
+    block: &bdk_wallet::bitcoin::Block,
+    hash: BlockHash,
+    height: u32,
+    network: BitcoinNetwork,
+) -> BlockSample {
+    let weight_wu = block.weight().to_wu();
+    let revenue: u64 = block
+        .txdata
+        .first()
+        .map(|coinbase| coinbase.output.iter().map(|o| o.value.to_sat()).sum())
+        .unwrap_or(0);
+    let fees = revenue.saturating_sub(block_subsidy_sat(height, network));
+    BlockSample {
+        hash,
+        fee_rate_sat_per_kwu: (fees.saturating_mul(1_000))
+            .checked_div(weight_wu)
+            .unwrap_or(0),
+        weight_wu,
+    }
+}
+
+/// The block subsidy at `height`: 50 BTC halved every 210,000 blocks (150 on regtest).
+fn block_subsidy_sat(height: u32, network: BitcoinNetwork) -> u64 {
+    let interval = match network {
+        BitcoinNetwork::Regtest => 150,
+        _ => 210_000,
+    };
+    let halvings = height / interval;
+    if halvings >= 64 {
+        0
+    } else {
+        (50 * 100_000_000u64) >> halvings
+    }
+}
+
+/// The ring's lock. A poisoned lock means a panic mid-update of plain data; the samples are
+/// still samples, so carry on with them.
+fn lock(samples: &SharedFeeSamples) -> std::sync::MutexGuard<'_, FeeSamples> {
+    samples
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Combine the block-derived estimate and the peers' maximum feefilter into the send's
 /// rate: the greater of the two, with the filter's contribution capped at the greater of
 /// [`FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB`] and [`FEEFILTER_MEDIAN_MULTIPLE`] times the
-/// median (the former alone when no median arrived). The flag reports whether the cap bit,
+/// estimate (the former alone when no estimate arrived). The flag reports whether the cap bit,
 /// for the caller's WARN.
 fn combine_fee_signals(median: Option<FeeRate>, feefilter: FeeRate) -> (FeeRate, bool) {
     let uncorroborated = FeeRate::from_sat_per_vb_u32(FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB);
@@ -1376,23 +1573,6 @@ fn combine_fee_signals(median: Option<FeeRate>, feefilter: FeeRate) -> (FeeRate,
     (rate, feefilter > cap)
 }
 
-/// The median of the collected block averages, or `None` when nothing arrived. Sorts in
-/// place; an even count takes the upper-middle element, erring high like the bias does.
-fn median_fee_rate(averages: &mut [FeeRate]) -> Option<FeeRate> {
-    if averages.is_empty() {
-        return None;
-    }
-    averages.sort_unstable();
-    Some(averages[averages.len() / 2])
-}
-
-/// The median plus [`MARKET_LAG_BIAS_PERCENT`], in sat/kwu so sub-sat/vB precision
-/// survives the multiplication.
-fn bias_for_market_lag(rate: FeeRate) -> FeeRate {
-    let per_kwu = rate.to_sat_per_kwu();
-    FeeRate::from_sat_per_kwu(per_kwu.saturating_add(per_kwu * MARKET_LAG_BIAS_PERCENT / 100))
-}
-
 impl Drop for KyotoConn {
     fn drop(&mut self) {
         // Order matters. `shutdown()` asks the node loop to return, which is the polite half;
@@ -1408,6 +1588,9 @@ impl Drop for KyotoConn {
         }
         self.bridge.abort();
         self.logs.abort();
+        if let Some(task) = &self.fee_sampler {
+            task.abort();
+        }
         if let Some((_, task)) = &self.anchor {
             task.abort();
         }
@@ -1637,34 +1820,6 @@ mod tests {
             combine_fee_signals(None, vb(1_999)),
             (vb(FEEFILTER_UNCORROBORATED_MAX_SAT_PER_VB), true)
         );
-    }
-
-    #[test]
-    fn the_fee_median_blunts_outlier_blocks() {
-        let vb = FeeRate::from_sat_per_vb_u32;
-        assert_eq!(median_fee_rate(&mut []), None);
-        assert_eq!(median_fee_rate(&mut [vb(7)]), Some(vb(7)));
-        // One absurd (or empty) block does not set the price - the caveat the upstream's
-        // own docs raise about averages is exactly what the median absorbs.
-        assert_eq!(
-            median_fee_rate(&mut [vb(3), vb(5_000), vb(4), vb(5), vb(4)]),
-            Some(vb(4))
-        );
-        assert_eq!(
-            median_fee_rate(&mut [vb(0), vb(0), vb(4), vb(5), vb(6)]),
-            Some(vb(4))
-        );
-        // An even count takes the upper-middle element, erring high like the bias.
-        assert_eq!(median_fee_rate(&mut [vb(2), vb(8)]), Some(vb(8)));
-    }
-
-    #[test]
-    fn the_market_lag_bias_raises_the_estimate_by_a_fifth() {
-        let rate = FeeRate::from_sat_per_kwu(1_000);
-        assert_eq!(bias_for_market_lag(rate).to_sat_per_kwu(), 1_200);
-        // A rate too small to carry the percentage survives unshrunk.
-        let tiny = FeeRate::from_sat_per_kwu(3);
-        assert_eq!(bias_for_market_lag(tiny).to_sat_per_kwu(), 3);
     }
 
     #[test]

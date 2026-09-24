@@ -438,7 +438,7 @@ async function loadInfo() {
 // test-network fallback (a made-up 1 sat/vB, which zecd applies itself where it is
 // legal and refuses on mainnet), and no estimate at all - then an auto-filled
 // field is cleared so a blank send lets zecd price it (on kyoto, from the
-// peer-derived median the page cannot see).
+// peer-derived estimate the page cannot see).
 function setFeePrefill(value) {
   const f = $("feerate");
   if (f.value && !f.dataset.auto) return;  // user-typed: keep it

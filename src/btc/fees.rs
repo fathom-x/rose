@@ -1,14 +1,14 @@
 //! The fee-oracle chain: the fee source for the kyoto backend.
 //!
 //! A BIP-157 light client has no `estimatesmartfee`. The signals it *can* produce - the
-//! peers' BIP-133 relay floor and a median of recent blocks' coinbase-derived fee averages -
-//! are a floor and a backward-looking average respectively, neither of which predicts
-//! confirmation time (see [`crate::btc::kyoto::estimate_fee_rate`]). So the kyoto spend path
+//! peers' BIP-133 relay floor and an estimate from recent blocks' coinbase-derived fee
+//! averages - are a floor and a backward-looking statistic respectively, neither of which
+//! sees the mempool (see [`crate::btc::kyoto::estimate_fee_rate`]). So the kyoto spend path
 //! asks HTTP oracles that publish an actual forward estimate first, and keeps the on-chain
 //! signals as the last resort.
 //!
 //! The chain is `[fees] sources`, by default mempool.space -> Esplora -> the peer-derived
-//! median ([`crate::config::DEFAULT_FEE_SOURCES`]). [`oracle_chain`] resolves it against the
+//! estimate ([`crate::config::DEFAULT_FEE_SOURCES`]). [`oracle_chain`] resolves it against the
 //! network into the tiers that can actually answer, and the caller walks them in order,
 //! taking the first success - every tier falls through on failure, the peer-derived one
 //! included, so `["peer_median", "mempool_space"]` asks a server only when the peers cannot
@@ -38,6 +38,10 @@
 //! than accepting it. An operator who wants the original no-server posture unconditionally
 //! sets `sources = ["peer_median"]`.
 //!
+//! An oracle is trusted to see the mempool, not to be right about everything: the actor
+//! checks each HTTP answer against what recent blocks paid (`kyoto::oracle_ceiling`) and
+//! falls through past one far above them, as it would past an unreachable one.
+//!
 //! The bitcoind backend never reaches this module: it has a real fee estimator locally.
 
 use std::collections::BTreeMap;
@@ -57,7 +61,7 @@ use crate::config::{FeeSource, FeesConfig};
 /// in the middle of a `sendtoaddress`, and a slow answer is worth less than a fast fallback.
 /// It bounds each tier rather than the chain, so the default two-oracle chain can spend twice
 /// this before reaching the peer-derived signals - still under the wall clock a light client's
-/// own five block fetches can take.
+/// own cold-start block fetches can take.
 const TIMEOUT: Duration = Duration::from_secs(4);
 
 /// The confirmation target every HTTP tier is read at, in blocks - the engine's one fee

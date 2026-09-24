@@ -281,7 +281,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def serve_feerate(self):
         """zecd's Bitcoin engine exposes no fee-estimate RPC, so mirror where the wallet
         gets its rate: the bitcoind backend uses bitcoind's estimatesmartfee, and the
-        kyoto backend uses mempool.space (then a recent-block median it derives from
+        kyoto backend uses mempool.space (then a recent-block estimate it derives from
         peers). Query whichever matches this config's backend so the page shows the rate
         the wallet would actually use."""
         if self.backend == "kyoto":
@@ -314,10 +314,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def serve_feerate_kyoto(self):
         """A kyoto wallet walks the [fees] oracle chain at send time (src/btc/fees.rs): each
-        HTTP tier in turn, then a peer-derived recent-block median. The page can't see the
+        HTTP tier in turn, then a peer-derived recent-block estimate. The page can't see the
         peer path, but it can walk the same HTTP tiers, in the same order, at the same
         endpoints this config resolves - the closest honest preview of what a kyoto send
-        would cost. If they're all unreachable, say so and name the fallback the wallet uses
+        would cost. One difference it cannot mirror: the wallet also skips an oracle whose
+        answer is far above what recent blocks paid (kyoto.rs::oracle_ceiling), which the
+        page has no blocks to judge, so on a broken oracle the preview can show a rate the
+        send would not use. If they're all unreachable, say so and name the fallback the wallet uses
         instead."""
         attempts = []
         for source, url in self.fee_tiers:
@@ -345,7 +348,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.relay(200, json.dumps(out).encode())
         tried = "; ".join(attempts) if attempts else "no HTTP fee source configured for this network"
         self.relay(200, json.dumps(
-            {"note": f"{tried}; kyoto falls back to a recent-block median"}).encode())
+            {"note": f"{tried}; kyoto falls back to a recent-block estimate"}).encode())
 
     def do_POST(self):
         if self.path != "/rpc":

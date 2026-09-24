@@ -887,6 +887,7 @@ pub fn spawn(
         rebroadcast_rejections: HashMap::new(),
         lookahead,
         unconfirmed_since: HashMap::new(),
+        fee_samples: Default::default(),
         sync_interval,
         status_tx,
         cmd_rx,
@@ -1029,6 +1030,10 @@ struct BtcActor {
     /// Kyoto only: the wallet tip at which each once-confirmed received transaction was
     /// first seen unconfirmed again - a reorg unwound it - for [`BtcActor::expire_reorged_receives`].
     unconfirmed_since: HashMap<Txid, u32>,
+    /// Kyoto only: the peer fee tier's block samples (`crate::btc::fee_samples`), kept
+    /// across reconnects; each connection's sampler and estimate refresh them against its
+    /// own header chain.
+    fee_samples: crate::btc::kyoto::SharedFeeSamples,
     sync_interval: Duration,
     status_tx: watch::Sender<BtcSyncStatus>,
     cmd_rx: mpsc::Receiver<BtcCommand>,
@@ -2917,7 +2922,7 @@ impl BtcActor {
     /// The upstream's fee rate for a send, in whichever dialect is connected.
     ///
     /// Bitcoind answers with `estimatesmartfee`. Kyoto has no such call and answers with a
-    /// far coarser signal - see [`KyotoConn::estimate_fee_rate`] - so the mainnet fallback
+    /// far coarser signal - see [`crate::btc::kyoto::estimate_fee_rate`] - so the mainnet fallback
     /// rule below is doing more work on that backend than on this one.
     /// The answer carries the name of the source that gave it, for `fee_reason`.
     async fn upstream_fee_rate(
@@ -2927,14 +2932,15 @@ impl BtcActor {
     }
 
     /// [`Self::upstream_fee_rate`] at a caller-chosen target - `estimatesmartfee`'s path.
-    /// Bitcoind estimates at `target` in the requested mode; the kyoto fee chain has no
-    /// notion of either (its oracles answer one horizon), so both are ignored there.
+    /// Bitcoind estimates at `target` in the requested mode. Over kyoto the HTTP oracles
+    /// answer one horizon, so they ignore both; the peer tier honors the target (one
+    /// quantile per target, `crate::btc::fee_samples`) and has no notion of a mode.
     async fn estimate_fee_at(
         &mut self,
         target: u16,
         conservative: Option<bool>,
     ) -> anyhow::Result<Option<(bdk_wallet::bitcoin::FeeRate, &'static str)>> {
-        let requester = match self.conn.as_ref() {
+        let requester = match self.conn.as_mut() {
             // Blocking and synchronous: answer here, before any await exists.
             Some(Conn::Bitcoind { rpc, .. }) => {
                 return tokio::task::block_in_place(|| {
@@ -2942,7 +2948,10 @@ impl BtcActor {
                 })
                 .map(|rate| rate.map(|rate| (rate, "estimatesmartfee")));
             }
-            Some(Conn::Kyoto(kyoto)) => kyoto.requester(),
+            Some(Conn::Kyoto(kyoto)) => {
+                kyoto.arm_fee_sampler(Arc::clone(&self.fee_samples), self.network);
+                kyoto.requester()
+            }
             None => return Err(anyhow::anyhow!("no upstream connection")),
         };
         // Kyoto has no fee estimator of its own worth the name, so walk the configured oracle
@@ -2961,7 +2970,34 @@ impl BtcActor {
             match tier {
                 crate::btc::fees::FeeTier::Http { source, url } => {
                     match crate::btc::fees::http_fee_rate(source, &url).await {
-                        Ok(rate) => return Ok(Some((rate, source.as_str()))),
+                        Ok(rate) => {
+                            // The oracle's answer against what recent blocks paid: one far
+                            // above them is broken or hostile, and falls through like a
+                            // failure. No readable block leaves the sanity ceiling as the
+                            // only bound, as it always was.
+                            let ceiling = crate::btc::kyoto::oracle_ceiling(
+                                requester.clone(),
+                                Arc::clone(&self.fee_samples),
+                                self.network,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                debug!("no block data to check the fee oracle against ({e:#})");
+                                None
+                            });
+                            match ceiling {
+                                Some(ceiling) if rate > ceiling => warn!(
+                                    source = source.as_str(),
+                                    %url,
+                                    oracle_sat_per_kwu = rate.to_sat_per_kwu(),
+                                    ceiling_sat_per_kwu = ceiling.to_sat_per_kwu(),
+                                    "the fee oracle's rate is implausibly far above what \
+                                     recent blocks paid; falling through to the next fee \
+                                     source"
+                                ),
+                                _ => return Ok(Some((rate, source.as_str()))),
+                            }
+                        }
                         Err(e) => warn!(
                             source = source.as_str(),
                             %url,
@@ -2970,11 +3006,16 @@ impl BtcActor {
                     }
                 }
                 crate::btc::fees::FeeTier::PeerMedian => {
-                    let attempt = crate::btc::kyoto::estimate_fee_rate(requester.clone())
-                        .await
-                        .map(|rate| {
-                            rate.map(|rate| (rate, crate::config::FeeSource::PeerMedian.as_str()))
-                        });
+                    let attempt = crate::btc::kyoto::estimate_fee_rate(
+                        requester.clone(),
+                        Arc::clone(&self.fee_samples),
+                        self.network,
+                        target,
+                    )
+                    .await
+                    .map(|rate| {
+                        rate.map(|rate| (rate, crate::config::FeeSource::PeerMedian.as_str()))
+                    });
                     if i == last {
                         return attempt;
                     }

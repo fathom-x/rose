@@ -32,7 +32,7 @@
 #     is on.
 #   - NO eviction reporting (again, unless the feed is on).
 #   - NO estimatesmartfee: sends price from the [fees] oracle chain below (mempool.space,
-#     then a Blockstream-style Esplora, then a peer-derived block median), or from the
+#     then a Blockstream-style Esplora, then a peer-derived block estimate), or from the
 #     explicit `fee_rate` argument.
 # In exchange it needs no node, no credentials, and reveals no addresses to a server.
 
@@ -72,8 +72,9 @@ server = "kyoto://216.230.225.43:48333"
 #   sources = ["mempool_space", "esplora", "peer_median"]
 #
 # `peer_median` is the only tier that contacts no server: it is kyoto's own BIP-133 relay
-# floor and a median of recent blocks' fee averages, which is a floor and a backward-looking
-# average rather than a forward estimate - hence the HTTP oracles ahead of it.
+# floor and an estimate from recent blocks' fee averages, which is a floor and a
+# backward-looking statistic rather than a forward estimate - hence the HTTP oracles ahead
+# of it. It also checks them: an oracle answer far above what recent blocks paid is skipped.
 #
 # The two HTTP tiers are the one time a kyoto wallet talks to a server, and what they learn
 # is that this IP is about to build a transaction (never an address, an amount, or which

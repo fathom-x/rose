@@ -731,7 +731,8 @@ pub enum FeeSource {
     /// A Blockstream-style Esplora `/fee-estimates`, read at the `"6"` key - a node's
     /// `estimatesmartfee`, so a different estimator than the tier above rather than a mirror.
     Esplora,
-    /// Kyoto's own peers: the BIP-133 relay floor and a median of recent blocks' fee averages.
+    /// Kyoto's own peers: the BIP-133 relay floor and an estimate from recent blocks' fee
+    /// averages (`btc/fee_samples.rs`).
     /// No server and no URL - see [`crate::btc::kyoto::estimate_fee_rate`].
     PeerMedian,
 }

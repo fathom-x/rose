@@ -4,7 +4,7 @@
 //! It walks: a first sync from genesis (`ScanType::Recovery` anchored at the regtest
 //! genesis floor), the no-mempool posture (a receive is invisible until it confirms), a
 //! confirmed receive found via a filter match, a wallet-built send priced by kyoto's own
-//! P2P fee signals (the relay floor + recent-block median - regtest has no mempool.space,
+//! P2P fee signals (the relay floor + recent-block estimate - regtest has no mempool.space,
 //! so this is the one path that exercises them end-to-end) and broadcast via
 //! `submit_package`, checkpoint persistence across a restart (`ScanType::Sync`), and a
 //! second send from the resumed wallet spending the first send's change - priced by an
@@ -224,7 +224,10 @@ impl ZecdKyoto {
         // The kyoto grammar: an explicit trusted peer (the bare token is refused on
         // regtest, which has no DNS seeds), which also makes the light client
         // whitelist-only with required_peers capped at 1. No [bitcoind] credentials -
-        // nothing on this path authenticates.
+        // nothing on this path authenticates. The mempool feed is switched off: its `p2p`
+        // source runs by default for a wallet with a trusted peer, and this suite pins the
+        // feed-less posture (a receive invisible until it confirms); the feed itself is
+        // `regtest_btc_p2p_mempool`'s.
         std::fs::write(
             &conf,
             format!(
@@ -235,7 +238,9 @@ impl ZecdKyoto {
                  [sync]\n\
                  interval_secs = 1\n\
                  [health]\n\
-                 enabled = false\n"
+                 enabled = false\n\
+                 [mempool]\n\
+                 sources = []\n"
             ),
         )
         .unwrap();
@@ -409,7 +414,7 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
 
     // The wallet builds, signs, prices, and broadcasts a send entirely over P2P: regtest
     // has no mempool.space endpoint, so the fee rate comes from kyoto's own signals (the
-    // peers' relay floor and the recent-block fee median) through the sanity ceiling, and
+    // peers' relay floor and the recent-block fee estimate) through the sanity ceiling, and
     // the broadcast is `submit_package` resolving on the node's `getdata`. The node's
     // mempool accepting the transaction proves the signatures, the fee, and the relay.
     let miner_addr = node

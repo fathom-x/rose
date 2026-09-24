@@ -41,7 +41,7 @@
 #     makes the default - without a feed an incoming payment is invisible until it confirms.
 #   - NO eviction reporting without p2p_snapshot (below).
 #   - NO estimatesmartfee: sends price from the [fees] oracle chain (mempool.space, then
-#     Blockstream's Esplora - both serve mainnet - then a peer-derived block median), or from
+#     Blockstream's Esplora - both serve mainnet - then a peer-derived block estimate), or from
 #     an explicit `fee_rate`, which the UI passes from its own preview of the same chain.
 
 network = "main"

@@ -52,7 +52,7 @@ bitcoind backend has. The differences are behavioral, not cosmetic:
 | 0-conf receives | yes (mempool pass at tip) | **only with the `[mempool]` feed** - a relay connection to the trusted peer (`p2p`, the default) or a mempool.space websocket (`mempool_space`, opt-in), both matched locally (see below) - since filters are block-derived, and with the feed off (`sources = []`) or no peer to relay from, a payment is first seen in its block |
 | Eviction reporting | yes | only via the feed - `p2p_snapshot` mempool snapshots, or the websocket's `removed` deltas - settled at the next scan tip; **none** without it |
 | Rebroadcast of unconfirmed transactions | at each new tip, skipping what the node's mempool holds, verdicts classified (see below) | at each new tip, skipping what the feed reports held when one runs, else blind - every unconfirmed transaction re-announced; no verdicts either way |
-| Fee estimation | `estimatesmartfee` | the `[fees]` oracle chain (mempool.space, then Esplora), falling back to a relay floor + block median |
+| Fee estimation | `estimatesmartfee` | the `[fees]` oracle chain (mempool.space, then Esplora), falling back to a relay floor + recent-block estimate |
 | Birthday at `init` | dials once for the tip | **defaults to today**, offline; `--birthday` overrides |
 | Fresh-wallet scan start | the birthday | the recorded birthday anchor, else a shipped checkpoint at/below the birthday (see below) |
 
@@ -673,10 +673,13 @@ Deliberate posture, not a gap: the fee fallback (1 sat/vB on test networks, hard
 mainnet when the upstream has no answer) mirrors bitcoind's own `fallbackfee` defaults. On
 the kyoto backend "the upstream" is the configurable chain in `[fees] sources`
 (`btc/fees.rs`): **mempool.space**, then a **Blockstream-style Esplora**, then the light
-client's own relay floor and a **median of the last five blocks' fee averages** (each
+client's own relay floor and an **estimate from recent blocks' fee averages** (each
 anchored to a coinbase the merkle root of a PoW-validated header commits to, so a peer
-cannot inflate one without mining; the median blunts single-block outliers, and a 20%
-upward bias covers the average's lag behind a rising market). Two HTTP oracles rather than
+cannot inflate one without mining): a recency-weighted quantile per confirmation target
+over a ring of up to 24 blocks, blended toward the relay floor unless recent blocks were
+full (`fee_samples.rs`). A background sampler keeps the ring warm once a wallet starts
+pricing sends, so a send no longer downloads blocks, and an HTTP oracle's answer far above
+what those blocks paid is disbelieved and falls through to the next tier. Two HTTP oracles rather than
 one because they are run by different operators and compute their numbers differently -
 mempool.space projects blocks from its own mempool view, Esplora reports a node's
 `estimatesmartfee` - so one being down no longer drops the send straight to the peers'
@@ -709,10 +712,9 @@ broken oracle becomes a refusal naming the number, never a payment. The ceiling 
 backstop; the peers' feefilter has a tighter bound of its own. `bip157` reports only the
 **maximum** filter across connected peers, so on a DNS-seeded wallet one stranger's free
 claim could otherwise price every send at the ceiling. The filter may therefore lift the
-estimate to at most the greater of 10 sat/vB and twice the (biased) block median - 10 sat/vB
-alone when no block median arrived (`kyoto.rs::combine_fee_signals`). The 10 sat/vB bound also
-keeps fee-less blocks (regtest, a quiet testnet: a zero median) from capping the relay floor to
-nothing. A send that undershoots one peer's inflated filter still propagates through any honest
+estimate to at most the greater of 10 sat/vB and twice the block-derived estimate - 10 sat/vB
+alone when no block could be read (`kyoto.rs::combine_fee_signals`). The 10 sat/vB bound also
+keeps fee-less blocks (regtest, a quiet testnet) from capping the relay floor to nothing. A send that undershoots one peer's inflated filter still propagates through any honest
 peer, which is all relay needs.
 
 Both fallback signals - the peers' BIP-133 feefilter and the tip-block average - are
@@ -742,5 +744,6 @@ would wedge every other command for that wallet, and the shutdown flush with the
   then relay), and it is the order every send takes now - see "Commit, then relay"
   below - so a transport failure (the light client itself having stopped) keeps the
   record too, for the same reason.
-- **Tip block for the fee average (10s).** Falls back to the peers' relay floor alone, which
+- **Recent blocks for the fee estimate (10s).** Only on a cold ring (the background sampler
+  keeps it warm after the first estimate); falls back to the peers' relay floor alone, which
   is the same degradation path an outright fetch error takes.

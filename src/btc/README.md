@@ -492,6 +492,42 @@ Two refusals bound every send before a signer exists, whatever priced it:
   a large consolidation at a sane rate can still carry a surprising total, and this is the
   number the operator pays. Both backends, estimated and explicit rates alike.
 
+### Fee bumping (`bumpfee`)
+
+`bumpfee "txid" ( options )` replaces an unconfirmed own send with a higher-fee version of
+itself (BIP 125), in Core's shape (`{txid, origfee, fee, errors}`) and with Core's
+precondition codes, checked in Core's order: a txid the wallet does not hold is `-5`; a
+mined one, or one conflicted with a mined one, `-4`; one already replaced `-4` naming the
+replacement; one with an unconfirmed wallet descendant `-8` (replacing it would evict the
+child); one that does not signal BIP 125 `-4`; one spending a foreign input `-4` (there is
+no signer for it). A watch-only wallet is `-4` - there is no `psbtbumpfee`.
+
+The replacement is BDK's `build_fee_bump`: every original input and recipient output kept,
+the change output dropped and coin selection re-run, taking more (confirmed) inputs only
+when the change cannot absorb the higher fee. The rate is the caller's `fee_rate`, else
+Core's default (`feebumper.cpp`'s `EstimateFeeRate`): the original's rate rounded up, plus
+1 sat/kvB, plus the wallet's 5 sat/vB incremental relay fee - or the upstream's estimate
+when that is higher. An unavailable estimate is not an error here, since the increment
+alone is a well-defined bump. Both BIP 125 fee rules hold: BDK enforces the rate (at least
+1 sat/vB above the original, `-8` otherwise), and zecd the total (the original's fee plus
+1 sat/vB of the replacement's own signed size) - a replacement that sheds its change output
+can clear the first and fail the second, so a default bump is rebuilt once at the rate that
+clears it and an explicit rate is refused with Core's `-8` "Insufficient total fee". The
+sanity ceiling and `[fees] max_tx_fee_sat` apply as on every send (the cap answers `-4`
+here, as Core's `bumpfee` does).
+
+Then the send path: per-call signers, commit before relay, and the relay's outcome settles
+the record. The replacement's sighting is stamped strictly after the original's, because
+BDK resolves two conflicting unconfirmed transactions by the later sighting and breaks a
+tie by txid - a bump in the same second as its send would otherwise lose half the time.
+The original stays in the wallet's graph, non-canonical: if the node rejects the
+replacement it is retired and the original is canonical again, and if the original
+confirms after all (over kyoto, a peer that never took the replacement) its block
+re-canonicalizes it. `replaceable = false` makes the replacement non-signalling, so it
+cannot be bumped again. `conf_target`, `estimate_mode`, `outputs` and
+`original_change_index` are refused rather than ignored, and an unknown option key is
+Core's `-3`. Live: `regtest_btc_bumpfee.rs`, both backends.
+
 ## Not yet implemented
 
 Everything here is refused with a clear error rather than silently ignored or half-done:
@@ -504,22 +540,19 @@ Everything here is refused with a clear error rather than silently ignored or ha
 - **Address types other than bech32** (BIP 84 is the engine's only derivation): issuance is
   bech32-only, and a restore of a seed whose history lives on BIP 44/49/86 derivations will
   not see those funds. Additional descriptor templates are the fix, once wanted.
-- **Fee bumping (`bumpfee`/RBF) and CPFP.** Sends already *signal* BIP 125 (BDK's
-  `TxBuilder` default sequence, surfaced as `bip125-replaceable`), but nothing can act on
-  the signal: `bumpfee` answers method-not-found (`abandontransaction` exists, but it releases
-  the inputs rather than rescuing the payment), and the send RPCs have no coin control, so
-  a high-fee child cannot be aimed at a stuck transaction's output
-  - and an incoming 0-conf output is `untrusted_pending`, which selection excludes, so CPFP
-  on a receive has no route at all. The interim escape hatch is building and signing the
-  replacement externally and broadcasting it via `sendrawtransaction` (the bitcoind
-  backend's mempool pass then reports the original's eviction; kyoto, with no mempool,
-  resolves the conflict only when one side confirms). For `bumpfee` itself BDK's
-  `build_fee_bump` makes the actor half cheap; the real work is Core's RPC contract (the
-  options shape, `psbt` for watch-only) and the conflict bookkeeping the history RPCs
-  currently omit (`walletconflicts`/`abandoned`, above). CPFP needs a coin-control argument
-  on the send RPCs plus an opt-in to spend the wallet's own unconfirmed outputs. Both want
-  a kyoto design pass of their own: without a mempool the replaced transaction cannot be
-  seen evicted, only superseded at confirmation.
+- **CPFP** (child pays for parent) and **`psbtbumpfee`**. `bumpfee` (above) covers the
+  wallet's own replaceable sends; what remains is the stuck transaction RBF cannot reach -
+  an incoming payment (not the wallet's to replace) or an own send made with
+  `replaceable = false`. Core has no CPFP RPC either (a user builds the child by hand), and
+  zecd's send RPCs have no coin control to aim a child at a chosen output; and an incoming
+  0-conf output is `untrusted_pending`, which selection excludes. So CPFP needs an RPC shape
+  of its own (a coin-control input on the send path, or a zecd extension naming the parent)
+  plus the package arithmetic: the child's fee must lift the *package* rate, i.e. pay
+  `target * (parent_vsize + child_vsize) - parent_fee`. Over kyoto the child is announced
+  like any send; a parent under the peers' relay floor needs package relay, which bip157's
+  broadcast does not do. `psbtbumpfee` (the watch-only half of Core's pair) waits on the
+  wallet's PSBT surface. The history RPCs also omit Core's `walletconflicts`/
+  `replaced_by_txid`: a replaced transaction simply leaves the wallet's canonical view.
 - **A mempool for the kyoto backend** - the opt-in `[mempool]` feed covers it since
   2026-09-10 (`mempool_feed.rs` + `p2p_feed.rs`), from either of two sources
   named in `sources` (a preference order; the first that can run for the wallet wins).

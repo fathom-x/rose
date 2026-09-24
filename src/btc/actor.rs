@@ -345,6 +345,12 @@ enum BtcCommand {
         txid: Txid,
         reply: oneshot::Sender<Result<(), RpcError>>,
     },
+    /// `bumpfee`: replace an unconfirmed own send with a higher-fee one (BIP 125).
+    BumpFee {
+        txid: Txid,
+        options: BtcBumpOptions,
+        reply: oneshot::Sender<Result<BtcBumped, RpcError>>,
+    },
     /// A window of the history in Core's `listtransactions` terms: skip `skip` entries from
     /// the newest end, then up to `count` entries, oldest first. Only that window is built.
     ListTransactions {
@@ -426,6 +432,28 @@ pub struct BtcSendOptions {
 pub struct BtcSent {
     pub txid: String,
     pub fee_reason: String,
+}
+
+/// Caller-supplied `bumpfee` options the engine honors - wire-friendly primitives, as
+/// [`BtcSendOptions`]. `Default` is Core's default bump: the old fee rate plus the wallet's
+/// incremental relay fee, or the upstream's estimate when that is higher.
+#[derive(Clone, Debug, Default)]
+pub struct BtcBumpOptions {
+    /// An explicit fee rate for the replacement, in sat/kvB (Core's `fee_rate`, sat/vB at
+    /// 3-decimal precision). Must still clear BIP 125's replacement rules against the
+    /// original - a higher rate *and* a higher total fee by the incremental relay fee.
+    pub fee_rate_sat_per_kvb: Option<u64>,
+    /// Core's `replaceable = false`: the replacement stops signalling BIP 125, so it cannot
+    /// itself be bumped again.
+    pub non_replaceable: bool,
+}
+
+/// What a completed `bumpfee` reports - Core's `{txid, origfee, fee}`, the fees in satoshis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtcBumped {
+    pub txid: String,
+    pub orig_fee_sat: u64,
+    pub fee_sat: u64,
 }
 
 /// A handle to a running Bitcoin wallet actor - the registry's
@@ -519,6 +547,21 @@ impl BtcWalletHandle {
     pub async fn abandon_transaction(&self, txid: Txid) -> Result<(), RpcError> {
         self.dispatch(|reply| BtcCommand::AbandonTransaction { txid, reply })
             .await
+    }
+
+    /// Replace an unconfirmed own send with a higher-fee version of itself (`bumpfee`). See
+    /// `BtcActor::do_bump_fee` for the eligibility rules and the fee arithmetic.
+    pub async fn bump_fee(
+        &self,
+        txid: Txid,
+        options: BtcBumpOptions,
+    ) -> Result<BtcBumped, RpcError> {
+        self.dispatch(|reply| BtcCommand::BumpFee {
+            txid,
+            options,
+            reply,
+        })
+        .await
     }
 
     /// Core's `listtransactions` window: the newest `count` visible entries after skipping
@@ -2716,6 +2759,14 @@ impl BtcActor {
             BtcCommand::AbandonTransaction { txid, reply } => {
                 let _ = reply.send(self.do_abandon(txid));
             }
+            BtcCommand::BumpFee {
+                txid,
+                options,
+                reply,
+            } => {
+                let result = self.do_bump_fee(txid, options).await;
+                let _ = reply.send(result);
+            }
             BtcCommand::ListTransactions { count, skip, reply } => {
                 let _ = reply.send(Ok(tx_history(&self.wallet, count, skip)));
             }
@@ -3017,10 +3068,16 @@ impl BtcActor {
     /// [`Commit::Recorded`] so a later withdrawal can stamp its eviction no earlier than
     /// the sighting - `SystemTime` is not monotonic, and an eviction one clock step
     /// *before* the sighting would leave the record canonical.
+    ///
+    /// `not_before` floors the sighting's timestamp: a fee bump passes one past the
+    /// original's `last_seen`, since BDK resolves two conflicting unconfirmed transactions
+    /// by the later sighting and breaks a tie by txid - a replacement committed in the same
+    /// second as its original would otherwise lose half the time. `0` for no floor.
     fn commit_before_relay(
         &mut self,
         tx: &Arc<Transaction>,
         what: &str,
+        not_before: u64,
     ) -> Result<Commit, RpcError> {
         let txid = tx.compute_txid();
         // A resubmission of a transaction the wallet once evicted (abandoned, retired) must
@@ -3031,7 +3088,8 @@ impl BtcActor {
         let seen_at = match self.wallet.tx_graph().get_last_evicted(txid) {
             Some(evicted_at) => unix_now().max(evicted_at + 1),
             None => unix_now(),
-        };
+        }
+        .max(not_before);
         self.wallet
             .apply_unconfirmed_txs(vec![(Arc::clone(tx), seen_at)]);
         if self.wallet.get_tx(txid).is_none() {
@@ -3167,22 +3225,7 @@ impl BtcActor {
     ) -> Result<BtcSent, RpcError> {
         // Checked here but borrowed only at the signing step below: the fee and broadcast
         // calls take `&mut self`, so holding a `&self.seed` across them would not borrow-check.
-        if self.seed.is_none() {
-            // Bitcoin Core's -4 for a wallet that cannot sign, worded for which of the two
-            // shapes this is: a watch-only wallet has nothing to unlock, ever; a locked
-            // spending wallet has a seed the custody model did not hand over.
-            return Err(RpcError::new(
-                codes::RPC_WALLET_ERROR,
-                if self.watch_only {
-                    "Error: Private keys are disabled for this wallet (watch-only, built from \
-                     an imported xpub); spend from the paired spending wallet"
-                } else {
-                    "Error: Private keys are disabled for this wallet, or the wallet is locked \
-                     (bitcoin wallets have no walletpassphrase yet - use an identity-file \
-                     wallet with auto_unlock for unattended sending)"
-                },
-            ));
-        }
+        self.require_signer()?;
         // Recipients first: pure checks, so a typo'd address or a bad amount is refused
         // before the send costs a fee-oracle round trip on the single-writer actor, and
         // answers the same `-5`/`-3` offline as online.
@@ -3236,7 +3279,7 @@ impl BtcActor {
         let sequence = options
             .non_replaceable
             .then_some(bdk_wallet::bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF);
-        let mut psbt = if options.subtract_fee_from.is_empty() {
+        let psbt = if options.subtract_fee_from.is_empty() {
             let mut builder = self.wallet.build_tx();
             builder.unspendable(immature);
             for (address, amount) in &parsed {
@@ -3265,32 +3308,13 @@ impl BtcActor {
             .map_err(|e| RpcError::misc(format!("compute the psbt fee: {e}")))?;
         check_max_tx_fee(fee.to_sat(), self.fees.max_tx_fee_sat)?;
 
-        // Signers are derived from the seed per send and dropped with this scope - the
-        // custody model's spend half (the persisted wallet holds public descriptors only).
-        let seed = self
-            .seed
-            .as_ref()
-            .expect("seed presence checked at the top of do_send");
-        let signing = keys::signing_wallet(seed, self.network)
-            .map_err(|e| RpcError::misc(format!("derive signing descriptors: {e:#}")))?;
-        let finalized = signing
-            .sign(&mut psbt, SignOptions::default())
-            .map_err(|e| RpcError::misc(format!("sign: {e}")))?;
-        if !finalized {
-            return Err(RpcError::misc(
-                "failed to finalize the transaction (signer did not complete all inputs)",
-            ));
-        }
-        let tx = Arc::new(
-            psbt.extract_tx()
-                .map_err(|e| RpcError::misc(format!("extract transaction: {e:?}")))?,
-        );
+        let tx = self.sign_and_extract(psbt)?;
         // Commit, then relay (module doc): the send is on disk at 0-conf - its inputs
         // locked against the next send's coin selection - before a byte of it can reach
         // the network. An own send always spends wallet outputs, so `NotOurs` cannot
         // happen here; treating it as recorded would relay without a record, which is the
         // window this order exists to close.
-        let seen_at = match self.commit_before_relay(&tx, "send")? {
+        let seen_at = match self.commit_before_relay(&tx, "send", 0)? {
             Commit::Recorded { seen_at } => seen_at,
             Commit::NotOurs => {
                 return Err(RpcError::misc(
@@ -3322,6 +3346,51 @@ impl BtcActor {
             txid: txid.to_string(),
             fee_reason: fee_reason.to_string(),
         })
+    }
+
+    /// Refuse a spend on a wallet with no seed in hand - Bitcoin Core's `-4` for a wallet
+    /// that cannot sign, worded for which of the two shapes this is: a watch-only wallet has
+    /// nothing to unlock, ever; a locked spending wallet has a seed the custody model did
+    /// not hand over.
+    fn require_signer(&self) -> Result<(), RpcError> {
+        if self.seed.is_some() {
+            return Ok(());
+        }
+        Err(RpcError::new(
+            codes::RPC_WALLET_ERROR,
+            if self.watch_only {
+                "Error: Private keys are disabled for this wallet (watch-only, built from \
+                 an imported xpub); spend from the paired spending wallet"
+            } else {
+                "Error: Private keys are disabled for this wallet, or the wallet is locked \
+                 (bitcoin wallets have no walletpassphrase yet - use an identity-file \
+                 wallet with auto_unlock for unattended sending)"
+            },
+        ))
+    }
+
+    /// Sign a built PSBT and extract the finished transaction. Signers are derived from the
+    /// seed per call and dropped with this scope - the custody model's spend half (the
+    /// persisted wallet holds public descriptors only). The caller has passed
+    /// [`Self::require_signer`].
+    fn sign_and_extract(&self, mut psbt: Psbt) -> Result<Arc<Transaction>, RpcError> {
+        let seed = self
+            .seed
+            .as_ref()
+            .ok_or_else(|| RpcError::misc("no seed to sign with"))?;
+        let signing = keys::signing_wallet(seed, self.network)
+            .map_err(|e| RpcError::misc(format!("derive signing descriptors: {e:#}")))?;
+        let finalized = signing
+            .sign(&mut psbt, SignOptions::default())
+            .map_err(|e| RpcError::misc(format!("sign: {e}")))?;
+        if !finalized {
+            return Err(RpcError::misc(
+                "failed to finalize the transaction (signer did not complete all inputs)",
+            ));
+        }
+        Ok(Arc::new(psbt.extract_tx().map_err(|e| {
+            RpcError::misc(format!("extract transaction: {e:?}"))
+        })?))
     }
 
     /// Build the PSBT for a subtract-fee send: the listed recipients pay the fee out of
@@ -3462,7 +3531,7 @@ impl BtcActor {
         // order as a send, for the same crash window. A foreign transaction has nothing to
         // record and is relayed on the uncommitted path, whose failures are reported
         // verbatim.
-        match self.commit_before_relay(&tx, "broadcast")? {
+        match self.commit_before_relay(&tx, "broadcast", 0)? {
             Commit::Recorded { seen_at } => {
                 match self.relay_committed(&tx, seen_at, "broadcast").await? {
                     (txid, RelayOutcome::Relayed) => Ok(txid.to_string()),
@@ -3566,6 +3635,255 @@ impl BtcActor {
         );
         self.restart_light_client(txid, "an abandoned transaction");
         Ok(())
+    }
+
+    /// `bumpfee`: replace an unconfirmed own send with a higher-fee version of itself
+    /// (BIP 125). Bitcoin Core's contract, precondition by precondition and with its codes:
+    /// the transaction must be the wallet's (`-5` "Invalid or non-wallet transaction id"),
+    /// not yet mined (`-4`), not already replaced (`-4` naming the replacement), have no
+    /// unconfirmed wallet descendants (`-8` - replacing it would silently evict them),
+    /// signal replaceability (`-4`), and spend only wallet inputs (`-4` - there is no
+    /// signer for a foreign one).
+    ///
+    /// The replacement keeps every recipient output and every original input; BDK's
+    /// `build_fee_bump` drops the change output and re-runs coin selection, taking more
+    /// (confirmed) inputs only if the change cannot absorb the higher fee. Its rate is the
+    /// caller's `fee_rate`, else Core's default: the original's rate plus the wallet's
+    /// incremental relay fee ([`default_bump_rate_sat_per_kvb`]), or the upstream's
+    /// estimate when that is higher - an unavailable estimate is not an error here, since
+    /// the incremental floor alone is a well-defined bump. BDK enforces BIP 125's rate rule
+    /// (at least 1 sat/vB above the original); the total-fee rule (the original's fee plus
+    /// 1 sat/vB of the replacement's size, [`bump_total_fee_floor`]) is checked here, since
+    /// a replacement that sheds its change output can clear the first and fail the second.
+    /// A default bump is then rebuilt once at the rate that clears it; an explicit rate is
+    /// refused with Core's `-8`. Then the send path: sanity ceiling, `max_tx_fee_sat`,
+    /// per-call signers, commit (stamped past the original's sighting, so the replacement
+    /// is the canonical one - see [`Self::commit_before_relay`]), relay.
+    ///
+    /// The original is not deleted: BDK keeps it in the graph, non-canonical while the
+    /// replacement stands. If the relay is rejected the replacement is retired and the
+    /// original is canonical again; if the original confirms after all (kyoto: a peer never
+    /// took the replacement), its block re-canonicalizes it and the replacement drops out.
+    async fn do_bump_fee(
+        &mut self,
+        txid: Txid,
+        options: BtcBumpOptions,
+    ) -> Result<BtcBumped, RpcError> {
+        self.require_signer()?;
+        let original = self.bump_candidate(txid)?;
+        if self.conn.is_none() {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "no connection to the upstream (fee estimation and broadcast need it); retry \
+                 once it is reachable",
+            ));
+        }
+        self.send_gate()?;
+        let orig_fee = self
+            .wallet
+            .calculate_fee(&original)
+            .map_err(|e| RpcError::misc(format!("compute the original fee: {e}")))?
+            .to_sat();
+        let orig_vsize = original.weight().to_vbytes_ceil();
+        let explicit = options.fee_rate_sat_per_kvb;
+        let rate_kvb = match explicit {
+            Some(kvb) => kvb,
+            None => {
+                let estimate_kvb = match self.upstream_fee_rate().await {
+                    Ok(Some((rate, _))) => Some(rate.to_sat_per_kwu() * 4),
+                    Ok(None) => None,
+                    Err(e) => {
+                        debug!(%txid, "bumpfee: no fee estimate ({e:#}); bumping by the incremental fee alone");
+                        None
+                    }
+                };
+                default_bump_rate_sat_per_kvb(orig_fee, orig_vsize, estimate_kvb)
+            }
+        };
+        // Signed before the total-fee rule is checked: the rule is priced on the
+        // replacement's final size, witnesses included.
+        let (mut tx, mut fee) = self.build_signed_bump(txid, rate_kvb, options.non_replaceable)?;
+        let floor = bump_total_fee_floor(orig_fee, tx.vsize() as u64);
+        if fee < floor {
+            if explicit.is_some() {
+                return Err(insufficient_bump_fee(fee, floor, orig_fee));
+            }
+            // A default bump that shed its change output: rebuild once at the rate that
+            // clears the total-fee rule for the size just built.
+            let vsize = tx.vsize() as u64;
+            let retry_kvb = (floor * 1_000).div_ceil(vsize).max(rate_kvb + 1);
+            (tx, fee) = self.build_signed_bump(txid, retry_kvb, options.non_replaceable)?;
+            let floor = bump_total_fee_floor(orig_fee, tx.vsize() as u64);
+            if fee < floor {
+                return Err(insufficient_bump_fee(fee, floor, orig_fee));
+            }
+        }
+        let not_before = self
+            .wallet
+            .tx_graph()
+            .get_tx_node(txid)
+            .and_then(|node| node.last_seen)
+            .map_or(0, |seen| seen + 1);
+        let seen_at = match self.commit_before_relay(&tx, "fee bump", not_before)? {
+            Commit::Recorded { seen_at } => seen_at,
+            Commit::NotOurs => {
+                return Err(RpcError::misc(
+                    "the replacement is not recognized as a wallet transaction; nothing was \
+                     broadcast",
+                ))
+            }
+        };
+        let (new_txid, outcome) = self.relay_committed(&tx, seen_at, "fee bump").await?;
+        info!(
+            target: "zecd::audit",
+            original = %txid,
+            replacement = %new_txid,
+            orig_fee,
+            fee,
+            relay = ?outcome,
+            "replaced an unconfirmed send with a higher-fee version (bumpfee)"
+        );
+        Ok(BtcBumped {
+            txid: new_txid.to_string(),
+            orig_fee_sat: orig_fee,
+            fee_sat: fee,
+        })
+    }
+
+    /// `bumpfee`'s preconditions - see [`Self::do_bump_fee`] - answering the original
+    /// transaction when every one holds.
+    fn bump_candidate(&self, txid: Txid) -> Result<Arc<Transaction>, RpcError> {
+        let Some(original) = self.wallet.tx_graph().get_tx(txid) else {
+            return Err(RpcError::invalid_address_or_key(
+                "Invalid or non-wallet transaction id",
+            ));
+        };
+        match self.wallet.get_tx(txid) {
+            Some(wtx) if wtx.chain_position.is_confirmed() => {
+                return Err(RpcError::new(
+                    codes::RPC_WALLET_ERROR,
+                    "Transaction has been mined, or is conflicted with a mined transaction",
+                ))
+            }
+            Some(_) => {}
+            // In the graph but not canonical: replaced (a canonical transaction spends one
+            // of its inputs), or abandoned/evicted.
+            None => {
+                let inputs: HashSet<OutPoint> =
+                    original.input.iter().map(|i| i.previous_output).collect();
+                let conflict = self.wallet.transactions().find(|wtx| {
+                    wtx.tx_node
+                        .tx
+                        .input
+                        .iter()
+                        .any(|i| inputs.contains(&i.previous_output))
+                });
+                return Err(RpcError::new(
+                    codes::RPC_WALLET_ERROR,
+                    match conflict {
+                        Some(wtx) if wtx.chain_position.is_confirmed() => {
+                            "Transaction has been mined, or is conflicted with a mined \
+                             transaction"
+                                .to_string()
+                        }
+                        Some(wtx) => format!(
+                            "Cannot bump transaction {txid} since it has already been bumped \
+                             by {}",
+                            wtx.tx_node.txid
+                        ),
+                        None => format!(
+                            "Transaction {txid} was abandoned or evicted, so there is nothing \
+                             in flight to bump; send the payment again"
+                        ),
+                    },
+                ));
+            }
+        }
+        if self.wallet.transactions().any(|wtx| {
+            wtx.tx_node
+                .tx
+                .input
+                .iter()
+                .any(|i| i.previous_output.txid == txid)
+        }) {
+            return Err(RpcError::invalid_parameter(
+                "Transaction has descendants in the wallet",
+            ));
+        }
+        if !original.is_explicitly_rbf() {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "Transaction is not BIP 125 replaceable",
+            ));
+        }
+        let foreign = original.input.iter().any(|input| {
+            self.wallet
+                .tx_graph()
+                .get_txout(input.previous_output)
+                .is_none_or(|txout| !self.wallet.is_mine(txout.script_pubkey.clone()))
+        });
+        if foreign {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "Transaction contains inputs that don't belong to this wallet",
+            ));
+        }
+        Ok(original)
+    }
+
+    /// [`Self::build_bump`], then the send path's checks on the built PSBT - the absolute
+    /// fee cap (answered as Core's `bumpfee` does, `-4`, not the send path's `-6`) - and the
+    /// per-call signers. Answers the signed replacement and its fee in satoshis.
+    fn build_signed_bump(
+        &mut self,
+        txid: Txid,
+        rate_kvb: u64,
+        non_replaceable: bool,
+    ) -> Result<(Arc<Transaction>, u64), RpcError> {
+        let psbt = self.build_bump(txid, rate_kvb, non_replaceable)?;
+        let fee = psbt
+            .fee()
+            .map_err(|e| RpcError::misc(format!("compute the psbt fee: {e}")))?
+            .to_sat();
+        check_max_tx_fee(fee, self.fees.max_tx_fee_sat)
+            .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, e.message))?;
+        Ok((self.sign_and_extract(psbt)?, fee))
+    }
+
+    /// One `build_fee_bump` attempt at `rate_kvb` (sat/kvB). The rate passes the sanity
+    /// ceiling first, like every send's; BDK's own replacement-rate refusal becomes Core's
+    /// `-8`.
+    fn build_bump(
+        &mut self,
+        txid: Txid,
+        rate_kvb: u64,
+        non_replaceable: bool,
+    ) -> Result<Psbt, RpcError> {
+        use bdk_wallet::error::{BuildFeeBumpError, CreateTxError};
+        let rate = crate::btc::fees::enforce_sanity_ceiling(FeeRate::from_sat_per_kwu(
+            rate_kvb.div_ceil(4),
+        ))
+        .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?;
+        let immature = self.immature_coinbase_outpoints();
+        let mut builder = self.wallet.build_fee_bump(txid).map_err(|e| match e {
+            BuildFeeBumpError::TransactionNotFound(_) => {
+                RpcError::invalid_address_or_key("Invalid or non-wallet transaction id")
+            }
+            other => RpcError::new(codes::RPC_WALLET_ERROR, format!("{other}")),
+        })?;
+        builder.unspendable(immature);
+        builder.fee_rate(rate);
+        if non_replaceable {
+            builder.set_exact_sequence(bdk_wallet::bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF);
+        }
+        builder.finish().map_err(|e| match e {
+            CreateTxError::FeeRateTooLow { required } => RpcError::invalid_parameter(format!(
+                "Insufficient fee rate: the replacement must pay at least {} sat/vB (the \
+                 original's rate plus the 1 sat/vB incremental relay fee)",
+                required.to_sat_per_kwu().saturating_mul(4).div_ceil(1_000)
+            )),
+            other => map_create_tx_error(other),
+        })
     }
 
     /// Over kyoto, drop the light client so its broadcast queue forgets `txid`: `bip157`
@@ -3893,6 +4211,47 @@ fn parse_recipients(
     Ok(parsed)
 }
 
+/// The wallet's incremental relay fee for a default `bumpfee`, in sat/kvB: Bitcoin Core's
+/// `WALLET_INCREMENTAL_RELAY_FEE` (5 sat/vB), deliberately above the node's 1 sat/vB so one
+/// bump clears the replacement rules with room to spare rather than inching up.
+const WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 5_000;
+
+/// BIP 125's incremental relay fee, in sat/vB: what a replacement must add to the
+/// original's total fee per virtual byte of its own size (Core's `-incrementalrelayfee`
+/// default, and what BDK's rate rule adds too).
+const INCREMENTAL_RELAY_FEE_SAT_PER_VB: u64 = 1;
+
+/// Core's default `bumpfee` rate (`feebumper.cpp`'s `EstimateFeeRate`), in sat/kvB: the
+/// original's rate rounded up, plus 1 sat/kvB, plus the wallet incremental relay fee -
+/// or the upstream's estimate when that is higher.
+fn default_bump_rate_sat_per_kvb(
+    orig_fee_sat: u64,
+    orig_vsize: u64,
+    estimate_sat_per_kvb: Option<u64>,
+) -> u64 {
+    let orig_kvb = (orig_fee_sat * 1_000).div_ceil(orig_vsize.max(1));
+    let floor = orig_kvb + 1 + WALLET_INCREMENTAL_RELAY_FEE_SAT_PER_KVB;
+    estimate_sat_per_kvb.map_or(floor, |estimate| estimate.max(floor))
+}
+
+/// BIP 125 rule 4: the least total fee a replacement of `new_vsize` vbytes may pay - the
+/// original's fee plus the incremental relay fee over the replacement's own size.
+fn bump_total_fee_floor(orig_fee_sat: u64, new_vsize: u64) -> u64 {
+    orig_fee_sat + INCREMENTAL_RELAY_FEE_SAT_PER_VB * new_vsize
+}
+
+/// Core's refusal for a replacement under [`bump_total_fee_floor`], `-8` with its message.
+fn insufficient_bump_fee(fee_sat: u64, floor_sat: u64, orig_fee_sat: u64) -> RpcError {
+    use crate::amount::zats_to_value;
+    RpcError::invalid_parameter(format!(
+        "Insufficient total fee {}, must be at least {} (oldFee {} + incrementalFee {})",
+        zats_to_value(fee_sat),
+        zats_to_value(floor_sat),
+        zats_to_value(orig_fee_sat),
+        zats_to_value(floor_sat - orig_fee_sat),
+    ))
+}
+
 /// Refuse a send whose absolute fee exceeds `[fees] max_tx_fee_sat` - Core's `-maxtxfee`,
 /// with Core's message and code (`-6`: Core's `SendMoney` surfaces every
 /// `CreateTransaction` failure, this one included, as `RPC_WALLET_INSUFFICIENT_FUNDS`).
@@ -4217,6 +4576,139 @@ mod tests {
         assert_eq!(err.code, crate::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS);
         assert!(err.message.contains("-maxtxfee"), "{}", err.message);
         assert!(err.message.contains("0.10000001"), "{}", err.message);
+    }
+
+    /// Core's default bump rate: the original's rate rounded up, plus 1 sat/kvB, plus the
+    /// 5 sat/vB wallet increment - an estimate only ever raises it. And BIP 125 rule 4's
+    /// floor is the old fee plus 1 sat/vB of the replacement's size, refused as Core's `-8`
+    /// naming all four numbers.
+    #[test]
+    fn bump_fee_arithmetic_follows_core() {
+        // 141 sat over 141 vB is exactly 1 sat/vB: 1000 + 1 + 5000 sat/kvB.
+        assert_eq!(default_bump_rate_sat_per_kvb(141, 141, None), 6_001);
+        // A fractional rate rounds up before the increments: 150/141 vB = 1063.8 -> 1064.
+        assert_eq!(default_bump_rate_sat_per_kvb(150, 141, None), 6_065);
+        // A higher estimate wins; a lower one does not undercut the increment.
+        assert_eq!(
+            default_bump_rate_sat_per_kvb(141, 141, Some(20_000)),
+            20_000
+        );
+        assert_eq!(default_bump_rate_sat_per_kvb(141, 141, Some(2_000)), 6_001);
+        assert_eq!(bump_total_fee_floor(141, 110), 251);
+        let err = insufficient_bump_fee(200, 251, 141);
+        assert_eq!(err.code, crate::error::codes::RPC_INVALID_PARAMETER);
+        assert_eq!(
+            err.message,
+            "Insufficient total fee 0.00000200, must be at least 0.00000251 \
+             (oldFee 0.00000141 + incrementalFee 0.00000110)"
+        );
+    }
+
+    /// What `do_bump_fee` relies on in BDK: `build_fee_bump` keeps the recipient, spends the
+    /// original's input and pays at least the requested rate; the replacement, committed one
+    /// second after the original's sighting (`commit_before_relay`'s `not_before`), is the
+    /// canonical one - the original leaves `transactions()` and the balance counts the
+    /// replacement's change - while a replacement stamped at the *same* second would be
+    /// decided by txid order, which is why the floor exists.
+    #[test]
+    fn a_fee_bump_replaces_the_original_in_the_canonical_view() {
+        use bdk_wallet::bitcoin::block::{Header, Version};
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        use bdk_wallet::bitcoin::{
+            absolute, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, TxIn, TxMerkleNode,
+            TxOut, Txid, Witness,
+        };
+        use std::str::FromStr as _;
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let mut wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .create_wallet_no_persist()
+        .unwrap();
+        let addr = wallet.reveal_next_address(KeychainKind::External).address;
+        let funding = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_str(&"33".repeat(32)).unwrap(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: addr.script_pubkey(),
+            }],
+        };
+        let block = Block {
+            header: Header {
+                version: Version::TWO,
+                prev_blockhash: wallet.latest_checkpoint().hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 1,
+            },
+            txdata: vec![funding],
+        };
+        wallet.apply_block(&block, 1).unwrap();
+        let signer = keys::signing_wallet(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let recipient = ScriptBuf::new_p2wpkh(&bdk_wallet::bitcoin::WPubkeyHash::all_zeros());
+        let sign = |mut psbt: Psbt| {
+            assert!(signer.sign(&mut psbt, SignOptions::default()).unwrap());
+            Arc::new(psbt.extract_tx().unwrap())
+        };
+
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(recipient.clone(), Amount::from_sat(100_000));
+        builder.fee_rate(FeeRate::from_sat_per_vb_u32(1));
+        let original = sign(builder.finish().unwrap());
+        let orig_txid = original.compute_txid();
+        wallet.apply_unconfirmed_txs([(Arc::clone(&original), 1_800_000_000)]);
+        let orig_fee = wallet.calculate_fee(&original).unwrap().to_sat();
+
+        // Below BIP 125's rate rule BDK refuses, which `build_bump` maps to Core's -8.
+        let mut builder = wallet.build_fee_bump(orig_txid).unwrap();
+        builder.fee_rate(FeeRate::from_sat_per_vb_u32(1));
+        assert!(matches!(
+            builder.finish(),
+            Err(bdk_wallet::error::CreateTxError::FeeRateTooLow { .. })
+        ));
+
+        let rate = default_bump_rate_sat_per_kvb(orig_fee, original.vsize() as u64, None);
+        let mut builder = wallet.build_fee_bump(orig_txid).unwrap();
+        builder.fee_rate(FeeRate::from_sat_per_kwu(rate.div_ceil(4)));
+        let replacement = sign(builder.finish().unwrap());
+        let new_txid = replacement.compute_txid();
+        assert_eq!(
+            replacement.input[0].previous_output,
+            original.input[0].previous_output
+        );
+        assert!(replacement
+            .output
+            .iter()
+            .any(|o| o.script_pubkey == recipient && o.value == Amount::from_sat(100_000)));
+        let fee = wallet.calculate_fee(&replacement).unwrap().to_sat();
+        assert!(fee >= bump_total_fee_floor(orig_fee, replacement.vsize() as u64));
+        // BDK prices by weight (a rounded-up vsize reads fractionally under the rate).
+        assert!(fee * 4_000 >= rate * replacement.weight().to_wu());
+
+        wallet.apply_unconfirmed_txs([(Arc::clone(&replacement), 1_800_000_001)]);
+        let canonical: Vec<Txid> = wallet.transactions().map(|t| t.tx_node.txid).collect();
+        assert!(canonical.contains(&new_txid), "{canonical:?}");
+        assert!(!canonical.contains(&orig_txid), "{canonical:?}");
+        assert_eq!(
+            wallet.balance().trusted_pending,
+            Amount::from_sat(1_000_000 - 100_000 - fee)
+        );
+        // The original stays in the graph, non-canonical: a retired replacement brings it
+        // back.
+        assert!(wallet.tx_graph().get_tx(orig_txid).is_some());
+        wallet.apply_evicted_txs([(new_txid, 1_800_000_002)]);
+        assert!(wallet.get_tx(orig_txid).is_some());
+        assert!(wallet.get_tx(new_txid).is_none());
     }
 
     /// `replaceable = false` rides on BDK's `set_exact_sequence`: the default build signals

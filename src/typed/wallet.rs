@@ -399,6 +399,21 @@ pub struct DescriptorEntry {
     pub next_index: u32,
 }
 
+/// `bumpfee` (`rpc/btc_methods.rs::bumpfee`), Bitcoin wallets only.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Bumped {
+    /// The replacement's txid.
+    pub txid: String,
+    /// The original transaction's fee.
+    pub origfee: Amount,
+    /// The replacement's fee.
+    pub fee: Amount,
+    /// Core's warning list; always empty from zecd.
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
 /// `z_getaddressforaccount` (`rpc/wallet_methods.rs::z_getaddressforaccount`).
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -728,6 +743,18 @@ impl Client<'_> {
             .await
     }
 
+    /// `bumpfee <txid> ( options )`: replace an unconfirmed own send with a higher-fee
+    /// version of itself (Bitcoin wallets; BIP 125). `options` is Core's options object
+    /// (`fee_rate` in sat/vB, `replaceable`), passed through as given.
+    pub async fn bump_fee(
+        &self,
+        txid: &str,
+        options: Option<Value>,
+    ) -> Result<Bumped, ClientError> {
+        let params = Self::positional(vec![Some(json!(txid)), options]);
+        self.call_typed("bumpfee", params).await
+    }
+
     /// `listwallets`: the loaded wallet names.
     pub async fn list_wallets(&self) -> Result<Vec<String>, ClientError> {
         self.call_typed("listwallets", vec![]).await
@@ -740,7 +767,7 @@ impl Client<'_> {
     }
 
     /// `createwallet "name" ... {"ufvk": ..., "birthday": ...}`: onboard a view wallet into the
-    /// fleet without restarting the daemon (`rpc/wallet_methods.rs::createwallet`).
+    /// fleet without restarting the daemon (`rpc/control.rs::createwallet`).
     ///
     /// zecd's arguments ride in Bitcoin Core's options object (param 8), and Core's leading
     /// positional flags are left at their defaults - a fleet wallet is watch-only by definition,
@@ -766,13 +793,13 @@ impl Client<'_> {
     }
 
     /// `loadwallet "name"`: serve a wallet that is provisioned but not loaded
-    /// (`rpc/wallet_methods.rs::loadwallet`).
+    /// (`rpc/control.rs::loadwallet`).
     pub async fn load_wallet(&self, name: &str) -> Result<WalletLoaded, ClientError> {
         self.call_typed("loadwallet", vec![json!(name)]).await
     }
 
     /// `unloadwallet "name"`: stop serving a wallet, without deleting anything
-    /// (`rpc/wallet_methods.rs::unloadwallet`).
+    /// (`rpc/control.rs::unloadwallet`).
     pub async fn unload_wallet(&self, name: &str) -> Result<WalletLoaded, ClientError> {
         self.call_typed("unloadwallet", vec![json!(name)]).await
     }
@@ -1122,6 +1149,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(without.address_index, None);
+    }
+
+    /// Fixture: the shape `rpc/btc_methods.rs::bumpfee` emits (Core's, fees in BTC).
+    #[test]
+    fn bumped_decodes() {
+        let b: Bumped = serde_json::from_value(serde_json::json!({
+            "txid": "cd".repeat(32), "origfee": 0.00000141, "fee": 0.00000846, "errors": []
+        }))
+        .unwrap();
+        assert_eq!(b.origfee.zatoshis(), 141);
+        assert_eq!(b.fee.zatoshis(), 846);
+        assert!(b.errors.is_empty());
     }
 
     #[test]

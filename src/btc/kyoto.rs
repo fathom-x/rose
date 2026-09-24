@@ -1254,9 +1254,9 @@ pub async fn tip_height(requester: Requester) -> anyhow::Result<u32> {
 const FEE_MEDIAN_BLOCKS: u32 = 5;
 
 /// Upward bias, in percent, applied to the block-derived median. A block average is
-/// backward-looking and lags a rising market, and zecd has no `bumpfee` yet, so a slight
-/// overbid is the only lever against a send sitting unconfirmed - 20% of a sane fee is
-/// cheap insurance.
+/// backward-looking and lags a rising market, so a slight overbid keeps a send from
+/// sitting unconfirmed in the first place - 20% of a sane fee is cheap insurance, and
+/// cheaper than the `bumpfee` that would otherwise follow.
 const MARKET_LAG_BIAS_PERCENT: u64 = 20;
 
 /// How far the peers' BIP-133 feefilter may lift the estimate above the (biased) block

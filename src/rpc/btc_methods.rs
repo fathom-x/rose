@@ -25,7 +25,8 @@ use serde_json::{json, Value};
 
 use crate::amount::{signed_zats_to_value, value_to_sat_per_kvb, value_to_zats, zats_to_value};
 use crate::btc::actor::{
-    BtcConnState, BtcReceipt, BtcSendOptions, BtcSent, BtcTxDetail, BtcTxRecord, BtcWalletHandle,
+    BtcBumpOptions, BtcConnState, BtcReceipt, BtcSendOptions, BtcSent, BtcTxDetail, BtcTxRecord,
+    BtcWalletHandle,
 };
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
@@ -64,6 +65,7 @@ pub(crate) const BITCOIN_METHODS: &[&str] = &[
     "sendmany",
     "sendrawtransaction",
     "abandontransaction",
+    "bumpfee",
     "getblockchaininfo",
     "getnetworkinfo",
     "estimatesmartfee",
@@ -97,6 +99,7 @@ pub(crate) async fn dispatch(
         "sendmany" => sendmany(handle, req).await,
         "sendrawtransaction" => sendrawtransaction(handle, req).await,
         "abandontransaction" => abandontransaction(handle, req).await,
+        "bumpfee" => bumpfee(handle, req).await,
         "getblockchaininfo" => Ok(getblockchaininfo(handle)),
         "getnetworkinfo" => Ok(crate::rpc::network::networkinfo_json(
             handle.status().conn_state != BtcConnState::Down,
@@ -867,7 +870,7 @@ fn send_result(sent: BtcSent, verbose: bool) -> Value {
 /// `minrelaytxfee`: a send priced under the floor builds a transaction no node relays -
 /// on bitcoind that fails late at broadcast, and over kyoto a peer's `getdata` counts as
 /// broadcast success, so the unminable transaction would be recorded at 0-conf with its
-/// inputs locked behind it and no bumpfee/abandon to free them.
+/// inputs locked behind it until a `bumpfee` or `abandontransaction` freed them.
 fn parse_fee_rate(v: Option<&Value>) -> Result<Option<u64>, RpcError> {
     match v {
         None | Some(Value::Null) => Ok(None),
@@ -1009,6 +1012,69 @@ async fn abandontransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Resul
     let txid = parse_txid(req.require_str(0, "txid is required")?)?;
     handle.abandon_transaction(txid).await?;
     Ok(Value::Null)
+}
+
+/// `bumpfee "txid" ( options )` - Bitcoin Core's shape: `{txid, origfee, fee, errors}`, the
+/// fees in BTC and `errors` always empty (Core's field for warnings it no longer emits). The
+/// options object takes Core's keys, strictly - an unknown key is Core's `-3` "Unexpected
+/// key": `fee_rate` (sat/vB, the relay floor refused up front as on the send methods) and
+/// `replaceable` are honored; `conf_target`/`estimate_mode` are refused when engaged, as on
+/// the send methods (the wallet estimates at one fixed target); `outputs` and
+/// `original_change_index` (Core's reduce-an-output bump) are refused rather than ignored.
+/// Preconditions, fee rules and codes: `btc::actor::BtcActor::do_bump_fee`.
+async fn bumpfee(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    let txid = parse_txid(req.require_str(0, "txid is required")?)?;
+    let options = match req.param(1) {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(map)) => map.clone(),
+        Some(_) => return Err(RpcError::type_error("options must be an object")),
+    };
+    const KNOWN: &[&str] = &[
+        "conf_target",
+        "fee_rate",
+        "replaceable",
+        "estimate_mode",
+        "outputs",
+        "original_change_index",
+    ];
+    if let Some(key) = options.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+        return Err(RpcError::type_error(format!("Unexpected key {key}")));
+    }
+    if options.get("conf_target").is_some_and(|v| !v.is_null()) {
+        return Err(RpcError::invalid_parameter(
+            "conf_target is not supported (the wallet estimates at a fixed target; pass an \
+             explicit fee_rate to price the bump yourself)",
+        ));
+    }
+    match options.get("estimate_mode") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if s.is_empty() || s.eq_ignore_ascii_case("unset") => {}
+        Some(_) => {
+            return Err(RpcError::invalid_parameter(
+                "estimate_mode is not supported (the wallet estimates at a fixed target; \
+                 pass an explicit fee_rate to price the bump yourself)",
+            ))
+        }
+    }
+    for key in ["outputs", "original_change_index"] {
+        if options.get(key).is_some_and(|v| !v.is_null()) {
+            return Err(RpcError::invalid_parameter(format!(
+                "{key} is not supported: a bump keeps every recipient output and takes the \
+                 higher fee from the change (or from added inputs)"
+            )));
+        }
+    }
+    let options = BtcBumpOptions {
+        fee_rate_sat_per_kvb: parse_fee_rate(options.get("fee_rate"))?,
+        non_replaceable: !parse_replaceable(options.get("replaceable"))?,
+    };
+    let bumped = handle.bump_fee(txid, options).await?;
+    Ok(json!({
+        "txid": bumped.txid,
+        "origfee": zats_to_value(bumped.orig_fee_sat),
+        "fee": zats_to_value(bumped.fee_sat),
+        "errors": [],
+    }))
 }
 
 /// A txid argument, with Core's `ParseHashV` messages and code (`-8`): the wrong length and

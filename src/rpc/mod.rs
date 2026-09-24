@@ -58,6 +58,7 @@ pub const ALL_METHODS: &[&str] = &[
     "getrawtransaction",
     "sendrawtransaction",
     "abandontransaction",
+    "bumpfee",
     // Wallet - reads
     "getbalance",
     "getbalances",
@@ -141,6 +142,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("getrawtransaction", 3),
     ("sendrawtransaction", 2),
     ("abandontransaction", 1),
+    ("bumpfee", 2),
     // Wallet - reads
     ("getbalance", 4),
     ("getbalances", 0),
@@ -205,7 +207,8 @@ enum MethodCoins {
 /// account address derivation). `BITCOIN_ONLY` holds the Core methods only the BDK engine
 /// serves (`listdescriptors`, a descriptor-wallet method; `abandontransaction`, whose
 /// release-the-inputs semantics the Zcash engine has no counterpart for - a shielded send
-/// expires on its own). Everything else is the shared Bitcoin-Core
+/// expires on its own; `bumpfee`, BIP 125 replacement, which shielded transactions have no
+/// equivalent of). Everything else is the shared Bitcoin-Core
 /// dialect *in shape*, but each method is listed for a coin only once that coin's engine
 /// actually serves it - a method the engine cannot serve yet must read as method-not-found,
 /// not reach a Zcash-typed handler. The BDK engine's surface grows by moving entries from
@@ -265,6 +268,7 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     // Raw transactions
     ("sendrawtransaction", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("abandontransaction", MethodCoins::Only(BITCOIN_ONLY)),
+    ("bumpfee", MethodCoins::Only(BITCOIN_ONLY)),
     ("getrawtransaction", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - reads
     ("getbalance", MethodCoins::Only(ZCASH_AND_BITCOIN)),
@@ -533,6 +537,7 @@ async fn dispatch_zecd(
         // so the dispatch table and `ALL_METHODS` stay in lockstep (the test scans them).
         "listdescriptors" => bitcoin_only_fallthrough(state, wallet, req),
         "abandontransaction" => bitcoin_only_fallthrough(state, wallet, req),
+        "bumpfee" => bitcoin_only_fallthrough(state, wallet, req),
 
         // Served by the Zcash engine, which this build does not carry. These are the
         // shared-dialect methods a Bitcoin wallet *can* serve, so the wallet is resolved first
@@ -667,7 +672,7 @@ mod tests {
         ];
         /// Core methods with no Zcash meaning at all: the only entries allowed to leave
         /// Zcash out of their coin set.
-        const BITCOIN_ONLY_METHODS: &[&str] = &["listdescriptors", "abandontransaction"];
+        const BITCOIN_ONLY_METHODS: &[&str] = &["listdescriptors", "abandontransaction", "bumpfee"];
         for (method, coins) in super::METHOD_COINS {
             if method.starts_with("z_") {
                 assert_eq!(

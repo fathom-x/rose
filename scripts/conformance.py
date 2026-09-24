@@ -806,7 +806,8 @@ def s_labels_removed(ctx):
     if ctx.coin == ZCASH:
         # Descriptor-wallet methods exist for the BDK engine only; a Zcash wallet cannot serve
         # them, and a method a wallet cannot serve is indistinguishable from one that does not exist.
-        for m, params in (("listdescriptors", []), ("abandontransaction", ["00" * 32])):
+        for m, params in (("listdescriptors", []), ("abandontransaction", ["00" * 32]),
+                          ("bumpfee", ["00" * 32])):
             try:
                 rpc.call(m, *params)
                 ck(f"{m} raises on a Zcash wallet", False)
@@ -898,6 +899,56 @@ def s_abandontransaction(ctx):
         ck("abandontransaction without txid raises", False)
     except JSONRPCException as e:
         ck("abandontransaction without txid -> code -1", e.code == -1, e.code)
+
+
+@section("bumpfee", BITCOIN)
+def s_bumpfee(ctx):
+    rpc, ck = ctx.rpc, ctx.ck
+    # Core's precondition and argument codes, without replacing anything: a confirmed
+    # transaction is "mined" (-4), an unknown txid is "non-wallet" (-5), a malformed one fails
+    # parsing (-8), a missing one is -1, and the options object is strict - an unknown key is
+    # -3, and the keys zecd cannot honor are refused (-8) rather than ignored. The live bump
+    # itself is regtest_btc_bumpfee.rs.
+    confirmed = [t for t in rpc.call("listtransactions", "*", 50)
+                 if t["confirmations"] > 0 and t["category"] == "send"]
+    if confirmed:
+        try:
+            rpc.call("bumpfee", confirmed[0]["txid"])
+            ck("bumpfee on a confirmed tx raises", False)
+        except JSONRPCException as e:
+            ck("bumpfee confirmed -> code -4", e.code == -4, e.code)
+            ck("bumpfee confirmed -> has been mined", "has been mined" in str(e), str(e))
+    try:
+        rpc.call("bumpfee", "00" * 32)
+        ck("bumpfee unknown txid raises", False)
+    except JSONRPCException as e:
+        ck("bumpfee unknown -> code -5", e.code == -5, e.code)
+        ck("bumpfee unknown -> non-wallet", "non-wallet" in str(e), str(e))
+    try:
+        rpc.call("bumpfee", "abc")
+        ck("bumpfee short txid raises", False)
+    except JSONRPCException as e:
+        ck("bumpfee short txid -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("bumpfee")
+        ck("bumpfee without txid raises", False)
+    except JSONRPCException as e:
+        ck("bumpfee without txid -> code -1", e.code == -1, e.code)
+    for options, code, what in (
+        ({"feerate": 5}, -3, "unknown option key"),
+        ("fast", -3, "non-object options"),
+        ({"conf_target": 2}, -8, "conf_target"),
+        ({"estimate_mode": "economical"}, -8, "estimate_mode"),
+        ({"outputs": []}, -8, "outputs"),
+        ({"original_change_index": 1}, -8, "original_change_index"),
+        ({"fee_rate": 0.5}, -8, "fee_rate under the relay floor"),
+        ({"replaceable": "no"}, -3, "non-boolean replaceable"),
+    ):
+        try:
+            rpc.call("bumpfee", "00" * 32, options)
+            ck(f"bumpfee {what} raises", False)
+        except JSONRPCException as e:
+            ck(f"bumpfee {what} -> code {code}", e.code == code, e.code)
 
 
 @section("wallets", *BOTH)
@@ -1753,6 +1804,11 @@ def s_errors_bitcoin(ctx):
             ck("abandontransaction extra arg raises", False)
         except JSONRPCException as e:
             ck("abandontransaction extra arg -> code -1", e.code == -1, e.code)
+        try:
+            rpc.call("bumpfee", "00" * 32, {}, "extra")
+            ck("bumpfee extra arg raises", False)
+        except JSONRPCException as e:
+            ck("bumpfee extra arg -> code -1", e.code == -1, e.code)
         # replaceable (param 5) is honored, so a non-boolean is a type error (-3) rather than
         # being ignored - refused at argument parsing, so this moves no funds.
         try:

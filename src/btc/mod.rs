@@ -24,6 +24,7 @@
 //! matches locally, since filters cover blocks only.
 
 pub mod actor;
+pub mod ancestors;
 pub mod birthdays;
 pub mod chain;
 pub mod derive;

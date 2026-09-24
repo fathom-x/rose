@@ -60,6 +60,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, info_span, warn, Instrument as _};
 
 use crate::backoff::Backoff;
+use crate::btc::ancestors::{AncestorAware, Ancestry, Unconfirmed};
 use crate::btc::chain::{BitcoindRpc, BroadcastError, BtcEndpoint};
 use crate::btc::keys::{self, AccountKeys};
 use crate::btc::kyoto::{KyotoConn, KyotoFailure};
@@ -2613,6 +2614,23 @@ impl BtcActor {
             .collect()
     }
 
+    /// The wallet's unconfirmed transactions for ancestor-aware funding: fees, sizes,
+    /// parents and Core's trust rule (see `crate::btc::ancestors`).
+    fn ancestry(&self) -> Ancestry {
+        wallet_ancestry(&self.wallet, &self.funded_txids())
+    }
+
+    /// Unconfirmed outputs a send may not select: those whose ancestry the wallet cannot
+    /// price - a foreign sender's unconfirmed payment, first of all (Core's untrusted).
+    fn unpriceable_unconfirmed(&self, ancestry: &Ancestry) -> Vec<OutPoint> {
+        self.wallet
+            .list_unspent()
+            .filter(|output| !output.chain_position.is_confirmed())
+            .filter(|output| !ancestry.is_spendable(&output.outpoint.txid))
+            .map(|output| output.outpoint)
+            .collect()
+    }
+
     /// Core's coinbase maturity rule, for the read path: a reward is immature until its
     /// block has `COINBASE_MATURITY` blocks on top of it - `GetBlocksToMaturity` is
     /// `COINBASE_MATURITY + 1 - depth`, so mature at 101 confirmations, immature at 100.
@@ -3275,13 +3293,20 @@ impl BtcActor {
             None => (FeeRate::from_sat_per_vb_u32(1), "Fallback fee"),
         };
         let started = Instant::now();
-        let immature = self.immature_coinbase_outpoints();
+        // Ancestor-aware funding (`crate::btc::ancestors`): an unconfirmed output is priced
+        // net of what its unconfirmed ancestry lacks at this rate, and one the wallet cannot
+        // price is not spent at all.
+        let ancestry = Arc::new(self.ancestry());
+        let mut unspendable = self.immature_coinbase_outpoints();
+        unspendable.extend(self.unpriceable_unconfirmed(&ancestry));
         let sequence = options
             .non_replaceable
             .then_some(bdk_wallet::bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF);
-        let psbt = if options.subtract_fee_from.is_empty() {
-            let mut builder = self.wallet.build_tx();
-            builder.unspendable(immature);
+        let (psbt, ancestor_fee) = if options.subtract_fee_from.is_empty() {
+            let selection = AncestorAware::new(Arc::clone(&ancestry), fee_rate);
+            let paid = selection.paid();
+            let mut builder = self.wallet.build_tx().coin_selection(selection);
+            builder.unspendable(unspendable);
             for (address, amount) in &parsed {
                 builder.add_recipient(address.script_pubkey(), *amount);
             }
@@ -3289,13 +3314,15 @@ impl BtcActor {
             if let Some(sequence) = sequence {
                 builder.set_exact_sequence(sequence);
             }
-            builder.finish().map_err(map_create_tx_error)?
+            let psbt = builder.finish().map_err(map_create_tx_error)?;
+            (psbt, paid.load(std::sync::atomic::Ordering::Relaxed))
         } else {
             self.build_subtract_fee_psbt(
                 &parsed,
                 &options.subtract_fee_from,
                 fee_rate,
-                immature,
+                &ancestry,
+                unspendable,
                 sequence,
             )?
         };
@@ -3325,6 +3352,14 @@ impl BtcActor {
         };
         let (txid, outcome) = self.relay_committed(&tx, seen_at, "send").await?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
+        if ancestor_fee > 0 {
+            info!(
+                %txid,
+                ancestor_fee,
+                "the send pays toward its unconfirmed parents so they confirm at its rate \
+                 (ancestor-aware funding)"
+            );
+        }
         match outcome {
             RelayOutcome::Relayed => info!(
                 %txid,
@@ -3421,11 +3456,15 @@ impl BtcActor {
         parsed: &[(Address, Amount)],
         subtract: &[usize],
         fee_rate: FeeRate,
+        ancestry: &Arc<Ancestry>,
         unspendable: Vec<OutPoint>,
         sequence: Option<bdk_wallet::bitcoin::Sequence>,
-    ) -> Result<Psbt, RpcError> {
+    ) -> Result<(Psbt, u64), RpcError> {
         let inputs: Vec<OutPoint> = {
-            let mut builder = self.wallet.build_tx();
+            let mut builder = self
+                .wallet
+                .build_tx()
+                .coin_selection(AncestorAware::new(Arc::clone(ancestry), fee_rate));
             builder.unspendable(unspendable);
             for (address, amount) in parsed {
                 builder.add_recipient(address.script_pubkey(), *amount);
@@ -3441,7 +3480,9 @@ impl BtcActor {
         let mut fee_sat = 0u64;
         for _ in 0..8 {
             let reduced = subtract_fee_from_amounts(parsed, subtract, fee_sat)?;
-            let mut builder = self.wallet.build_tx();
+            let selection = AncestorAware::new(Arc::clone(ancestry), fee_rate);
+            let paid = selection.paid();
+            let mut builder = self.wallet.build_tx().coin_selection(selection);
             builder
                 .add_utxos(&inputs)
                 .map_err(|e| RpcError::misc(format!("re-select inputs: {e:?}")))?;
@@ -3466,7 +3507,7 @@ impl BtcActor {
                     if actual == fee_sat
                         || (changeless && actual > fee_sat && actual - fee_sat <= DUST_SLACK_SAT)
                     {
-                        return Ok(psbt);
+                        return Ok((psbt, paid.load(std::sync::atomic::Ordering::Relaxed)));
                     }
                     fee_sat = actual;
                 }
@@ -3865,12 +3906,20 @@ impl BtcActor {
         ))
         .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, format!("{e:#}")))?;
         let immature = self.immature_coinbase_outpoints();
-        let mut builder = self.wallet.build_fee_bump(txid).map_err(|e| match e {
-            BuildFeeBumpError::TransactionNotFound(_) => {
-                RpcError::invalid_address_or_key("Invalid or non-wallet transaction id")
-            }
-            other => RpcError::new(codes::RPC_WALLET_ERROR, format!("{other}")),
-        })?;
+        // The original's own unconfirmed parents are paid for at the new rate too (Core's
+        // `feebumper` adds the combined bump fee of the reused inputs); BDK adds only
+        // confirmed coins to a bump, so those inputs are the only ones that can carry any.
+        let ancestry = Arc::new(self.ancestry());
+        let mut builder = self
+            .wallet
+            .build_fee_bump(txid)
+            .map_err(|e| match e {
+                BuildFeeBumpError::TransactionNotFound(_) => {
+                    RpcError::invalid_address_or_key("Invalid or non-wallet transaction id")
+                }
+                other => RpcError::new(codes::RPC_WALLET_ERROR, format!("{other}")),
+            })?
+            .coin_selection(AncestorAware::new(ancestry, rate));
         builder.unspendable(immature);
         builder.fee_rate(rate);
         if non_replaceable {
@@ -3912,6 +3961,27 @@ impl BtcActor {
              already received it may still relay it"
         );
     }
+}
+
+/// [`BtcActor::ancestry`] over a bare wallet, given the funded set.
+fn wallet_ancestry(wallet: &Wallet, funded: &HashSet<Txid>) -> Ancestry {
+    let txs: Vec<Unconfirmed> = wallet
+        .transactions()
+        .filter(|wtx| !wtx.chain_position.is_confirmed())
+        .map(|wtx| {
+            let tx = &wtx.tx_node.tx;
+            let parents: Vec<Txid> = tx.input.iter().map(|i| i.previous_output.txid).collect();
+            Unconfirmed {
+                txid: wtx.tx_node.txid,
+                fee: wallet.calculate_fee(tx).ok().map(Amount::to_sat),
+                vsize: tx.vsize() as u64,
+                funded: funded.contains(&wtx.tx_node.txid),
+                unknown_parents: parents.iter().any(|p| wallet.get_tx(*p).is_none()),
+                parents,
+            }
+        })
+        .collect();
+    Ancestry::new(txs)
 }
 
 /// `sendrawtransaction`'s answer for a transaction that was not relayed: Core's `-25`
@@ -4709,6 +4779,111 @@ mod tests {
         wallet.apply_evicted_txs([(new_txid, 1_800_000_002)]);
         assert!(wallet.get_tx(orig_txid).is_some());
         assert!(wallet.get_tx(new_txid).is_none());
+    }
+
+    /// Ancestor-aware funding over a real wallet: a send that can only spend the change of
+    /// a 1 sat/vB send pays for that parent, so the pair confirms at the child's rate; a
+    /// foreign unconfirmed payment is not a candidate at all.
+    #[test]
+    fn a_send_from_unconfirmed_change_pays_for_its_parent() {
+        use crate::btc::ancestors::AncestorAware;
+        use bdk_wallet::bitcoin::block::{Header, Version};
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        use bdk_wallet::bitcoin::{
+            absolute, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, TxIn, TxMerkleNode,
+            TxOut, Txid, Witness,
+        };
+        use std::str::FromStr as _;
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let mut wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .create_wallet_no_persist()
+        .unwrap();
+        let addr = wallet.reveal_next_address(KeychainKind::External).address;
+        let pay = |prev: &str, value: u64| Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_str(&prev.repeat(32)).unwrap(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: addr.script_pubkey(),
+            }],
+        };
+        let block = Block {
+            header: Header {
+                version: Version::TWO,
+                prev_blockhash: wallet.latest_checkpoint().hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 1,
+            },
+            txdata: vec![pay("33", 1_000_000)],
+        };
+        wallet.apply_block(&block, 1).unwrap();
+        let signer = keys::signing_wallet(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let recipient = ScriptBuf::new_p2wpkh(&bdk_wallet::bitcoin::WPubkeyHash::all_zeros());
+        let sign = |mut psbt: Psbt| {
+            assert!(signer.sign(&mut psbt, SignOptions::default()).unwrap());
+            Arc::new(psbt.extract_tx().unwrap())
+        };
+        let funded = |wallet: &Wallet| -> HashSet<Txid> {
+            wallet
+                .transactions()
+                .filter(|wtx| wallet.sent_and_received(&wtx.tx_node.tx).0 > Amount::ZERO)
+                .map(|wtx| wtx.tx_node.txid)
+                .collect()
+        };
+
+        // The parent: 1 sat/vB, leaving its change as the wallet's only coin.
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(recipient.clone(), Amount::from_sat(100_000));
+        builder.fee_rate(FeeRate::from_sat_per_vb_u32(1));
+        let parent = sign(builder.finish().unwrap());
+        wallet.apply_unconfirmed_txs([(Arc::clone(&parent), 1_800_000_000)]);
+        let parent_fee = wallet.calculate_fee(&parent).unwrap().to_sat();
+        // And a foreign sender's unconfirmed payment, which the wallet cannot price.
+        let foreign = Arc::new(pay("44", 5_000_000));
+        wallet.apply_unconfirmed_txs([(Arc::clone(&foreign), 1_800_000_000)]);
+
+        let ancestry = Arc::new(wallet_ancestry(&wallet, &funded(&wallet)));
+        assert!(ancestry.is_spendable(&parent.compute_txid()));
+        assert!(!ancestry.is_spendable(&foreign.compute_txid()));
+
+        // The child at 10 sat/vB, the foreign coin withheld as `do_send` withholds it.
+        let rate = FeeRate::from_sat_per_vb_u32(10);
+        let selection = AncestorAware::new(Arc::clone(&ancestry), rate);
+        let paid = selection.paid();
+        let mut builder = wallet.build_tx().coin_selection(selection);
+        builder.unspendable(vec![OutPoint::new(foreign.compute_txid(), 0)]);
+        builder.add_recipient(recipient.clone(), Amount::from_sat(100_000));
+        builder.fee_rate(rate);
+        let child = sign(builder.finish().unwrap());
+        assert!(child
+            .input
+            .iter()
+            .all(|i| i.previous_output.txid == parent.compute_txid()));
+        let child_fee = wallet.calculate_fee(&child).unwrap().to_sat();
+        let paid = paid.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(paid, 10 * parent.vsize() as u64 - parent_fee);
+        // The package clears the child's rate - by weight, as BDK prices (a rounded-up
+        // vsize reads fractionally under the rate).
+        let package_wu = parent.weight().to_wu() + child.weight().to_wu();
+        assert!(
+            (parent_fee + child_fee) * 4 >= 10 * package_wu,
+            "package {} sat over {package_wu} WU",
+            parent_fee + child_fee
+        );
+        // And the child alone pays its own rate plus exactly the parent's shortfall.
+        assert!(child_fee >= paid + 10 * child.vsize() as u64 - 10);
     }
 
     /// `replaceable = false` rides on BDK's `set_exact_sequence`: the default build signals

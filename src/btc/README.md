@@ -540,17 +540,17 @@ Everything here is refused with a clear error rather than silently ignored or ha
 - **Address types other than bech32** (BIP 84 is the engine's only derivation): issuance is
   bech32-only, and a restore of a seed whose history lives on BIP 44/49/86 derivations will
   not see those funds. Additional descriptor templates are the fix, once wanted.
-- **CPFP** (child pays for parent) and **`psbtbumpfee`**. `bumpfee` (above) covers the
-  wallet's own replaceable sends; what remains is the stuck transaction RBF cannot reach -
-  an incoming payment (not the wallet's to replace) or an own send made with
-  `replaceable = false`. Core has no CPFP RPC either (a user builds the child by hand), and
-  zecd's send RPCs have no coin control to aim a child at a chosen output; and an incoming
-  0-conf output is `untrusted_pending`, which selection excludes. So CPFP needs an RPC shape
-  of its own (a coin-control input on the send path, or a zecd extension naming the parent)
-  plus the package arithmetic: the child's fee must lift the *package* rate, i.e. pay
-  `target * (parent_vsize + child_vsize) - parent_fee`. Over kyoto the child is announced
-  like any send; a parent under the peers' relay floor needs package relay, which bip157's
-  broadcast does not do. `psbtbumpfee` (the watch-only half of Core's pair) waits on the
+- **CPFP of an incoming payment** and **`psbtbumpfee`**. Ancestor-aware funding
+  (`ancestors.rs`, Core 26's behaviour) covers the wallet's own chains: any send that
+  spends an unconfirmed own output pays what its unconfirmed ancestry lacks at the send's
+  rate, so a cheap send - replaceable or not - is unstuck by the next send that spends its
+  change. What remains is an incoming payment stuck at a low rate: the wallet cannot price
+  a stranger's parents (over kyoto it never sees them), so an unconfirmed receive is never
+  selected, as Core's default refuses untrusted outputs. Doing that needs Core's
+  `send`-with-`inputs` coin control plus a parent-fee source (the node's
+  `getmempoolentry` over bitcoind; over kyoto only the mempool.space feed carries prevout
+  values). Over kyoto a child is announced like any send; a parent under the peers' relay
+  floor needs package relay, which bip157's broadcast does not do. `psbtbumpfee` (the watch-only half of Core's pair) waits on the
   wallet's PSBT surface. The history RPCs also omit Core's `walletconflicts`/
   `replaced_by_txid`: a replaced transaction simply leaves the wallet's canonical view.
 - **A mempool for the kyoto backend** - the `[mempool]` feed covers it since

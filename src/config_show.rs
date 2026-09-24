@@ -855,18 +855,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let show = |body: &str| render(&resolve_from(body, dir.path()));
 
-        // Off by default: the empty list is the effective value, rendered so a reader sees
-        // the knob exists, and nothing else about it.
-        let off = show(&format!(
+        // The default chain, rendered as the real key so a reader sees what is running
+        // without having to know the built-in.
+        let default_on = show(&format!(
             "network = \"test\"\nbtc_testnet = \"testnet4\"\ndatadir = {:?}\n",
             dir.path()
         ));
+        assert!(
+            default_on.contains("[mempool]\nsources = [\"p2p\"]\n"),
+            "{default_on}"
+        );
+        // Nothing about the websocket endpoint in the section, since the default never names
+        // that tier (the `[fees]` section has a key of the same name, so look at this section
+        // alone).
+        let section = default_on.split("[mempool]").nth(1).unwrap();
+        let section = section.split("\n[").next().unwrap();
+        assert!(!section.contains("mempool_space_url"), "{default_on}");
+        assert_eq!(default_on, render(&resolve_from(&default_on, dir.path())));
+
+        // Switched off outright: the empty list is the effective value, rendered so a reader
+        // sees the knob exists, and nothing else about it.
+        let off = show(&format!(
+            "network = \"test\"\nbtc_testnet = \"testnet4\"\ndatadir = {:?}\n\
+             [mempool]\nsources = []\n",
+            dir.path()
+        ));
         assert!(off.contains("[mempool]\nsources = []\n"), "{off}");
-        // Nothing about the endpoint in the section (the `[fees]` section has a key of the
-        // same name, so look at this section alone).
         let section = off.split("[mempool]").nth(1).unwrap();
         let section = section.split("\n[").next().unwrap();
-        assert!(!section.contains("mempool_space_url"), "{off}");
+        assert!(!section.contains("p2p_snapshot"), "{off}");
         assert_eq!(off, render(&resolve_from(&off, dir.path())));
 
         // Named: the resolved public endpoint rides as a note (it is not a config value).

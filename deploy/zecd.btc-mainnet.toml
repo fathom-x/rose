@@ -37,9 +37,9 @@
 # birthday scans from SegWit activation, the slow case.
 #
 # What kyoto gives up versus the bitcoind backend (filters cover blocks only, no mempool):
-#   - NO 0-conf receives: an incoming payment is invisible until it confirms - unless the
-#     opt-in [mempool] feed is on (below).
-#   - NO eviction reporting (unless the feed is on).
+#   - 0-conf receives only through the [mempool] feed (below), which the pinned peer above
+#     makes the default - without a feed an incoming payment is invisible until it confirms.
+#   - NO eviction reporting without p2p_snapshot (below).
 #   - NO estimatesmartfee: sends price from the [fees] oracle chain (mempool.space, then
 #     Blockstream's Esplora - both serve mainnet - then a peer-derived block median), or from
 #     an explicit `fee_rate`, which the UI passes from its own preview of the same chain.
@@ -69,17 +69,18 @@ server = "kyoto://127.0.0.1:8333"
 # "this IP is building a transaction" disclosure, or drop to ["peer_median"] for no server
 # contact at all (see deploy/zecd.btc-testnet4-kyoto.toml for the shapes).
 
-# [mempool] - the opt-in 0-conf feed, OFF by default, so a payment is seen before its
-# block. "p2p" is a relay connection to the trusted node above (every transaction entering
-# its mempool, ~150-300 MB a day at raw size, no server); add p2p_snapshot = true only on a
-# node that grants this host the `mempool` permission (-whitelist=mempool@<host>), since
-# Core disconnects a peer that asks without it. "mempool_space" is a websocket to a
-# mempool.space instance instead (wss://mempool.space/api/v1/ws): several GB a day of JSON
-# and a third party knowing a wallet is online at this IP; a self-hosted instance
-# (mempool_space_url) removes the third party. See deploy/zecd.btc-testnet4-kyoto.toml for
-# the full note.
+# [mempool] - the 0-conf feed, so a payment is seen before its block. "p2p" RUNS BY
+# DEFAULT: a relay connection to the trusted node above (every transaction entering its
+# mempool, ~150-300 MB a day at raw size, no server, nothing about the wallet on the wire),
+# which is why the section is commented out here. `sources = []` turns it off. Add
+# p2p_snapshot = true only on a node that grants this host the `mempool` permission
+# (-whitelist=mempool@<host>), since Core disconnects a peer that asks without it.
+# "mempool_space" is a websocket to a mempool.space instance instead
+# (wss://mempool.space/api/v1/ws) and stays opt-in: several GB a day of JSON and a third
+# party knowing a wallet is online at this IP; a self-hosted instance (mempool_space_url)
+# removes the third party. See deploy/zecd.btc-testnet4-kyoto.toml for the full note.
 # [mempool]
-# sources = ["p2p"]
+# sources = ["p2p"]      # the default; `sources = []` is the off switch
 # p2p_snapshot = true
 
 [rpc]

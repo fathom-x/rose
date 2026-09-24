@@ -233,7 +233,7 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
   with `coin`, `server`, `conn_state`, `synced_height`. A first sync is 503 `reason=syncing`;
   a dropped or hung upstream 503 `reason=upstream_down`. No `scan_lag` or enhancement
   backlog on this path.
-- **Kyoto wallets with the `[mempool]` feed on** report it under
+- **Kyoto wallets with the `[mempool]` feed on** (the default, unless `sources = []`) report it under
   `getwalletinfo.mempool_feed`: `state` (`disabled` / `connecting` / `connected`), the
   endpoint (`p2p://<ip>:<port> (relay[ + mempool snapshots])` or the websocket URL),
   `last_delta` (unix time of the last delta or snapshot - a healthy mainnet feed delivers

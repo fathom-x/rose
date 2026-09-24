@@ -92,13 +92,18 @@ server = "kyoto://216.230.225.43:48333"
 # skipped unless `esplora_url` names an instance that does serve it - `zecd config check`
 # reports that, rather than leaving the chain quietly one tier shorter than it reads.
 
-# [mempool] - the opt-in 0-conf feed, OFF by default. Filters cover blocks only, so a kyoto
-# wallet otherwise first sees a payment in its block; with a feed on, an incoming payment
+# [mempool] - the 0-conf feed. Filters cover blocks only, so a kyoto wallet without one
+# first sees a payment in its block; with the feed on, an incoming payment
 # shows in getbalances' untrusted_pending, listtransactions and `listunspent 0` before its
 # block, and a transaction that leaves the mempool is evicted at the next scan tip. Both
 # sources match every transaction locally - no address or txid ever leaves the wallet -
 # and `sources` is a preference order (the first that can run for this wallet wins).
 # getwalletinfo.mempool_feed reports the feed's state.
+#
+# "p2p" RUNS BY DEFAULT, which is why there is no [mempool] section here: it needs no
+# setting beyond the trusted peer this wallet already names. `sources = []` is the off
+# switch, and a DNS-seeded wallet (`server = "kyoto"`) has no peer to relay from, so it
+# runs no feed either way.
 #
 #   * "p2p": a relay connection to the trusted node above (the kyoto:// peer; p2p_peer
 #     overrides it) over the Bitcoin P2P protocol - every transaction entering its mempool,
@@ -108,8 +113,10 @@ server = "kyoto://216.230.225.43:48333"
 #     Bitcoin Core answers that request only for a peer with the `mempool` permission
 #     (-whitelist=mempool@<this host> on the node) and DISCONNECTS one that asks without it,
 #     so leave it off against a node you do not run.
+# p2p_snapshot stays OFF here: that node runs no -whitelist=mempool@<this host>, and Core
+# disconnects a peer that asks without the permission.
 # [mempool]
-# sources = ["p2p"]
+# sources = ["p2p"]                  # the default; `sources = []` turns the feed off
 # p2p_snapshot = true
 # p2p_snapshot_interval_secs = 300   # how stale an eviction may be; one mempool inv per request
 # p2p_peer = "216.230.225.61:48333"

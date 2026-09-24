@@ -291,8 +291,12 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
     // and the actor never starts it there), and on a network no named source has an endpoint
     // for (regtest, with no override). Both are legal, both are silent at runtime beyond a
     // log line, and both are worth a warning here, where the fix is one line away.
+    //
+    // Only when the operator named `sources`: the default chain reaches both situations on
+    // its own (every bitcoind wallet, every DNS-seeded kyoto wallet), and warning about a
+    // line that is not in the file gives no fix to make.
     #[cfg(feature = "bitcoin")]
-    if !config.mempool.sources.is_empty() {
+    if config.mempool.sources_explicit && !config.mempool.sources.is_empty() {
         let btc_network =
             crate::coin::BitcoinNetwork::from_environment(config.network, config.btc_testnet);
         for (name, wallet) in &config.wallets {

@@ -27,9 +27,9 @@
 # spending wallet's own birthday, or the date the key first handed out an address; for a
 # key with no history yet, today.
 #
-# No 0-conf by default: filters are block-derived, so a payment is first seen at its
-# first confirmation. The opt-in [mempool] feed (commented below) adds the "detected"
-# state before the block. No sends, so the [fees] chain is never consulted.
+# 0-conf comes from the [mempool] feed, which the pinned replicas below make the default:
+# filters are block-derived, so without it a payment is first seen at its first
+# confirmation. No sends, so the [fees] chain is never consulted.
 
 network = "main"
 datadir = "./data-btc-mainnet-view"
@@ -52,15 +52,16 @@ server = "kyoto://216.230.225.43:8333,216.230.225.42:8333"
 # scripts in the filter match, both cheap at this size.
 lookahead = 200
 
-# [mempool] - the opt-in 0-conf feed, OFF by default, so a payment is seen before its
-# block: what turns a merchant's "waiting" into "detected" at broadcast. "p2p" is a relay
+# [mempool] - the 0-conf feed, so a payment is seen before its block: what turns a
+# merchant's "waiting" into "detected" at broadcast. "p2p" RUNS BY DEFAULT - a relay
 # connection to the trusted replicas above (every transaction entering their mempool,
-# ~150-300 MB a day at raw size, no server); add p2p_snapshot = true only once the
-# replicas grant this host the `mempool` permission (-whitelist=mempool@<host>), since
-# Core disconnects a peer that asks without it. See deploy/zecd.btc-mainnet.toml and
+# ~150-300 MB a day at raw size, no server) - which is why the section is commented out
+# here; `sources = []` turns it off. Add p2p_snapshot = true only once the replicas grant
+# this host the `mempool` permission (-whitelist=mempool@<host>), since Core disconnects a
+# peer that asks without it. See deploy/zecd.btc-mainnet.toml and
 # deploy/zecd.btc-testnet4-kyoto.toml for the full note and the mempool.space alternative.
 # [mempool]
-# sources = ["p2p"]
+# sources = ["p2p"]      # the default; `sources = []` is the off switch
 # p2p_snapshot = true
 
 [rpc]

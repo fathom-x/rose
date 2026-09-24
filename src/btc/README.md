@@ -49,7 +49,7 @@ bitcoind backend has. The differences are behavioral, not cosmetic:
 | | `bitcoind` | `kyoto` |
 |---|---|---|
 | Credentials | rpcauth/cookie, cleartext-locality gated | none - nothing secret on the wire |
-| 0-conf receives | yes (mempool pass at tip) | **only with the opt-in `[mempool]` feed** - a relay connection to the trusted peer (`p2p`) or a mempool.space websocket (`mempool_space`), both matched locally (see below) - since filters are block-derived, and without it a payment is first seen in its block |
+| 0-conf receives | yes (mempool pass at tip) | **only with the `[mempool]` feed** - a relay connection to the trusted peer (`p2p`, the default) or a mempool.space websocket (`mempool_space`, opt-in), both matched locally (see below) - since filters are block-derived, and with the feed off (`sources = []`) or no peer to relay from, a payment is first seen in its block |
 | Eviction reporting | yes | only via the feed - `p2p_snapshot` mempool snapshots, or the websocket's `removed` deltas - settled at the next scan tip; **none** without it |
 | Rebroadcast of unconfirmed transactions | at each new tip, skipping what the node's mempool holds, verdicts classified (see below) | at each new tip, skipping what the feed reports held when one runs, else blind - every unconfirmed transaction re-announced; no verdicts either way |
 | Fee estimation | `estimatesmartfee` | the `[fees]` oracle chain (mempool.space, then Esplora), falling back to a relay floor + block median |
@@ -553,9 +553,11 @@ Everything here is refused with a clear error rather than silently ignored or ha
   broadcast does not do. `psbtbumpfee` (the watch-only half of Core's pair) waits on the
   wallet's PSBT surface. The history RPCs also omit Core's `walletconflicts`/
   `replaced_by_txid`: a replaced transaction simply leaves the wallet's canonical view.
-- **A mempool for the kyoto backend** - the opt-in `[mempool]` feed covers it since
+- **A mempool for the kyoto backend** - the `[mempool]` feed covers it since
   2026-09-10 (`mempool_feed.rs` + `p2p_feed.rs`), from either of two sources
-  named in `sources` (a preference order; the first that can run for the wallet wins).
+  named in `sources` (a preference order; the first that can run for the wallet wins),
+  defaulting to `["p2p"]` - the source that peers with the node the wallet already syncs
+  from.
   BIP-158 filters cover blocks only, so
   without it an incoming payment is invisible until it confirms and `getbalances`'
   `untrusted_pending` stays empty; nothing in BIP-157 fixes that.

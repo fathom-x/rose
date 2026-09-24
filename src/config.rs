@@ -815,13 +815,14 @@ impl Default for FeesConfig {
     }
 }
 
-/// One source of the kyoto backend's opt-in mempool feed, named in `[mempool] sources`.
+/// One source of the kyoto backend's mempool feed, named in `[mempool] sources`.
 ///
-/// A BIP-157 light client sees a transaction when it confirms and not before. The feed is a
-/// long-lived websocket to a mempool.space instance whose deltas the wallet matches locally
-/// (`crate::btc::mempool_feed`), which is what gives a kyoto wallet 0-conf receives. One
-/// variant today; the list shape mirrors `[fees] sources` so a second can be added without a
-/// config change. The bitcoind backend never consults it - it has a real mempool.
+/// A BIP-157 light client sees a transaction when it confirms and not before. The feed is
+/// what gives a kyoto wallet 0-conf receives: either a relay connection to one node or a
+/// long-lived websocket to a mempool.space instance, whose announcements the wallet matches
+/// locally (`crate::btc::mempool_feed`). The list shape mirrors `[fees] sources`, so a tier
+/// can be dropped or reordered rather than only switched off. The bitcoind backend never
+/// consults it - it has a real mempool.
 #[cfg(feature = "bitcoin")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MempoolSource {
@@ -852,15 +853,29 @@ impl MempoolSource {
     }
 }
 
-/// `[mempool]` - the kyoto backend's opt-in 0-conf feed: which sources to try, in order, and
-/// where each connects instead of its default.
+/// The chain when `[mempool] sources` is unset: the relay peer only.
 ///
-/// **Off by default** (`sources = []`): a feed costs an always-on connection and tells the
-/// other side that a wallet is online at this IP. The `p2p` source keeps that to the node the
-/// wallet already peers with (raw-size bandwidth, no server); the `mempool_space` source adds
-/// a third party and, on mainnet, gigabytes a day of JSON - its override is the answer to the
-/// third party (a self-hosted instance), and `ws://` is allowed for it on the same terms
-/// `[fees]` allows plain `http://` (no credentials, no wallet data on the wire).
+/// [`MempoolSource::P2p`] is the default because it is the source that contacts nobody new -
+/// it peers with the node the kyoto wallet already syncs from, and a wallet with no trusted
+/// peer to name simply runs no feed. [`MempoolSource::MempoolSpace`] stays opt-in: it adds a
+/// third party and, on mainnet, gigabytes a day of JSON.
+#[cfg(feature = "bitcoin")]
+pub const DEFAULT_MEMPOOL_SOURCES: [MempoolSource; 1] = [MempoolSource::P2p];
+
+/// `[mempool]` - the kyoto backend's 0-conf feed: which sources to try, in order, and where
+/// each connects instead of its default.
+///
+/// **`p2p` runs by default** ([`DEFAULT_MEMPOOL_SOURCES`]): without a feed a kyoto wallet
+/// first sees a payment in its block, which reads as a stall rather than a setting, and the
+/// relay connection that fixes it is to the node the wallet already peers with - no new
+/// counterparty, raw-size bandwidth, no server. What it costs is legibility: a peer that
+/// requests every announced transaction looks like a wallet chasing 0-conf rather than a
+/// plain filter client. `sources = []` turns the feed off outright.
+///
+/// The `mempool_space` source is opt-in and stays that way: it adds a third party and, on
+/// mainnet, gigabytes a day of JSON. Its override is the answer to the third party (a
+/// self-hosted instance), and `ws://` is allowed for it on the same terms `[fees]` allows
+/// plain `http://` (no credentials, no wallet data on the wire).
 ///
 /// The value type lives here (shared layer); the engine resolves it into an endpoint and
 /// runs the socket at its edge (`crate::btc::mempool_feed`).
@@ -868,8 +883,14 @@ impl MempoolSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MempoolConfig {
     /// The sources to subscribe to, in preference order; the first with an endpoint for
-    /// the wallet's network runs. Empty (the default) is "no feed".
+    /// the wallet's network runs. Defaults to [`DEFAULT_MEMPOOL_SOURCES`]; an explicit empty
+    /// list is legal and means "no feed at all", so a kyoto wallet sees a payment only once
+    /// it confirms.
     pub sources: Vec<MempoolSource>,
+    /// Whether `[mempool] sources` was named in the config file rather than defaulted. Only
+    /// `config check` reads it: a section that cannot do what it says is worth a warning,
+    /// while the same situation reached by default is not the operator's doing.
+    pub sources_explicit: bool,
     /// Full websocket URL for the [`MempoolSource::MempoolSpace`] source, replacing the
     /// built-in per-network endpoint. Unset uses the public instance (and leaves the feed
     /// off where there is none - regtest).
@@ -906,7 +927,8 @@ pub const MIN_P2P_SNAPSHOT_INTERVAL_SECS: u64 = 5;
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
-            sources: Vec::new(),
+            sources: DEFAULT_MEMPOOL_SOURCES.to_vec(),
+            sources_explicit: false,
             mempool_space_url: None,
             p2p_peer: None,
             p2p_snapshot: false,
@@ -1442,8 +1464,8 @@ struct FeesFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MempoolFile {
-    /// Source names (`p2p` / `mempool_space`), in preference order; unset or empty is no
-    /// feed.
+    /// Source names (`p2p` / `mempool_space`), in preference order; unset is
+    /// [`DEFAULT_MEMPOOL_SOURCES`] and an explicit empty list is no feed.
     sources: Option<Vec<String>>,
     mempool_space_url: Option<String>,
     p2p_peer: Option<String>,
@@ -2453,17 +2475,24 @@ impl AppConfig {
         #[cfg(feature = "bitcoin")]
         let mempool = {
             let mempool_file = file.mempool.unwrap_or_default();
-            // Unset and empty both mean "no feed" - the default, since the feed is opt-in. A
-            // repeated name is refused like a repeated fee source: subscribing twice is never
-            // what was meant.
-            let mut sources: Vec<MempoolSource> = Vec::new();
-            for name in mempool_file.sources.unwrap_or_default().iter() {
-                let source = MempoolSource::parse(name)?;
-                if sources.contains(&source) {
-                    anyhow::bail!("[mempool] sources names {name:?} more than once");
+            // Unset is the built-in chain; an explicit list is taken verbatim, so `sources =
+            // []` is how the feed is turned off rather than a second knob. A repeated name is
+            // refused like a repeated fee source: subscribing twice is never what was meant.
+            let sources_explicit = mempool_file.sources.is_some();
+            let sources = match mempool_file.sources {
+                None => DEFAULT_MEMPOOL_SOURCES.to_vec(),
+                Some(names) => {
+                    let mut sources: Vec<MempoolSource> = Vec::with_capacity(names.len());
+                    for name in &names {
+                        let source = MempoolSource::parse(name)?;
+                        if sources.contains(&source) {
+                            anyhow::bail!("[mempool] sources names {name:?} more than once");
+                        }
+                        sources.push(source);
+                    }
+                    sources
                 }
-                sources.push(source);
-            }
+            };
             let mempool_space_url = mempool_file
                 .mempool_space_url
                 .filter(|u| !u.trim().is_empty());
@@ -2492,6 +2521,7 @@ impl AppConfig {
             }
             MempoolConfig {
                 sources,
+                sources_explicit,
                 mempool_space_url,
                 p2p_peer,
                 p2p_snapshot: mempool_file.p2p_snapshot.unwrap_or(false),
@@ -4508,12 +4538,13 @@ mod tests {
     #[test]
     fn the_mempool_feed_is_off_by_default_and_opt_in() {
         use clap::Parser as _;
-        // No `[mempool]` at all: no feed. The cost (bandwidth, an always-on connection to a
-        // third party) is the operator's to opt into.
+        // No `[mempool]` at all: the relay peer, which contacts nobody the wallet is not
+        // already peered with. The websocket tier is never reached by default.
         let cli = Cli::parse_from(["zecd"]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.mempool, MempoolConfig::default());
-        assert!(cfg.mempool.sources.is_empty());
+        assert_eq!(cfg.mempool.sources, DEFAULT_MEMPOOL_SOURCES.to_vec());
+        assert!(!cfg.mempool.sources_explicit);
 
         let dir = tempfile::tempdir().unwrap();
         let conf = dir.path().join("zecd.toml");
@@ -4574,12 +4605,11 @@ mod tests {
         let cfg = resolve("[mempool]\nsources = [\"mempool_space\"]\nmempool_space_url = \"\"\n")
             .unwrap();
         assert!(cfg.mempool.mempool_space_url.is_none());
-        // An explicit empty list is off, same as unset.
-        assert!(resolve("[mempool]\nsources = []\n")
-            .unwrap()
-            .mempool
-            .sources
-            .is_empty());
+        // An explicit empty list is the off switch, and is NOT the same as unset: a named
+        // list is taken verbatim, so the default chain never comes back through the side door.
+        let cfg = resolve("[mempool]\nsources = []\n").unwrap();
+        assert!(cfg.mempool.sources.is_empty());
+        assert!(cfg.mempool.sources_explicit);
 
         // Refusals, each naming the line to fix: an unknown source, a repeated one, and an
         // override that is the HTTP API rather than the websocket.

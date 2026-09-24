@@ -1500,6 +1500,41 @@ mod tests {
 
         // The wallet-independent shell answers regardless of coin.
         assert_eq!(call("listwallets", vec![]).await.unwrap(), json!(["btc"]));
+        // So do the registry operations, with the contract conformance.py's shared "wallets"
+        // section asserts: createwallet's parameter refusals are -8 in every build, and the
+        // configured wallet is refused an unload (-4) rather than dropped. A bitcoin-only build
+        // answered all of them -32601 when their arms were gated on the Zcash engine.
+        let code = |r: Result<Value, crate::error::RpcError>| r.unwrap_err().code;
+        use crate::error::codes::{RPC_INVALID_PARAMETER, RPC_WALLET_ERROR, RPC_WALLET_NOT_FOUND};
+        assert_eq!(
+            code(call("createwallet", vec![]).await),
+            RPC_INVALID_PARAMETER
+        );
+        assert_eq!(
+            code(call("createwallet", vec![json!("tmp")]).await),
+            RPC_INVALID_PARAMETER
+        );
+        assert_eq!(
+            code(call("createwallet", vec![json!("tmp"), json!(false)]).await),
+            RPC_INVALID_PARAMETER
+        );
+        let mut full = vec![json!("tmp"), json!(true)];
+        full.extend(std::iter::repeat_n(Value::Null, 6));
+        full.push(json!({ "ufvk": "uview1x", "birthday": 1 }));
+        assert_eq!(code(call("createwallet", full).await), RPC_WALLET_ERROR);
+        assert_eq!(
+            code(call("unloadwallet", vec![json!("btc")]).await),
+            RPC_WALLET_ERROR
+        );
+        assert_eq!(
+            code(call("unloadwallet", vec![json!("nope")]).await),
+            RPC_WALLET_NOT_FOUND
+        );
+        assert_eq!(
+            code(call("loadwallet", vec![json!("nope")]).await),
+            RPC_WALLET_ERROR
+        );
+        assert_eq!(call("listwallets", vec![]).await.unwrap(), json!(["btc"]));
 
         // Everything the engine does not serve reads as method-not-found: a Zcash-dialect
         // node read, the passphrase surface, and a z_* extension alike.

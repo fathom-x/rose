@@ -488,12 +488,9 @@ async fn dispatch_zecd(
         "listwalletdir" => control::listwalletdir(state),
 
         // Wallet - management (fleet onboarding)
-        #[cfg(feature = "zcash")]
-        "createwallet" => wallet_methods::createwallet(state, &req.params).await,
-        #[cfg(feature = "zcash")]
-        "loadwallet" => wallet_methods::loadwallet(state, &req.params).await,
-        #[cfg(feature = "zcash")]
-        "unloadwallet" => wallet_methods::unloadwallet(state, &req.params, wallet),
+        "createwallet" => control::createwallet(state, &req.params).await,
+        "loadwallet" => control::loadwallet(state, &req.params).await,
+        "unloadwallet" => control::unloadwallet(state, &req.params, wallet),
 
         // Wallet - writes / async
         #[cfg(feature = "zcash")]

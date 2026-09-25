@@ -159,7 +159,6 @@ services:
       - --bind=0.0.0.0
       - --port=8080
       - --rpc-url=http://host.docker.internal:${ZECD_GUI_RPC_PORT:-48232}
-      - --bitcoind-url=http://bitcoind:48332
 
 networks:
   zecd-net:

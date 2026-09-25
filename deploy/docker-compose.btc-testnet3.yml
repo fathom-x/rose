@@ -92,7 +92,6 @@ services:
       - --conf=/config/zecd.btc-testnet3.toml
       - --bind=0.0.0.0
       - --port=8080
-      - --bitcoind-url=http://bitcoind:18332
 
 networks:
   zecd-net:

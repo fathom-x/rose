@@ -82,6 +82,18 @@
   button.copy:hover { color: var(--accent); border-color: var(--accent); }
   button.copy.done { color: var(--good); border-color: var(--good); }
   body.watchonly #sendcard { opacity: .55; }
+  /* One recipient per row: address, amount, whether that recipient pays the fee, remove. */
+  .recip { display: grid; grid-template-columns: minmax(0, 1fr) 10rem auto auto;
+           gap: .5rem; align-items: center; margin-top: .4rem; }
+  .recip label { margin: 0; white-space: nowrap; }
+  @media (max-width: 640px) { .recip { grid-template-columns: 1fr 1fr; } }
+  select { background: var(--bg); color: var(--text); border: 1px solid var(--line);
+           border-radius: 4px; padding: .4rem .5rem; font: inherit; }
+  .feerow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .5rem;
+            align-items: end; }
+  button.small { padding: .1rem .45rem; font-size: .75rem; font-weight: 500; }
+  #txaction { margin-top: .75rem; padding: .75rem; border: 1px solid var(--line);
+              border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -130,22 +142,40 @@
     <span class="sub">birthdate: <span id="st-birthdate">&ndash;</span></span>
   </div>
 
+  <!-- One recipient is sendtoaddress, several are sendmany; either way the page asks for
+       `verbose` so the answer names where the fee rate came from (fee_reason). -->
   <div class="card" id="sendcard" style="grid-column: 1 / -1">
     <h2>Send</h2>
-    <label>to address
-      <input type="text" id="to" placeholder="tb1&hellip;" spellcheck="false"></label>
-    <label>amount (<span class="unit">tBTC</span>, up to 8 decimals)</label>
-    <div style="display:flex;gap:.5rem;margin-top:.15rem">
-      <input type="text" id="amount" placeholder="0.0001" inputmode="decimal" style="flex:1">
-      <button type="button" id="maxbtn" class="ghost" style="white-space:nowrap">send all</button>
+    <label>recipients (address, amount in <span class="unit">tBTC</span> up to 8 decimals, and
+      whether that recipient's amount pays the fee)</label>
+    <div id="recips"></div>
+    <div class="row" style="margin-top:.4rem">
+      <button type="button" id="addrecip" class="ghost">+ recipient</button>
+      <button type="button" id="maxbtn" class="ghost" style="white-space:nowrap"
+              title="one recipient: the whole spendable balance, fee taken from it">send all</button>
     </div>
-    <label>fee rate (sat/vB &mdash; prefilled with the estimate below; edit to override, clear to let zecd price the send itself)
-      <input type="text" id="feerate" placeholder="" inputmode="decimal"></label>
+    <div class="feerow">
+      <label>fee rate (sat/vB &mdash; prefilled with zecd's estimate for the target; edit to override, clear to let zecd price the send itself)
+        <input type="text" id="feerate" placeholder="" inputmode="decimal"></label>
+      <label>confirm within
+        <select id="feetarget">
+          <option value="1">1 block</option>
+          <option value="2">2 blocks</option>
+          <option value="6" selected>6 blocks (~1 h)</option>
+          <option value="12">12 blocks</option>
+          <option value="24">24 blocks</option>
+          <option value="144">144 blocks (~1 day)</option>
+          <option value="1008">1008 blocks (~1 week)</option>
+        </select></label>
+    </div>
     <div class="sub" id="feeest" style="margin-top:.3rem">fee estimate: &ndash;</div>
     <div class="row">
-      <label style="margin:0"><input type="checkbox" id="subfee"> subtract fee from amount</label>
+      <label style="margin:0" title="BIP 125: lets bumpfee replace the send with a higher-fee version later">
+        <input type="checkbox" id="replaceable" checked> replaceable (can be fee-bumped)</label>
       <button id="send">send</button>
     </div>
+    <div class="sub" style="margin-top:.4rem">A send that spends unconfirmed change also pays what
+      its unconfirmed parents lack at this rate, so a stuck cheap send confirms with it.</div>
     <div class="msg" id="sendmsg"></div>
   </div>
 </div>
@@ -167,6 +197,21 @@
         <tfoot id="txtotals"></tfoot>
       </table>
     </div>
+    <!-- Bump or abandon an unconfirmed send: the buttons on its fee row open this panel. -->
+    <div id="txaction" hidden>
+      <div class="sub" id="txa-title"></div>
+      <div id="txa-bump">
+        <label>new fee rate (sat/vB; blank = zecd's default, the original's rate + 5 sat/vB or the estimate if higher)
+          <input type="text" id="txa-rate" inputmode="decimal"></label>
+        <label style="margin-top:.4rem"><input type="checkbox" id="txa-replaceable" checked>
+          keep the replacement replaceable (uncheck to make it final)</label>
+      </div>
+      <div class="row">
+        <button id="txa-go">bump fee</button>
+        <button id="txa-cancel" class="ghost">cancel</button>
+      </div>
+    </div>
+    <div class="msg" id="txmsg"></div>
   </div>
   <div id="pane-addrs" class="pane" hidden>
     <!-- The account xpub, from listdescriptors: the receiving descriptor's key with its
@@ -201,13 +246,13 @@ let watchOnly = null;  // getwalletinfo.private_keys_enabled === false; null unt
 // with: zecd answers every send with -4. Rather than let the user fill in a form that can
 // only fail, say so at the top of the page and disable the send controls. Re-evaluated on
 // every refresh, so a wallet swapped behind the proxy is reflected without a reload.
-const SEND_CONTROLS = ["to", "amount", "maxbtn", "feerate", "subfee", "send"];
+const sendControls = () => document.querySelectorAll("#sendcard input, #sendcard button, #sendcard select");
 function setWatchOnly(flag) {
   if (flag === watchOnly) return;
   const changed = watchOnly !== null;  // false on the first refresh, which merely learns it
   watchOnly = flag;
   document.body.classList.toggle("watchonly", flag);
-  for (const id of SEND_CONTROLS) $(id).disabled = flag;
+  for (const el of sendControls()) el.disabled = flag;
   $("sendmsg").className = "msg";
   $("sendmsg").textContent = flag ? "watch-only wallet: sending is disabled" : "";
   if (changed || flag) loadInfo();  // the header badge names the mode too
@@ -376,12 +421,22 @@ async function refresh() {
     }
     const rows = entries.slice(-25).reverse().map(({ tx, debit, credit, net, synthetic }) => {
       const when = tx.time ? new Date(tx.time * 1000).toLocaleString() : "";
+      // The fee row stands for its whole transaction, so an unconfirmed send's actions sit
+      // there, beside its "transaction fee" label: bump (BIP 125, only while it signals replaceability) and abandon (zecd refuses
+      // one still in the mempool, and says so). Hidden on a watch-only wallet, which cannot sign.
+      const pending = synthetic && !watchOnly && (tx.confirmations ?? 0) === 0
+        && /^[0-9a-f]{64}$/.test(tx.txid || "");
+      const actions = pending
+        ? (tx["bip125-replaceable"] === "yes"
+            ? `<button class="ghost small" data-bump="${tx.txid}" title="bumpfee: replace with a higher-fee version">bump</button> ` : "")
+          + `<button class="ghost small" data-abandon="${tx.txid}" title="abandontransaction: release its inputs (only once it has left the mempool)">abandon</button>`
+        : "";
       return `<tr>
         <td>${when}</td>
         <td class="amt neg" style="text-align:right">${debit ? fmtSats(debit) : ""}</td>
         <td class="amt pos" style="text-align:right">${credit ? fmtSats(credit) : ""}</td>
         <td>${tx.confirmations ?? 0}</td>
-        <td title="${tx.address || ""}">${synthetic ? tx.address : short(tx.address, 18) + copyBtn(tx.address)}</td>
+        <td title="${tx.address || ""}">${synthetic ? tx.address + (actions ? " " + actions : "") : short(tx.address, 18) + copyBtn(tx.address)}</td>
         <td class="txid" title="${tx.txid}">${short(tx.txid)}${copyBtn(tx.txid)}</td>
         <td class="amt ${net < 0 ? "neg" : "pos"}" style="text-align:right">${fmtSats(net)}</td>
       </tr>`;
@@ -417,7 +472,7 @@ async function loadInfo() {
     backend = i.backend;
     unit = (i.network === "main" || i.network === "mainnet") ? "BTC" : "tBTC";
     for (const el of document.querySelectorAll(".unit")) el.textContent = unit;
-    $("to").placeholder = unit === "BTC" ? "bc1\u2026" : "tb1\u2026";
+    for (const el of document.querySelectorAll(".r-to")) el.placeholder = unit === "BTC" ? "bc1\u2026" : "tb1\u2026";
     const mode = watchOnly ? " · watch-only" : "";
     $("cfgbadge").textContent =
       `${i.network} · ${i.backend} · ${i.wallet}${mode}  (${i.conf})`;
@@ -426,19 +481,20 @@ async function loadInfo() {
   } catch (e) { $("cfgbadge").textContent = ""; }
 }
 
-// The fee estimate is served by the proxy, mirroring where the wallet gets its
-// rate: bitcoind's estimatesmartfee on the bitcoind backend, the [fees] oracle
-// chain on kyoto - already rounded to the whole sat/vB zecd would pay.
+// The fee estimate is zecd's own estimatesmartfee at the chosen target - the same answer a
+// send without a fee rate would use: bitcoind's estimator on that backend (a test network's
+// flat, data-less curve reported as no estimate), the [fees] chain on kyoto (the peer tier
+// honors the target; the HTTP oracles answer one horizon). `source` names which answered.
+// On kyoto an estimate also keeps the wallet's block-sample ring warm, so an open page keeps
+// it sampling.
 //
-// The estimate is PREFILLED into the fee-rate field and sent as sendtoaddress's
-// explicit fee_rate, so the send pays exactly the number the page showed rather
-// than whatever zecd re-estimates seconds later. Refreshes keep overwriting the
-// field only while it still holds a prefilled value (data-auto); a value the user
-// typed is left alone. Two cases deliberately do NOT prefill: the proxy's own
-// test-network fallback (a made-up 1 sat/vB, which zecd applies itself where it is
-// legal and refuses on mainnet), and no estimate at all - then an auto-filled
-// field is cleared so a blank send lets zecd price it (on kyoto, from the
-// peer-derived estimate the page cannot see).
+// The estimate is PREFILLED into the fee-rate field and sent as the explicit fee_rate, so
+// the send pays exactly the number the page showed rather than whatever zecd re-estimates
+// seconds later. It is carried at sat/kvB precision (3 decimals of sat/vB), which is what
+// the estimate is and what fee_rate accepts. Refreshes keep overwriting the field only while
+// it still holds a prefilled value (data-auto); a value the user typed is left alone. With
+// no estimate the field is cleared, so a blank send lets zecd apply its own rule (1 sat/vB
+// on a test network, a refusal on mainnet).
 function setFeePrefill(value) {
   const f = $("feerate");
   if (f.value && !f.dataset.auto) return;  // user-typed: keep it
@@ -449,29 +505,33 @@ function setFeePrefill(value) {
   f.value = String(value); f.dataset.auto = "1";
 }
 async function refreshFee() {
+  const target = Number($("feetarget").value);
   try {
-    const r = await (await fetch("/feerate")).json();
-    if (r.error) {
-      $("feeest").textContent = "fee estimate: unavailable (" + r.error + ")";
-      setFeePrefill(null);
-      return;
-    }
-    if (r.sat_per_vb != null) {
-      const src = r.source === "fallback" ? "testnet fallback"
-                : r.source === "estimatesmartfee" ? `node, target ~${r.blocks} blocks`
-                : r.source || "estimate";
-      $("feeest").textContent = `fee estimate: ${r.sat_per_vb} sat/vB (${src})`
-        + (r.note ? ` - ${r.note}` : "");
-      setFeePrefill(r.source === "fallback" ? null : r.sat_per_vb);
+    const r = await rpc("estimatesmartfee", [target]);
+    if (r.feerate != null) {
+      // BTC/kvB -> sat/vB, exactly: the estimate is whole sat/kvB.
+      const perKvb = toSats(r.feerate);
+      const satPerVb = String(perKvb / 1000);
+      $("feeest").textContent =
+        `fee estimate: ${satPerVb} sat/vB for ${r.blocks} blocks (${r.source || "estimate"})`;
+      setFeePrefill(satPerVb);
     } else {
-      $("feeest").textContent = "fee estimate: " + (r.note || "unavailable");
+      const why = (r.errors || []).join("; ") || "no estimate";
+      $("feeest").textContent = `fee estimate: none (${why}); ` + (unit === "BTC"
+        ? "a send without a fee rate is refused on mainnet"
+        : "a send without a fee rate pays zecd's 1 sat/vB test-network fallback");
       setFeePrefill(null);
     }
   } catch (e) {
-    $("feeest").textContent = "fee estimate: unavailable";
+    $("feeest").textContent = "fee estimate: unavailable (" + e.message + ")";
     setFeePrefill(null);
   }
 }
+// Choosing a target asks for that target's estimate, replacing whatever the field held.
+$("feetarget").addEventListener("change", () => {
+  $("feerate").value = ""; $("feerate").dataset.auto = "1";
+  refreshFee();
+});
 // Typing (or clearing) the field makes it the user's; the next refresh leaves it alone.
 $("feerate").addEventListener("input", () => { delete $("feerate").dataset.auto; });
 
@@ -487,47 +547,138 @@ $("newaddr").onclick = async () => {
 };
 $("copyaddr").onclick = () => navigator.clipboard.writeText($("addr").textContent);
 
-// "send all": fill the amount with the whole spendable balance and force
-// subtract-fee on (draining the wallet needs the fee taken out of the amount,
-// or there is nothing left to pay it). The user still reviews and hits Send.
+// Recipient rows. The first cannot be removed, so the form always has one.
+function addRecipient() {
+  const row = document.createElement("div");
+  row.className = "recip";
+  row.innerHTML = `
+    <input type="text" class="r-to" placeholder="${unit === "BTC" ? "bc1\u2026" : "tb1\u2026"}" spellcheck="false">
+    <input type="text" class="r-amt" placeholder="0.0001" inputmode="decimal">
+    <label title="this recipient's amount pays the fee (subtractfeefromamount)"><input type="checkbox" class="r-subfee"> pays fee</label>
+    <button type="button" class="ghost small r-del" title="remove">&times;</button>`;
+  row.querySelector(".r-del").onclick = () => {
+    if (document.querySelectorAll(".recip").length > 1) row.remove();
+  };
+  if (watchOnly) for (const el of row.querySelectorAll("input, button")) el.disabled = true;
+  $("recips").appendChild(row);
+  return row;
+}
+$("addrecip").onclick = () => addRecipient();
+addRecipient();
+
+// "send all": one recipient, the whole spendable balance, the fee taken out of it (draining
+// the wallet needs that, or there is nothing left to pay it). The user still reviews and sends.
 $("maxbtn").onclick = () => {
   const msg = $("sendmsg");
+  const rows = document.querySelectorAll(".recip");
+  if (rows.length !== 1) { msg.className = "msg err"; msg.textContent = "send all takes a single recipient"; return; }
   if (!(spendable > 0)) { msg.className = "msg err"; msg.textContent = "no spendable balance"; return; }
-  $("amount").value = fmt(spendable);   // exact 8dp of the confirmed balance
-  $("subfee").checked = true;
+  rows[0].querySelector(".r-amt").value = fmt(spendable);   // exact 8dp of the confirmed balance
+  rows[0].querySelector(".r-subfee").checked = true;
   msg.className = "msg"; msg.textContent = "amount set to full balance; fee will be taken from it";
 };
 
 $("send").onclick = async () => {
   const msg = $("sendmsg");
   msg.className = "msg"; msg.textContent = "";
-  if (watchOnly) { msg.className = "msg err"; msg.textContent = "watch-only wallet: sending is disabled"; return; }
-  const to = $("to").value.trim();
-  const amount = $("amount").value.trim();
+  const fail = text => { msg.className = "msg err"; msg.textContent = text; };
+  if (watchOnly) return fail("watch-only wallet: sending is disabled");
+  const recips = [...document.querySelectorAll(".recip")].map(row => ({
+    to: row.querySelector(".r-to").value.trim(),
+    amount: row.querySelector(".r-amt").value.trim(),
+    subfee: row.querySelector(".r-subfee").checked,
+  }));
+  for (const r of recips) {
+    if (!r.to) return fail("every recipient needs an address");
+    if (!/^\d+(\.\d{1,8})?$/.test(r.amount) || Number(r.amount) <= 0)
+      return fail("amounts must be positive decimals with at most 8 places");
+  }
+  if (new Set(recips.map(r => r.to)).size !== recips.length) return fail("each address may appear once");
   const feerate = $("feerate").value.trim();
-  if (!to) { msg.className = "msg err"; msg.textContent = "recipient address required"; return; }
-  if (!/^\d+(\.\d{1,8})?$/.test(amount) || Number(amount) <= 0) {
-    msg.className = "msg err"; msg.textContent = "amount must be a positive decimal with at most 8 places"; return;
+  if (feerate && !/^\d+(\.\d{1,3})?$/.test(feerate)) return fail("fee rate must be sat/vB with at most 3 decimals");
+  const replaceable = $("replaceable").checked;
+  // Amounts and the fee rate ride as raw JSON placeholders, so zecd parses exactly the
+  // decimals typed (no float round trip on the send path).
+  const raw = {};
+  const feeParam = feerate ? "__FEE__" : null;
+  if (feerate) raw.__FEE__ = feerate;
+  let method, params;
+  if (recips.length === 1) {
+    // sendtoaddress "address" amount comment comment_to subtractfeefromamount
+    //               replaceable conf_target estimate_mode avoid_reuse fee_rate verbose
+    const r = recips[0];
+    raw.__AMT0__ = r.amount;
+    method = "sendtoaddress";
+    params = [r.to, "__AMT0__", null, null, r.subfee, replaceable, null, null, null, feeParam, true];
+  } else {
+    // sendmany "" {"address": amount, ...} minconf comment [subtractfeefrom]
+    //          replaceable conf_target estimate_mode fee_rate verbose
+    const amounts = {};
+    recips.forEach((r, i) => { amounts[r.to] = `__AMT${i}__`; raw[`__AMT${i}__`] = r.amount; });
+    method = "sendmany";
+    params = ["", amounts, null, null, recips.filter(r => r.subfee).map(r => r.to),
+              replaceable, null, null, feeParam, true];
   }
-  if (feerate && !/^\d+(\.\d{1,3})?$/.test(feerate)) {
-    msg.className = "msg err"; msg.textContent = "fee rate must be sat/vB with at most 3 decimals"; return;
-  }
-  // sendtoaddress "address" amount comment comment_to subtractfeefromamount
-  //               replaceable conf_target estimate_mode avoid_reuse fee_rate
-  const params = [to, "__AMT__", null, null, $("subfee").checked];
-  const raw = { __AMT__: amount };
-  if (feerate) { params.push(null, null, null, null, "__FEE__"); raw.__FEE__ = feerate; }
-  if (!confirm(`Send ${amount} ${unit} to\n${to}?`)) return;
+  const summary = recips.map(r => `  ${r.amount} ${unit} -> ${r.to}${r.subfee ? " (pays fee)" : ""}`).join("\n");
+  const rate = feerate ? `${feerate} sat/vB` : "zecd's own estimate";
+  if (!confirm(`Send\n${summary}\nat ${rate}${replaceable ? "" : ", not replaceable"}?`)) return;
   $("send").disabled = true; msg.textContent = "sending...";
   try {
-    const txid = await rpc("sendtoaddress", params, raw);
-    msg.className = "msg ok"; msg.textContent = `sent: ${txid}`;
-    $("to").value = ""; $("amount").value = "";
+    const sent = await rpc(method, params, raw);
+    msg.className = "msg ok";
+    msg.textContent = `sent: ${sent.txid} (fee rate from: ${sent.fee_reason})`;
+    $("recips").innerHTML = ""; addRecipient();
     refresh();
   } catch (e) {
-    msg.className = "msg err"; msg.textContent = e.message;
+    fail(e.message);
   } finally {
     $("send").disabled = false;
+  }
+};
+
+// Bump or abandon, from an unconfirmed send's fee row.
+let actionTxid = null;
+document.addEventListener("click", async e => {
+  const bump = e.target.closest("button[data-bump]");
+  const abandon = e.target.closest("button[data-abandon]");
+  if (bump) {
+    actionTxid = bump.dataset.bump;
+    $("txa-title").textContent = `bumpfee ${actionTxid}`;
+    $("txa-rate").value = ""; $("txa-replaceable").checked = true;
+    $("txaction").hidden = false; $("txmsg").textContent = "";
+  } else if (abandon) {
+    const txid = abandon.dataset.abandon;
+    if (!confirm(`Abandon ${txid}?\nIts inputs are released for the next send. zecd refuses while the transaction is still in the mempool - bump it instead.`)) return;
+    try {
+      await rpc("abandontransaction", [txid]);
+      $("txmsg").className = "msg ok"; $("txmsg").textContent = `abandoned ${txid}`;
+      refresh();
+    } catch (err) {
+      $("txmsg").className = "msg err"; $("txmsg").textContent = err.message;
+    }
+  }
+});
+$("txa-cancel").onclick = () => { $("txaction").hidden = true; actionTxid = null; };
+$("txa-go").onclick = async () => {
+  const rate = $("txa-rate").value.trim();
+  if (rate && !/^\d+(\.\d{1,3})?$/.test(rate)) {
+    $("txmsg").className = "msg err"; $("txmsg").textContent = "fee rate must be sat/vB with at most 3 decimals"; return;
+  }
+  // bumpfee "txid" {fee_rate, replaceable}: a blank rate lets zecd pick Core's default.
+  const options = { replaceable: $("txa-replaceable").checked };
+  const raw = {};
+  if (rate) { options.fee_rate = "__RATE__"; raw.__RATE__ = rate; }
+  $("txa-go").disabled = true;
+  try {
+    const r = await rpc("bumpfee", [actionTxid, options], raw);
+    $("txmsg").className = "msg ok";
+    $("txmsg").textContent = `replaced by ${r.txid}: fee ${fmt(r.origfee)} -> ${fmt(r.fee)} ${unit}`;
+    $("txaction").hidden = true; actionTxid = null;
+    refresh();
+  } catch (err) {
+    $("txmsg").className = "msg err"; $("txmsg").textContent = err.message;
+  } finally {
+    $("txa-go").disabled = false;
   }
 };
 

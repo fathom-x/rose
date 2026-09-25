@@ -16,8 +16,8 @@ from your own `cargo build --release --features bitcoin` and only the UI is cont
 `serve.py` can take every value from a mounted zecd config, from the environment, or a mix -
 each is resolved **flag > env > config > default**. So the image needs no config mounted at
 all: point `--conf` at a path that isn't there and it is skipped (not an error), and the only
-config-derived extras that fall away are the fee-preview tiers and the info panel's
-network/backend labels - moot for a view-only dashboard, whose send form is disabled anyway.
+config-derived extras that fall away are the info panel's network/backend labels. The fee
+estimate needs no config: the page asks zecd's own `estimatesmartfee` through the proxy.
 
 | Value | Flag | Env | Config |
 |---|---|---|---|
@@ -42,7 +42,7 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 ```
 
 (`ZECD_NETWORK`/`ZECD_BACKEND` are optional - they only set the info panel's network/backend
-labels, the BTC/tBTC unit, and the fee source; the RPC works without them.)
+labels and the BTC/tBTC unit; the RPC works without them.)
 
 `ZECD_RPC_HOST`/`PORT`/`SCHEME` exist for callers that only have a **bare hostname** to hand in -
 e.g. an orchestrator service reference (`fromService`) that can't have `http://` or a port
@@ -144,7 +144,8 @@ image - substitute `"$GUI_IMAGE"`. The compose stacks still build from
 
 Publish the port on loopback (`-p 127.0.0.1:8080:8080`, as below and as the compose stacks
 do), never on every interface: the proxy holds the wallet's RPC credentials and forwards
-`sendtoaddress`, so an interface-wide publish hands the spend surface to the whole LAN. The
+`sendtoaddress`, `sendmany`, `bumpfee` and `abandontransaction`, so an interface-wide publish
+hands the spend surface to the whole LAN. The
 proxy itself refuses cross-origin browser requests and any method the page does not use,
 but neither is a substitute for not exposing it.
 
@@ -201,11 +202,10 @@ with the flags and the config.
   that can't have a scheme composed onto it); `SCHEME` defaults to `http`. They fall back to
   `[rpc] bind`/`port` from the config.
 - `ZECD_NETWORK` - The network label for the info panel (`main`/`test`/`testnet3`/`testnet4`).
-  Only cosmetic-ish: the page picks its unit from it (`BTC` on `main`/`mainnet`, else `tBTC`),
-  and it selects the per-network fee endpoints. Set it when running env-only, since no
+  Only cosmetic-ish: the page picks its unit from it (`BTC` on `main`/`mainnet`, else
+  `tBTC`). Set it when running env-only, since no
   Bitcoin-wallet RPC reports the network; falls back to `[btc_testnet]`/`network` from the config.
-- `ZECD_BACKEND` - `kyoto` or `bitcoind`, the chain backend the info panel shows and the fee
-  preview keys on (bitcoind's `estimatesmartfee` vs the `[fees]` oracle chain). Set it env-only;
+- `ZECD_BACKEND` - `kyoto` or `bitcoind`, the chain backend the info panel shows. Set it env-only;
   falls back to detecting `kyoto` from the config's `server` token.
 
 ### Command-line Arguments
@@ -216,8 +216,7 @@ Pass arguments via the docker `CMD`:
 docker run zecd-gui \
   --conf /config/zecd.btc-testnet3.toml \
   --port 8080 \
-  --wallet btc \
-  --bitcoind-url http://127.0.0.1:48332
+  --wallet btc
 ```
 
 Full options:
@@ -230,7 +229,8 @@ Full options:
 - `--rpc-url URL` - whole zecd JSON-RPC base URL, overriding the config's `[rpc]` bind/port (env: `ZECD_RPC_URL`)
 - `--rpc-host HOST` / `--rpc-port PORT` / `--rpc-scheme SCHEME` - compose the base URL from parts
   when `--rpc-url` is unset (env: `ZECD_RPC_HOST`/`ZECD_RPC_PORT`/`ZECD_RPC_SCHEME`; scheme default `http`)
-- `--bitcoind-url URL` - bitcoind RPC for fee estimates (default: `http://127.0.0.1:48332`)
+- `--bitcoind-url URL` - ignored, accepted so older deployments still start. The fee estimate
+  is zecd's own `estimatesmartfee` (the estimate a send would use), not a separate bitcoind call
 
 ## Networking
 
@@ -287,10 +287,11 @@ dependencies, so there is nothing to install.
 - Set the `ZECD_RPC_PASSWORD` environment variable to the password the host zecd runs with
   (compose reads it from `deploy/.env`; the daemon needs it in its own environment)
 
-### "no [bitcoind] credentials"
+### "fee estimate: none"
 
-- Fee estimates require bitcoind credentials in the config
-- This is optional; the UI will still work without them
+- zecd had no estimate for the chosen target (a fresh regtest chain, or a test network whose
+  node estimator has no usable data). A send without a fee rate then pays zecd's 1 sat/vB
+  test-network fallback, and is refused on mainnet: type a rate, or pick another target
 
 ### Port already in use
 

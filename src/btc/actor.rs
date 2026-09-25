@@ -1480,7 +1480,8 @@ impl BtcActor {
                                     .map(|(tx, _)| tx.compute_txid())
                                     .collect(),
                             );
-                            self.wallet.apply_unconfirmed_txs(event.update);
+                            let sightings = self.drop_superseded_sightings(event.update);
+                            self.wallet.apply_unconfirmed_txs(sightings);
                             // The emitter diffs the node's whole mempool, so nearly every
                             // departure it reports is a foreign transaction the wallet never
                             // held. Retiring those wrote one tombstone row apiece (244
@@ -2004,6 +2005,7 @@ impl BtcActor {
             .filter(|feed_tx| crate::btc::mempool_feed::wallet_relevant(&self.wallet, feed_tx))
             .map(|feed_tx| (feed_tx.tx.clone(), feed_tx.seen))
             .collect();
+        let matched = self.drop_superseded_sightings(matched);
         for txid in &delta.removed {
             // Gone from the server's mempool: no longer known held (so the rebroadcast
             // pass may resubmit it if it turns out to still be valid), and a candidate for
@@ -2605,6 +2607,33 @@ impl BtcActor {
             .transactions()
             .filter(|wtx| self.wallet.sent_and_received(&wtx.tx_node.tx).0 > Amount::ZERO)
             .map(|wtx| wtx.tx_node.txid)
+            .collect()
+    }
+
+    /// Drop mempool sightings of transactions the wallet holds as *replaced by one of its own
+    /// unconfirmed sends* - an original that `bumpfee` superseded. A sighting sets
+    /// `last_seen`, and BDK keeps whichever of two conflicting unconfirmed transactions was
+    /// seen later (a tie broken by txid), so a sighting that reached the wallet after the
+    /// bump - the P2P feed relaying the original's announcement, a bitcoind mempool pass
+    /// captured before the bump - would make the original canonical again, in the same
+    /// second as often as not. The wallet's own replacement is authoritative until a block
+    /// says otherwise: if the network kept the original instead, its confirmation settles it.
+    fn drop_superseded_sightings(
+        &self,
+        sightings: Vec<(Arc<Transaction>, u64)>,
+    ) -> Vec<(Arc<Transaction>, u64)> {
+        sightings
+            .into_iter()
+            .filter(|(tx, _)| {
+                let drop = replaced_by_own_send(&self.wallet, tx);
+                if drop {
+                    debug!(
+                        txid = %tx.compute_txid(),
+                        "ignoring a mempool sighting of a transaction the wallet replaced"
+                    );
+                }
+                !drop
+            })
             .collect()
     }
 
@@ -4004,6 +4033,27 @@ impl BtcActor {
     }
 }
 
+/// Whether the wallet holds `tx` as replaced by one of its own unconfirmed sends: in the
+/// graph, not canonical, and conflicting with a canonical unconfirmed transaction the wallet
+/// funded. See [`BtcActor::drop_superseded_sightings`].
+fn replaced_by_own_send(wallet: &Wallet, tx: &Transaction) -> bool {
+    let txid = tx.compute_txid();
+    if wallet.tx_graph().get_tx(txid).is_none() || wallet.get_tx(txid).is_some() {
+        return false;
+    }
+    let inputs: HashSet<OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
+    wallet.transactions().any(|wtx| {
+        !wtx.chain_position.is_confirmed()
+            && wallet.sent_and_received(&wtx.tx_node.tx).0 > Amount::ZERO
+            && wtx
+                .tx_node
+                .tx
+                .input
+                .iter()
+                .any(|i| inputs.contains(&i.previous_output))
+    })
+}
+
 /// [`BtcActor::ancestry`] over a bare wallet, given the funded set.
 fn wallet_ancestry(wallet: &Wallet, funded: &HashSet<Txid>) -> Ancestry {
     let txs: Vec<Unconfirmed> = wallet
@@ -4810,6 +4860,22 @@ mod tests {
         let canonical: Vec<Txid> = wallet.transactions().map(|t| t.tx_node.txid).collect();
         assert!(canonical.contains(&new_txid), "{canonical:?}");
         assert!(!canonical.contains(&orig_txid), "{canonical:?}");
+        // A late mempool sighting of the original is dropped rather than applied: at a
+        // later `last_seen` it would win back (drop_superseded_sightings).
+        assert!(replaced_by_own_send(&wallet, &original));
+        assert!(!replaced_by_own_send(&wallet, &replacement));
+        let mut probe = wallet.tx_graph().clone();
+        let _ = probe.insert_seen_at(orig_txid, 1_800_000_002);
+        assert!(
+            probe
+                .list_canonical_txs(
+                    wallet.local_chain(),
+                    wallet.local_chain().tip().block_id(),
+                    Default::default()
+                )
+                .any(|t| t.tx_node.txid == orig_txid),
+            "the hazard the drop exists for"
+        );
         assert_eq!(
             wallet.balance().trusted_pending,
             Amount::from_sat(1_000_000 - 100_000 - fee)

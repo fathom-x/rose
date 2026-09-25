@@ -12,10 +12,17 @@
 //! actually *is* - a name, a viewing key, a birthday:
 //!
 //! ```toml
-//! # <datadir>/wallets.d/acct-00417.toml
+//! # <datadir>/fleet/zec/wallets.d/acct-00417.toml
 //! ufvk = "uview1..."
 //! birthday = 2837400
 //! ```
+//!
+//! The fleet is one subtree, `<datadir>/fleet/`, and everything inside it is coin-scoped:
+//! `<datadir>/fleet/zec/wallets.d/` and `<datadir>/fleet/zec/shards/shard-NNNN/lrz/`. See
+//! [`crate::config::fleet_root`] for why the fleet is the outer unit and the coin sits inside
+//! it, and [`crate::config::fleet_manifest_dir`] / [`crate::config::fleet_dir`] for why the coin
+//! is there at all: a UFVK is coin-specific in a way a mnemonic is not, and shard placement is a
+//! per-chain decision.
 //!
 //! This is the same class of datum `keys.toml` holds, so it respects the statelessness invariant:
 //! it is operator-supplied key material, and balances, history and addresses are all rebuilt from
@@ -133,8 +140,18 @@ pub fn load_manifests(dir: &Path) -> anyhow::Result<(Vec<ShardMember>, Vec<Skipp
 /// Write one manifest into `manifest_dir`, atomically, refusing to overwrite an existing one.
 ///
 /// Free-standing rather than a [`FleetManager`] method so it can be exercised without a shard
-/// template: the operation needs only a directory and a member.
-fn write_manifest_in(manifest_dir: &Path, member: &ShardMember) -> anyhow::Result<()> {
+/// template, and public because provisioning a member is a thing hosts do *without* a running
+/// node: the alternative is re-implementing the write below, whose atomicity is the difference
+/// between a torn file and a lost viewing key. Pairs with [`load_manifests`].
+///
+/// The write is temp + fsync + rename within `manifest_dir`, so the manifest is only ever
+/// observed whole, and an existing manifest for the same wallet is an error rather than an
+/// overwrite. A daemon already running picks the new file up on `loadwallet` (which re-reads the
+/// directory) without a restart, and `listwalletdir` lists it either way.
+///
+/// Experimental, like the rest of [`the fleet`](crate::fleet): the manifest format may change in
+/// a patch release.
+pub fn write_manifest(manifest_dir: &Path, member: &ShardMember) -> anyhow::Result<()> {
     std::fs::create_dir_all(manifest_dir).with_context(|| {
         format!(
             "creating the fleet manifest directory {}",
@@ -335,16 +352,19 @@ fn next_free_shard_dir(fleet_dir: &Path, from: usize) -> (usize, PathBuf) {
 /// precisely so it cannot disagree with reality: a wallet's shard *is* wherever its account is,
 /// and a wallet with no account anywhere is simply one that has not been imported yet.
 ///
-/// Opened read-only, so this never disturbs a database (and never creates one).
+/// Opened read-only, so this never disturbs a database (and never creates one). `dir` is the
+/// shard directory; the databases sit one engine level inside it
+/// ([`crate::config::shard_engine_dir`]).
 pub fn inspect_shard(
     network: crate::network::ZNetwork,
+    coin: crate::coin::Coin,
     dir: &Path,
     index: usize,
     placed: &mut BTreeMap<String, usize>,
 ) -> anyhow::Result<ShardState> {
     use zcash_client_backend::data_api::{Account as _, WalletRead as _};
 
-    let db = crate::wallet::open::open_read(network, dir)?;
+    let db = crate::wallet::open::open_read(network, &crate::config::shard_engine_dir(dir, coin))?;
     let ids = db.get_account_ids()?;
     let mut lowest_birthday: Option<u32> = None;
     for id in &ids {
@@ -526,7 +546,7 @@ mod tests {
             ufvk: "uview1w".to_string(),
             birthday: BlockHeight::from_u32(42),
         };
-        write_manifest_in(&manifest_dir, &member).unwrap();
+        write_manifest(&manifest_dir, &member).unwrap();
 
         let (members, skipped) = load_manifests(&manifest_dir).unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -553,12 +573,12 @@ mod tests {
             ufvk: "uview1w".to_string(),
             birthday: BlockHeight::from_u32(42),
         };
-        write_manifest_in(&manifest_dir, &member).unwrap();
+        write_manifest(&manifest_dir, &member).unwrap();
         let second = ShardMember {
             ufvk: "uview1OTHER".to_string(),
             ..member.clone()
         };
-        assert!(write_manifest_in(&manifest_dir, &second).is_err());
+        assert!(write_manifest(&manifest_dir, &second).is_err());
         let (members, _) = load_manifests(&manifest_dir).unwrap();
         assert_eq!(members[0].ufvk, "uview1w", "the first key was overwritten");
     }
@@ -617,6 +637,7 @@ mod tests {
         let (shutdown, _) = tokio::sync::watch::channel(false);
         let template = ShardTemplate {
             network: crate::network::ZNetwork::Test,
+            coin: crate::coin::Coin::Zcash,
             hub: crate::chain::hub::ChainHub::new(
                 crate::backend::resolve("zebra://127.0.0.1:18234", crate::network::ZNetwork::Test)
                     .expect("a loopback zebra endpoint resolves"),
@@ -624,10 +645,17 @@ mod tests {
             ),
             sync_interval: std::time::Duration::from_secs(60),
             rebroadcast_interval: std::time::Duration::from_secs(60),
+            fetch_memos: true,
+            batch_size: crate::sync::engine::DEFAULT_BATCH_SIZE,
+            writer_cache_mib: crate::wallet::open::DEFAULT_WRITER_CACHE_MIB,
+            enhance_concurrency: crate::config::DEFAULT_ENHANCE_CONCURRENCY,
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(2),
             confirmations_policy: Default::default(),
-            orchard_action_limit: 0,
+            spend_limits: crate::config::SpendLimits::new(&crate::config::SpendConfig {
+                orchard_action_limit: 0,
+                ..Default::default()
+            }),
             target_note_count: crate::config::DEFAULT_TARGET_NOTE_COUNT,
             min_split_output_value: crate::config::DEFAULT_MIN_SPLIT_OUTPUT_VALUE,
             enabled_pools: crate::pools::ReceiverSet::single(crate::pools::Receiver::Orchard),
@@ -746,13 +774,26 @@ pub struct FleetManager {
 #[derive(Clone)]
 pub struct ShardTemplate {
     pub network: crate::network::ZNetwork,
+    /// The coin the shards serve, which is what gives them their engine directory
+    /// ([`crate::config::shard_engine_dir`]).
+    pub coin: crate::coin::Coin,
     pub hub: std::sync::Arc<crate::chain::hub::ChainHub>,
     pub sync_interval: std::time::Duration,
     pub rebroadcast_interval: std::time::Duration,
+    /// Daemon-global `[sync] fetch_memos`: shard members are watch-only wallets like any other,
+    /// so they honour the same memo-retrieval opt-out.
+    pub fetch_memos: bool,
+    /// Blocks per download-and-scan batch (`[sync] batch_size`).
+    pub batch_size: u32,
+    /// Each shard's writer page-cache ceiling (`[sync] writer_cache_mib`); a shard is one
+    /// more writer connection, so the daemon-wide memory figure counts it.
+    pub writer_cache_mib: u32,
+    /// Transaction fetches in flight per enhancement pass (`[sync] enhance_concurrency`).
+    pub enhance_concurrency: usize,
     pub reconnect_base: std::time::Duration,
     pub reconnect_max: std::time::Duration,
     pub confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
-    pub orchard_action_limit: usize,
+    pub spend_limits: crate::config::SpendLimits,
     pub target_note_count: usize,
     pub min_split_output_value: u64,
     pub enabled_pools: crate::pools::ReceiverSet,
@@ -883,7 +924,7 @@ impl FleetManager {
             .map_err(|e| OnboardError::BadKey(format!("{e:#}")))?;
 
         if persist {
-            self.write_manifest(&member).map_err(OnboardError::Failed)?;
+            write_manifest(&self.config.manifest_dir, &member).map_err(OnboardError::Failed)?;
         }
         match self.place(member.clone()).await {
             Ok(handle) => {
@@ -923,6 +964,22 @@ impl FleetManager {
         // for a second account under one name, which the actor rightly refuses - so serving it is
         // a rename of any handle from that shard, exactly as onboarding is.
         if let Some(prototype) = self.shard_holding(&member.name) {
+            // Unless its import was refused, in which case the account is *not* there and the
+            // shard is not scanning for it - the actor dropped it from the queue because
+            // retrying unchanged would fail identically. Re-queuing here is what makes
+            // `loadwallet` the retry after the manifest is fixed; without it the only route back
+            // is a daemon restart, since this branch matches on a name the manager still lists.
+            // Asked of the shard's published status keyed by *this* member's name, not through
+            // `prototype.import_error()`: the prototype is any handle from the shard, so it
+            // carries some other member's name and would answer for that wallet instead.
+            if prototype.status().import_errors.contains_key(&member.name) {
+                tracing::info!(
+                    wallet = %member.name,
+                    "re-queuing a view wallet whose import had failed"
+                );
+                prototype.add_shard_member(member.clone()).await?;
+                return Ok(prototype.sibling(member.name));
+            }
             tracing::info!(wallet = %member.name, "reloaded a view wallet already in a shard");
             return Ok(prototype.sibling(member.name));
         }
@@ -1012,10 +1069,6 @@ impl FleetManager {
         manifest_path_in(&self.config.manifest_dir, name)
     }
 
-    fn write_manifest(&self, member: &ShardMember) -> anyhow::Result<()> {
-        write_manifest_in(&self.config.manifest_dir, member)
-    }
-
     /// The `RwLock`/`Mutex` critical sections here are all short and cannot leave a half-built
     /// value behind, so recover from a poisoned lock instead of taking the daemon down.
     fn lock_shards(&self) -> std::sync::MutexGuard<'_, Vec<ShardRuntime>> {
@@ -1038,20 +1091,26 @@ impl ShardTemplate {
         crate::wallet::actor::ActorConfig {
             name: name.to_string(),
             network: self.network,
-            engine_dir: dir.to_path_buf(),
+            engine_dir: crate::config::shard_engine_dir(dir, self.coin),
             // A shard has no keys.toml: its wallets are watch-only accounts imported from the
-            // manifest's viewing keys.
+            // manifest's viewing keys. The path is carried anyway, at the shard root where a
+            // wallet's would sit - above the engine directory, which nothing but librustzcash
+            // owns.
             keys_path: dir.join("keys.toml"),
             hub: std::sync::Arc::clone(&self.hub),
             sync_interval: self.sync_interval,
             rebroadcast_interval: self.rebroadcast_interval,
+            fetch_memos: self.fetch_memos,
+            batch_size: self.batch_size,
+            writer_cache_mib: self.writer_cache_mib,
+            enhance_concurrency: self.enhance_concurrency,
             reconnect_base: self.reconnect_base,
             reconnect_max: self.reconnect_max,
             age_identity: None,
             auto_unlock: false,
             bootstrap: false,
             confirmations_policy: self.confirmations_policy,
-            orchard_action_limit: self.orchard_action_limit,
+            spend_limits: self.spend_limits.clone(),
             // Never consulted - a shard member cannot spend - but carried so a shard actor's
             // config matches a wallet actor's on every field they share.
             target_note_count: self.target_note_count,
@@ -1059,6 +1118,8 @@ impl ShardTemplate {
             // Shard members never spend, so the proving keys would be dead weight.
             orchard_keys: None,
             pipeline_proving: false,
+            // Nor is there anything to drain: a shard actor accepts no sends.
+            shutdown_drain: std::time::Duration::ZERO,
             // Never consulted either: the trust marker is written at send-store time.
             trust_own_transactions: false,
             enabled_pools: self.enabled_pools.clone(),

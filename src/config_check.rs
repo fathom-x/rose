@@ -99,7 +99,10 @@ pub fn inspect(config: &AppConfig) -> Vec<Finding> {
     }
 
     check_backend(config, &mut findings);
+    check_sync(config, &mut findings);
     check_rpc(config, &mut findings);
+    #[cfg(feature = "zcash")]
+    check_spend(config, &mut findings);
     check_layout(config, &mut findings);
     check_paths(config, &mut findings);
     #[cfg(feature = "zcash")]
@@ -126,6 +129,21 @@ fn check_fleet(config: &AppConfig, findings: &mut Vec<Finding>) {
     };
 
     if !config.fleet.enabled {
+        // Latent, because `resolve` only refuses this when the fleet actually runs: switching
+        // `enabled` on would then make the daemon refuse to start, which is worth knowing before
+        // the flip rather than after it.
+        if let Some((name, wallet_path, fleet_path)) =
+            crate::config::fleet_path_conflict(&config.wallets, &config.fleet)
+        {
+            findings.push(Finding::warning(format!(
+                "wallet '{name}' has its data directory at {}, which overlaps the fleet's {}. \
+                 Harmless while [fleet] enabled is false - those paths are never read - but \
+                 setting it true would make zecd refuse to start. Rename the wallet, or point \
+                 [wallets.{name}] dir (or the [fleet] manifest_dir/dir) somewhere else",
+                wallet_path.display(),
+                fleet_path.display(),
+            )));
+        }
         if manifests > 0 {
             findings.push(Finding::warning(format!(
                 "{manifests} fleet manifest(s) in {} are not being served: [fleet] enabled is \
@@ -149,6 +167,54 @@ fn check_fleet(config: &AppConfig, findings: &mut Vec<Finding>) {
         config.fleet.manifest_dir.display()
     )));
 }
+
+/// `[spend]` settings whose sound value depends on the environment rather than on the config.
+#[cfg(feature = "zcash")]
+fn check_spend(config: &AppConfig, findings: &mut Vec<Finding>) {
+    // The two spend bounds are in different units and neither implies the other, so a config
+    // can set an action cap that no transaction under the size ceiling could ever reach. That
+    // is not an error - the ceiling still stops the send, correctly - but it means the cap the
+    // operator tuned is not the one that will bind, and the refusal they eventually get will
+    // name the other knob. Say so at check time instead.
+    let ceiling = config.spend.max_tx_bytes;
+    let actions_that_fit = crate::tx_size::max_orchard_family_actions(ceiling);
+    if ceiling > 0
+        && (config.spend.orchard_action_limit == 0
+            || config.spend.orchard_action_limit > actions_that_fit)
+    {
+        let cap = match config.spend.orchard_action_limit {
+            0 => "is disabled".to_string(),
+            n => format!("is {n}"),
+        };
+        findings.push(Finding::warning(format!(
+            "[spend] orchard_action_limit {cap}, but [spend] max_tx_bytes = {ceiling} holds \
+             only about {actions_that_fit} Orchard actions - so a large send is refused for \
+             its size rather than its action count. That is the intended order (the size \
+             ceiling is what a node will actually relay); raise max_tx_bytes only if every \
+             node between this wallet and a miner accepts the larger size"
+        )));
+    }
+    // The drain only runs for as long as the *supervisor* lets the process live after its stop
+    // signal, and every common supervisor's default is at or below 90s: systemd's
+    // `DefaultTimeoutStopSec` is 90, Kubernetes' `terminationGracePeriodSeconds` 30, and
+    // `docker stop` 10. A drain longer than the shortest of those is not wrong - the operator
+    // may have raised it - but it is the kind of setting that silently does nothing, which is
+    // exactly what a warning is for.
+    if config.spend.shutdown_drain_secs > SUPERVISOR_STOP_TIMEOUT_HINT_SECS {
+        findings.push(Finding::warning(format!(
+            "[spend] shutdown_drain_secs = {} is longer than the default stop timeout of every \
+             common supervisor (systemd 90s, Kubernetes 30s, `docker stop` 10s). Unless yours \
+             is raised to match, the drain will be cut short by SIGKILL and accepted sends will \
+             be lost anyway",
+            config.spend.shutdown_drain_secs
+        )));
+    }
+}
+
+/// The longest supervisor stop timeout zecd assumes is available by default (systemd's
+/// `DefaultTimeoutStopSec`). Past this, `[spend] shutdown_drain_secs` is warned about.
+#[cfg(feature = "zcash")]
+const SUPERVISOR_STOP_TIMEOUT_HINT_SECS: u64 = 90;
 
 /// The verdict `zecd config check` derives from a set of findings. The pass/fail and
 /// `--strict` semantics live here so a library caller and the CLI cannot disagree on them.
@@ -182,6 +248,95 @@ impl CheckOutcome {
 pub fn check(config: &AppConfig) -> CheckOutcome {
     CheckOutcome {
         findings: inspect(config),
+    }
+}
+
+/// The `[sync] batch_size` above which the memory two resident batches take (the one scanning
+/// and the one fetched ahead) is worth a warning: on mainnet's densest ranges a batch this
+/// size is hundreds of megabytes of compact blocks.
+const BATCH_SIZE_MEMORY_WARN: u32 = 50_000;
+
+/// The daemon-wide writer page-cache ceiling (`[sync] writer_cache_mib` times the writer
+/// connections: one per configured wallet, one per fleet shard) above which it is worth
+/// saying so: 2 GiB. Past that the ceiling is the kind of number a memory-capped container
+/// is sized against, and a cache that has grown is kept for the connection's lifetime.
+const WRITER_CACHE_TOTAL_WARN_MIB: u64 = 2048;
+/// The `[sync] enhance_concurrency` above which a warning is worth it: past the measured knee
+/// (64 in flight took 136 s where 256 took 105 s on a rack-local lightwalletd), and enough
+/// concurrent streams that a public lightwalletd may throttle the client.
+const ENHANCE_CONCURRENCY_WARN: usize = 64;
+
+/// `[sync]`: settings with a consequence an operator should meet before deploying rather than
+/// after.
+///
+/// Warnings, never errors - a memo-less wallet is a legitimate and supported deployment (and
+/// reversible without a rescan), and a large batch is a server-class choice. But `fetch_memos`
+/// is silent in operation (a history with no memos looks exactly like a history whose senders
+/// attached none), and a batch's memory only shows on the densest ranges, so name the
+/// consequence where an operator is already reading findings.
+fn check_sync(config: &AppConfig, findings: &mut Vec<Finding>) {
+    if config.sync.enhance_concurrency > ENHANCE_CONCURRENCY_WARN {
+        findings.push(Finding::warning(format!(
+            "[sync] enhance_concurrency = {}: this many transaction fetches go to the upstream \
+             at once during the enhancement drain. The gain flattens past 64 (measured: 64 in \
+             flight 136 s, 256 in flight 105 s on the same drain), and a public lightwalletd \
+             may throttle a client opening that many streams; a zebra upstream caps them at its \
+             own in-flight limit regardless",
+            config.sync.enhance_concurrency
+        )));
+    }
+    if config.sync.batch_size > BATCH_SIZE_MEMORY_WARN {
+        findings.push(Finding::warning(format!(
+            "[sync] batch_size = {}: a batch lives in memory while it scans, and the next one \
+             is fetched alongside it, so two batches of compact blocks are resident at once - \
+             on mainnet's densest ranges hundreds of megabytes at this size. The measured \
+             sweet spot is 25000; the scan gains nothing past it",
+            config.sync.batch_size
+        )));
+    }
+    // One writer connection per configured wallet, plus one per fleet shard that already
+    // exists (a fleet adds shards at runtime, so this is the floor, not the total).
+    #[cfg(feature = "zcash")]
+    let shards = if config.fleet.enabled {
+        crate::fleet::existing_shard_dirs(&config.fleet.dir).len()
+    } else {
+        0
+    };
+    #[cfg(not(feature = "zcash"))]
+    let shards = 0;
+    let writers = config.wallets.len() + shards;
+    let ceiling_mib = u64::from(config.sync.writer_cache_mib) * writers as u64;
+    if ceiling_mib > WRITER_CACHE_TOTAL_WARN_MIB {
+        #[cfg(feature = "zcash")]
+        let fleet_note = if config.fleet.enabled {
+            " ({shards} existing fleet shards counted; every shard the fleet adds at runtime \
+             raises it by the same amount)"
+        } else {
+            ""
+        };
+        #[cfg(not(feature = "zcash"))]
+        let fleet_note = "";
+        findings.push(Finding::warning(format!(
+            "[sync] writer_cache_mib = {}: with {} writer connection{} that is a {} MiB \
+             page-cache ceiling for the daemon{}. It is a ceiling, not an allocation, but a \
+             cache that has grown is kept for the process lifetime, so a memory-capped host \
+             should be sized for it or set a lower value",
+            config.sync.writer_cache_mib,
+            writers,
+            if writers == 1 { "" } else { "s" },
+            ceiling_mib,
+            fleet_note.replace("{shards}", &shards.to_string()),
+        )));
+    }
+    if !config.sync.fetch_memos {
+        findings.push(Finding::warning(
+            "[sync] fetch_memos = false: this wallet never fetches the full data of a \
+             transaction it saw only as a compact block, so memos are never reported (the \
+             history RPCs omit them entirely, and getwalletinfo reports fetch_memos: false). \
+             Everything else stays exact - balances, receives, and the wallet's own sends with \
+             their recipients and fees. Keep it true if depositors are identified BY MEMO. \
+             Reversible: setting it back to true backfills the skipped memos with no rescan",
+        ));
     }
 }
 
@@ -534,6 +689,25 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
                 )));
             }
         }
+
+        // A multi-receiver default means the address `getnewaddress` hands out is not the string
+        // history reports, since only the receiver an output paid reaches the chain and zecd
+        // keeps no recipient-side record. The actor warns at spawn; here it is worth catching
+        // before a deployment builds reconciliation on the wrong assumption. Transparent cannot
+        // trip this - see `ReceiverSet::is_multi_receiver`.
+        #[cfg(feature = "zcash")]
+        if wallet.default_receivers.is_multi_receiver() {
+            findings.push(Finding::warning(format!(
+                "wallet '{name}': default_receivers = [{}] hands out multi-receiver Unified \
+                 Addresses, which transaction history does not report - listtransactions, \
+                 gettransaction, listsinceblock and z_listtransactions name the single receiver \
+                 each output actually paid, because only that receiver reaches the chain and \
+                 zecd is stateless. Match a payment by deconstructing the issued address into \
+                 its receivers, or with getreceivedbyaddress, which accepts any encoding of an \
+                 address the wallet owns",
+                wallet.default_receivers.display_names()
+            )));
+        }
     }
     if initialized == 0 && !config.wallets.is_empty() {
         findings.push(Finding::warning(format!(
@@ -705,6 +879,207 @@ mod tests {
             .collect()
     }
 
+    /// A multi-receiver `default_receivers` is warned about, a single-receiver one is silent,
+    /// and **enabling transparent receiving never trips it**. The divergence the warning names
+    /// needs two *shielded* receivers in one address; transparent receivers are handed out as
+    /// bare t-addresses, so for them the address issued is the receiver paid and history matches
+    /// what the operator gave out. Pinned here because the whole point of the warning is that
+    /// this class of surprise should be said before a deployment reconciles against it.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn a_multi_receiver_default_is_warned_about_but_transparent_alone_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path());
+
+        let multi = inspect(&resolve(
+            &format!(
+                "{base}[pools]\nenabled = [\"sapling\", \"orchard\"]\n\
+                 default_receivers = [\"sapling\", \"orchard\"]\n"
+            ),
+            dir.path(),
+        ));
+        assert!(
+            errors(&multi).is_empty(),
+            "a multi-receiver wallet is a supported deployment, never an error: {:?}",
+            errors(&multi)
+        );
+        let warned: Vec<&str> = warnings(&multi)
+            .into_iter()
+            .filter(|w| w.contains("default_receivers"))
+            .collect();
+        assert_eq!(
+            warned.len(),
+            1,
+            "exactly one finding must name the setting: {:?}",
+            warnings(&multi)
+        );
+        assert!(
+            warned[0].contains("listtransactions") && warned[0].contains("getreceivedbyaddress"),
+            "the warning must name what diverges and how to match a payment anyway: {}",
+            warned[0]
+        );
+
+        // Silent cases: the default (no [pools] at all), an explicit single shielded receiver,
+        // and a transparent-enabled wallet - transparent is not a receiver-set member, so it
+        // cannot make a wallet's addresses multi-receiver.
+        for body in [
+            "",
+            "[pools]\nenabled = [\"orchard\"]\ndefault_receivers = [\"orchard\"]\n",
+            "[pools]\ntransparent = true\ntransparent_default = true\n",
+            "[pools]\nenabled = [\"sapling\", \"orchard\"]\ndefault_receivers = [\"orchard\"]\n",
+        ] {
+            let quiet = inspect(&resolve(&format!("{base}{body}"), dir.path()));
+            assert!(
+                !warnings(&quiet)
+                    .iter()
+                    .any(|w| w.contains("default_receivers")),
+                "config {body:?} must not warn about receiver divergence: {:?}",
+                warnings(&quiet)
+            );
+        }
+    }
+
+    /// `[sync] fetch_memos = false` is warned about, and only then. The setting is legitimate
+    /// and reversible, so it is never an error - but it is silent in operation (a history with
+    /// no memos is indistinguishable from one whose senders attached none), which is exactly
+    /// the class of thing this command exists to say out loud before a deployment, not after.
+    /// The writer page cache is warned about by its daemon-wide ceiling - the value times the
+    /// writer connections - never by the value alone: the default on one wallet is silent, the
+    /// same value across enough wallets is not, and a large value on one wallet is.
+    #[test]
+    fn writer_cache_ceiling_is_warned_about_past_two_gib() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path());
+        let mentions_cache = |findings: &[Finding]| {
+            warnings(findings)
+                .iter()
+                .any(|w| w.contains("writer_cache_mib"))
+        };
+
+        let default_one_wallet = inspect(&resolve(&base, dir.path()));
+        assert!(
+            !mentions_cache(&default_one_wallet),
+            "the default on one wallet is silent: {:?}",
+            warnings(&default_one_wallet)
+        );
+
+        let large_one_wallet = inspect(&resolve(
+            &format!("{base}[sync]\nwriter_cache_mib = 4096\n"),
+            dir.path(),
+        ));
+        assert!(
+            errors(&large_one_wallet).is_empty(),
+            "the cache size is never an error: {:?}",
+            errors(&large_one_wallet)
+        );
+        assert!(
+            warnings(&large_one_wallet)
+                .iter()
+                .any(|w| w.contains("writer_cache_mib = 4096") && w.contains("4096 MiB")),
+            "one 4 GiB writer is named with its ceiling: {:?}",
+            warnings(&large_one_wallet)
+        );
+
+        // Four wallets (the implicit `default` plus three more) at 1 GiB each: no single value
+        // is alarming, the product is.
+        let mut many = format!("{base}[sync]\nwriter_cache_mib = 1024\n");
+        for name in ["a", "b", "c"] {
+            many.push_str(&format!("[wallets.{name}]\n"));
+        }
+        let many_wallets = inspect(&resolve(&many, dir.path()));
+        assert!(
+            warnings(&many_wallets)
+                .iter()
+                .any(|w| w.contains("4 writer connections") && w.contains("4096 MiB")),
+            "the warning counts the wallets: {:?}",
+            warnings(&many_wallets)
+        );
+    }
+
+    /// The two `[sync]` sizes are warned about only past their measured knees: the defaults
+    /// and the server-class settings (25000 blocks, 64 fetches) are silent.
+    #[test]
+    fn oversized_sync_batch_and_concurrency_are_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path());
+
+        let big = inspect(&resolve(
+            &format!("{base}[sync]\nbatch_size = 100000\nenhance_concurrency = 256\n"),
+            dir.path(),
+        ));
+        assert!(
+            errors(&big).is_empty(),
+            "sizes are never errors: {:?}",
+            errors(&big)
+        );
+        assert!(
+            warnings(&big)
+                .iter()
+                .any(|w| w.contains("batch_size = 100000")),
+            "the batch warning names the value: {:?}",
+            warnings(&big)
+        );
+        assert!(
+            warnings(&big)
+                .iter()
+                .any(|w| w.contains("enhance_concurrency = 256")),
+            "the concurrency warning names the value: {:?}",
+            warnings(&big)
+        );
+
+        let server_class = inspect(&resolve(
+            &format!("{base}[sync]\nbatch_size = 25000\nenhance_concurrency = 64\n"),
+            dir.path(),
+        ));
+        assert!(
+            !warnings(&server_class)
+                .iter()
+                .any(|w| w.contains("batch_size") || w.contains("enhance_concurrency")),
+            "the measured sweet spots do not warn: {:?}",
+            warnings(&server_class)
+        );
+    }
+
+    #[test]
+    fn fetch_memos_off_is_warned_about_and_on_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("network = \"regtest\"\ndatadir = {:?}\n", dir.path());
+
+        let off = inspect(&resolve(
+            &format!("{base}[sync]\nfetch_memos = false\n"),
+            dir.path(),
+        ));
+        assert!(
+            errors(&off).is_empty(),
+            "a memo-less wallet is a supported deployment, never an error: {:?}",
+            errors(&off)
+        );
+        let warned: Vec<&str> = warnings(&off)
+            .into_iter()
+            .filter(|w| w.contains("fetch_memos"))
+            .collect();
+        assert_eq!(
+            warned.len(),
+            1,
+            "exactly one finding must name the setting: {:?}",
+            warnings(&off)
+        );
+        assert!(
+            warned[0].contains("memos are never reported"),
+            "the warning must name the consequence, not just the key: {}",
+            warned[0]
+        );
+
+        for body in ["", "[sync]\nfetch_memos = true\n"] {
+            let on = inspect(&resolve(&format!("{base}{body}"), dir.path()));
+            assert!(
+                !warnings(&on).iter().any(|w| w.contains("fetch_memos")),
+                "the default must not warn (config body: {body:?}): {:?}",
+                warnings(&on)
+            );
+        }
+    }
+
     /// Manifests present with the fleet disabled is the failure mode `[fleet] enabled`
     /// introduces: the files look identical either way, and nothing else in the daemon mentions
     /// them, so an operator who provisioned wallets sees them silently unwatched.
@@ -712,9 +1087,10 @@ mod tests {
     #[test]
     fn manifests_with_the_fleet_disabled_are_reported() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("wallets.d")).unwrap();
+        let manifests = dir.path().join("fleet").join("zec").join("wallets.d");
+        std::fs::create_dir_all(&manifests).unwrap();
         std::fs::write(
-            dir.path().join("wallets.d").join("w1.toml"),
+            manifests.join("w1.toml"),
             "ufvk = \"uview1a\"\nbirthday = 100\n",
         )
         .unwrap();

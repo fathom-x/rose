@@ -307,6 +307,11 @@ mod tests {
         assert_eq!(Coin::supported_names(), expected.join(", "));
         assert_eq!(Coin::SUPPORTED.len(), expected.len());
         assert_eq!(Coin::DEFAULT, Coin::SUPPORTED[0]);
+        // The round trip, over the whole table rather than the literals above: it is the loop
+        // where a second coin's parse/name mismatch would show up.
+        for coin in Coin::SUPPORTED {
+            assert_eq!(Coin::parse(coin.name()), Some(*coin));
+        }
     }
 
     #[cfg(feature = "bitcoin")]
@@ -410,13 +415,6 @@ mod tests {
                 "two coins share the data directory {:?}",
                 coin.data_dir()
             );
-        }
-    }
-
-    #[test]
-    fn names_round_trip_through_parse() {
-        for coin in Coin::SUPPORTED {
-            assert_eq!(Coin::parse(coin.name()), Some(*coin));
         }
     }
 }

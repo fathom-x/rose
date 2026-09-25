@@ -1306,6 +1306,8 @@ mod tests {
             operations: Arc::new(crate::operations::OperationRegistry::new()),
             #[cfg(feature = "zcash")]
             fleet: None,
+            #[cfg(feature = "zcash")]
+            spend_limits: crate::config::SpendLimits::new(&crate::config::SpendConfig::default()),
         };
         let call = |method: &str, params: Vec<Value>| {
             let req = RpcRequest::positional(method.to_string(), params);

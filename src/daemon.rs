@@ -46,6 +46,20 @@ pub fn init_tracing(log: &config::LogConfig) {
 
 #[cfg(feature = "server")]
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
+    run_with_reload(config, None).await
+}
+
+/// [`run`], with an optional way to re-read the configuration on SIGHUP.
+///
+/// `reresolve` returns a freshly resolved config each time it is called - the binary passes a
+/// closure that re-runs the same `AppConfig::resolve` it started with, so a reload sees exactly
+/// what a restart would. `None` disables the signal handler, which is what a caller with no
+/// config file to re-read wants.
+#[cfg(feature = "server")]
+pub async fn run_with_reload(
+    config: AppConfig,
+    reresolve: Option<Box<dyn Fn() -> anyhow::Result<AppConfig> + Send + Sync>>,
+) -> anyhow::Result<()> {
     // One identifying line before anything can fail or connect - ahead of even the datadir
     // lock, so a refusal to start is still attributable to a build and a datadir. Both
     // documented stuck-sync incidents came down to "which zecd build, on which network,
@@ -88,6 +102,79 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         wait_for_shutdown_signal().await;
         signal_state.trigger_shutdown();
     });
+
+    // SIGHUP re-reads the configuration file and applies what can be applied to the running
+    // daemon. This is how `[spend] orchard_action_limit` changes without a restart: a wallet
+    // whose notes have fragmented fails every send until the cap moves, and restarting a live
+    // payment wallet to change a number is a poor answer. It is a signal rather than an RPC on
+    // purpose - the cap bounds what a single call can make the daemon prove, so the channel
+    // that raises it must require process-level authority, not an RPC credential.
+    //
+    // Binary-only, like process hardening: signals are the process's own policy, and an
+    // embedded node's host owns its own. A config the resolver rejects leaves the running
+    // values alone and is logged - a typo in an edited file must not take down a daemon that is
+    // serving.
+    // Unix-only: `tokio::signal::unix` does not exist on other targets, and SIGHUP has no
+    // Windows equivalent. The daemon runs there (the release images are Linux, but the crate is
+    // cross-checked for Windows), so the reload is simply absent rather than the build broken.
+    // Likewise in a build without the Zcash engine: every reloadable key is a `[spend]` one.
+    #[cfg(all(unix, feature = "zcash"))]
+    if let Some(reresolve) = reresolve {
+        let reload_state = state.clone();
+        tokio::spawn(async move {
+            // Imported here rather than at module scope: `error!` is used only on this path, and
+            // a module-scope import would be unused - and warn - on a target without SIGHUP.
+            use tokio::signal::unix::{signal, SignalKind};
+            use tracing::error;
+            let mut hangup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("SIGHUP handler unavailable, config reload disabled: {e}");
+                    return;
+                }
+            };
+            while hangup.recv().await.is_some() {
+                match reresolve() {
+                    Err(e) => error!(
+                        target: "zecd::audit",
+                        "SIGHUP: the configuration was not reloaded, the running values are \
+                         unchanged: {e:#}"
+                    ),
+                    Ok(fresh) => {
+                        let report = crate::config::apply_reload(
+                            &reload_state.config,
+                            &fresh,
+                            &reload_state.spend_limits,
+                        );
+                        if report.is_empty() {
+                            info!(target: "zecd::audit", "SIGHUP: configuration unchanged");
+                        }
+                        for (key, old, new) in &report.applied {
+                            info!(
+                                target: "zecd::audit",
+                                key, old = %old, new = %new,
+                                "SIGHUP: configuration reloaded"
+                            );
+                        }
+                        if !report.requires_restart.is_empty() {
+                            warn!(
+                                target: "zecd::audit",
+                                keys = ?report.requires_restart,
+                                "SIGHUP: these settings differ from the running daemon but only \
+                                 a restart can apply them"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+    #[cfg(not(all(unix, feature = "zcash")))]
+    {
+        // Consume the argument so the signature is identical on every target; a caller that
+        // passes a re-resolver simply gets no reload here.
+        let _ = &reresolve;
+    }
 
     // Liveness/readiness probes on a separate port (best-effort; non-fatal if it can't bind).
     tokio::spawn(health::run(state.clone()));
@@ -412,6 +499,24 @@ mod tests {
         assert!(msg.contains("'default'"), "{msg}");
         assert!(msg.contains("'second'"), "{msg}");
         assert!(msg.contains("at most one"), "{msg}");
+
+        // Watch-only wallets interleaved with the spenders neither mask the violation nor get
+        // named by it: the two names are the first two *spenders* in order, not the first two
+        // entries.
+        let err = ensure_single_spending_wallet(
+            &wallets(&[
+                ("view-a", true),
+                ("spend-a", false),
+                ("view-b", true),
+                ("spend-b", false),
+            ]),
+            false,
+        )
+        .expect_err("two spending wallets must be rejected across watch-only entries");
+        let msg = err.to_string();
+        assert!(msg.contains("'spend-a'"), "{msg}");
+        assert!(msg.contains("'spend-b'"), "{msg}");
+        assert!(!msg.contains("'view-a'"), "{msg}");
     }
 
     /// The library opt-in turns the refusal into an audit record rather than an error. Only an
@@ -454,25 +559,6 @@ mod tests {
         assert!(msg.contains("allow_multiple_spending_wallets"), "{msg}");
         assert!(msg.contains("embedding zecd as a library"), "{msg}");
         assert!(msg.contains("one zecd per wallet"), "{msg}");
-    }
-
-    #[test]
-    fn two_spending_wallets_mixed_with_watch_only_are_rejected() {
-        // Watch-only wallets interleaved with the spenders don't mask the violation; the first
-        // two spenders in order are named.
-        let err = ensure_single_spending_wallet(
-            &wallets(&[
-                ("view-a", true),
-                ("spend-a", false),
-                ("view-b", true),
-                ("spend-b", false),
-            ]),
-            false,
-        )
-        .expect_err("two spending wallets must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("'spend-a'"), "{msg}");
-        assert!(msg.contains("'spend-b'"), "{msg}");
     }
 
     #[cfg(feature = "server")]

@@ -37,6 +37,7 @@ use crate::wallet::open::{data_db_path, open_read};
 /// are the actor's own maintenance reads (the rebroadcast set, the transparent spend-watch set),
 /// which must cover every account the actor scans for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AccountScope {
     /// Every account in the database. The pre-fleet behaviour, and what a wallet whose account
     /// does not exist yet (an encrypted wallet awaiting its first `walletpassphrase`, so the
@@ -47,6 +48,21 @@ pub enum AccountScope {
     Any,
     /// Exactly one account.
     Only(AccountUuid),
+    /// **No** account: every scoped read reports nothing.
+    ///
+    /// This is [`AccountScope::Any`]'s counterpart for the one case where "the account does not
+    /// exist yet" and "every account in this database" are not the same answer: a fleet shard
+    /// member that has been placed but whose viewing key has not been imported yet. Its
+    /// database is its shard's, holding its shard-mates' accounts, so answering `Any` there
+    /// reports *other wallets'* money and history under this wallet's name. A conventional
+    /// wallet awaiting its bootstrap keeps using `Any`, where the database holds no accounts at
+    /// all and the two are identical.
+    ///
+    /// It is a scope rather than an error because the wallet is legitimately servable in that
+    /// window - `createwallet` returns before the import runs, by design - and "nothing yet" is
+    /// the truthful answer to what it holds. `waitforsync`'s `imported` field is how a caller
+    /// tells that window from a wallet that really is empty.
+    NoAccount,
 }
 
 impl AccountScope {
@@ -61,6 +77,12 @@ impl AccountScope {
         match self {
             AccountScope::Any => None,
             AccountScope::Only(account) => Some(account.expose_uuid()),
+            // The nil UUID, which no account can carry: `AccountUuid`s are random v4s. Binding a
+            // non-NULL value that matches nothing is what lets `NoAccount` ride the same single
+            // SQL string as the other two variants - the predicates below are all
+            // `:scope_account IS NULL OR column = :scope_account`, so this fails the `IS NULL`
+            // arm and then compares unequal to every row.
+            AccountScope::NoAccount => Some(Uuid::nil()),
         }
     }
 
@@ -68,7 +90,14 @@ impl AccountScope {
     /// come from librustzcash's own API rather than SQL written here, so the filter is applied in
     /// Rust instead.
     fn excludes(&self, account: AccountUuid) -> bool {
-        matches!(self, AccountScope::Only(only) if *only != account)
+        // Written as an exhaustive match rather than a `matches!`, so that a variant added later
+        // is a compile error here instead of silently defaulting to "excludes nothing" - which
+        // for this predicate means leaking every account's rows into a scoped read.
+        match self {
+            AccountScope::Any => false,
+            AccountScope::Only(only) => *only != account,
+            AccountScope::NoAccount => true,
+        }
     }
 }
 
@@ -309,12 +338,44 @@ fn coinbase_zats(
     Ok(u64::try_from(total).unwrap_or(0))
 }
 
-/// Number of transactions in the wallet (for `getwalletinfo.txcount`).
+/// The `(account, transaction)` pairs `v_transactions` emits a row for: every transaction in
+/// which an account received an output, or spent one of its own.
+///
+/// Counting them straight off the view means aggregating the whole wallet - the same cost the
+/// per-transaction reads used to pay (see [`TX_RECORD_SQL`]), and `getwalletinfo` pays it on
+/// every call, which is enough to keep a monitoring poll expensive on a large wallet. Reading
+/// the account and transaction columns out of the base tables instead lets each arm run off the
+/// per-pool `account_id` and `transaction_id` indexes, and the `UNION` supplies the same
+/// deduplication the view's `GROUP BY account_id, transaction_id` does. Pinned against the view
+/// by `regtest_tests::tx_count_matches_the_view_it_replaces`.
+pub(crate) const TX_INVOLVEMENT_SQL: &str = "
+SELECT account_id, transaction_id FROM sapling_received_notes
+UNION
+SELECT account_id, transaction_id FROM orchard_received_notes
+UNION
+SELECT account_id, transaction_id FROM ironwood_received_notes
+UNION
+SELECT account_id, transaction_id FROM transparent_received_outputs
+UNION
+SELECT n.account_id, s.transaction_id FROM sapling_received_note_spends s
+    JOIN sapling_received_notes n ON n.id = s.sapling_received_note_id
+UNION
+SELECT n.account_id, s.transaction_id FROM orchard_received_note_spends s
+    JOIN orchard_received_notes n ON n.id = s.orchard_received_note_id
+UNION
+SELECT n.account_id, s.transaction_id FROM ironwood_received_note_spends s
+    JOIN ironwood_received_notes n ON n.id = s.ironwood_received_note_id
+UNION
+SELECT n.account_id, s.transaction_id FROM transparent_received_output_spends s
+    JOIN transparent_received_outputs n ON n.id = s.transparent_received_output_id";
+
+/// Number of transactions in the wallet (for `getwalletinfo.txcount`). See
+/// [`TX_INVOLVEMENT_SQL`] for why this does not count the view directly.
 pub fn tx_count(engine_dir: &Path, scope: AccountScope) -> anyhow::Result<u64> {
     let conn = open_conn(engine_dir)?;
-    let account = scope_by_uuid("account_uuid");
+    let account = scope_by_id("account_id");
     let n: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM v_transactions WHERE {account}"),
+        &format!("SELECT COUNT(*) FROM ({TX_INVOLVEMENT_SQL}) WHERE {account}"),
         named_params! { ":scope_account": scope.param() },
         |r| r.get(0),
     )?;
@@ -352,6 +413,15 @@ pub struct TxOutputRecord {
     pub recipient_key_scope: Option<i64>,
     /// The output's ZIP-302 memo bytes, when the wallet decrypted/stored one.
     pub memo: Option<Vec<u8>>,
+    /// The ZIP 32 diversifier index of the wallet address this output was received on, read
+    /// from the `addresses` row the note links to - so it costs no cryptography and is the same
+    /// on the authoring instance and after a from-seed restore (the scanner recovers the index
+    /// from the note itself). `None` for a pure send (the recipient's index is theirs, not ours)
+    /// and for a received output with no linked address row. The index is the stateless
+    /// identity of an address: every encoding of one address shares it, so a consumer that
+    /// stored the index at issuance (`z_getaddressforaccount` returns it) matches receipts by
+    /// integer with no address parsing at all.
+    pub diversifier_index: Option<u128>,
 }
 
 impl TxOutputRecord {
@@ -439,6 +509,11 @@ pub struct UnspentNote {
 fn open_conn(engine_dir: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(data_db_path(engine_dir))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Every read RPC opens its own connection, so each one starts with a cold page cache -
+    // SQLite's default is about 2 MiB, which a history read on a large wallet exhausts while
+    // walking the note tables and their indexes. Negative means KiB rather than pages: 32 MiB,
+    // bounded per connection and released with it.
+    conn.pragma_update(None, "cache_size", -32_000)?;
     Ok(conn)
 }
 
@@ -487,32 +562,157 @@ fn tx_unexpired_sql(alias: &str) -> String {
 /// and prefers the recipient recorded at construction time for outputs the wallet created. So
 /// `to_address` is already the address observably paid on chain, and zecd does no rewriting of
 /// its own (it used to map the unified encoding back to the t-address here).
-/// The statement [`load_outputs`] runs. Ordered by `(output_pool, output_index)`, the
-/// within-transaction half of the total order documented on [`query_transactions`]: a
-/// transaction can hold outputs in more than one pool, and `output_index` is the index within
-/// that pool's bundle, so the pool must lead for the pair to be a well-defined key. Named so
-/// the ordering tests exercise this exact text rather than a transcription of it.
+/// The statement [`load_outputs`] runs: one transaction's outputs, ordered by
+/// `(output_pool, output_index)`.
+///
+/// **This is `v_tx_outputs` restricted to a single transaction, written out rather than
+/// queried.** The view is an aggregate (`GROUP BY transaction_id, output_pool, output_index`)
+/// over a union of every received note and every sent note in the wallet, and SQLite will not
+/// push a `WHERE` term through it - measured on 3.50 against the real schema, with the
+/// predicate on `txid` *and* on the grouping column `transaction_id`, both of which plan as a
+/// full scan of all four note tables plus `sent_notes`. So selecting one transaction's outputs
+/// from the view costs a whole-history aggregation, and this statement is run once per
+/// transaction in a history page: on the 130k-transaction wallet that reported this, that was
+/// seconds for `gettransaction` and minutes for `listtransactions count=100`.
+///
+/// Restricting each arm by `transaction_id` at the leaves instead turns every table access into
+/// an index seek (`transactions` by primary key, the per-pool note tables and `sent_notes` by
+/// their `transaction_id` indexes), so the cost follows the transaction's own output count.
+///
+/// The shape below mirrors `VIEW_TX_OUTPUTS` in `zcash_client_sqlite`'s `wallet/db.rs`
+/// term for term - the same two arms, the same aggregate, the same `to_address` precedence
+/// (the address the wallet recorded when it *created* an output wins over the address it was
+/// received at) - so that it answers identically. Two deliberate deviations, neither
+/// observable: the four-arm union of `v_received_outputs` is `UNION ALL` here rather than
+/// `UNION`, since each arm carries a distinct pool literal and a primary key so no two rows can
+/// collide; and only the columns [`TxOutputRecord`] reads are selected. One column is selected
+/// that the view computes but does **not** expose: `diversifier_index_be`, which the view's
+/// received arm joins from `addresses` and then drops at its outer `SELECT`. It is carried
+/// through here because it is the stateless identity of the receiving address (see
+/// [`TxOutputRecord::diversifier_index`]); the differential test compares only the columns
+/// both statements share. **If a librustzcash
+/// bump changes that view, this must change with it** - which is what
+/// `regtest_tests::load_outputs_sql_matches_the_view_it_replaces` exists to catch: it runs both
+/// against a populated database and requires identical rows.
 ///
 /// The account predicate is written into the constant rather than formatted in, so the ordering
 /// test still runs character-for-character what the caller runs. It is the same predicate
 /// [`scope_by_output_account`] builds for the queries that must assemble their SQL.
-const LOAD_OUTPUTS_SQL: &str = "SELECT output_pool, output_index, from_account_uuid,
-                to_account_uuid, to_address, value, is_change, recipient_key_scope, memo
-         FROM v_tx_outputs
-         WHERE txid = :txid
-           AND (:scope_account IS NULL OR to_account_uuid = :scope_account
-                OR from_account_uuid = :scope_account)
-         ORDER BY output_pool ASC, output_index ASC";
+pub(crate) const LOAD_OUTPUTS_SQL: &str = "
+WITH ro AS (
+    SELECT r.id AS id_within_pool_table, r.transaction_id AS transaction_id, r.pool AS pool,
+           r.output_index AS output_index, r.account_id AS account_id, r.value AS value,
+           r.is_change AS is_change, r.memo AS memo, r.address_id AS address_id,
+           sn.id AS sent_note_id
+    FROM (
+        SELECT id, transaction_id, 2 AS pool, output_index, account_id, value, is_change,
+               memo, address_id
+        FROM sapling_received_notes WHERE transaction_id = :id_tx
+        UNION ALL
+        SELECT id, transaction_id, 3 AS pool, action_index AS output_index, account_id, value,
+               is_change, memo, address_id
+        FROM orchard_received_notes WHERE transaction_id = :id_tx
+        UNION ALL
+        SELECT id, transaction_id, 4 AS pool, action_index AS output_index, account_id, value,
+               is_change, memo, address_id
+        FROM ironwood_received_notes WHERE transaction_id = :id_tx
+        UNION ALL
+        SELECT id, transaction_id, 0 AS pool, output_index, account_id, value_zat AS value,
+               0 AS is_change, NULL AS memo, address_id
+        FROM transparent_received_outputs WHERE transaction_id = :id_tx
+    ) r
+    LEFT JOIN sent_notes sn
+        ON sn.transaction_id = r.transaction_id
+        AND sn.output_pool = r.pool
+        AND sn.output_index = r.output_index
+),
+unioned AS (
+    SELECT ro.pool AS output_pool,
+           ro.output_index AS output_index,
+           from_account.uuid AS from_account_uuid,
+           to_account.uuid AS to_account_uuid,
+           CASE ro.pool
+                WHEN 0 THEN a.cached_transparent_receiver_address
+                ELSE a.address
+           END AS to_address,
+           0 AS is_sent_row,
+           ro.value AS value,
+           ro.is_change AS is_change,
+           ro.memo AS memo,
+           a.key_scope AS recipient_key_scope,
+           a.diversifier_index_be AS diversifier_index_be
+    FROM ro
+    LEFT JOIN addresses a ON a.id = ro.address_id
+    LEFT JOIN sent_notes ON sent_notes.id = ro.sent_note_id
+    LEFT JOIN accounts from_account ON from_account.id = sent_notes.from_account_id
+    LEFT JOIN accounts to_account ON to_account.id = ro.account_id
+    UNION ALL
+    SELECT sent_notes.output_pool AS output_pool,
+           sent_notes.output_index AS output_index,
+           from_account.uuid AS from_account_uuid,
+           NULL AS to_account_uuid,
+           sent_notes.to_address AS to_address,
+           1 AS is_sent_row,
+           sent_notes.value AS value,
+           0 AS is_change,
+           sent_notes.memo AS memo,
+           NULL AS recipient_key_scope,
+           NULL AS diversifier_index_be
+    FROM sent_notes
+    LEFT JOIN ro ON ro.sent_note_id = sent_notes.id
+    LEFT JOIN accounts from_account ON from_account.id = sent_notes.from_account_id
+    WHERE sent_notes.transaction_id = :id_tx
+)
+SELECT output_pool,
+       output_index,
+       MAX(from_account_uuid) AS from_account_uuid,
+       MAX(to_account_uuid) AS to_account_uuid,
+       COALESCE(
+           MAX(CASE WHEN is_sent_row THEN to_address END),
+           MAX(CASE WHEN NOT is_sent_row THEN to_address END)
+       ) AS to_address,
+       MAX(value) AS value,
+       MAX(is_change) AS is_change,
+       MAX(recipient_key_scope) AS recipient_key_scope,
+       MAX(memo) AS memo,
+       MAX(diversifier_index_be) AS diversifier_index_be
+FROM unioned
+GROUP BY output_pool, output_index
+HAVING (:scope_account IS NULL OR MAX(to_account_uuid) = :scope_account
+        OR MAX(from_account_uuid) = :scope_account)
+ORDER BY output_pool ASC, output_index ASC";
 
-/// Outputs come back ordered by `(output_pool, output_index)` - see [`LOAD_OUTPUTS_SQL`].
+/// Decode the `addresses.diversifier_index_be` column: `zcash_client_sqlite` stores the 11-byte
+/// ZIP 32 index big-endian so it sorts, i.e. the little-endian representation reversed. Anything
+/// but 11 bytes is not an index this wallet wrote and is reported as absent rather than guessed.
+fn decode_diversifier_index_be(be: &[u8]) -> Option<u128> {
+    let mut le: [u8; 11] = be.try_into().ok()?;
+    le.reverse();
+    Some(u128::from(DiversifierIndex::from(le)))
+}
+
+/// Outputs come back ordered by `(output_pool, output_index)` - see [`LOAD_OUTPUTS_SQL`],
+/// which also explains why the transaction is named by its `transactions.id_tx` row id rather
+/// than by its txid.
+///
+/// `omit_memos` drops every output's memo (`[sync] fetch_memos = false`). The suppression is
+/// here, at the one place outputs are loaded, rather than at each RPC that renders them,
+/// because the point is a property of the wallet's data - "this wallet has no memos" - and a
+/// renderer-side filter would have to be repeated by every future consumer. Under that setting
+/// a memo survives only where the mempool path happened to store the full transaction before
+/// the block scan reached it, so returning them would make a memo's presence depend on how the
+/// wallet met the transaction: caught live it would have one, recovered by a restore of the
+/// same wallet it would not. Dropping them unconditionally is what keeps a restored wallet's
+/// history identical to the live one, which is the invariant the setting would otherwise break.
 fn load_outputs(
     conn: &Connection,
     scope: AccountScope,
-    txid: &[u8],
+    id_tx: i64,
+    omit_memos: bool,
 ) -> anyhow::Result<Vec<TxOutputRecord>> {
     let mut stmt = conn.prepare(LOAD_OUTPUTS_SQL)?;
     let rows = stmt.query_map(
-        named_params! {":txid": txid, ":scope_account": scope.param()},
+        named_params! {":id_tx": id_tx, ":scope_account": scope.param()},
         |row| {
             Ok(TxOutputRecord {
                 pool: row.get("output_pool")?,
@@ -523,7 +723,10 @@ fn load_outputs(
                 value: row.get("value")?,
                 is_change: row.get("is_change")?,
                 recipient_key_scope: row.get::<_, Option<i64>>("recipient_key_scope")?,
-                memo: row.get("memo")?,
+                memo: if omit_memos { None } else { row.get("memo")? },
+                diversifier_index: row
+                    .get::<_, Option<Vec<u8>>>("diversifier_index_be")?
+                    .and_then(|be| decode_diversifier_index_be(&be)),
             })
         },
     )?;
@@ -542,6 +745,7 @@ const TX_COLS: &str = "v.mined_height, v.txid, v.expiry_height, v.account_balanc
             v.fee_paid, v.block_time,
             v.expired_unmined, v.tx_index,
             b.hash AS block_hash,
+            t.id_tx AS id_tx,
             CAST(strftime('%s', t.created) AS INTEGER) AS created_time";
 
 /// The matching source clause for [`TX_COLS`].
@@ -549,11 +753,16 @@ const TX_FROM: &str = "FROM v_transactions v
      LEFT JOIN blocks b ON b.height = v.mined_height
      LEFT JOIN transactions t ON t.txid = v.txid";
 
-/// Parse one [`TX_COLS`] row into `(internal txid, TxRecord)` (outputs filled by callers).
-fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Vec<u8>, TxRecord)> {
+/// Parse one [`TX_COLS`] row into `(transactions.id_tx, TxRecord)` (outputs filled by callers,
+/// which pass that row id to [`load_outputs`]). The id rides on the row rather than being
+/// looked up per transaction because [`TX_FROM`] already joins `transactions`; it is `None`
+/// only if that join found nothing, which cannot happen for a row `v_transactions` produced
+/// (the view is built from `transactions`) but is typed honestly rather than unwrapped.
+fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxRecord)> {
     let txid: Vec<u8> = row.get("txid")?;
     Ok((
-        txid.clone(),
+        // Absent from statements that already know the row id they selected by.
+        row.get::<_, Option<i64>>("id_tx").unwrap_or(None),
         TxRecord {
             mined_height: row.get("mined_height")?,
             txid_hex: txid_display(&txid),
@@ -572,6 +781,87 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Vec<u8>, TxRecord)>
         },
     ))
 }
+
+/// One transaction's row, built from base tables instead of `v_transactions`.
+///
+/// `v_transactions` is an aggregate view over every note and every spend in the wallet, and as
+/// with `v_tx_outputs` (see [`LOAD_OUTPUTS_SQL`]) SQLite pushes no `WHERE` term through it - so
+/// reading a single transaction out of it cost a whole-history aggregation, about four seconds
+/// on the 130k-transaction wallet that reported this, whether the transaction was found or not.
+/// The "or not" is what made it hurt most: a reconciler probing a few hundred txids after a
+/// reorg paid that cost on every miss.
+///
+/// This selects the transaction by its unique `txid` index and reconstructs the two aggregate
+/// columns zecd reads. `expired_unmined` is the view's own expression. `account_balance_delta`
+/// is the view's `SUM(notes.value)` over the same `notes` relation: outputs the account
+/// received in this transaction, positive, and outputs of the account spent by it, negative.
+/// The `involved` count is what makes the row exist at all: `v_transactions` only emits a
+/// transaction for an account that received or spent in it, so a transaction stored but not the
+/// account's - a foreign unmined transaction the mempool path recorded, say - must still read
+/// as absent here.
+///
+/// Under [`AccountScope::Any`] this sums across accounts rather than picking one. The view
+/// emits a row per account, and the query this replaces took whichever SQLite yielded first,
+/// which was only well defined because a conventional wallet holds exactly one account; summing
+/// agrees with it there and is at least deterministic on a shard database.
+///
+/// Pinned against the view by
+/// `regtest_tests::transaction_record_matches_the_view_it_replaces`.
+pub(crate) const TX_RECORD_SQL: &str = "
+WITH notes AS (
+    SELECT account_id, value FROM (
+        SELECT account_id, value FROM sapling_received_notes WHERE transaction_id = :id_tx
+        UNION ALL
+        SELECT account_id, value FROM orchard_received_notes WHERE transaction_id = :id_tx
+        UNION ALL
+        SELECT account_id, value FROM ironwood_received_notes WHERE transaction_id = :id_tx
+        UNION ALL
+        SELECT account_id, value_zat AS value FROM transparent_received_outputs
+            WHERE transaction_id = :id_tx
+    )
+    UNION ALL
+    SELECT account_id, -value AS value FROM (
+        SELECT n.account_id AS account_id, n.value AS value
+        FROM sapling_received_note_spends s
+        JOIN sapling_received_notes n ON n.id = s.sapling_received_note_id
+        WHERE s.transaction_id = :id_tx
+        UNION ALL
+        SELECT n.account_id, n.value
+        FROM orchard_received_note_spends s
+        JOIN orchard_received_notes n ON n.id = s.orchard_received_note_id
+        WHERE s.transaction_id = :id_tx
+        UNION ALL
+        SELECT n.account_id, n.value
+        FROM ironwood_received_note_spends s
+        JOIN ironwood_received_notes n ON n.id = s.ironwood_received_note_id
+        WHERE s.transaction_id = :id_tx
+        UNION ALL
+        SELECT n.account_id, n.value_zat
+        FROM transparent_received_output_spends s
+        JOIN transparent_received_outputs n ON n.id = s.transparent_received_output_id
+        WHERE s.transaction_id = :id_tx
+    )
+),
+mine AS (
+    SELECT value FROM notes
+    WHERE (:scope_account IS NULL
+           OR account_id = (SELECT id FROM accounts WHERE uuid = :scope_account))
+)
+SELECT t.mined_height AS mined_height,
+       t.txid AS txid,
+       t.expiry_height AS expiry_height,
+       t.fee AS fee_paid,
+       t.tx_index AS tx_index,
+       b.time AS block_time,
+       b.hash AS block_hash,
+       CAST(strftime('%s', t.created) AS INTEGER) AS created_time,
+       (t.mined_height IS NULL
+        AND t.expiry_height BETWEEN 1 AND (SELECT MAX(height) FROM blocks)) AS expired_unmined,
+       (SELECT COUNT(*) FROM mine) AS involved,
+       (SELECT IFNULL(SUM(value), 0) FROM mine) AS account_balance_delta
+FROM transactions t
+LEFT JOIN blocks b ON b.height = t.mined_height
+WHERE t.id_tx = :id_tx";
 
 /// Filter/pagination for [`query_transactions`], mirroring zcashd's height-range and
 /// count/from arguments. The history/received-by RPCs push their windowing through this so
@@ -594,6 +884,12 @@ pub struct TxQuery {
     pub limit: Option<u32>,
     /// Order newest-first (`sort_height DESC NULLS FIRST`) instead of oldest-first.
     pub newest_first: bool,
+    /// Drop every output's memo (`[sync] fetch_memos = false`; see [`load_outputs`]).
+    ///
+    /// Phrased as *omit* rather than *include* so the derived `Default` - `false` - is the
+    /// memo-preserving one: a call site that does not know about this field keeps the existing
+    /// behaviour instead of silently dropping memos.
+    pub omit_memos: bool,
 }
 
 /// The statement [`query_transactions`] runs, for the requested direction. Extracted (with
@@ -665,13 +961,15 @@ pub fn query_transactions(
         },
         tx_from_row,
     )?;
-    let mut pending: Vec<(Vec<u8>, TxRecord)> = Vec::new();
+    let mut pending: Vec<(Option<i64>, TxRecord)> = Vec::new();
     for r in rows {
         pending.push(r?);
     }
     let mut records = Vec::with_capacity(pending.len());
-    for (txid, mut rec) in pending {
-        rec.outputs = load_outputs(&conn, scope, &txid)?;
+    for (id_tx, mut rec) in pending {
+        if let Some(id_tx) = id_tx {
+            rec.outputs = load_outputs(&conn, scope, id_tx, q.omit_memos)?;
+        }
         records.push(rec);
     }
     Ok(records)
@@ -692,18 +990,43 @@ pub fn list_transactions(engine_dir: &Path, scope: AccountScope) -> anyhow::Resu
 /// `expired_unmined`, and each output's `to_account`/`to_address`/`value`/`is_change`), so the
 /// existing - and tested - `received_by_address` logic produces identical output.
 ///
-/// `address_filter` (display encoding) is pushed into SQL for `getreceivedbyaddress`, which
-/// asks about a single address: only its outputs are loaded. It is compared against
-/// `v_tx_outputs.to_address` as given - a received transparent output is stored under its bare
-/// t-address (see [`load_outputs`]), so a t-address filter matches the stored rows directly.
+/// `address_filter` is pushed into SQL for `getreceivedbyaddress`, which asks about a single
+/// address: only its outputs are loaded. It is a *set* of candidate encodings rather than the
+/// one string the caller typed, because the recorded encoding of an address is not a stable
+/// identity - see [`recorded_encodings_of`], which is what builds this set. Each candidate is
+/// compared against `v_tx_outputs.to_address` as given, so a bare t-address matches the rows a
+/// transparent receive is stored under (see [`load_outputs`]) while a unified address also
+/// matches whichever sibling encoding of its diversifier index the wallet happens to hold.
+///
+/// An empty slice is not the same as `None`: `None` loads the whole history (the unfiltered
+/// `listreceivedbyaddress`), while an empty set is a filter nothing can satisfy, which is the
+/// right answer for an address the wallet owns but has no `addresses` row for - it can have
+/// received nothing.
 pub fn received_tx_records(
     engine_dir: &Path,
     scope: AccountScope,
-    address_filter: Option<&str>,
+    address_filter: Option<&[String]>,
 ) -> anyhow::Result<Vec<TxRecord>> {
     let conn = open_conn(engine_dir)?;
     let account = scope_by_uuid("v.account_uuid");
-    // Order by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
+    // The candidate list is at most a handful of strings (one recorded row per in-scope account
+    // and key scope), so it is inlined as a bound-parameter list rather than a temporary table.
+    let address_clause = match address_filter {
+        None => "1".to_string(),
+        Some(candidates) => {
+            let holes = (0..candidates.len())
+                .map(|i| format!(":addr{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // An empty candidate set must match nothing, and `IN ()` is not valid SQL.
+            if holes.is_empty() {
+                "0".to_string()
+            } else {
+                format!("o.to_address IN ({holes})")
+            }
+        }
+    };
+    // Ordered by the same `sort_height` (oldest-first) as `list_transactions`, so the per-address
     // `txids` list `listreceivedbyaddress` emits is in the identical order it was before this
     // flat path replaced the full N+1 load.
     let mut stmt = conn.prepare(&format!(
@@ -712,7 +1035,7 @@ pub fn received_tx_records(
                 o.recipient_key_scope, v.tx_index
          FROM v_transactions v
          JOIN v_tx_outputs o ON o.txid = v.txid
-         WHERE (:addr IS NULL OR o.to_address = :addr)
+         WHERE {address_clause}
            AND {account}
          ORDER BY COALESCE(
                 v.mined_height,
@@ -720,8 +1043,20 @@ pub fn received_tx_records(
             ) ASC NULLS LAST,
             v.txid ASC, o.output_pool ASC, o.output_index ASC"
     ))?;
+    let scope_param = scope.param();
+    let mut params: Vec<(String, &dyn rusqlite::ToSql)> = vec![(
+        ":scope_account".to_string(),
+        &scope_param as &dyn rusqlite::ToSql,
+    )];
+    let held = address_filter.unwrap_or(&[]);
+    for (i, candidate) in held.iter().enumerate() {
+        params.push((format!(":addr{i}"), candidate as &dyn rusqlite::ToSql));
+    }
     let rows = stmt.query_map(
-        named_params! { ":addr": address_filter, ":scope_account": scope.param() },
+        &*params
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect::<Vec<_>>(),
         |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
@@ -742,6 +1077,8 @@ pub fn received_tx_records(
                     is_change: row.get(5)?,
                     recipient_key_scope: row.get::<_, Option<i64>>(8)?,
                     memo: None,
+                    // Not carried by `v_tx_outputs`, and the aggregation keys by address anyway.
+                    diversifier_index: None,
                 },
             ))
         },
@@ -782,23 +1119,32 @@ pub fn get_transaction(
     engine_dir: &Path,
     scope: AccountScope,
     txid_hex: &str,
+    omit_memos: bool,
 ) -> anyhow::Result<Option<TxRecord>> {
     let Some(internal) = txid_internal(txid_hex) else {
         return Ok(None);
     };
     let conn = open_conn(engine_dir)?;
-    let account = scope_by_uuid("v.account_uuid");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {TX_COLS} {TX_FROM} WHERE v.txid = :txid AND {account}"
-    ))?;
-    let mut rows =
-        stmt.query(named_params! {":txid": internal, ":scope_account": scope.param()})?;
+    // Resolve the txid through its unique index first, so a txid the wallet has never seen -
+    // what a reconciler probing reorged-out transactions asks about, hundreds of times in a row
+    // - costs one index seek and nothing else.
+    let Some(id_tx) = tx_row_id(&conn, &internal)? else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(TX_RECORD_SQL)?;
+    let mut rows = stmt.query(named_params! {":id_tx": id_tx, ":scope_account": scope.param()})?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
-    let (txid, mut rec) = tx_from_row(row)?;
+    // `v_transactions` emits no row for a transaction this account was not part of, and callers
+    // rely on that: a foreign unmined transaction the mempool path stored is not this wallet's
+    // history. Reproduce it rather than reporting an all-zero record.
+    if row.get::<_, i64>("involved")? == 0 {
+        return Ok(None);
+    }
+    let (_, mut rec) = tx_from_row(row)?;
     drop(rows);
-    rec.outputs = load_outputs(&conn, scope, &txid)?;
+    rec.outputs = load_outputs(&conn, scope, id_tx, omit_memos)?;
     // Fetch the raw transaction bytes for `gettransaction.hex` via the public `WalletRead` API
     // (mirroring the actor's `do_get_raw_tx`) instead of reading librustzcash's internal
     // `transactions.raw` column directly: this yields the canonical consensus serialization off
@@ -808,6 +1154,18 @@ pub fn get_transaction(
         .ok()
         .and_then(|bytes| raw_tx_bytes(network, engine_dir, TxId::from_bytes(bytes)));
     Ok(Some(rec))
+}
+
+/// The `transactions.id_tx` row id for an internal-order txid, via the table's unique index on
+/// `txid`. `None` when the wallet has never stored that transaction.
+fn tx_row_id(conn: &Connection, internal_txid: &[u8]) -> anyhow::Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT id_tx FROM transactions WHERE txid = :txid",
+            named_params! {":txid": internal_txid},
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// Serialized bytes of a wallet-known transaction, via the public `WalletRead::get_transaction`.
@@ -888,6 +1246,50 @@ pub fn unmined_raw_txs(engine_dir: &Path, tip: u32) -> anyhow::Result<Vec<(Strin
     for r in rows {
         let (txid, raw) = r?;
         out.push((txid_display(&txid), raw));
+    }
+    Ok(out)
+}
+
+/// Every transaction that spends funds this wallet holds, by txid - the set
+/// `actor::request_in_scope` keeps enhancing under `[sync] fetch_memos = false`.
+///
+/// A transaction the wallet only **received** in is complete from the compact scan alone except
+/// for its memo, so skipping its full-transaction fetch costs exactly the memo. A transaction
+/// the wallet **spent** in is not: its outgoing side (recipient, amount) is recoverable only by
+/// OVK-decrypting the full transaction, and its fee only from the full transaction's values. So
+/// the fetch is skipped for the first kind and kept for the second, which is what lets the
+/// setting leave every RPC except the memo fields exact - see `request_in_scope`.
+///
+/// Spends are recorded by the compact scan itself (nullifier matches for the shielded pools,
+/// zecd's own transparent-input matcher for pool 0), so this is populated on a from-seed restore
+/// before any enhancement runs - the case the whole setting exists for. It reads the four
+/// `*_spends` tables directly rather than `v_received_output_spends`: the view adds a join to
+/// each note table for an `account_id` this has no use for, and this runs on the actor's sync
+/// path. It is deliberately **not** account-scoped, because a fleet shard's actor drains one
+/// queue for every account in its database.
+pub fn wallet_spending_txids(
+    engine_dir: &Path,
+) -> anyhow::Result<std::collections::BTreeSet<TxId>> {
+    let conn = open_conn(engine_dir)?;
+    let mut stmt = conn.prepare(
+        "SELECT t.txid FROM transactions t
+         WHERE t.id_tx IN (
+             SELECT transaction_id FROM sapling_received_note_spends
+             UNION SELECT transaction_id FROM orchard_received_note_spends
+             UNION SELECT transaction_id FROM ironwood_received_note_spends
+             UNION SELECT transaction_id FROM transparent_received_output_spends
+         )",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut out = std::collections::BTreeSet::new();
+    for row in rows {
+        let txid_bytes = row?;
+        // A txid column that is not 32 bytes is corrupt rather than merely unexpected; skip it
+        // (the request it would have matched simply stays in scope, which is the safe side).
+        let Ok(bytes) = <[u8; 32]>::try_from(txid_bytes.as_slice()) else {
+            continue;
+        };
+        out.insert(TxId::from_bytes(bytes));
     }
     Ok(out)
 }
@@ -1595,6 +1997,111 @@ pub fn classify_unified_receivers(
     UaReceivers::Foreign
 }
 
+/// Recover the diversifier index (and scope) at which this wallet derived `ua`'s shielded
+/// receivers, or `None` if no in-scope account owns them. Pure crypto against the account's
+/// viewing key - one FF1 diversifier decrypt per receiver, never an index search.
+///
+/// Both receivers of a wallet-derived UA share one index, so the first that resolves settles it;
+/// a UA whose receivers disagree is a hand-spliced address that [`classify_unified_receivers`]
+/// rejects before any caller reaches this.
+pub fn diversifier_index_of(
+    network: ZNetwork,
+    engine_dir: &Path,
+    scope: AccountScope,
+    addr: &str,
+) -> Option<(DiversifierIndex, Scope)> {
+    let decoded = crate::address::decode_on_network(&network, addr)?;
+    let db = open_read(network, engine_dir).ok()?;
+    for account in scoped_account_ids(&db, scope).ok()? {
+        let Ok(Some(acct)) = db.get_account(account) else {
+            continue;
+        };
+        let Some(ufvk) = acct.ufvk() else {
+            continue;
+        };
+        let found = match &decoded {
+            Address::Unified(ua) => ua
+                .orchard()
+                .and_then(|o| {
+                    ufvk.orchard()
+                        .and_then(|fvk| orchard_receiver_index(fvk, o))
+                })
+                .or_else(|| {
+                    ua.sapling()
+                        .and_then(|p| ufvk.sapling().and_then(|dfvk| dfvk.decrypt_diversifier(p)))
+                }),
+            Address::Sapling(pa) => ufvk.sapling().and_then(|dfvk| dfvk.decrypt_diversifier(pa)),
+            // A transparent address is its own identity in the received-by aggregations (a
+            // t-address receive is recorded under the bare t-address that was paid), so it has
+            // no unified sibling to look up.
+            Address::Transparent(_) | Address::Tex(_) => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// The `addresses` rows this wallet has recorded at the same diversifier index as `addr` - every
+/// encoding under which a receipt at that index could have been stored.
+///
+/// This is what lets `getreceivedbyaddress` answer for an address the wallet owns but recorded
+/// under a *different* encoding of the same index. The recorded string is not a stable identity:
+/// `getnewaddress` writes the `[pools] default_receivers` encoding, while the block scan, meeting
+/// an index with no row yet, writes `zcash_client_sqlite`'s all-receivers one (see
+/// [`crate::address::issued_encoding`]). Since a from-seed restore or `zecd rescan` rebuilds the
+/// table from the scan alone, which of the two is on disk is not something a caller can know.
+///
+/// The index is recovered cryptographically and the lookup is a point read on the
+/// `(account_id, key_scope, diversifier_index_be)` unique index, so this costs one indexed row
+/// per in-scope account rather than a walk of the address list. Returns an empty vector for an
+/// address no in-scope account owns, and for a bare transparent address (its own identity).
+pub fn recorded_encodings_of(
+    network: ZNetwork,
+    engine_dir: &Path,
+    scope: AccountScope,
+    addr: &str,
+) -> Vec<String> {
+    let Some((index, key_scope)) = diversifier_index_of(network, engine_dir, scope, addr) else {
+        return Vec::new();
+    };
+    // The column stores the index big-endian so it sorts; `zcash_client_sqlite` writes it as the
+    // 11-byte little-endian representation reversed.
+    let mut index_be = *index.as_bytes();
+    index_be.reverse();
+    let scope_code = match key_scope {
+        Scope::External => 0,
+        Scope::Internal => 1,
+    };
+    let Ok(conn) = open_conn(engine_dir) else {
+        return Vec::new();
+    };
+    let account = scope_by_id("a.account_id");
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT a.address
+         FROM addresses a
+         WHERE a.diversifier_index_be = :index_be
+           AND a.key_scope = :key_scope
+           AND a.address IS NOT NULL
+           AND {account}"
+    )) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map(
+        named_params! {
+            ":index_be": &index_be[..],
+            ":key_scope": scope_code,
+            ":scope_account": scope.param(),
+        },
+        |row| row.get::<_, String>(0),
+    );
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
 /// Where a transparent address the wallet owns sits in its BIP 44 derivation - the answer to
 /// "which index did `getnewaddress "" "transparent"` just hand me?", which is otherwise
 /// unanswerable (the RPC returns a bare string, and zecd persists no off-chain issuance log).
@@ -1689,11 +2196,14 @@ fn transparent_scope_index(scope: TransparentKeyScope) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// A stand-in for the columns [`tx_query_sql`] and [`LOAD_OUTPUTS_SQL`] read. The real
-    /// `v_transactions`/`v_tx_outputs` are librustzcash views over a dozen tables, and
-    /// materializing a wallet whose *views* yield a same-height txid tie means minting real
-    /// notes; the ordering under test is a property of the query text alone, so the fixture
-    /// supplies the view columns directly and the tests run the production SQL over it.
+    /// A stand-in for the columns [`tx_query_sql`] reads. The real `v_transactions` is a
+    /// librustzcash view over a dozen tables, and materializing a wallet whose *view* yields a
+    /// same-height txid tie means minting real notes; the transaction-level ordering under test
+    /// is a property of the query text alone, so the fixture supplies the view columns directly
+    /// and the tests run the production SQL over it. The within-transaction output ordering is
+    /// tested against the real schema instead, in
+    /// `regtest_tests::load_outputs_sql_matches_the_view_it_replaces` - [`LOAD_OUTPUTS_SQL`]
+    /// reads base tables now, not a view a fixture can stand in for.
     fn ordering_fixture() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1705,13 +2215,8 @@ mod tests {
                  -- ordering tests bind `NULL` for it, which is the unscoped arm.
                  account_uuid BLOB
              );
-             CREATE TABLE v_tx_outputs (
-                 txid BLOB, output_pool INTEGER, output_index INTEGER,
-                 from_account_uuid BLOB, to_account_uuid BLOB, to_address TEXT,
-                 value INTEGER, is_change BOOLEAN, recipient_key_scope INTEGER, memo BLOB
-             );
              CREATE TABLE blocks (height INTEGER, hash BLOB);
-             CREATE TABLE transactions (txid BLOB, created TEXT);",
+             CREATE TABLE transactions (id_tx INTEGER, txid BLOB, created TEXT);",
         )
         .unwrap();
         conn
@@ -1806,36 +2311,6 @@ mod tests {
             seen.extend(page);
         }
         assert_eq!(seen, vec![0x01, 0x02, 0x03]);
-    }
-
-    /// A transaction with outputs in more than one pool must come back ordered by
-    /// `(output_pool, output_index)`. `output_index` is the index within the pool's bundle, so
-    /// it is not unique across pools and cannot order the set on its own.
-    #[test]
-    fn outputs_are_ordered_by_pool_then_index() {
-        let conn = ordering_fixture();
-        let txid: Vec<u8> = vec![0x07; 32];
-        for (pool, index) in [(4i64, 1u32), (2, 1), (4, 0), (2, 0)] {
-            conn.execute(
-                "INSERT INTO v_tx_outputs
-                     (txid, output_pool, output_index, from_account_uuid, to_account_uuid,
-                      to_address, value, is_change, recipient_key_scope, memo)
-                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, 0, 0, NULL, NULL)",
-                rusqlite::params![txid, pool, index],
-            )
-            .unwrap();
-        }
-
-        let mut stmt = conn.prepare(LOAD_OUTPUTS_SQL).unwrap();
-        let got: Vec<(i64, u32)> = stmt
-            .query_map(
-                named_params! {":txid": txid, ":scope_account": None::<Uuid>},
-                |row| Ok((row.get("output_pool")?, row.get("output_index")?)),
-            )
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(got, vec![(2, 0), (2, 1), (4, 0), (4, 1)]);
     }
 
     /// The `created_time` expression in [`super::TX_COLS`] must parse rusqlite's
@@ -2116,6 +2591,19 @@ mod tests {
             super::mature_coinbase_zats(dir.path(), AccountScope::Any, target).unwrap(),
             9_001_000,
             "AccountScope::Any sums every account, as it always did"
+        );
+        // And `NoAccount` is the opposite of `Any` rather than a synonym for it: a wallet whose
+        // own account does not exist yet must not be handed its shard-mates' money. This is the
+        // whole point of the variant - `Any` in a shared database reports 9_001_000 zats under a
+        // wallet that owns none of it.
+        assert_eq!(
+            super::mature_coinbase_zats(dir.path(), AccountScope::NoAccount, target).unwrap(),
+            0,
+            "AccountScope::NoAccount reports no account's money"
+        );
+        assert_eq!(
+            super::immature_coinbase_zats(dir.path(), AccountScope::NoAccount, target).unwrap(),
+            0
         );
     }
 

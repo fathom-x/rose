@@ -111,6 +111,94 @@ impl ConnState {
     }
 }
 
+/// Everything the block scan has spent since this actor started, split by phase.
+///
+/// The per-batch `batch complete` log line is the fine-grained view; this is the running total,
+/// so "the restore took an hour - doing what?" is answerable from one `/status` read rather than
+/// by summing several hundred log lines. Never cleared: it covers the process lifetime.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+#[cfg(feature = "zcash")]
+pub struct SyncTotals {
+    /// Batches that downloaded and scanned a range.
+    pub batches: u64,
+    pub blocks: u64,
+    /// Compact-block bytes as served.
+    pub bytes: u64,
+    pub txs: u64,
+    pub sapling_outputs: u64,
+    pub orchard_actions: u64,
+    /// Streaming blocks (or taking a prefetched range), in milliseconds.
+    pub download_ms: u64,
+    /// The per-batch tree-state round trip.
+    pub tree_state_ms: u64,
+    /// `scan_cached_blocks`: trial decryption, tree insertion, and the database write.
+    pub scan_ms: u64,
+    /// Recording block-scan-matched transparent receives and spends.
+    pub transparent_ms: u64,
+}
+
+#[cfg(feature = "zcash")]
+impl SyncTotals {
+    /// Fold one batch's timings in.
+    pub fn add(&mut self, t: &crate::sync::engine::BatchTimings) {
+        self.batches += 1;
+        self.blocks += u64::from(t.shape.blocks);
+        self.bytes += t.shape.bytes;
+        self.txs += t.shape.txs;
+        self.sapling_outputs += t.shape.sapling_outputs;
+        self.orchard_actions += t.shape.orchard_actions;
+        self.download_ms += t.download.as_millis() as u64;
+        self.tree_state_ms += t.tree_state.as_millis() as u64;
+        self.scan_ms += t.scan.as_millis() as u64;
+        self.transparent_ms += t.transparent.as_millis() as u64;
+    }
+
+    /// Wall clock across every phase, in milliseconds.
+    pub fn total_ms(&self) -> u64 {
+        self.download_ms + self.tree_state_ms + self.scan_ms + self.transparent_ms
+    }
+}
+
+/// Everything the enhancement drain has spent since this actor started.
+///
+/// The drain is the half of a restore that runs after the block scan reports done, and on a
+/// wallet with real history it is the larger half. It is bounded by upstream round trips and by
+/// the single writer, not by this host's cores, so its cost cannot be read off [`SyncTotals`] -
+/// it needs its own counters.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+#[cfg(feature = "zcash")]
+pub struct EnhanceTotals {
+    /// Drain passes run (each services at most `[sync] enhance_concurrency` requests).
+    pub passes: u64,
+    /// Requests serviced across every pass.
+    pub serviced: u64,
+    /// Wall clock reading and de-duplicating the request table to decide what a pass services,
+    /// in milliseconds. A fixed cost per pass, so it grows relative to the useful work as the
+    /// number of requests serviced per pass falls.
+    pub requests_ms: u64,
+    /// Wall clock waiting on the upstream for the pass's concurrent fetches, in milliseconds -
+    /// roughly one round trip per pass, not per request.
+    pub upstream_ms: u64,
+    /// Wall clock applying the fetched transactions to the wallet database, in milliseconds:
+    /// trial decryption plus the writes, on the single writer, so nothing overlaps it.
+    pub apply_ms: u64,
+}
+
+#[cfg(feature = "zcash")]
+impl EnhanceTotals {
+    /// Mean milliseconds of upstream wait plus database apply per serviced request, or `0.0`
+    /// before anything is serviced.
+    pub fn per_request_ms(&self) -> f64 {
+        if self.serviced > 0 {
+            (self.upstream_ms + self.apply_ms) as f64 / self.serviced as f64
+        } else {
+            0.0
+        }
+    }
+}
+
 /// A snapshot of sync state, published by the actor and read by blockchain/wallet RPCs.
 #[cfg(feature = "zcash")]
 #[derive(Clone, Debug, Default)]
@@ -148,7 +236,10 @@ pub struct SyncStatus {
     /// transparent spend-search requests re-emit on every tip advance for a wallet holding
     /// unspent transparent UTXOs, so it transiently rises after sends/new blocks in steady state
     /// (which is what `readiness = "scanned"` exists for). Surfaced on `/status`, factored into
-    /// `synced` readiness, and reflected in `getwalletinfo.scanning`.
+    /// `synced` readiness, and reflected in `getwalletinfo.scanning`. With `[sync]
+    /// fetch_memos = false` the memo-backfill requests are out of scope and never counted here
+    /// (skipping them in the drain while counting them would pin this above zero and the wallet
+    /// would never report ready); only status tracking and the transparent address checks remain.
     pub pending_enhancements: u64,
     /// The height through which the wallet is **fully enhanced**: every transaction mined at or
     /// below it has had its full data fetched, so its memos are readable. `None` means "not
@@ -165,10 +256,15 @@ pub struct SyncStatus {
     /// It is a floor, not a promise about anything above it: heights above may be enhanced too.
     /// It is `None` while the block scan is running (the backlog is unmeasured there, see
     /// `pending_enhancements`), when the backlog is too large to resolve cheaply
-    /// (`actor::ENHANCED_THROUGH_MAX_PROBE`), and on a database read error - all cases where a
-    /// consumer should hold its cursor still rather than advance it. Surfaced on `/status`,
-    /// `getwalletinfo.scanning`, and `waitforsync`.
+    /// (`actor::ENHANCED_THROUGH_MAX_PROBE`), on a database read error, and - permanently - on a
+    /// wallet with `[sync] fetch_memos = false`, where the memos below any height are never going
+    /// to be fetched - all cases where a consumer should hold its cursor still rather than
+    /// advance it. Surfaced on `/status`, `getwalletinfo.scanning`, and `waitforsync`.
     pub enhanced_through: Option<u32>,
+    /// Cumulative block-scan cost by phase since this actor started. See [`SyncTotals`].
+    pub sync_totals: SyncTotals,
+    /// Cumulative enhancement-drain cost since this actor started. See [`EnhanceTotals`].
+    pub enhance_totals: EnhanceTotals,
     /// True when the wallet is passphrase-encrypted (Bitcoin Core's `HasEncryptionKeys()`).
     /// Drives whether `getwalletinfo` reports `unlocked_until` and how the passphrase RPCs behave.
     pub encrypted: bool,
@@ -185,6 +281,15 @@ pub struct SyncStatus {
     /// Publishing it rather than fixing it at spawn is what lets the scope start reporting an
     /// account the moment one of those completes.
     pub accounts: Arc<BTreeMap<String, AccountUuid>>,
+    /// Why a wallet this actor serves will never get an account, keyed by wallet name.
+    ///
+    /// Only a fleet shard populates this, and only for a member whose import failed in a way
+    /// that retrying cannot fix (a birthday no tree state can serve, a viewing key the database
+    /// refuses). Such a member is dropped from the import queue, which otherwise makes it
+    /// indistinguishable from one still waiting its turn - both hold no account and read empty.
+    /// Surfaced on `waitforsync` and `getwalletinfo` so a caller stops waiting, and cleared when
+    /// the member is queued again (`loadwallet` after fixing the manifest).
+    pub import_errors: Arc<BTreeMap<String, String>>,
     /// True for a watch-only wallet (imported UFVK; no spending material anywhere). Drives
     /// `getwalletinfo.private_keys_enabled` - the wallet-level signal, as in Bitcoin Core's
     /// descriptor wallets (per-address `iswatchonly` is deprecated there and stays false).
@@ -292,6 +397,14 @@ pub enum SendSource {
     /// coin control is not supported (notes are account-scoped): the account is the source, and
     /// the address only names it.
     Shielded,
+    /// Fund the send from one shielded pool family only (`z_sendmany`'s `ANY_SAPLING` /
+    /// `ANY_ORCHARD`), rather than from whatever the account holds.
+    ///
+    /// This is the same one-source-per-send invariant one level finer: a shortfall in the named
+    /// family is `-6`, never a silent top-up from the other pool. It is what a wallet holding
+    /// both needs in order to say which side of the turnstile a send comes from - the reason
+    /// `z_mergetoaddress` has had these wildcards all along.
+    ShieldedFamily(ShieldedFamily),
     /// Fund the send from the wallet's non-coinbase transparent UTXOs (`z_sendmany` from a
     /// wallet-owned t-address, or `ANY_TADDR`). `None` = any of the account's transparent
     /// receivers (`ANY_TADDR`); `Some(addr)` = only that address's UTXOs. Requires
@@ -328,6 +441,44 @@ pub struct ShieldCoinbasePlan {
     pub remaining_utxos: u64,
     /// Zatoshis of mature coinbase UTXOs left unselected.
     pub remaining_value: u64,
+}
+
+#[cfg(feature = "zcash")]
+impl SendSource {
+    /// Whether this source funds the send from shielded notes.
+    ///
+    /// Prefer this over comparing against [`SendSource::Shielded`]: a pool-restricted shielded
+    /// source is still a shielded source, and the routing that keys on "is this shielded"
+    /// (notably the fully-transparent t-to-t branch, which must not engage for either) would
+    /// otherwise treat the two differently.
+    pub fn is_shielded(&self) -> bool {
+        matches!(self, SendSource::Shielded | SendSource::ShieldedFamily(_))
+    }
+}
+
+/// One shielded pool *family*, as `z_sendmany` and `z_mergetoaddress`'s wildcards name it.
+///
+/// Orchard and Ironwood are one family rather than two pools: post-NU6.3 an Orchard receiver
+/// holds Ironwood notes, so a caller naming "Orchard" means both, and separating them would ask
+/// for a distinction no address can express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "zcash")]
+pub enum ShieldedFamily {
+    /// `ANY_SAPLING`.
+    Sapling,
+    /// `ANY_ORCHARD` - Orchard V2 notes and the Ironwood V3 notes that share its receiver.
+    Orchard,
+}
+
+#[cfg(feature = "zcash")]
+impl ShieldedFamily {
+    /// The pools this family selects from, for a librustzcash spend policy.
+    pub fn pools(&self) -> Vec<ShieldedPool> {
+        match self {
+            ShieldedFamily::Sapling => vec![ShieldedPool::Sapling],
+            ShieldedFamily::Orchard => vec![ShieldedPool::Orchard, ShieldedPool::Ironwood],
+        }
+    }
 }
 
 /// The source selector for `z_mergetoaddress` (zcashd's `fromaddresses` argument), resolved at
@@ -545,6 +696,24 @@ pub struct WalletHandle {
     /// This wallet's external transparent gap limit - the stateless-restore scan depth, surfaced
     /// in `getwalletinfo` so an operator can audit transparent coverage.
     pub transparent_gap_limit: u32,
+    /// `[sync] fetch_memos`. `false` means this wallet never fetches a compact-block-only
+    /// transaction's full data to recover its memo, so the history RPCs must not report memos
+    /// at all: the read layer drops them (`read::load_outputs`), because otherwise a memo's
+    /// presence would depend on whether the mempool path happened to store the transaction
+    /// before the block scan reached it - present on the wallet that caught it live, absent on
+    /// a restore of that same wallet. Surfaced on `getwalletinfo` so a consumer can assert the
+    /// wallet kind it is talking to rather than infer it from empty memo fields.
+    pub fetch_memos: bool,
+    /// Whether this handle belongs to a **fleet shard** - an actor whose one database holds
+    /// several wallets' accounts.
+    ///
+    /// Static for the life of the handle (a shard's siblings are clones differing only in
+    /// name), and read by [`WalletHandle::account_scope`] alone: it is what distinguishes a
+    /// wallet whose account does not exist yet in a database holding *other wallets' accounts*
+    /// from one whose database is simply empty. Carried on the handle rather than published on
+    /// [`SyncStatus`] because it is decided at spawn and cannot change, unlike everything on
+    /// that snapshot.
+    pub is_shard: bool,
     /// Transient first-seen times for unmined txs, shared with the actor (the writer). See
     /// [`FirstSeen`].
     first_seen: FirstSeen,
@@ -571,12 +740,21 @@ impl WalletHandle {
 
     /// Which account in this wallet's database its reads apply to.
     ///
-    /// [`read::AccountScope::Any`] until the account exists (a pending bootstrap), which is also
-    /// exactly the pre-fleet behaviour - and identical to naming the account whenever the
-    /// database holds only one, which is every non-fleet wallet.
+    /// [`read::AccountScope::Only`] once the account exists. Before that the answer depends on
+    /// what else the database holds, and the two cases are not interchangeable:
+    ///
+    /// - A conventional wallet awaiting its bootstrap (an encrypted wallet before its first
+    ///   `walletpassphrase`) has a database with **no** accounts in it, so
+    ///   [`read::AccountScope::Any`] reports nothing - the pre-fleet behaviour, and identical to
+    ///   naming the account whenever the database holds only one.
+    /// - A **shard member** awaiting import shares its database with its shard-mates' accounts,
+    ///   so `Any` there would report their money and history under this wallet's name. It scopes
+    ///   to [`read::AccountScope::NoAccount`] instead, which reports nothing until its own
+    ///   account exists.
     pub fn account_scope(&self) -> read::AccountScope {
         match self.account() {
             Some(account) => read::AccountScope::Only(account),
+            None if self.is_shard => read::AccountScope::NoAccount,
             None => read::AccountScope::Any,
         }
     }
@@ -585,6 +763,17 @@ impl WalletHandle {
     /// pending bootstrap, or a shard member awaiting import).
     pub fn account(&self) -> Option<AccountUuid> {
         self.status_rx.borrow().accounts.get(&self.name).copied()
+    }
+
+    /// Why this wallet will never get an account, if its actor has recorded such a failure. See
+    /// [`SyncStatus::import_errors`]; `None` for every wallet outside that case, which is every
+    /// conventional wallet.
+    pub fn import_error(&self) -> Option<String> {
+        self.status_rx
+            .borrow()
+            .import_errors
+            .get(&self.name)
+            .cloned()
     }
 
     /// A private receiver on the actor's published [`SyncStatus`], for RPC handlers that must
@@ -604,6 +793,15 @@ impl WalletHandle {
     #[cfg(test)]
     pub(crate) fn for_test(name: &str, network: ZNetwork, status: SyncStatus) -> Self {
         WalletHandle::for_test_publishing(name, network, status).0
+    }
+
+    /// Mark a test handle as a shard's, so [`WalletHandle::account_scope`] takes the shard
+    /// branch. A builder rather than a `for_test` parameter because the handle's other fields
+    /// are private, so a caller outside this module cannot set one by struct update.
+    #[cfg(test)]
+    pub(crate) fn into_shard_for_test(mut self) -> Self {
+        self.is_shard = true;
+        self
     }
 
     /// [`WalletHandle::for_test`] plus the live sender, for tests that need to *publish* a new
@@ -630,6 +828,11 @@ impl WalletHandle {
             transparent_enabled: false,
             transparent_default: false,
             transparent_gap_limit: 20,
+            fetch_memos: true,
+            // A conventional wallet: an unset account map means an empty database, not a shard
+            // holding other wallets' accounts. A test that wants the shard behaviour builds
+            // `WalletHandle { is_shard: true, ..for_test(..) }`.
+            is_shard: false,
             // Inert test handle: no encrypted seed, so `walletlock` is a no-op (returns -15).
             seed: None,
             cmd_tx,
@@ -1021,6 +1224,24 @@ impl WalletRegistry {
         v
     }
 
+    /// Every loaded wallet with its handle, name-sorted, under a single read lock.
+    ///
+    /// For callers that want the whole registry rather than one wallet: taking `names()` and
+    /// then `get()` per name acquires the lock once per wallet, and each acquisition is a fresh
+    /// chance to be descheduled on a busy runtime - which is what made `/status` slow to answer
+    /// on a fleet deployment while `/healthz`, which reads nothing, kept up. It also cannot
+    /// observe a consistent registry: a `createwallet` landing mid-iteration leaves a name whose
+    /// handle is missing, which the per-name form silently skips.
+    pub fn snapshot(&self) -> Vec<(String, CoinWallet)> {
+        let mut v: Vec<(String, CoinWallet)> = self
+            .read()
+            .iter()
+            .map(|(name, wallet)| (name.clone(), wallet.clone()))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
     /// The lock guards a plain map and every critical section is a single map operation, so a
     /// poisoned lock cannot leave a half-updated registry; recover rather than take the daemon
     /// down with it.
@@ -1046,6 +1267,8 @@ pub(crate) fn make_handle(
     transparent_enabled: bool,
     transparent_default: bool,
     transparent_gap_limit: u32,
+    fetch_memos: bool,
+    is_shard: bool,
     first_seen: FirstSeen,
     seed: Option<SharedSeed>,
     cmd_tx: mpsc::Sender<WalletCommand>,
@@ -1061,10 +1284,59 @@ pub(crate) fn make_handle(
         transparent_enabled,
         transparent_default,
         transparent_gap_limit,
+        fetch_memos,
+        is_shard,
         first_seen,
         seed,
         cmd_tx,
         status_rx,
+    }
+}
+
+#[cfg(all(test, feature = "zcash"))]
+mod registry_tests {
+    use super::*;
+
+    fn handle(name: &str) -> WalletHandle {
+        let (cmd_tx, _rx) = mpsc::channel(1);
+        let (_status_tx, status_rx) = watch::channel(SyncStatus::default());
+        make_handle(
+            name.to_string(),
+            PathBuf::from("/nonexistent"),
+            crate::network::regtest(),
+            ConfirmationsPolicy::default(),
+            ReceiverSet::new([crate::pools::Receiver::Orchard]).unwrap(),
+            ReceiverSet::new([crate::pools::Receiver::Orchard]).unwrap(),
+            false,
+            false,
+            20,
+            true,
+            false,
+            FirstSeen::default(),
+            None,
+            cmd_tx,
+            status_rx,
+        )
+    }
+
+    /// `snapshot` must return every loaded wallet, name-sorted, so `/status` reports the same
+    /// set and the same order as the per-name walk it replaced.
+    #[test]
+    fn snapshot_returns_every_wallet_name_sorted() {
+        let registry = WalletRegistry::new("default".into());
+        assert!(registry.snapshot().is_empty());
+
+        for name in ["zeta", "alpha", "mu"] {
+            registry.insert(CoinWallet::Zcash(handle(name)));
+        }
+        let got: Vec<String> = registry.snapshot().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(got, vec!["alpha", "mu", "zeta"]);
+        assert_eq!(got, registry.names(), "snapshot agrees with names()");
+
+        // The handles are the same ones `get` hands out, so a caller reading status through
+        // either sees one wallet.
+        let (name, h) = registry.snapshot().remove(0);
+        assert_eq!(h.name(), registry.get(Some(&name)).unwrap().name);
     }
 }
 
@@ -1092,6 +1364,8 @@ mod tests {
             false,
             false,
             20,
+            true,
+            false,
             Arc::new(Mutex::new(HashMap::new())),
             seed,
             cmd_tx,
@@ -1160,5 +1434,66 @@ mod tests {
         let err = handle.lock().await.unwrap_err();
         assert_eq!(err.message, "from actor");
         actor.await.unwrap();
+    }
+
+    /// A wallet with no account of its own scopes two different ways, and picking the wrong one
+    /// leaks money between wallets.
+    ///
+    /// Both cases publish the same thing, a status whose account map does not name this wallet,
+    /// so the handle cannot tell them apart from the map alone; `is_shard` is what does. A
+    /// conventional wallet in that window has a database with no accounts in it, where `Any`
+    /// reports nothing and is the behaviour every pre-fleet release had. A shard member in that
+    /// window shares its database with its shard-mates' accounts, where `Any` would report their
+    /// balances and history under this wallet's name, and it is servable before its import runs,
+    /// so those reads are actually served.
+    #[test]
+    fn a_wallet_without_an_account_scopes_by_whether_it_shares_a_database() {
+        let net = crate::network::regtest();
+        let (conventional, _tx) =
+            WalletHandle::for_test_publishing("w", net, SyncStatus::default());
+        assert_eq!(
+            conventional.account_scope(),
+            read::AccountScope::Any,
+            "a conventional wallet awaiting its bootstrap keeps the pre-fleet scope"
+        );
+
+        let member = conventional.clone().into_shard_for_test();
+        assert_eq!(
+            member.account_scope(),
+            read::AccountScope::NoAccount,
+            "a shard member awaiting import must not read its shard-mates' accounts"
+        );
+
+        // Once the account exists both name it, and the distinction stops mattering.
+        let account = AccountUuid::from_uuid(uuid::Uuid::from_u128(1));
+        let status = SyncStatus {
+            accounts: Arc::new([("w".to_string(), account)].into_iter().collect()),
+            ..Default::default()
+        };
+        let (imported, _tx2) = WalletHandle::for_test_publishing("w", net, status);
+        assert_eq!(imported.account_scope(), read::AccountScope::Only(account));
+        assert_eq!(
+            imported.clone().into_shard_for_test().account_scope(),
+            read::AccountScope::Only(account)
+        );
+    }
+
+    /// A recorded import failure is readable through the handle, keyed by wallet name - so one
+    /// shard member's bad manifest is not reported on its shard-mates.
+    #[test]
+    fn import_errors_are_reported_per_wallet() {
+        let net = crate::network::regtest();
+        let status = SyncStatus {
+            import_errors: Arc::new(
+                [("broken".to_string(), "no tree state".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let (broken, _tx) = WalletHandle::for_test_publishing("broken", net, status.clone());
+        assert_eq!(broken.import_error().as_deref(), Some("no tree state"));
+        let (fine, _tx2) = WalletHandle::for_test_publishing("fine", net, status);
+        assert_eq!(fine.import_error(), None);
     }
 }

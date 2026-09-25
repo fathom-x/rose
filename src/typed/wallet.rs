@@ -34,6 +34,11 @@ pub struct WalletDirEntry {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WalletDir {
     pub wallets: Vec<WalletDirEntry>,
+    /// zecd extension: fleet manifests that could not be read, and so name wallets the daemon is
+    /// not serving. Empty when there are none (the handler omits the key), which is why a typed
+    /// consumer that ignored this could not tell a skipped wallet from one never provisioned.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// The reply shape shared by `createwallet`, `loadwallet` and `unloadwallet`
@@ -167,6 +172,15 @@ pub struct WalletInfo {
     pub descriptors: bool,
     /// Present only for passphrase-encrypted wallets: unix relock time, or 0 while locked.
     pub unlocked_until: Option<i64>,
+    /// `false` when this wallet does not recover memos (`[sync] fetch_memos = false`), so the
+    /// history RPCs report none at all and `enhanced_through` stays `None`. Absent - and so
+    /// `None` here - on a wallet that does, which is the default; a consumer that reads memos
+    /// checks this rather than reading empty memo fields as "no memo was attached".
+    pub fetch_memos: Option<bool>,
+    /// zecd extension, present only when this wallet's import can never succeed: why. Only a
+    /// fleet member whose viewing key the database refused has one, and without it that wallet is
+    /// a healthy-looking zero balance forever.
+    pub import_error: Option<String>,
     /// Present only when transparent receiving is enabled.
     pub transparent: Option<TransparentInfo>,
 }
@@ -199,6 +213,10 @@ pub struct AddressInfo {
     pub ischange: Option<bool>,
     /// zecd extension: the bare BIP 44 child index (what `z_getaddressforaccount` takes).
     pub address_index: Option<u32>,
+    /// zecd extension: the ZIP 32 diversifier index of any own address, shielded or
+    /// transparent - the stateless identity every encoding of one address shares, and what
+    /// history entries report as `diversifier_index`. Absent for a foreign address.
+    pub diversifier_index: Option<u64>,
 }
 
 /// One `listtransactions`/`listsinceblock` entry (`rpc/wallet_methods.rs::tx_entries` +
@@ -219,6 +237,9 @@ pub struct TransactionEntry {
     /// `(txid, pool, vout)` - not `(txid, vout)` - identifies an output. Optional so an entry
     /// from a zecd predating the field still decodes.
     pub pool: Option<String>,
+    /// zecd extension: the diversifier index of the own address a *received* output landed
+    /// on; absent on sends. Restore-stable, and shared by every encoding of that address.
+    pub diversifier_index: Option<u64>,
     /// -1 for an expired unmined transaction (it can never confirm).
     pub confirmations: i64,
     pub txid: String,
@@ -257,6 +278,9 @@ pub struct ZTransactionEntry {
     pub walletconflicts: Vec<Value>,
     /// `"transparent"` / `"sapling"` / `"orchard"` / `"ironwood"`.
     pub pool: String,
+    /// zecd extension: the diversifier index of the own address a *received* output landed
+    /// on; absent on sends. Restore-stable, and shared by every encoding of that address.
+    pub diversifier_index: Option<u64>,
     pub category: String,
     pub amount: SignedAmount,
     #[serde(rename = "amountZat")]
@@ -347,6 +371,9 @@ pub struct Unspent {
     pub safe: bool,
     /// `"transparent"` / `"sapling"` / `"orchard"` / `"ironwood"`.
     pub pool: String,
+    /// zecd extension: the diversifier index of the own address a *received* output landed
+    /// on; absent on sends. Restore-stable, and shared by every encoding of that address.
+    pub diversifier_index: Option<u64>,
     /// Transparent entries only: true iff produced by a coinbase transaction.
     pub generated: Option<bool>,
 }
@@ -455,6 +482,35 @@ impl OperationState {
 pub struct OperationError {
     pub code: i64,
     pub message: String,
+}
+
+/// `z_validateaddress` (`rpc/wallet_methods.rs::z_validateaddress`). Everything but `isvalid`
+/// is absent for an address that does not parse or is for another network.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZValidateAddress {
+    pub isvalid: bool,
+    /// Present only when valid.
+    pub address: Option<String>,
+    /// zcashd's kind token: `p2pkh`, `p2sh`, `sapling`, `unified`, or zecd's `tex`.
+    pub address_type: Option<String>,
+    /// Whether the routed wallet owns this address.
+    pub ismine: Option<bool>,
+    /// A unified address's receivers, in zcashd's vocabulary (`p2pkh`, not `transparent`).
+    /// Absent for the bare encodings, where the address kind is already the receiver.
+    pub receivers: Option<Vec<String>>,
+}
+
+/// `z_listunifiedreceivers` (`rpc/wallet_methods.rs::z_listunifiedreceivers`): a unified
+/// address taken apart, one field per receiver present, each re-encoded on its own in zcashd's
+/// vocabulary. `orchard` is a single-receiver unified address (Orchard has no bare encoding).
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ZListUnifiedReceivers {
+    pub p2pkh: Option<String>,
+    pub p2sh: Option<String>,
+    pub sapling: Option<String>,
+    pub orchard: Option<String>,
 }
 
 /// A successful operation's result: the sends all return `{ "txid": ... }`.
@@ -799,7 +855,11 @@ impl Client<'_> {
     }
 
     /// `unloadwallet "name"`: stop serving a wallet, without deleting anything
-    /// (`rpc/control.rs::unloadwallet`).
+    /// (`rpc/wallet_methods.rs::unloadwallet`).
+    ///
+    /// The reply's `warning` says what the call did *not* do: the account stays in its shard and
+    /// is still scanned. Core's `load_on_startup` is deliberately not exposed here - zecd accepts
+    /// only the value it can honor (`true`), so there is nothing for a typed caller to choose.
     pub async fn unload_wallet(&self, name: &str) -> Result<WalletLoaded, ClientError> {
         self.call_typed("unloadwallet", vec![json!(name)]).await
     }
@@ -966,6 +1026,25 @@ impl Client<'_> {
         self.call_typed("z_listoperationids", params).await
     }
 
+    /// `z_validateaddress <address>`: validity, kind and ownership for any address.
+    ///
+    /// Unlike zcashd's, this answers for transparent addresses too rather than reporting them
+    /// invalid; `address_type` names the kind.
+    pub async fn z_validate_address(&self, address: &str) -> Result<ZValidateAddress, ClientError> {
+        self.call_typed("z_validateaddress", vec![json!(address)])
+            .await
+    }
+
+    /// `z_listunifiedreceivers <unified_address>`: the address taken apart into its receivers,
+    /// each re-encoded on its own - the strings history reports for outputs paid to it.
+    pub async fn z_list_unified_receivers(
+        &self,
+        address: &str,
+    ) -> Result<ZListUnifiedReceivers, ClientError> {
+        self.call_typed("z_listunifiedreceivers", vec![json!(address)])
+            .await
+    }
+
     /// `z_waitforoperation <opid> ( timeout_secs )`: block until the operation finishes.
     /// Timeout in SECONDS (unlike the `waitfor*` family's milliseconds): `0` is an immediate
     /// single-operation read, and `None` waits the server-side default (clamped to 3600).
@@ -1062,6 +1141,31 @@ mod tests {
         let w: WalletInfo = serde_json::from_value(idle).unwrap();
         assert!(!w.scanning.is_scanning());
         assert!(w.transparent.is_none() && w.unlocked_until.is_none());
+        assert!(
+            w.import_error.is_none(),
+            "a healthy wallet carries no import failure, and the key is absent rather than empty"
+        );
+    }
+
+    /// `listwalletdir`'s `warnings` names fleet manifests the daemon could not read, so those
+    /// wallets are listed but not served. The key is absent when there are none, which is the
+    /// common case and the reason it needs a default rather than being required.
+    #[test]
+    fn wallet_dir_decodes_with_and_without_warnings() {
+        let healthy: WalletDir = serde_json::from_value(serde_json::json!({
+            "wallets": [{ "name": "default" }, { "name": "view-1" }],
+        }))
+        .unwrap();
+        assert_eq!(healthy.wallets.len(), 2);
+        assert!(healthy.warnings.is_empty());
+
+        let skipped: WalletDir = serde_json::from_value(serde_json::json!({
+            "wallets": [{ "name": "default" }],
+            "warnings": ["/data/wallets.d/view-2.toml: invalid ufvk"],
+        }))
+        .unwrap();
+        assert_eq!(skipped.warnings.len(), 1);
+        assert!(skipped.warnings[0].contains("view-2"));
     }
 
     /// Fixture shaped like `regtest_funded`'s memo receive: a mined receive entry with the
@@ -1302,5 +1406,72 @@ mod tests {
         assert!(serde_json::to_string(&r)
             .unwrap()
             .contains("\"memo\":\"f600\""));
+    }
+}
+
+#[cfg(test)]
+mod z_list_unified_receivers_tests {
+    use super::ZListUnifiedReceivers;
+
+    /// Fixture from `address::tests::unified_receivers_are_the_strings_history_reports`: a
+    /// three-receiver address yields all three keys; a single-receiver one yields only its own.
+    #[test]
+    fn z_list_unified_receivers_decodes_partial_shapes() {
+        let full = serde_json::json!({
+            "p2pkh": "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86",
+            "sapling": "ztestsapling1...",
+            "orchard": "utest1...",
+        });
+        let v: ZListUnifiedReceivers = serde_json::from_value(full).unwrap();
+        assert!(v.p2pkh.is_some() && v.sapling.is_some() && v.orchard.is_some());
+        assert!(v.p2sh.is_none());
+
+        let orchard_only = serde_json::json!({ "orchard": "utest1..." });
+        let v: ZListUnifiedReceivers = serde_json::from_value(orchard_only).unwrap();
+        assert!(v.orchard.is_some());
+        assert!(v.p2pkh.is_none() && v.sapling.is_none());
+    }
+}
+
+#[cfg(test)]
+mod z_validate_address_tests {
+    use super::ZValidateAddress;
+
+    /// Fixtures from `wallet_methods::tests::z_validateaddress_reports_kind_and_ownership`,
+    /// which builds them through the handler's own response builder.
+    #[test]
+    fn z_validate_address_decodes_both_shapes() {
+        let valid = serde_json::json!({
+            "isvalid": true,
+            "address": "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86",
+            "address_type": "p2pkh",
+            "ismine": false,
+        });
+        let v: ZValidateAddress = serde_json::from_value(valid).unwrap();
+        assert!(v.isvalid);
+        assert_eq!(v.address_type.as_deref(), Some("p2pkh"));
+        assert_eq!(v.ismine, Some(false));
+        assert!(
+            v.receivers.is_none(),
+            "a bare address carries no receiver list"
+        );
+
+        let unified = serde_json::json!({
+            "isvalid": true,
+            "address": "utest1...",
+            "address_type": "unified",
+            "ismine": true,
+            "receivers": ["p2pkh", "orchard"],
+        });
+        let v: ZValidateAddress = serde_json::from_value(unified).unwrap();
+        assert_eq!(
+            v.receivers.as_deref(),
+            Some(&["p2pkh".to_string(), "orchard".to_string()][..])
+        );
+
+        let invalid = serde_json::json!({ "isvalid": false });
+        let v: ZValidateAddress = serde_json::from_value(invalid).unwrap();
+        assert!(!v.isvalid);
+        assert!(v.address.is_none() && v.ismine.is_none());
     }
 }

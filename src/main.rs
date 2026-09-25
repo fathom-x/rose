@@ -72,7 +72,17 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::ChainInfo(args)) => zecd::chain_probe::run(&config, args).await,
         #[cfg(not(feature = "zcash"))]
         Some(Command::ChainInfo(_)) => Err(unsupported_without_zcash("chain-info")),
-        _ => daemon::run(config).await,
+        _ => {
+            // SIGHUP re-resolves through exactly the path the daemon started with, so a reload
+            // sees what a restart would - the same file, the same CLI overrides, the same
+            // defaults.
+            let cli_for_reload = cli.clone();
+            daemon::run_with_reload(
+                config,
+                Some(Box::new(move || AppConfig::resolve(&cli_for_reload))),
+            )
+            .await
+        }
     }
 }
 

@@ -157,8 +157,12 @@ fn is_locked(st: &crate::wallet::SyncStatus) -> bool {
 }
 
 fn snapshot(state: &AppState) -> Snapshot {
-    let names = state.registry.names();
-    let mut ready = !names.is_empty();
+    // One lock acquisition for the whole registry, not one per wallet: this runs on every
+    // `/status` and `/readyz`, a fleet deployment holds thousands of wallets, and each
+    // acquisition on a busy runtime is a chance to be descheduled. It also reads a consistent
+    // registry, where name-then-lookup could see a wallet unloaded between the two.
+    let loaded = state.registry.snapshot();
+    let mut ready = !loaded.is_empty();
     let mut any_down = false;
     let mut any_actor_down = false;
     // Both are the Zcash engine's signals - a wallet whose seed is locked, and one still
@@ -168,10 +172,7 @@ fn snapshot(state: &AppState) -> Snapshot {
     #[cfg_attr(not(feature = "zcash"), allow(unused_mut))]
     let mut any_enhancing = false;
     let mut wallets = Map::new();
-    for name in names {
-        let Ok(wallet) = state.registry.get_coin(Some(&name)) else {
-            continue;
-        };
+    for (name, wallet) in loaded {
         let coin = wallet.coin().name();
         // Every loaded wallet is claimed by exactly one engine arm, and each arm folds its
         // own verdict into `ready`. That is what keeps readiness fail-closed: a wallet no arm
@@ -229,6 +230,34 @@ fn snapshot(state: &AppState) -> Snapshot {
                         "scanning": st.scanning,
                         "pending_enhancements": st.pending_enhancements,
                         "enhanced_through": st.enhanced_through,
+                        // Where the block scan's wall clock went, cumulatively. The per-batch
+                        // `batch complete` log line carries the same split one range at a time;
+                        // this is the running total, so a slow restore is attributable to the
+                        // upstream (download) or to this host (scan) from one read.
+                        "sync_totals": {
+                            "batches": st.sync_totals.batches,
+                            "blocks": st.sync_totals.blocks,
+                            "bytes": st.sync_totals.bytes,
+                            "txs": st.sync_totals.txs,
+                            "sapling_outputs": st.sync_totals.sapling_outputs,
+                            "orchard_actions": st.sync_totals.orchard_actions,
+                            "download_ms": st.sync_totals.download_ms,
+                            "tree_state_ms": st.sync_totals.tree_state_ms,
+                            "scan_ms": st.sync_totals.scan_ms,
+                            "transparent_ms": st.sync_totals.transparent_ms,
+                            "total_ms": st.sync_totals.total_ms(),
+                        },
+                        // The drain that runs after the scan, reported apart: it is bound by upstream
+                        // round trips and the single writer, so its cost does not move with this
+                        // host's cores the way the scan's does.
+                        "enhance_totals": {
+                            "passes": st.enhance_totals.passes,
+                            "serviced": st.enhance_totals.serviced,
+                            "requests_ms": st.enhance_totals.requests_ms,
+                            "upstream_ms": st.enhance_totals.upstream_ms,
+                            "apply_ms": st.enhance_totals.apply_ms,
+                            "per_request_ms": st.enhance_totals.per_request_ms(),
+                        },
                         "encrypted": st.encrypted,
                         "locked": locked,
                         "ready": w_ready,
@@ -435,16 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn connected_mode_ignores_the_enhancement_backlog() {
-        // The lenient mode is "upstream is live past our birthday"; it deliberately doesn't wait on
-        // the scan, so it shouldn't wait on enhancement either.
-        let connected = cfg(ReadinessMode::Connected);
-        let mut enhancing = st(true, Some(4_080_983), Some(4_080_983));
-        enhancing.pending_enhancements = 29_660;
-        assert!(wallet_ready(&enhancing, &connected));
-    }
-
-    #[test]
     fn connected_mode_only_requires_a_live_upstream_past_the_birthday() {
         let connected = cfg(ReadinessMode::Connected);
         // Far behind on the scan (gap 357k) but connected and the tip is past birthday 50: ready.
@@ -464,6 +483,12 @@ mod tests {
         // Disconnected, or no tip yet: never ready.
         assert!(!wallet_ready(&st(false, Some(4_080_983), None), &connected));
         assert!(!wallet_ready(&st(true, None, None), &connected));
+
+        // The mode deliberately doesn't wait on the scan, so it doesn't wait on the enhancement
+        // backlog either - the one piece of scan state that is not a height.
+        let mut enhancing = st(true, Some(4_080_983), Some(4_080_983));
+        enhancing.pending_enhancements = 29_660;
+        assert!(wallet_ready(&enhancing, &connected));
     }
 
     #[test]

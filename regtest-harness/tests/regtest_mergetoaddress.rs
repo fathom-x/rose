@@ -137,6 +137,12 @@ async fn merge_stack(zebrad_bin: &std::path::Path) -> (Zebrad, Funder, Zecd, Opt
     // window)"). At 80 that ingest measured ~47s per round against ~78s for the funder's send.
     cfg.transparent_gap_limit = Some(40);
     cfg.orchard_action_limit = Some(0);
+    // And the transaction-size ceiling, for the same reason: these tests measure
+    // `shielded_limit`, and zcashd's 200-note default builds a ~634 KB transaction - larger
+    // than any node relays, which is exactly what `[spend] max_tx_bytes` refuses by default.
+    // Disabling it here keeps the assertion on the limit under test; the node's own relay
+    // policy is raised to match on the zakura leg (see `mempool_policy_section`).
+    cfg.max_tx_bytes = Some(0);
     let zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
         .expect("attach zecd backend");
@@ -445,8 +451,186 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     );
     phase("t->z merges done (0 UTXOs left)");
 
-    // 5. Note merges. Round 1: an explicit shielded_limit that binds (8 < 14 eligible) takes
-    //    the manual limited-selection path and reports the remainder.
+    // 4a. A SIGHUP reload changes the Orchard-action cap on a running daemon.
+    //
+    // This wallet runs with the cap disabled, so first set a cap low enough that the next send
+    // cannot fit, confirm the daemon rejects it with the `-8` that names the knob, then put the
+    // cap back and confirm the same send goes through - all without restarting. That is the
+    // whole point: a fragmented payout wallet fails every send until the cap moves, and a live
+    // payment wallet should not have to be restarted to change a number.
+    zecd.edit_config(|toml| toml.replace("orchard_action_limit = 0", "orchard_action_limit = 1"))
+        .expect("lower the action cap in zecd.toml");
+    zecd.reload_config().expect("SIGHUP the daemon");
+
+    let capped =
+        wait_for_send_outcome(&zecd, &own_ua, Some(-8), "the lowered cap takes effect").await;
+    assert_eq!(
+        capped.0,
+        Some(-8),
+        "a send over the reloaded cap is rejected: {:?}",
+        capped.1
+    );
+    assert!(
+        capped.1.contains("orchard_action_limit"),
+        "the refusal names the knob: {}",
+        capped.1
+    );
+    assert!(
+        capped.1.contains("z_mergetoaddress"),
+        "and points at consolidating first: {}",
+        capped.1
+    );
+
+    // Restore it and the same send succeeds, still without a restart.
+    zecd.edit_config(|toml| toml.replace("orchard_action_limit = 1", "orchard_action_limit = 0"))
+        .expect("restore the action cap");
+    zecd.reload_config().expect("SIGHUP the daemon again");
+    let restored =
+        wait_for_send_outcome(&zecd, &own_ua, None, "the restored cap takes effect").await;
+    assert_eq!(
+        restored.0, None,
+        "with the cap back at 0 the send succeeds: {:?}",
+        restored.1
+    );
+
+    // A config the resolver refuses must leave the daemon running on its current values rather
+    // than taking it down - a typo in an edited file is not a reason to stop serving.
+    zecd.edit_config(|toml| format!("{toml}\nnot_a_real_key = true\n"))
+        .expect("write an invalid config");
+    zecd.reload_config().expect("SIGHUP with a bad config");
+    let after_bad =
+        wait_for_send_outcome(&zecd, &own_ua, None, "a bad config changes nothing").await;
+    assert_eq!(
+        after_bad.0, None,
+        "the daemon keeps serving on its previous config: {:?}",
+        after_bad.1
+    );
+    zecd.edit_config(|toml| toml.replace("\nnot_a_real_key = true\n", "\n"))
+        .expect("undo the invalid config");
+    phase("SIGHUP reloads [spend] orchard_action_limit");
+
+    // 4a'. The same, for the *other* send bound: `[spend] max_tx_bytes`.
+    //
+    // It is worth its own probe rather than folding into the block above, because the two
+    // bounds fail for different reasons and an operator has to be able to tell which one
+    // stopped a send. This wallet has the ceiling disabled (see `merge_stack`), so drop it to
+    // a size no shielded transaction can fit in - one action alone is about 6 KB - and the
+    // next send must be refused for its *size*, naming `max_tx_bytes` and not the action cap.
+    //
+    // This is also the only live proof that the estimate is wired into the send path at all:
+    // the arithmetic is unit-tested offline against ZIP 225 and against a transaction zakura
+    // measured, but only a real proposal, built against a real wallet, exercises the path from
+    // proposal to refusal.
+    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 0", "max_tx_bytes = 1000"))
+        .expect("lower the size ceiling in zecd.toml");
+    zecd.reload_config().expect("SIGHUP the daemon");
+
+    let too_large = wait_for_send_outcome(
+        &zecd,
+        &own_ua,
+        Some(-8),
+        "the lowered size ceiling takes effect",
+    )
+    .await;
+    assert_eq!(
+        too_large.0,
+        Some(-8),
+        "a send over the reloaded size ceiling is rejected: {:?}",
+        too_large.1
+    );
+    assert!(
+        too_large.1.contains("max_tx_bytes"),
+        "the refusal names the knob: {}",
+        too_large.1
+    );
+    assert!(
+        !too_large.1.contains("orchard_action_limit"),
+        "and not the other bound, which is not what stopped this send: {}",
+        too_large.1
+    );
+
+    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 1000", "max_tx_bytes = 0"))
+        .expect("restore the size ceiling");
+    zecd.reload_config().expect("SIGHUP the daemon again");
+    let restored = wait_for_send_outcome(
+        &zecd,
+        &own_ua,
+        None,
+        "the restored size ceiling takes effect",
+    )
+    .await;
+    assert_eq!(
+        restored.0, None,
+        "with the ceiling back at 0 the send succeeds: {:?}",
+        restored.1
+    );
+    phase("SIGHUP reloads [spend] max_tx_bytes");
+
+    // 4b. `z_sendmany` accepts the same shielded pool-family wildcards as the merge above.
+    //     This wallet's notes are all Orchard-family, so an `ANY_ORCHARD` send must fund and
+    //     confirm normally, while `ANY_SAPLING` must report insufficient funds rather than
+    //     silently drawing on the Orchard notes - which is the whole point of naming a family:
+    //     a shortfall in it is an error, not a top-up from the other side of the turnstile.
+    let opid = zecd
+        .call(
+            "z_sendmany",
+            json!(["ANY_ORCHARD", [{"address": own_ua, "amount": 0.01}]]),
+        )
+        .await
+        .expect("z_sendmany from ANY_ORCHARD");
+    let result = await_op(
+        &zecd,
+        opid.as_str().expect("opid string"),
+        "ANY_ORCHARD send",
+    )
+    .await;
+    assert!(
+        result["txid"].as_str().is_some_and(|t| t.len() == 64),
+        "the ANY_ORCHARD send produced a txid: {result}"
+    );
+
+    let opid = zecd
+        .call(
+            "z_sendmany",
+            json!(["ANY_SAPLING", [{"address": own_ua, "amount": 0.01}]]),
+        )
+        .await
+        .expect("z_sendmany from ANY_SAPLING is accepted, then fails on funds");
+    let waited = zecd
+        .call(
+            "z_waitforoperation",
+            json!([opid, OP_TIMEOUT.as_secs() as i64]),
+        )
+        .await
+        .expect("z_waitforoperation on the ANY_SAPLING send");
+    assert_eq!(
+        waited["status"], "failed",
+        "no Sapling notes to spend: {waited}"
+    );
+    assert_eq!(
+        waited["error"]["code"],
+        json!(-6),
+        "a shortfall in the named family is insufficient funds, not a top-up: {waited}"
+    );
+    phase("z_sendmany pool-family wildcards");
+
+    // Confirm what 4a and 4b just spent and minted, then re-read the eligible note set. The
+    // count captured before those phases is stale by now: every probe that lands before a SIGHUP
+    // takes effect is a real send, so how many notes this wallet holds here is not a fixed
+    // number - it has to be read back rather than carried forward. Mining first is what makes
+    // the two views agree: `unspent_counts` reads `listunspent 1` while the merge selector
+    // honours the untrusted confirmation depth, and 12 blocks satisfies both.
+    confirm_untrusted(&zebrad, &zecd).await;
+    let (_, z_with_merge_outputs) = unspent_counts(&zecd).await;
+    assert!(
+        z_with_merge_outputs > NOTE_MERGE_LIMIT,
+        "the fixture must still hold more notes than the explicit limit ({z_with_merge_outputs} \
+         vs {NOTE_MERGE_LIMIT}) - otherwise round 1 below merges everything and its \"the limit \
+         binds\" assertion passes vacuously"
+    );
+
+    // 5. Note merges. Round 1: an explicit shielded_limit that binds (8 against the count just
+    //    read back) takes the manual limited-selection path and reports the remainder.
     let resp = zecd
         .call(
             "z_mergetoaddress",
@@ -526,11 +710,26 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     // `zebrad` and `funder` clean up on drop.
 }
 
-/// The >200-notes case: a defaults call against a 225-note wallet reports exactly
-/// `mergingNotes: 200` (zcashd's default `shielded_limit` binding on the manual selection
-/// path), and the follow-up drains the rest. ~200 actions of proving on both the fan-out and
-/// the merge sides puts this well past the PR tier's envelope, so it runs on the extended tier
-/// (`ZECD_REGTEST_EXTENDED=1`: weekly schedule + workflow dispatch), like the other heavy e2es.
+/// The >200-notes case, and the size ceiling that binds before it.
+///
+/// A defaults call against a 225-note wallet reports exactly `mergingNotes: 200` (zcashd's
+/// default `shielded_limit` binding on the manual selection path), and the follow-up drains
+/// the rest. Before that, a deliberately small `[spend] max_tx_bytes` proves the other half of
+/// the same behaviour: a merge over the size ceiling **truncates** its selection rather than
+/// failing, which is what lets a fragmented wallet consolidate at all under the shipped
+/// default (about 78 notes fit in 250000, so the byte cap is what a real deployment meets
+/// first, not `shielded_limit`).
+///
+/// ~200 actions of proving on both the fan-out and the merge sides puts this well past the PR
+/// tier's envelope, so it runs on the extended tier (`ZECD_REGTEST_EXTENDED=1`: weekly
+/// schedule + workflow dispatch), like the other heavy e2es.
+///
+/// The 200-input merge serializes to ~634 KB, which a stock zakura node will not relay (its
+/// `[mempool] max_transaction_bytes` defaults to 250 KB - a node-local policy zebra does not
+/// have). The harness raises that ceiling to the consensus block limit on the zakura leg, and
+/// `merge_stack` disables zecd's own, so what the 200 asserts stays the *selection* limit; see
+/// `mempool_policy_section` in the harness for why that hides nothing a default zecd
+/// deployment would meet.
 #[tokio::test]
 async fn regtest_mergetoaddress_default_shielded_limit() {
     if !extended_enabled() {
@@ -572,7 +771,55 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
     );
     phase("fragmented: 225 notes");
 
-    // Defaults: the 200-note default shielded_limit binds against 225 eligible.
+    // A binding `[spend] max_tx_bytes` **truncates** the selection rather than refusing it.
+    //
+    // This is the difference between a merge and a send. A send pays what the caller asked or
+    // nothing, so an over-large one is an error; a merge exists to be called repeatedly and
+    // already reports what it left behind, so the size ceiling is just another limit to select
+    // under. Under the shipped 250000 the byte cap is what binds first on a wallet like this
+    // one - about 78 notes against a `shielded_limit` of 200 - so without truncation a default
+    // deployment could not consolidate a fragmented wallet at all.
+    //
+    // Set the ceiling small enough that the cap is unmistakably *it* rather than any note
+    // limit, and small enough that the round it merges leaves the wallet above 200 notes, so
+    // the `shielded_limit` assertions below still have something to bind against. The exact
+    // count is the byte arithmetic's business (unit-tested in `tx_size`); what matters here is
+    // that the call succeeded, selected far fewer notes than `shielded_limit` would have, and
+    // accounted for the rest.
+    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 0", "max_tx_bytes = 20000"))
+        .expect("lower the size ceiling in zecd.toml");
+    zecd.reload_config().expect("SIGHUP the daemon");
+    let resp = zecd
+        .call("z_mergetoaddress", json!([["ANY_ORCHARD"], own_ua]))
+        .await
+        .expect("a size-capped merge is planned, not refused");
+    let capped = resp["mergingNotes"].as_u64().expect("mergingNotes");
+    assert!(
+        (1..20).contains(&capped),
+        "the size ceiling should have bound the selection well below shielded_limit: {resp}"
+    );
+    assert_eq!(
+        resp["remainingNotes"].as_u64(),
+        Some(225 - capped),
+        "and the rest must be reported as remaining: {resp}"
+    );
+    let opid = resp["opid"].as_str().expect("opid").to_string();
+    await_op(&zecd, &opid, "size-capped merge").await;
+    confirm_untrusted(&zebrad, &zecd).await;
+    // The merged notes are gone and their single output has taken their place.
+    let remaining = 225 - capped + 1;
+    let (_, z_after_cap) = unspent_counts(&zecd).await;
+    assert_eq!(
+        z_after_cap as u64, remaining,
+        "a truncated merge consolidated its selection and left the rest"
+    );
+    phase(&format!("size-capped merge done ({capped} notes)"));
+
+    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 20000", "max_tx_bytes = 0"))
+        .expect("restore the size ceiling");
+    zecd.reload_config().expect("SIGHUP the daemon again");
+
+    // Defaults, with only the note limit left to bind: 200 against `remaining` eligible.
     let resp = zecd
         .call("z_mergetoaddress", json!([["ANY_ORCHARD"], own_ua]))
         .await
@@ -582,7 +829,11 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
         json!(200),
         "zcashd's default shielded_limit is 200: {resp}"
     );
-    assert_eq!(resp["remainingNotes"], json!(25), "{resp}");
+    assert_eq!(
+        resp["remainingNotes"].as_u64(),
+        Some(remaining - 200),
+        "{resp}"
+    );
     let opid = resp["opid"].as_str().expect("opid").to_string();
     await_op(&zecd, &opid, "default-limit note merge").await;
     confirm_untrusted(&zebrad, &zecd).await;
@@ -593,7 +844,11 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
         .call("z_mergetoaddress", json!([["ANY_ORCHARD"], own_ua]))
         .await
         .expect("drain merge");
-    assert_eq!(resp["mergingNotes"], json!(26), "{resp}");
+    assert_eq!(
+        resp["mergingNotes"].as_u64(),
+        Some(remaining - 200 + 1),
+        "{resp}"
+    );
     assert_eq!(resp["remainingNotes"], json!(0), "{resp}");
     let opid = resp["opid"].as_str().expect("opid").to_string();
     await_op(&zecd, &opid, "drain merge").await;
@@ -603,4 +858,66 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
     phase("converged to 1 note");
 
     drop(zecd);
+}
+
+/// Issue small self-sends until one produces `expect` as its error code (`None` meaning the
+/// send succeeded), and return that outcome's message.
+///
+/// A SIGHUP reload is asynchronous with respect to the RPC that follows it - the signal handler
+/// re-reads the file on its own task - so a send issued immediately after signalling can still
+/// see the old cap. Retrying until the expected outcome appears (or the deadline passes, which
+/// fails the assertion in the caller with the last message seen) keeps that from being a race.
+///
+/// Two details keep the polling from eating the wallet it is probing. It sleeps **before** each
+/// probe rather than after: this is a wait for a signal-driven state change, so the first send
+/// should come after the daemon has plausibly had the signal, and the common case then costs no
+/// wasted send at all. And the amount is small enough to fund from one `N_FANOUT_ZATS` note plus
+/// the fee, so a probe that does land before the reload spends one note and returns two (payment
+/// plus change) - it can only fragment the fixture further, never consolidate it. The `-8`
+/// coverage is unaffected by the size: with the cap at 1 every shielded send exceeds it, since
+/// the cheapest possible one still has a spend and two outputs.
+async fn wait_for_send_outcome(
+    zecd: &Zecd,
+    to: &str,
+    expect: Option<i64>,
+    what: &str,
+) -> (Option<i64>, String) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let outcome = match zecd
+            .call(
+                "z_sendmany",
+                json!([to, [{"address": to, "amount": 0.001}]]),
+            )
+            .await
+        {
+            // A transport failure has no RPC code; report it as a distinct value so it can
+            // never be mistaken for the success case (`None`) and time the loop out instead.
+            Err(e) => (Some(e.code().unwrap_or(i64::MIN)), format!("{e}")),
+            Ok(opid) => {
+                let waited = zecd
+                    .call(
+                        "z_waitforoperation",
+                        json!([opid, OP_TIMEOUT.as_secs() as i64]),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{what}: z_waitforoperation: {e}"));
+                if waited["status"] == "success" {
+                    (None, waited.to_string())
+                } else {
+                    (
+                        waited["error"]["code"].as_i64(),
+                        waited["error"]["message"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                }
+            }
+        };
+        if outcome.0 == expect || Instant::now() >= deadline {
+            return outcome;
+        }
+    }
 }

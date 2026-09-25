@@ -40,11 +40,17 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use zecd_regtest_harness::{
     attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zebrad, Zecd,
     ZecdConfig,
 };
+
+/// How long a health endpoint may take to answer while the wallet is busy. These handlers read
+/// a cached status snapshot and do no I/O, so a healthy daemon answers in milliseconds; the
+/// failure this guards against is the runtime having no worker free to poll them, which showed
+/// up in the field as multi-second stalls. Generous enough for a loaded CI box.
+const HEALTH_PROBE_BOUND: Duration = Duration::from_secs(3);
 
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
@@ -90,8 +96,11 @@ async fn regtest_funded_orchard_receive() {
     // pipeline_proving`): this wallet is Orchard-only with the cached proving key, so the pipeline
     // engages, and every send below (sendtoaddress/sendmany/z_sendmany, the self-send, the
     // concurrent burst, the send-during-outage) becomes correctness coverage for it on every PR
-    // run. The inline PCZT path stays covered by regtest_proving_cache, the fused path by
-    // regtest_sapling, so all three send paths are exercised across the funded tier.
+    // run. The inline (non-pipelined) PCZT path stays covered by every other shielded-source
+    // send from a cache-on wallet - regtest_ironwood, regtest_coinbase's closing UA spend,
+    // regtest_shielding's deshield, regtest_lwd - and the fused path by
+    // regtest_sapling/regtest_shielding/regtest_mergetoaddress, so all three send paths are
+    // exercised across the funded tier without a binary dedicated to any of them.
     cfg.pipeline_proving = Some(true);
     // `ZECD_REGTEST_BACKEND=lwd` reruns this whole suite with zecd on a dedicated lightwalletd
     // (light mode) instead of zebra's JSON-RPC. The funder is unaffected either way - it always
@@ -1372,6 +1381,223 @@ async fn regtest_funded_orchard_receive() {
         "getwalletinfo.balance and default-policy getbalance are the same read: {wi} vs {gb}"
     );
 
+    // ---- a send accepted just before `stop` is still finished ----
+    //
+    // `z_sendmany` returns an opid immediately and does the real work on a background task that
+    // funnels through the wallet actor. The actor used to exit at the top of its loop as soon as
+    // shutdown was signalled, dropping whatever it had accepted but not yet started: the reply
+    // channel closed, the operation failed with "actor stopped", and since the operation
+    // registry is in-memory the operator had no record of it either - on exactly the restart
+    // boundary where reconstructing that is hardest. Nothing had been broadcast, so no funds
+    // were at risk; what was lost was the answer to "did that send happen".
+    //
+    // Issue a send and stop the daemon while it is in flight, then restart and require the
+    // transaction to be there and to confirm. The opid is deliberately not looked up afterwards
+    // - it is gone by contract, which is the reason a client must reconcile by txid.
+    let self_addr = zecd
+        .call("getnewaddress", json!([]))
+        .await
+        .expect("address for the shutdown-drain send");
+    let self_addr = self_addr.as_str().expect("address string").to_string();
+    let opid = zecd
+        .call(
+            "z_sendmany",
+            json!([&self_addr, [{"address": &self_addr, "amount": 0.01}]]),
+        )
+        .await
+        .expect("z_sendmany before shutdown");
+    assert!(
+        opid.as_str().is_some_and(|o| o.starts_with("opid-")),
+        "z_sendmany returns an opid: {opid}"
+    );
+    zecd.stop_keeping_datadir()
+        .await
+        .expect("stop the daemon with a send in flight");
+    zecd.respawn().await.expect("restart after the stop");
+    zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+        .await
+        .expect("resync after the restart");
+
+    // The send must have been stored and broadcast before the actor stopped, so it is in the
+    // wallet's history by txid and mines like any other.
+    let after = zecd
+        .call("listtransactions", json!(["*", 50]))
+        .await
+        .expect("listtransactions after the restart");
+    let drained = after
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|t| t["category"] == "send" && t["amount"].as_f64() == Some(-0.01))
+        .unwrap_or_else(|| panic!("the send accepted before shutdown must survive it: {after}"))
+        .clone();
+    let drained_txid = drained["txid"].as_str().expect("txid").to_string();
+    mine_until_confirmed(&zebrad, &zecd, &drained_txid, "the pre-shutdown send").await;
+    eprintln!("phase: a send accepted before shutdown was finished, not dropped");
+
+    // ---- history equivalence: the three history readers agree, transaction by transaction ----
+    //
+    // `listtransactions`, `gettransaction` and `listsinceblock` are three different queries over
+    // the same wallet history, and each is free to be rewritten for speed - the per-transaction
+    // reads are being moved off librustzcash's aggregate views, where a single-txid lookup costs
+    // a full-history aggregation. What must not change while that happens is the answers, and no
+    // existing assertion pins them against each other: the phases above check individual fields
+    // on individual transactions they just created.
+    //
+    // So walk everything this wallet has done - by now: receives, four sends, a two-output
+    // sendmany, a self-send, an unbroadcast send - and require the three readers to agree on
+    // every transaction. Anything reconstructed per-transaction from base tables rather than
+    // read out of a view (the balance delta, the fee, the mined height, expiry) is compared here
+    // against the view's own answer, so an arithmetic slip in the reconstruction fails loudly
+    // rather than quietly reporting a wrong amount.
+    let history = zecd
+        .call("listtransactions", json!(["*", 1000]))
+        .await
+        .expect("listtransactions over the whole funded history");
+    let entries = history.as_array().expect("listtransactions array").clone();
+    assert!(
+        entries.len() >= 6,
+        "the funded phases should have produced a substantial history: {}",
+        entries.len()
+    );
+
+    let mut seen_txids: Vec<String> = Vec::new();
+    for entry in &entries {
+        let txid = entry["txid"].as_str().expect("history entry has a txid");
+        if !seen_txids.iter().any(|t| t == txid) {
+            seen_txids.push(txid.to_string());
+        }
+    }
+
+    for txid in &seen_txids {
+        let gt = zecd
+            .call("gettransaction", json!([txid]))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("gettransaction on a txid from listtransactions: {txid}: {e}")
+            });
+        // The per-transaction fields both readers carry must be identical. `confirmations` and
+        // `blockhash`/`blockheight`/`blocktime` come from the mined block, `time` from the block
+        // or the in-memory first-seen map, and `amount`/`fee` from the account's balance delta -
+        // which is the arithmetic a base-table reconstruction has to get right.
+        for entry in entries.iter().filter(|e| e["txid"] == json!(txid)) {
+            for field in [
+                "confirmations",
+                "blockhash",
+                "blockheight",
+                "blocktime",
+                "time",
+            ] {
+                assert_eq!(
+                    entry.get(field),
+                    gt.get(field),
+                    "{field} disagrees between listtransactions and gettransaction for {txid}: \
+                     {entry} vs {gt}"
+                );
+            }
+        }
+        // gettransaction.amount is the whole transaction's effect on the wallet; the
+        // listtransactions entries for that txid are its per-output rows. For a transaction with
+        // exactly one entry the two must match (a multi-output send splits across entries, and a
+        // self-send reports a send and a receive, so those are checked structurally instead).
+        let rows: Vec<&Value> = entries
+            .iter()
+            .filter(|e| e["txid"] == json!(txid))
+            .collect();
+        if rows.len() == 1 {
+            assert_eq!(
+                rows[0]["amount"], gt["amount"],
+                "single-entry transaction {txid} must report one amount: {} vs {gt}",
+                rows[0]
+            );
+        }
+        // Every listtransactions row must appear as a gettransaction detail with the same
+        // category, address, amount and memo - the detail list is built from the same outputs.
+        let details = gt["details"].as_array().cloned().unwrap_or_default();
+        for row in rows {
+            assert!(
+                details.iter().any(|d| {
+                    d["category"] == row["category"]
+                        && d["amount"] == row["amount"]
+                        && d.get("address") == row.get("address")
+                        && d.get("memo") == row.get("memo")
+                }),
+                "listtransactions row has no matching gettransaction detail for {txid}: \
+                 {row} not in {:?}",
+                details
+            );
+        }
+    }
+
+    // `listsinceblock` with no cursor is the same history under a different query shape (it
+    // walks oldest-first with no limit), so it must report exactly the same set of txids.
+    let lsb_all = zecd
+        .call("listsinceblock", json!([]))
+        .await
+        .expect("listsinceblock with no cursor");
+    let mut lsb_txids: Vec<String> = lsb_all["transactions"]
+        .as_array()
+        .expect("listsinceblock transactions")
+        .iter()
+        .map(|t| t["txid"].as_str().expect("txid").to_string())
+        .collect();
+    lsb_txids.sort();
+    lsb_txids.dedup();
+    let mut lt_txids = seen_txids.clone();
+    lt_txids.sort();
+    assert_eq!(
+        lsb_txids, lt_txids,
+        "listsinceblock and listtransactions must cover the same transactions"
+    );
+
+    // Paging must partition the history rather than drop or duplicate rows: `from` is the half a
+    // cursor-paged rewrite is most likely to get wrong, and the doubling retry in the RPC layer
+    // makes an off-by-one invisible on a single page.
+    //
+    // Bitcoin Core's paging runs *backwards* and this is easy to get wrong (it was, here, on the
+    // first attempt): `from` skips from the newest end, so page 0 is the newest `count` entries,
+    // page 1 the `count` before those, and so on - while each page is itself returned
+    // oldest-first, as is the unpaged list. Reversing the page order and concatenating is
+    // therefore what reconstructs the unpaged walk, and a partial final page (the oldest
+    // entries) lands at the front where it belongs.
+    let mut pages: Vec<Vec<Value>> = Vec::new();
+    let page = 3usize;
+    let mut from = 0usize;
+    loop {
+        let chunk = zecd
+            .call("listtransactions", json!(["*", page, from]))
+            .await
+            .expect("paged listtransactions");
+        let chunk = chunk.as_array().expect("array").clone();
+        if chunk.is_empty() {
+            break;
+        }
+        assert!(
+            chunk.len() <= page,
+            "a page must not exceed the requested count: {}",
+            chunk.len()
+        );
+        pages.push(chunk);
+        from += page;
+        assert!(from < 10_000, "paging did not terminate");
+    }
+    let paged: Vec<Value> = pages.into_iter().rev().flatten().collect();
+    assert_eq!(
+        paged.len(),
+        entries.len(),
+        "paging through the history must yield exactly the unpaged entries"
+    );
+    for (i, (a, b)) in paged.iter().zip(entries.iter()).enumerate() {
+        assert_eq!(
+            a["txid"], b["txid"],
+            "paged entry {i} differs from the unpaged walk: {a} vs {b}"
+        );
+        assert_eq!(
+            a["amount"], b["amount"],
+            "paged entry {i} amount differs from the unpaged walk: {a} vs {b}"
+        );
+    }
+
     // ---- conformance.py against the live, funded daemon ----
     // The wallet was created encrypted (`init --encrypt`) and is unlocked by now; passing the
     // passphrase enables conformance's lock/unlock state machine (unlock → walletlock → -13 →
@@ -1461,6 +1687,73 @@ async fn regtest_funded_orchard_receive() {
          time waitforsync reports synced: {txs}"
     );
 
+    // History names the receive by the receiver that was actually paid - the same string the
+    // funder's own send entry carries, and the same one the live wallet reported before this
+    // restore. The recorded `addresses` row here says otherwise: rebuilt from the block scan, it
+    // holds librustzcash's all-receivers encoding of that diversifier index. Printing that is
+    // what the fix exists to stop, so assert both halves - the address is the one the wallet
+    // issues, and it carries no receiver a shielded-only wallet does not watch.
+    let restored_receive = txs
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|t| t["category"] == "receive" && t["memoStr"].as_str() == Some(RECEIVE_MEMO))
+        .expect("the restored wallet's funding receive");
+    assert_eq!(
+        restored_receive["address"].as_str(),
+        Some(zecd_ua.as_str()),
+        "a restored wallet's history must name the receive as its live self did ({zecd_ua}), not \
+         by whichever encoding the block scan recorded: {restored_receive}"
+    );
+    let restored_receive_info = watch_only
+        .call("validateaddress", json!([restored_receive["address"]]))
+        .await
+        .expect("validateaddress on the restored receive address");
+    assert_eq!(
+        restored_receive_info["receiver_types"],
+        json!(["orchard"]),
+        "history offered an address this shielded-only wallet does not issue: \
+         {restored_receive_info}"
+    );
+
+    // The stateless identity behind all of that is the diversifier index, and it must line up
+    // three ways across the restore: the receive entry reports it, getaddressinfo on the issued
+    // address reads the same value back, and the live wallet that issued the address agrees.
+    // The restored wallet computed its index from the note alone (its `addresses` table was
+    // rebuilt by the scan), so this is the guard that a site keying its ledger on the index
+    // at issuance keeps matching after a from-seed restore.
+    let restored_index = restored_receive["diversifier_index"]
+        .as_u64()
+        .expect("a received entry carries its diversifier index");
+    let restored_info = watch_only
+        .call("getaddressinfo", json!([zecd_ua]))
+        .await
+        .expect("getaddressinfo on the restored wallet");
+    assert_eq!(
+        restored_info["diversifier_index"].as_u64(),
+        Some(restored_index),
+        "getaddressinfo must read back the index the receive entry reports: {restored_info}"
+    );
+    let live_info = zecd
+        .call("getaddressinfo", json!([zecd_ua]))
+        .await
+        .expect("getaddressinfo on the live wallet");
+    assert_eq!(
+        live_info["diversifier_index"].as_u64(),
+        Some(restored_index),
+        "the live wallet and its restore must agree on the address's index: {live_info}"
+    );
+    // And the address takes apart into exactly the string history reports for it.
+    let parts = watch_only
+        .call("z_listunifiedreceivers", json!([zecd_ua]))
+        .await
+        .expect("z_listunifiedreceivers on the restored wallet");
+    assert_eq!(
+        parts,
+        json!({ "orchard": zecd_ua }),
+        "an orchard-only address takes apart into itself under `orchard`"
+    );
+
     // What was just rediscovered from nothing but a viewing key + the chain is an IRONWOOD note.
     // This is the from-scratch recovery path for the pool mainnet/testnet are on: the scan had to
     // trial-decrypt an Orchard-V3 note out of the compact blocks, record it in `ironwood_received_notes`,
@@ -1478,20 +1771,91 @@ async fn regtest_funded_orchard_receive() {
         "the viewing-key-only rescan rediscovers the receive as an ironwood note: {watch_lu:?}"
     );
 
+    // The restored wallet must answer for the address the ORIGINAL wallet handed out. This is
+    // the guard for the per-address reporting bug: the funded wallet got `zecd_ua` from
+    // `getnewaddress`, which recorded that exact encoding in its `addresses` table, but this
+    // wallet was rebuilt from a viewing key and the chain alone - so every one of its address
+    // rows was written by the block scan, which records `UnifiedAddressRequest::ALLOW_ALL`
+    // (transparent + Sapling + Orchard) rather than the Orchard-only encoding zecd issues.
+    //
+    // Under whole-string matching that divergence was silent and total: `getreceivedbyaddress`
+    // returned 0.00000000 for the wallet's own address while the same funds were listed under a
+    // UA the wallet would never derive - one carrying a transparent receiver a shielded-only
+    // wallet does not watch. A payment processor reconciling per address sees every address at
+    // zero, with wallet-level balances still correct, so nothing else in this file would notice.
+    //
+    // Both directions are asserted, because the fix has two halves that fail differently: the
+    // total (the diversifier-index lookup behind the SQL filter) and the reported address (the
+    // re-encoding). Note the balance is deliberately not used as a proxy - it stays right in
+    // exactly the broken case.
+    let restored_recv = watch_only
+        .call("getreceivedbyaddress", json!([zecd_ua]))
+        .await
+        .expect("getreceivedbyaddress on the restored wallet");
+    assert_eq!(
+        restored_recv.as_f64(),
+        Some(1.0),
+        "a restored wallet must credit the funding receive to the address its live self handed \
+         out ({zecd_ua}), not to whichever encoding the block scan recorded: {restored_recv}"
+    );
+    let restored_lra = watch_only
+        .call("listreceivedbyaddress", json!([1, false]))
+        .await
+        .expect("listreceivedbyaddress on the restored wallet");
+    let restored_lra = restored_lra.as_array().expect("array");
+    assert!(
+        restored_lra.iter().any(|e| {
+            e["address"] == json!(zecd_ua.as_str())
+                && e["txids"].as_array().is_some_and(|t| !t.is_empty())
+        }),
+        "a restored wallet must report its receipts under the address it issues ({zecd_ua}): \
+         {restored_lra:?}"
+    );
+    // ...and must not report them under any other spelling of the same funds. Every address it
+    // lists has to be one this wallet would hand out, which for a shielded-only wallet means no
+    // transparent receiver - the shape that would send a payer's funds somewhere nothing is
+    // watching if an operator ever copied it out of here and gave it to a customer.
+    for entry in restored_lra {
+        let listed = entry["address"].as_str().expect("address string");
+        let info = watch_only
+            .call("validateaddress", json!([listed]))
+            .await
+            .expect("validateaddress on a listed address");
+        assert_eq!(
+            info["receiver_types"],
+            json!(["orchard"]),
+            "listreceivedbyaddress offered {listed}, which this shielded-only wallet does not \
+             issue: {info}"
+        );
+    }
+
     // The enhancement backlog is an observable signal, not just an internal step: once the drain
     // completes, /status must report `pending_enhancements: 0` and the connection back to `ready`
     // (it stays `syncing` while the backlog drains, even after the block scan reaches the tip).
     // This is the end-to-end check that the headline bug - "sync complete" hiding the backlog - is
     // fixed: the field is plumbed actor → SyncStatus → /status and reaches zero.
-    let watch_health = format!("http://127.0.0.1:{}", watch_cfg.health_port());
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let st: serde_json::Value = reqwest::get(format!("{watch_health}/status"))
+        // The health endpoints must keep answering promptly while the wallet works through its
+        // enhancement backlog: that is the phase where they stall, and the cause is runtime
+        // workers held by blocking queries rather than anything the health handlers themselves
+        // do. Bound the probe so a regression shows up as a failure here rather than as a slow
+        // test.
+        let started = Instant::now();
+        let (_, st) = tokio::time::timeout(HEALTH_PROBE_BOUND, watch_only.health_get("/status"))
             .await
-            .expect("GET /status on the watch-only wallet")
-            .json()
-            .await
-            .expect("watch-only /status body is JSON");
+            .unwrap_or_else(|_| {
+                panic!(
+                    "GET /status did not answer within {HEALTH_PROBE_BOUND:?} while the \
+                     enhancement backlog was draining"
+                )
+            })
+            .expect("GET /status on the watch-only wallet");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < HEALTH_PROBE_BOUND,
+            "/status took {elapsed:?} while enhancing, over the {HEALTH_PROBE_BOUND:?} bound"
+        );
         let w = &st["wallets"]["default"];
         if w["pending_enhancements"] == json!(0) && w["conn_state"] == json!("ready") {
             break;
@@ -1502,6 +1866,166 @@ async fn regtest_funded_orchard_receive() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    drop(watch_only);
+
+    // ---- memo-less twin: [sync] fetch_memos = false skips the drain, reversibly ----
+    //
+    // The guard above proved enhancement recovers the received memo from nothing but compact
+    // blocks. This twin is the opt-out's contract, on the identical restore: with
+    // `[sync] fetch_memos = false` the wallet must
+    //
+    // (1) still reach a fully-synced state - the skipped requests are excluded from
+    //     `pending_enhancements`, or readiness would wedge at "enhancing" forever;
+    // (2) report NO memo anywhere, while the received funds stay visible (the note rides the
+    //     compact scan; only the memo needed the full-tx fetch);
+    // (3) still report the wallet's own mined sends in full, with their recipients and fees -
+    //     the load-bearing assertion for the receive-only cut in `actor::request_in_scope`. A
+    //     send's outgoing record exists only in the full transaction, so an implementation that
+    //     skipped every `Enhancement` request (this knob's first draft did) leaves a restored
+    //     wallet's sends missing from `listtransactions` while its balance still moved. Nothing
+    //     else in this file would notice, because the authoring wallet stores its own sends at
+    //     send time - only a restore like this one can;
+    // (4) report `enhanced_through: null` and `getwalletinfo.fetch_memos: false` - the watermark
+    //     promises "memos at or below here are readable", which will never be true here, and a
+    //     height would hand a memo-cursor consumer a silent permanent skip; and
+    // (5) the reversibility contract - flipping the knob back on over the SAME data directory
+    //     must backfill the memo with no rescan: the skipped requests stay queued in the wallet
+    //     DB, so re-enabling drains them on the next caught-up pass.
+    let ufvk = zecd
+        .export_ufvk("default")
+        .expect("export the funded wallet's UFVK for the memo-less twin");
+    let mut memoless_cfg = ZecdConfig::new(
+        zebrad.rpc_port,
+        pick_port().expect("pick memo-less rpc port"),
+    );
+    memoless_cfg.ufvk = Some(ufvk);
+    memoless_cfg.birthday = Some(2);
+    memoless_cfg.fetch_memos = Some(false);
+    let _memoless_lwd = attach_backend(&mut memoless_cfg, zebrad.rpc_port)
+        .await
+        .expect("attach memo-less backend");
+    let mut memoless = Zecd::start(&memoless_cfg)
+        .await
+        .expect("start the memo-less watch-only wallet");
+    let tip = zecd
+        .block_count()
+        .await
+        .expect("getblockcount before the memo-less sync");
+    memoless
+        .wait_until_synced(tip, FUND_TIMEOUT)
+        .await
+        .expect("the memo-less wallet scans from birthday to the tip");
+    let sync = memoless
+        .call("waitforsync", json!([FUND_TIMEOUT.as_millis() as u64]))
+        .await
+        .expect("waitforsync on the memo-less wallet");
+    assert_eq!(
+        sync["synced"], true,
+        "fetch_memos = false must not wedge readiness - skipped memo requests may not keep \
+         the wallet 'enhancing': {sync}"
+    );
+    assert_eq!(
+        sync["pending_enhancements"], 0,
+        "skipped memo requests must be excluded from the pending count: {sync}"
+    );
+    assert!(
+        sync["enhanced_through"].is_null(),
+        "the enhancement watermark must stay unknown when memos are never fetched: {sync}"
+    );
+    let wi = memoless
+        .call("getwalletinfo", json!([]))
+        .await
+        .expect("getwalletinfo on the memo-less wallet");
+    assert_eq!(
+        wi["fetch_memos"],
+        json!(false),
+        "a memo-less wallet must advertise itself, so a consumer can assert the wallet kind \
+         instead of inferring it from memo fields that are merely absent: {wi}"
+    );
+
+    let txs = memoless
+        .call("listtransactions", json!(["*", 100]))
+        .await
+        .expect("listtransactions on the memo-less wallet");
+    let txs = txs.as_array().expect("listtransactions is an array");
+    assert!(
+        txs.iter().any(|t| t["category"] == "receive"),
+        "the memo-less wallet still discovers the received funds: {txs:?}"
+    );
+    // No memo on ANY entry, not merely the funder's. The suppression is uniform by design: a
+    // memo recovered because the mempool path happened to store a transaction before the scan
+    // reached it would make this wallet answer differently from a restore of itself, which is
+    // the divergence the whole setting is built to avoid.
+    assert!(
+        txs.iter()
+            .all(|t| t["memo"].is_null() && t["memoStr"].is_null()),
+        "fetch_memos = false must report no memo on any entry: {txs:?}"
+    );
+
+    // (3) The wallet's own sends survive the setting, in full. This restore has never sent
+    // anything itself, so every `send` entry here was reconstructed by OVK-decrypting a full
+    // transaction that the drain fetched *because the wallet spent in it* - exactly the
+    // requests `request_in_scope` keeps. A `fee` proves the same fetch, from the other side:
+    // the fee is only knowable from the full transaction.
+    let sends: Vec<_> = txs.iter().filter(|t| t["category"] == "send").collect();
+    assert!(
+        !sends.is_empty(),
+        "the wallet's own sends must still be reported under fetch_memos = false - skipping \
+         their enhancement would drop them from history while the balance still moved: {txs:?}"
+    );
+    assert!(
+        sends
+            .iter()
+            .any(|t| t["address"].as_str().is_some_and(|a| !a.is_empty())
+                && t["fee"].as_f64().is_some_and(|f| f < 0.0)),
+        "a recovered send must carry its recipient and its fee, both of which exist only in \
+         the full transaction: {sends:?}"
+    );
+
+    // (5) Reversibility: same datadir, knob back on, the backlog drains and the memo appears.
+    memoless_cfg.fetch_memos = Some(true);
+    memoless
+        .restart(&memoless_cfg)
+        .await
+        .expect("restart the memo-less wallet with fetch_memos back on");
+    let sync = memoless
+        .call("waitforsync", json!([FUND_TIMEOUT.as_millis() as u64]))
+        .await
+        .expect("waitforsync after re-enabling fetch_memos");
+    assert_eq!(
+        sync["synced"], true,
+        "the re-enabled wallet must drain the queued memo backlog and sync: {sync}"
+    );
+    let enhanced_through = sync["enhanced_through"]
+        .as_u64()
+        .expect("a memo-fetching wallet reports a known enhancement watermark once synced");
+    assert!(
+        enhanced_through >= tip,
+        "after re-enabling, the watermark ({enhanced_through}) must cover the tip ({tip}): {sync}"
+    );
+    let txs = memoless
+        .call("listtransactions", json!(["*", 100]))
+        .await
+        .expect("listtransactions after re-enabling fetch_memos");
+    assert!(
+        txs.as_array()
+            .expect("listtransactions is an array")
+            .iter()
+            .any(|t| t["category"] == "receive" && t["memoStr"].as_str() == Some(RECEIVE_MEMO)),
+        "re-enabling fetch_memos must backfill the skipped memo from the queued requests, \
+         with no rescan: {txs}"
+    );
+    // ...and the wallet stops advertising itself as memo-less, so the flag tracks the setting
+    // rather than sticking from the datadir it was first created under.
+    let wi = memoless
+        .call("getwalletinfo", json!([]))
+        .await
+        .expect("getwalletinfo after re-enabling fetch_memos");
+    assert!(
+        wi["fetch_memos"].is_null(),
+        "a memo-fetching wallet must not carry the memo-less marker: {wi}"
+    );
+    drop(memoless);
 
     // ---- bootstrap: rebuild data.sqlite from keys.toml on an empty data directory ----
     //
@@ -1510,26 +2034,47 @@ async fn regtest_funded_orchard_receive() {
     // the account from keys.toml and the funds - and spendability - come back. The wallet is
     // encrypted, so this also exercises the locked path: it comes back with no account, refuses
     // address generation, and only rebuilds once `walletpassphrase` supplies the seed.
-    drop(watch_only);
-    // Age the Phase-8 self-send past the *untrusted* confirmation window (10) before comparing
-    // balances across the wipe. On the authoring wallet its payment output is trusted (marked at
-    // store time - see `actor::mark_own_tx_trusted`) and spendable from 3 confirmations, but the
-    // wipe below erases the trust marker with the rest of data.sqlite, and by that helper's
-    // documented statelessness caveat a rebuilt wallet classifies the still-young output as
-    // untrusted (spendable at 10). Without this aging, `balance_before` includes the payment and
-    // `balance_after` does not - the deliberate, conservative restore divergence, not the funds
-    // loss this phase exists to catch. Past 10 confirmations both classifications agree.
-    let tip = zecd
-        .block_count()
+    // Age every wallet transaction past the *untrusted* confirmation window before comparing
+    // balances across the wipe. On the authoring wallet a self-send's payment output is trusted
+    // (marked at store time - see `actor::mark_own_tx_trusted`) and spendable from 3
+    // confirmations, but the wipe below erases the trust marker with the rest of data.sqlite,
+    // and by that helper's documented statelessness caveat a rebuilt wallet classifies the
+    // still-young output as untrusted. Without this aging, `balance_before` includes the payment
+    // and `balance_after` does not - the deliberate, conservative restore divergence, not the
+    // funds loss this phase exists to catch. Past the untrusted depth both classifications
+    // agree.
+    //
+    // The depth to mine is derived from the youngest entry the wallet actually holds rather than
+    // written as a fixed block count: this file has more than one self-send now, and a fixed
+    // count silently ages only the one it was written for. It did - the shutdown-drain self-send
+    // above lands here with a single confirmation, and eight blocks left it one short of the
+    // window, which showed up as a rebuilt wallet exactly 0.01 ZEC light.
+    const UNTRUSTED_CONFIRMATIONS: i64 = 10;
+    let aged = zecd
+        .call("listtransactions", json!(["*", 100]))
         .await
-        .expect("getblockcount before aging the self-send");
-    zebrad
-        .generate_blocks(8)
-        .await
-        .expect("age the self-send past the untrusted window");
-    zecd.wait_until_synced(tip + 8, FUND_TIMEOUT)
-        .await
-        .expect("scan the aging blocks");
+        .expect("listtransactions before aging the wallet's transactions");
+    let youngest = aged
+        .as_array()
+        .expect("listtransactions array")
+        .iter()
+        .map(|t| t["confirmations"].as_i64().unwrap_or(0))
+        .min()
+        .unwrap_or(UNTRUSTED_CONFIRMATIONS);
+    let need = u32::try_from((UNTRUSTED_CONFIRMATIONS - youngest).max(0)).expect("small depth");
+    if need > 0 {
+        let tip = zecd
+            .block_count()
+            .await
+            .expect("getblockcount before aging the wallet's transactions");
+        zebrad
+            .generate_blocks(need)
+            .await
+            .expect("age every wallet transaction past the untrusted window");
+        zecd.wait_until_synced(tip + u64::from(need), FUND_TIMEOUT)
+            .await
+            .expect("scan the aging blocks");
+    }
     let tip = zecd
         .block_count()
         .await
@@ -1589,6 +2134,13 @@ async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &s
             .await
             .expect("gettransaction while polling for confirmation");
         if gt["confirmations"].as_i64().unwrap_or(0) >= 1 {
+            // Confirmed is not caught up: a block mined on the poll that found the wallet one
+            // behind is still unscanned here, and a phase that reads the history twice over
+            // the next second sees `confirmations` move between its reads (it did, in CI:
+            // 20 against 21 for the same transaction). Leave the wallet at the node's tip.
+            zecd.wait_until_synced_to_node(zebrad, FUND_TIMEOUT)
+                .await
+                .expect("scan the blocks mined while polling for confirmation");
             return;
         }
     }

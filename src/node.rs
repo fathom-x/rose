@@ -138,11 +138,19 @@ impl PreparedNode {
         // carries a receiver and can stop its sync loop between batches.
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
+        // The `[spend]` values a SIGHUP reload can change while running. One cell, shared by
+        // every actor, so a reload reaches all of them at once - and read per send rather than
+        // copied into each actor, so it takes effect on the next send instead of the next
+        // restart. See `crate::config::SpendLimits`.
+        #[cfg(feature = "zcash")]
+        let spend_limits = crate::config::SpendLimits::new(&config.spend);
+
         let registry = WalletRegistry::new(config.default_wallet.clone());
         let mut actor_tasks = Vec::new();
-        // Build the Orchard proving keys once (they're wallet-independent) and share them across
-        // every actor, so each send reuses the cached key instead of rebuilding it per transaction.
-        // On by default (`[spend] cache_proving_key`).
+        // Warm the Orchard proving keys once (they're wallet-independent; the Zakura stack
+        // caches them process-wide, and the fused builder reads the same cells) and share the
+        // handle across every actor, so the first send finds them built and their prepared
+        // commitment tables armed. On by default (`[spend] cache_proving_key`).
         //
         // The keygen runs **in the background**: it is seconds of CPU, and only sends need its
         // result, so blocking here would delay spawning the actors (and, in the daemon, binding
@@ -155,8 +163,16 @@ impl PreparedNode {
         // bitcoin-only daemon used to pay ~4s of CPU and hold two proving keys for sends it
         // could never make. The handle still exists in that case, so the lazy first-send
         // build stays the fallback for any wallet that does get spawned.
+        // ...but only where a send is possible at all. A daemon whose every wallet is
+        // watch-only - a `[fleet]` of view wallets, or `init --ufvk` replicas - cannot sign a
+        // transaction, so warming and arming these keys spends startup CPU and holds the armed
+        // commitment tables resident for something nothing in the process can reach. This is the
+        // same cut the actor already makes one level down, where a watch-only actor builds no
+        // Sapling prover.
         #[cfg(feature = "zcash")]
-        let orchard_keys = if config.spend.cache_proving_key {
+        let spender_present = any_wallet_can_spend(&config.wallets);
+        #[cfg(feature = "zcash")]
+        let orchard_keys = if config.spend.cache_proving_key && spender_present {
             // Also build the PostNu6_3 (Ironwood) proving key when this network can activate
             // NU6.3, so post-NU6.3 sends prove the Ironwood bundle from the cache instead of
             // rebuilding a key per send. NU6.3 is live on mainnet (3_428_143) and testnet
@@ -184,6 +200,23 @@ impl PreparedNode {
                 );
             }
             Some(keys)
+        } else if config.spend.cache_proving_key {
+            // Not `None`: the handle still builds on demand (`ProvingKeys::get` is a
+            // `OnceCell::get_or_try_init`), so a send that arrives anyway - a wallet this
+            // predicate read as watch-only, or one added by a future runtime path - still
+            // proves, paying the warm-up inline exactly as a send arriving before the
+            // background task would. Skipping the *eager* warm-up is the whole change; it
+            // cannot make a send fail.
+            info!(
+                "no wallet holds spending keys; not warming the Orchard proving keys (they build \
+                 on demand if a send ever arrives)"
+            );
+            Some(actor::ProvingKeys::new(
+                config
+                    .network
+                    .activation_height(NetworkUpgrade::Nu6_3)
+                    .is_some(),
+            ))
         } else {
             None
         };
@@ -323,17 +356,22 @@ impl PreparedNode {
                     hub: Arc::clone(&hub),
                     sync_interval: Duration::from_secs(config.sync.interval_secs),
                     rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
+                    fetch_memos: config.sync.fetch_memos,
+                    batch_size: config.sync.batch_size,
+                    writer_cache_mib: config.sync.writer_cache_mib,
+                    enhance_concurrency: config.sync.enhance_concurrency,
                     reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
                     reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
                     age_identity: config.keys.age_identity.clone(),
                     auto_unlock: config.keys.auto_unlock,
                     bootstrap: config.keys.bootstrap_from_keys,
                     confirmations_policy,
-                    orchard_action_limit: config.spend.orchard_action_limit,
+                    spend_limits: spend_limits.clone(),
                     target_note_count: config.spend.target_note_count,
                     min_split_output_value: config.spend.min_split_output_value,
                     orchard_keys: orchard_keys.clone(),
                     pipeline_proving: config.spend.pipeline_proving,
+                    shutdown_drain: Duration::from_secs(config.spend.shutdown_drain_secs),
                     trust_own_transactions: config.spend.trust_own_transactions,
                     enabled_pools: entry.pools.clone(),
                     default_receivers: entry.default_receivers.clone(),
@@ -404,6 +442,7 @@ impl PreparedNode {
             &config,
             &fleet_hub,
             confirmations_policy,
+            &spend_limits,
             &shutdown_tx,
             &registry,
             &mut actor_tasks,
@@ -447,6 +486,8 @@ impl PreparedNode {
             operations: Arc::new(crate::operations::OperationRegistry::new()),
             #[cfg(feature = "zcash")]
             fleet: fleet.clone(),
+            #[cfg(feature = "zcash")]
+            spend_limits,
         };
 
         Ok(Node {
@@ -472,6 +513,7 @@ async fn spawn_fleet(
     config: &AppConfig,
     hub: &Arc<chain::hub::ChainHub>,
     confirmations_policy: zcash_client_backend::data_api::wallet::ConfirmationsPolicy,
+    spend_limits: &crate::config::SpendLimits,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     registry: &WalletRegistry,
     actor_tasks: &mut Vec<(String, tokio::task::JoinHandle<()>)>,
@@ -518,8 +560,9 @@ async fn spawn_fleet(
     let mut placed = std::collections::BTreeMap::new();
     let mut existing = Vec::with_capacity(shard_dirs.len());
     for (index, dir) in shard_dirs.iter().enumerate() {
-        let state = crate::fleet::inspect_shard(config.network, dir, index, &mut placed)
-            .with_context(|| format!("inspecting shard {}", dir.display()))?;
+        let state =
+            crate::fleet::inspect_shard(config.network, config.fleet.coin, dir, index, &mut placed)
+                .with_context(|| format!("inspecting shard {}", dir.display()))?;
         existing.push(state);
     }
 
@@ -531,13 +574,18 @@ async fn spawn_fleet(
         config.fleet.clone(),
         crate::fleet::ShardTemplate {
             network: config.network,
+            coin: config.fleet.coin,
             hub: Arc::clone(hub),
             sync_interval: Duration::from_secs(config.sync.interval_secs),
             rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
+            fetch_memos: config.sync.fetch_memos,
+            batch_size: config.sync.batch_size,
+            writer_cache_mib: config.sync.writer_cache_mib,
+            enhance_concurrency: config.sync.enhance_concurrency,
             reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
             reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
             confirmations_policy,
-            orchard_action_limit: config.spend.orchard_action_limit,
+            spend_limits: spend_limits.clone(),
             target_note_count: config.spend.target_note_count,
             min_split_output_value: config.spend.min_split_output_value,
             enabled_pools: config.pools.enabled.clone(),
@@ -556,20 +604,26 @@ async fn spawn_fleet(
         let actor_cfg = ActorConfig {
             name: name.clone(),
             network: config.network,
-            engine_dir: dir.clone(),
+            engine_dir: crate::config::shard_engine_dir(&dir, config.fleet.coin),
             // A shard has no keys.toml: its wallets are watch-only accounts imported from the
             // manifest's viewing keys, so there is no seed, passphrase or bootstrap involved.
+            // The path still points at the shard root, where a wallet's would sit - above the
+            // engine directory, which nothing but librustzcash owns.
             keys_path: dir.join("keys.toml"),
             hub: Arc::clone(hub),
             sync_interval: Duration::from_secs(config.sync.interval_secs),
             rebroadcast_interval: Duration::from_secs(config.sync.rebroadcast_secs),
+            fetch_memos: config.sync.fetch_memos,
+            batch_size: config.sync.batch_size,
+            writer_cache_mib: config.sync.writer_cache_mib,
+            enhance_concurrency: config.sync.enhance_concurrency,
             reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
             reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),
             age_identity: None,
             auto_unlock: false,
             bootstrap: false,
             confirmations_policy,
-            orchard_action_limit: config.spend.orchard_action_limit,
+            spend_limits: spend_limits.clone(),
             // Carried for completeness: a shard member never spends, so the change-splitting
             // knobs are never consulted. Taking the configured values rather than defaults keeps
             // a shard actor's config identical to a wallet actor's on every field it shares.
@@ -578,6 +632,8 @@ async fn spawn_fleet(
             // Shard members never spend, so the proving keys are dead weight here.
             orchard_keys: None,
             pipeline_proving: false,
+            // Nor is there anything to drain: a shard actor accepts no sends.
+            shutdown_drain: Duration::ZERO,
             // Never consulted either: the trust marker is written at send-store time.
             trust_own_transactions: false,
             enabled_pools: config.pools.enabled.clone(),
@@ -627,6 +683,45 @@ async fn spawn_fleet(
 }
 
 /// How many shards the manager currently tracks (for the startup line).
+/// Whether any configured wallet could ever sign a transaction - i.e. whether this daemon has
+/// any use for the Orchard proving keys.
+///
+/// Reads `keys.toml`, not the wallet database. A `zecd init --ufvk` wallet is seedless by
+/// construction (`WalletStore::init_view_only`), and `keys.toml` is written before the database
+/// exists, so this is answerable at startup - before any actor has spawned and reported the
+/// `watch_only` flag the single-spender invariant later uses. An *encrypted* wallet still holds
+/// its seed as ciphertext, so a locked spender counts as a spender without decrypting anything.
+///
+/// Fleet shards are deliberately not consulted: a manifest carries a viewing key and nothing
+/// else, so a shard member can never spend (`wallet/shard.rs` imports it watch-only).
+///
+/// An unreadable or absent `keys.toml` counts as **spending**. Both directions are safe - the
+/// keys build on demand either way - but being wrong this way costs one eager warm-up, where
+/// being wrong the other way costs a send its warm-up latency, and this is also the reading
+/// that leaves a misconfigured datadir behaving exactly as it does today.
+#[cfg(feature = "zcash")]
+fn any_wallet_can_spend(
+    wallets: &std::collections::BTreeMap<String, crate::config::WalletEntry>,
+) -> bool {
+    wallets
+        .values()
+        .filter(|entry| entry.coin == crate::coin::Coin::Zcash)
+        .any(|entry| keys_file_can_spend(&entry.keys_path()))
+}
+
+/// The per-wallet half of [`any_wallet_can_spend`]: whether the `keys.toml` at this path holds
+/// spending material.
+#[cfg(feature = "zcash")]
+fn keys_file_can_spend(keys_path: &std::path::Path) -> bool {
+    if !WalletStore::exists(keys_path) {
+        return true;
+    }
+    match WalletStore::read(keys_path) {
+        Ok(store) => store.has_seed(),
+        Err(_) => true,
+    }
+}
+
 #[cfg(feature = "zcash")]
 fn shard_count(manager: &crate::fleet::FleetManager) -> usize {
     manager.shards()
@@ -743,6 +838,31 @@ pub struct SendOptions {
     pub source: crate::wallet::SendSource,
 }
 
+/// Where one wallet's librustzcash database is, and which account in it is that wallet's.
+///
+/// Both halves are needed to call [`crate::wallet::read`] against a running node's wallet, and
+/// neither was reachable before: a wallet's engine directory is computable from
+/// [`crate::config::WalletEntry::engine_dir`] only for a configured `[wallets.<name>]` entry,
+/// and a fleet member has no such entry - its account lives in a shard directory the config
+/// layer knows nothing about. See [`Node::wallet_location`].
+#[cfg(feature = "zcash")]
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct WalletLocation {
+    /// The directory holding this wallet's `data.sqlite`, as [`crate::wallet::read`] takes it.
+    /// Shared with the rest of a shard for a fleet member.
+    pub engine_dir: std::path::PathBuf,
+    /// This wallet's account, or `None` while it does not exist yet (a wallet awaiting its
+    /// bootstrap, or a fleet member awaiting import - `waitforsync`'s `imported` tells them
+    /// apart).
+    pub account: Option<crate::AccountUuid>,
+    /// The scope to hand [`crate::wallet::read::query_transactions`] and its siblings. Not
+    /// derivable from `account` alone: a `None` account means "every account in this database"
+    /// for a conventional wallet, whose database holds none, and "no account" for a fleet member
+    /// awaiting import, whose database holds its shard-mates'.
+    pub scope: crate::wallet::read::AccountScope,
+}
+
 /// A running embedded zecd node: the wallet actors, registry, and async-operation registry,
 /// behind the same dispatch table the HTTP server uses. Owns the datadir lock for its
 /// lifetime; call [`Node::shutdown`] to stop the actors and release it cleanly.
@@ -754,6 +874,26 @@ pub struct Node {
 }
 
 impl Node {
+    /// Where `wallet`'s database is and which account in it to read, for an embedder querying
+    /// [`crate::wallet::read`] directly instead of going through [`Node::call`].
+    ///
+    /// `wallet` names the wallet as the HTTP `/wallet/<name>` segment does, `None` meaning the
+    /// default; an unknown name is the usual `-18`. This is the only supported route to a
+    /// **fleet** member's files, whose shard directory no config helper can produce.
+    ///
+    /// The account is `None` in the window before it exists, which is why the scope is reported
+    /// beside it rather than left for the caller to derive - the two `None` cases scope
+    /// differently (see [`WalletLocation::scope`]).
+    #[cfg(feature = "zcash")]
+    pub fn wallet_location(&self, wallet: Option<&str>) -> Result<WalletLocation, RpcError> {
+        let handle = self.state.registry.get(wallet)?;
+        Ok(WalletLocation {
+            engine_dir: handle.engine_dir.clone(),
+            account: handle.account(),
+            scope: handle.account_scope(),
+        })
+    }
+
     /// Dispatch one RPC with wire-identical semantics: the same dispatch table, the same
     /// `[rpc] allowed_methods` safelist, the same positional-arity checks, and the same error
     /// codes as an HTTP call. `wallet` plays the role of the HTTP `/wallet/<name>` path
@@ -846,6 +986,24 @@ impl Node {
             .await
     }
 
+    /// Apply a freshly resolved configuration to this running node.
+    ///
+    /// Only the keys on [`crate::config::RELOADABLE_KEYS`] take effect; every other difference
+    /// is reported as needing a restart rather than being silently dropped. The returned report
+    /// says exactly what changed and what did not, which is what the caller logs - an operator
+    /// who edits a key that cannot be reloaded needs to be told, not left to infer it from
+    /// behaviour that did not change.
+    ///
+    /// This exists for the Orchard-action cap: a wallet whose notes have fragmented fails every
+    /// send until the cap moves, and restarting a live payment wallet to change a number is a
+    /// poor answer. The cap is deliberately not reachable from RPC - it bounds what one call
+    /// can make the daemon prove, so its raise channel must require process-level authority.
+    /// The binary wires this to SIGHUP; an embedder calls it directly.
+    #[cfg(feature = "zcash")]
+    pub fn reload_config(&self, fresh: &AppConfig) -> crate::config::ReloadReport {
+        crate::config::apply_reload(&self.state.config, fresh, &self.state.spend_limits)
+    }
+
     /// Request graceful shutdown (what `stop` and the daemon's SIGINT/SIGTERM handling do):
     /// wallet actors stop their sync loops between batches and blocking `waitfor*` calls
     /// unblock. Await [`Node::shutdown`] to wait for the actors afterwards.
@@ -927,7 +1085,31 @@ pub(crate) mod testutil {
             operations: Arc::new(crate::operations::OperationRegistry::new()),
             #[cfg(feature = "zcash")]
             fleet: None,
+            #[cfg(feature = "zcash")]
+            spend_limits: crate::config::SpendLimits::new(&crate::config::SpendConfig::default()),
         })
+    }
+
+    /// A node serving exactly one wallet, built from a [`crate::wallet::WalletHandle::for_test`]
+    /// handle: no actor, no database, only the registry lookups and the fields the handle
+    /// publishes. Enough for the accessors that read a handle without dispatching.
+    #[cfg(feature = "zcash")]
+    pub(crate) fn node_with_test_wallet(
+        name: &str,
+        status: crate::wallet::SyncStatus,
+        is_shard: bool,
+    ) -> Node {
+        let node = walletless_node();
+        let handle = crate::wallet::WalletHandle::for_test(name, crate::network::regtest(), status);
+        let handle = if is_shard {
+            handle.into_shard_for_test()
+        } else {
+            handle
+        };
+        node.state
+            .registry
+            .insert(crate::wallet::CoinWallet::Zcash(handle));
+        node
     }
 
     /// The resolved config behind [`walletless_node`], for tests that check a *policy* over a
@@ -992,6 +1174,10 @@ pub(crate) mod testutil {
             sync: SyncConfig {
                 interval_secs: 20,
                 rebroadcast_secs: 60,
+                fetch_memos: true,
+                batch_size: crate::config::DEFAULT_BATCH_SIZE,
+                writer_cache_mib: crate::config::DEFAULT_WRITER_CACHE_MIB,
+                enhance_concurrency: crate::config::DEFAULT_ENHANCE_CONCURRENCY,
             },
             #[cfg(feature = "zcash")]
             spend: crate::config::SpendConfig::default(),
@@ -1016,9 +1202,122 @@ pub(crate) mod testutil {
 mod tests {
     use serde_json::Value;
 
+    #[cfg(feature = "zcash")]
+    use super::testutil::node_with_test_wallet;
     use super::testutil::{
         walletless_node as test_node, walletless_node_with_safelist as test_node_with_safelist,
     };
+
+    /// `wallet_location` is the only supported route to a fleet member's database, so it has to
+    /// answer three ways, and the third is the one the config helpers cannot express: an account
+    /// that does not exist *yet* in a database that holds other wallets' accounts.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn wallet_location_reports_the_account_and_the_scope_it_implies() {
+        use crate::wallet::read::AccountScope;
+        use crate::wallet::SyncStatus;
+        use std::sync::Arc;
+        use zcash_client_sqlite::AccountUuid;
+
+        // Imported: the account, and a scope naming it.
+        let account = AccountUuid::from_uuid(uuid::Uuid::from_u128(7));
+        let status = SyncStatus {
+            accounts: Arc::new([("w".to_string(), account)].into_iter().collect()),
+            ..Default::default()
+        };
+        let node = node_with_test_wallet("w", status, true);
+        let loc = node.wallet_location(Some("w")).expect("a loaded wallet");
+        assert_eq!(loc.account, Some(account));
+        assert_eq!(loc.scope, AccountScope::Only(account));
+
+        // A conventional wallet awaiting its bootstrap: no account, and the database holds none,
+        // so every account in it is the same as this wallet's - the pre-fleet scope.
+        let node = node_with_test_wallet("w", SyncStatus::default(), false);
+        let loc = node.wallet_location(Some("w")).expect("a loaded wallet");
+        assert_eq!(loc.account, None);
+        assert_eq!(loc.scope, AccountScope::Any);
+
+        // A shard member awaiting import: also no account, but its database is its shard's, so
+        // the same `None` must scope to nothing instead. This is why the scope is reported
+        // rather than left for the caller to derive from `account`.
+        let node = node_with_test_wallet("w", SyncStatus::default(), true);
+        let loc = node.wallet_location(Some("w")).expect("a loaded wallet");
+        assert_eq!(loc.account, None);
+        assert_eq!(loc.scope, AccountScope::NoAccount);
+    }
+
+    /// An unknown wallet is the same `-18` the RPC path gives, so a caller handles one error for
+    /// both seams.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn wallet_location_rejects_an_unknown_wallet() {
+        let node = test_node();
+        let err = node
+            .wallet_location(Some("nope"))
+            .expect_err("no such wallet");
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_NOT_FOUND);
+    }
+
+    /// The check that decides whether to warm the Orchard proving keys reads `keys.toml`, so it
+    /// must answer for a watch-only wallet (seedless, `init --ufvk`) and a spending one - and,
+    /// the case that matters most, for anything it cannot read, which has to count as spending
+    /// so an unexpected datadir keeps today's behaviour rather than quietly losing the warm-up.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn only_a_seedless_keys_file_skips_the_proving_key_warmup() {
+        use crate::wallet::store::WalletStore;
+
+        // The committed testnet development phrase (valueless) - a deterministic spending seed.
+        const PHRASE: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
+                              midnight culture idea mountain fame park social drip bid doctor \
+                              scatter glance defy moment stage";
+        // Stored verbatim by `init_view_only` and never parsed here, so an obvious placeholder
+        // is better than a real-looking key nobody can verify (as in `store.rs`'s own tests).
+        const UFVK: &str = "uviewtest1nodeplaceholder";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let net = crate::network::regtest();
+
+        let seedless = dir.path().join("view-only.toml");
+        WalletStore::init_view_only(&seedless, 1, net, UFVK).expect("write a seedless keys.toml");
+        assert!(
+            !super::keys_file_can_spend(&seedless),
+            "a seedless wallet cannot sign, so nothing needs the proving keys"
+        );
+
+        // An encrypted spender still counts: the seed is present as ciphertext, so this decides
+        // without unlocking anything.
+        let encrypted = dir.path().join("encrypted.toml");
+        let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(PHRASE).expect("phrase");
+        WalletStore::init_with_passphrase(
+            &encrypted,
+            crate::wallet::store::Passphrase::from("correct horse battery".to_string()),
+            &mnemonic,
+            1,
+            net,
+            UFVK,
+        )
+        .expect("write an encrypted keys.toml");
+        assert!(
+            super::keys_file_can_spend(&encrypted),
+            "a locked spending wallet is still a spending wallet"
+        );
+
+        // A `keys.toml` that is not there at all: the wallet loop warns and skips such a wallet,
+        // but reading its absence as watch-only would be inferring custody from a missing file.
+        assert!(
+            super::keys_file_can_spend(&dir.path().join("does-not-exist.toml")),
+            "an absent keys.toml must not be read as watch-only"
+        );
+
+        // Likewise one that does not parse.
+        let corrupt = dir.path().join("corrupt.toml");
+        std::fs::write(&corrupt, b"this is not toml at all").expect("write");
+        assert!(
+            super::keys_file_can_spend(&corrupt),
+            "an unreadable keys.toml must not be read as watch-only"
+        );
+    }
 
     /// `call` runs the same dispatch table as HTTP: a method that does not exist is -32601,
     /// with the same message shape.

@@ -25,7 +25,8 @@ use zcash_client_backend::data_api::wallet::{
 use zcash_client_backend::data_api::{
     Account, AccountBirthday, AccountPurpose, AccountSource, CoinbaseFilter, InputSource,
     MaxSpendMode, NoteRetention, SentTransaction, SentTransactionOutput, TargetValue,
-    TransactionDataRequest, TransactionStatus, WalletRead, WalletWrite,
+    TransactionDataRequest, TransactionStatus, TransactionsInvolvingAddress, WalletRead,
+    WalletWrite,
 };
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
@@ -37,7 +38,7 @@ use zcash_client_backend::wallet::{
     OvkPolicy, Recipient, TransparentAddressSource, WalletTransparentOutput,
 };
 use zcash_client_sqlite::error::SqliteClientError;
-use zcash_client_sqlite::{AccountUuid, FsBlockDb};
+use zcash_client_sqlite::AccountUuid;
 use zcash_keys::address::Address;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
@@ -64,6 +65,7 @@ use crate::error::{codes, ErrorDetails, InsufficientFunds, RpcError};
 use crate::network::ZNetwork;
 use crate::pools::{Receiver, ReceiverSet};
 use crate::sync::engine;
+use crate::tx_size;
 use crate::wallet::binding;
 use crate::wallet::keys::{self, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
@@ -89,18 +91,26 @@ type ProposalError = zcash_client_backend::data_api::error::Error<
     zcash_client_sqlite::ReceivedNoteId,
 >;
 
-/// The Orchard (+ Ironwood) proving keys, built once and shared (read-only) across
-/// every wallet actor via `Arc`. These are wallet-independent (they're the circuit's keys), and
-/// `ProvingKey::build()` is a full `keygen_vk`+`keygen_pk` - seconds of work - so the fused
-/// librustzcash send path (which rebuilds the proving key on *every* transaction) pays that
-/// cost per send. Building them here once and feeding them to the PCZT prove path eliminates that
-/// per-send overhead (the `[spend] cache_proving_key` knob, default on).
+/// The Orchard (+ Ironwood) proving keys every send proves with, plus their verifying keys,
+/// shared (read-only) across every wallet actor via `Arc`.
 ///
-/// Deliberately **no verifying key**: the extract step's only use for one was a PCZT with no
-/// Ironwood actions, and post-NU6.3 - live on both public networks - every send's outputs are
-/// Ironwood, so it went unread while costing ~1.2 s of every startup. [`store_pczt`] now always
-/// passes `None`, and the extractor generates the right key per bundle on the fly, exactly as it
-/// already did for every Ironwood send.
+/// The keys themselves live in **the Zakura stack's process-wide cache**
+/// (`zcash_primitives::transaction::builder::cached_orchard_proving_key`, one `OnceLock` per
+/// circuit version): the fork's fused transaction builder reads its key from there on every
+/// `Builder::build`, so holding `&'static` references to the same cells means the PCZT prove
+/// path and the fused path (`create_proposed_transactions`, used by Sapling-spending wallets,
+/// transparent-source sends, `z_shieldcoinbase`, `z_mergetoaddress` and `cache_proving_key =
+/// false`) prove with **one** key set. zecd used to build its own copy, which was the whole
+/// point of this type when the upstream builder regenerated a key per transaction (a
+/// `Params::new` + `keygen_vk` + `keygen_pk`, seconds of work); the fork caches it, reads the
+/// commitment parameters from an embedded artifact instead of regenerating them, and leaves
+/// zecd two jobs: warm the cells in the background at startup rather than on the first send,
+/// and arm the fork's prepared commitment tables (see [`ProvingKeyCache::build`]).
+///
+/// The **verifying keys** are cloned out of the proving keys (`ProvingKey::verifying_key` copies
+/// key material, no keygen) so [`store_pczt`] can hand the extractor the key it would otherwise
+/// regenerate per bundle on every send (`VerifyingKey::build`, the bulk of the old `store_ms`).
+/// They share the proving keys' `Params`, so the prepared tables serve verification too.
 ///
 /// Two circuit versions exist (orchard `bundle.rs`): a **V2 Orchard** bundle uses `FixedPostNu6_2`,
 /// a **V3 Ironwood** bundle uses `PostNu6_3`, and `Bundle::create_proof` rejects a key whose circuit
@@ -112,12 +122,17 @@ type ProposalError = zcash_client_backend::data_api::error::Error<
 /// `ZECD_REGTEST_NU63_HEIGHT` - where the PostNu6_3 keygen would be ~4.5 s of wasted startup for a
 /// key no send can use.
 pub struct ProvingKeyCache {
-    /// `FixedPostNu6_2` proving key - proves the V2 Orchard bundle.
-    orchard_pk: orchard::circuit::ProvingKey,
+    /// `FixedPostNu6_2` proving key - proves the V2 Orchard bundle. A reference into the
+    /// stack's process-wide cache, shared with the fused builder.
+    orchard_pk: &'static orchard::circuit::ProvingKey,
     /// `PostNu6_3` proving key - proves the V3 Ironwood bundle. `None` only when the network has
     /// no NU6.3 activation height at all (so no send produces an Ironwood bundle); mainnet and
     /// testnet both have one. See [`ProvingKeyCache::build`].
-    ironwood_pk: Option<orchard::circuit::ProvingKey>,
+    ironwood_pk: Option<&'static orchard::circuit::ProvingKey>,
+    /// Verifying key matching `orchard_pk`, for the extract step.
+    orchard_vk: orchard::circuit::VerifyingKey,
+    /// Verifying key matching `ironwood_pk`, for the extract step.
+    ironwood_vk: Option<orchard::circuit::VerifyingKey>,
 }
 
 impl ProvingKeyCache {
@@ -134,19 +149,70 @@ impl ProvingKeyCache {
     /// `zcash_primitives`' default features), so on a single-core host the two simply interleave
     /// and cost what they always did.
     pub fn build(build_ironwood: bool) -> Self {
-        use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
+        use orchard::circuit::OrchardCircuitVersion;
+        use zcash_primitives::transaction::builder::cached_orchard_proving_key;
+        // `cached_orchard_proving_key` is the stack's own `OnceLock` per circuit version: the
+        // first caller builds the key (from the embedded k=11 commitment parameters, so no
+        // `Params::new` any more), every later caller - this cache, and the fused builder on
+        // every `Builder::build` - gets the same `&'static` key back. Warming both cells here,
+        // in the background at startup, is what keeps the first send from paying the keygen.
         let (orchard_pk, ironwood_pk) = std::thread::scope(|scope| {
-            let ironwood = build_ironwood
-                .then(|| scope.spawn(|| ProvingKey::build(OrchardCircuitVersion::PostNu6_3)));
-            let orchard_pk = ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2);
+            let ironwood = build_ironwood.then(|| {
+                scope.spawn(|| cached_orchard_proving_key(OrchardCircuitVersion::PostNu6_3))
+            });
+            let orchard_pk = cached_orchard_proving_key(OrchardCircuitVersion::FixedPostNu6_2);
             // A keygen panic is not recoverable (it means this build cannot prove at all), so
             // propagate it to the caller's `spawn_blocking`, which reports it as a failed build.
             let ironwood_pk = ironwood.map(|h| h.join().expect("Ironwood keygen panicked"));
             (orchard_pk, ironwood_pk)
         });
+        // Arm the Zakura fork's prepared fixed-base commitment tables on each key. The prover's
+        // polynomial commitments then evaluate through the preparations on bounded-width rayon
+        // pools (up to eight effective threads; halo2 falls back to its usual multiexp on wider
+        // ones, so this never slows proving down). It costs hundreds of milliseconds and tens of
+        // MiB per key, once, and is a no-op returning `false` unless orchard was built with its
+        // opt-in `orbits` feature - which `Cargo.toml` enables for exactly this call. Because the
+        // tables hang off the shared `Params`, the fused path's proofs go through them too.
+        let armed = orchard_pk.prepare_proving();
+        let ironwood_armed = ironwood_pk.map(|pk| pk.prepare_proving());
+        info!(
+            orchard = armed,
+            ironwood = ?ironwood_armed,
+            "prepared Orchard proving-key commitment tables"
+        );
         ProvingKeyCache {
             orchard_pk,
             ironwood_pk,
+            orchard_vk: orchard_pk.verifying_key(),
+            ironwood_vk: ironwood_pk.map(|pk| pk.verifying_key()),
+        }
+    }
+
+    /// The cached proving key for `version`, or `None` where this cache holds none: the
+    /// `PostNu6_3` key on a chain that never activates NU6.3, and the insecure pre-NU6.2
+    /// circuit, which no send may prove with.
+    fn pk_for(
+        &self,
+        version: orchard::circuit::OrchardCircuitVersion,
+    ) -> Option<&'static orchard::circuit::ProvingKey> {
+        use orchard::circuit::OrchardCircuitVersion as V;
+        match version {
+            V::FixedPostNu6_2 => Some(self.orchard_pk),
+            V::PostNu6_3 => self.ironwood_pk,
+            V::InsecurePreNu6_2 => None,
+        }
+    }
+
+    /// The cached verifying key for `version`; see [`Self::pk_for`].
+    fn vk_for(
+        &self,
+        version: orchard::circuit::OrchardCircuitVersion,
+    ) -> Option<&orchard::circuit::VerifyingKey> {
+        use orchard::circuit::OrchardCircuitVersion as V;
+        match version {
+            V::FixedPostNu6_2 => Some(&self.orchard_vk),
+            V::PostNu6_3 => self.ironwood_vk.as_ref(),
+            V::InsecurePreNu6_2 => None,
         }
     }
 }
@@ -235,6 +301,12 @@ struct PendingSend {
     request: TransactionRequest,
     confirmations: Option<ConfirmationsPolicy>,
     privacy: SendPrivacy,
+    /// The funding source, carried so a send that waited in the queue selects its inputs from
+    /// the same pools it would have selected from had it started immediately. A queued send is
+    /// always shielded-sourced (`begin_or_queue_send` routes transparent ones inline), but
+    /// "shielded" is not one thing: `ANY_SAPLING` and `ANY_ORCHARD` each name one pool family,
+    /// and dropping that here would silently widen the selection back to every pool.
+    source: SendSource,
     reply: oneshot::Sender<Result<TxId, RpcError>>,
 }
 
@@ -244,6 +316,9 @@ struct SendCompletion {
     /// The signed PCZT ready to extract+store, or the error that aborted phase A/B (proposal,
     /// PCZT build, proving, signing, or a caught panic in the proof job).
     result: Result<pczt::Pczt, RpcError>,
+    /// The circuit the send's Orchard-pool bundle was proved under, which picks the extract
+    /// step's verifying key (see [`orchard_circuit_for_branch`]).
+    orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
     /// The confirmations policy this send used, to enrich a `-6` if storing surfaces one.
     policy: ConfirmationsPolicy,
     /// The send's shape (input/action counts), carried through for the latency log line.
@@ -355,14 +430,19 @@ fn sync_error_retry_deadline(now: Instant) -> Instant {
     now + SYNC_ERROR_RETRY_INTERVAL
 }
 
-/// How many transaction-enhancement requests to service per `enhance_step` call before
-/// yielding back to the actor loop. Enhancement runs only once the block scan is caught up,
-/// but it can be a multi-hour backlog on a from-birthday restore (one upstream
-/// `getrawtransaction` then decrypt/store per request). Draining it in bounded batches - instead
-/// of one monolithic pass - keeps the single-writer actor responsive: queued commands (sends) are
-/// serviced between batches and the shrinking backlog is republished on `SyncStatus` after each
-/// one. At ~0.3s/request this is a few seconds of work per batch.
-const ENHANCE_BATCH: usize = 16;
+/// One transaction as the enhancement drain fetches it: the parsed transaction and the height
+/// it was mined at (`None` while unmined), or `None` when the upstream does not know the txid.
+type FetchedTransaction = Option<(Transaction, Option<BlockHeight>)>;
+
+/// A pending request that names one transaction - the two kinds the drain fetches
+/// concurrently. `enhance` is true for an `Enhancement` (decrypt and store the transaction)
+/// and false for a `GetStatus` (record its chain status only). The original request rides
+/// along so a serviced one can be marked satisfied.
+struct TxidRequest<'a> {
+    req: &'a TransactionDataRequest,
+    txid: TxId,
+    enhance: bool,
+}
 
 /// How often to emit an enhancement-drain progress heartbeat (throttled by wall time, like the
 /// transparent pre-exposure heartbeat). The `pending_enhancements` count alone can sit flat for
@@ -423,9 +503,53 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
     )
 }
 
+/// Whether a [`TransactionDataRequest`] is in scope for this wallet's enhancement drain:
+/// serviceable ([`is_serviceable_request`]) and not excluded by policy.
+///
+/// The one policy exclusion is an `Enhancement` request under `[sync] fetch_memos = false`, and
+/// only for a transaction the wallet did **not** spend in (`spending`, from
+/// [`read::wallet_spending_txids`]). That split is what makes the setting cost exactly the
+/// memos and nothing else, so it is the whole reason the predicate takes a set rather than
+/// matching on the variant alone:
+///
+/// - A transaction the wallet only **received** in is already complete from the compact scan -
+///   the note, its value, its nullifier and the receiving address all ride the compact output.
+///   The one thing the full-transaction fetch would add is the memo (compact outputs carry the
+///   note plaintext minus its memo), and the operator has said they do not read memos. Its fee
+///   is the sender's, not the wallet's, and is not reported on a receive entry.
+/// - A transaction the wallet **spent** in is not complete: its outgoing records (recipient and
+///   amount, recovered by OVK-decrypting the full transaction into `sent_notes`) and its fee
+///   exist nowhere else. Skipping those would make a restored wallet's own sends vanish from
+///   `listtransactions` while the balance still moved - so they are always fetched, and every
+///   RPC but the memo fields stays exact whether the wallet is live or freshly restored.
+///
+/// `GetStatus` and `TransactionsInvolvingAddress` are never excluded either: status tracking and
+/// the transparent spend/ephemeral checks are correctness, not history detail.
+///
+/// Both the drain ([`WalletActor::enhance_step`]) and the backlog count
+/// ([`WalletActor::enhancement_backlog`], which feeds `SyncStatus.pending_enhancements` and
+/// therefore `/readyz` and `conn_state`) apply this predicate via [`outstanding_requests`]:
+/// skipping a request in the drain while still counting it would pin the backlog above zero
+/// forever and the wallet would never report ready. The skipped requests stay queued in the
+/// wallet DB (librustzcash removes a request only when it is satisfied), which is what makes
+/// the knob reversible - flipping `fetch_memos` back on picks the backlog up and backfills the
+/// memos, no rescan needed.
+fn request_in_scope(
+    req: &TransactionDataRequest,
+    fetch_memos: bool,
+    spending: &std::collections::BTreeSet<TxId>,
+) -> bool {
+    is_serviceable_request(req)
+        && match req {
+            TransactionDataRequest::Enhancement(txid) => fetch_memos || spending.contains(txid),
+            _ => true,
+        }
+}
+
 /// Filter one `transaction_data_requests()` read down to the requests actually outstanding in
-/// this drain: serviceable ([`is_serviceable_request`]), not yet attempted (`satisfied`), and
-/// **deduplicated**, preserving first-occurrence order.
+/// this drain: in scope ([`request_in_scope`] - serviceable, and not policy-excluded by `[sync]
+/// fetch_memos = false`), not yet attempted (`satisfied`), and **deduplicated**, preserving
+/// first-occurrence order.
 ///
 /// The dedup is load-bearing, not cosmetic. `zcash_client_sqlite`'s spend-search generation (the
 /// non-`spend-index` arm of `wallet/transparent.rs::transaction_data_requests`) joins the
@@ -443,11 +567,17 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
 fn outstanding_requests(
     requests: Vec<TransactionDataRequest>,
     satisfied: &std::collections::BTreeSet<TransactionDataRequest>,
+    fetch_memos: bool,
+    spending: &std::collections::BTreeSet<TxId>,
 ) -> Vec<TransactionDataRequest> {
     let mut seen = std::collections::BTreeSet::new();
     requests
         .into_iter()
-        .filter(|r| is_serviceable_request(r) && !satisfied.contains(r) && seen.insert(r.clone()))
+        .filter(|r| {
+            request_in_scope(r, fetch_memos, spending)
+                && !satisfied.contains(r)
+                && seen.insert(r.clone())
+        })
         .collect()
 }
 
@@ -623,6 +753,18 @@ pub struct ActorConfig {
     pub sync_interval: Duration,
     /// Minimum spacing between unmined-tx rebroadcast passes.
     pub rebroadcast_interval: Duration,
+    /// Whether the enhancement step fetches full transactions to complete the ones the wallet
+    /// only saw as compact blocks - memos, fees, outgoing-send records (`[sync] fetch_memos`;
+    /// on by default). Off skips only `Enhancement` requests - transaction-status tracking and
+    /// the transparent address checks still run. See [`request_in_scope`].
+    pub fetch_memos: bool,
+    /// Blocks per download-and-scan batch (`[sync] batch_size`).
+    pub batch_size: u32,
+    /// The writer connection's SQLite page-cache ceiling in MiB (`[sync] writer_cache_mib`).
+    pub writer_cache_mib: u32,
+    /// Transaction fetches in flight at once during the enhancement drain (`[sync]
+    /// enhance_concurrency`), which is also how many requests one drain pass services.
+    pub enhance_concurrency: usize,
     /// Reconnect backoff base/max delays.
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
@@ -634,24 +776,33 @@ pub struct ActorConfig {
     /// The wallet-wide confirmations policy (`[spend]` config; ZIP-315 3/10 by default),
     /// anchoring balances, spend proposals, and the `-6` enrichment.
     pub confirmations_policy: ConfirmationsPolicy,
-    /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
-    pub orchard_action_limit: usize,
+    /// The `[spend]` limits a SIGHUP reload can change while the daemon runs; shared with
+    /// every other actor and with the reload path (see [`crate::config::SpendLimits`]).
+    pub spend_limits: crate::config::SpendLimits,
     /// Change-splitting target and floor (`[spend] target_note_count` /
     /// `[spend] min_split_output_value`), validated at config resolution.
     pub target_note_count: usize,
     /// See [`ActorConfig::target_note_count`].
     pub min_split_output_value: u64,
     /// Shared cached Orchard proving/verifying keys (`[spend] cache_proving_key`). `Some`
-    /// selects the PCZT prove path with the cached key; `None` selects the legacy fused path
-    /// (`create_proposed_transactions`), which rebuilds the proving key per send. Created once in
-    /// `daemon::run` and cloned into every actor (the key is wallet-independent), with the keygen
-    /// itself running in the background - a send awaits it. NB: the PCZT path here signs only
-    /// Orchard spends, so a wallet that can spend Sapling notes (`enabled_pools` includes
-    /// Sapling) falls back to the fused path regardless - see `do_send`.
+    /// selects the PCZT prove path; `None` selects the fused path
+    /// (`create_proposed_transactions`). Both prove from the same keys on the Zakura stack - the
+    /// fork caches them process-wide and this type holds `&'static` references into those cells
+    /// (see [`ProvingKeyCache`]), so the choice is about the prove/store seam (and therefore
+    /// `pipeline_proving`), not about who pays a keygen. Created once in
+    /// `node::PreparedNode::start` and cloned into every actor (the keys are wallet-independent),
+    /// with the warm-up itself running in the background - a send awaits it. NB: the PCZT path
+    /// here signs only Orchard spends, so a wallet that can spend Sapling notes (`enabled_pools`
+    /// includes Sapling) falls back to the fused path regardless - see `do_send`.
     pub orchard_keys: Option<Arc<ProvingKeys>>,
     /// Run the proving step off the actor so a long send doesn't freeze sync (`[spend]
     /// pipeline_proving`). Only engages on the cached-Orchard PCZT path; off by default.
     pub pipeline_proving: bool,
+    /// How long to spend finishing already-accepted sends when shutdown is signalled (`[spend]
+    /// shutdown_drain_secs`, default 60s; `0` drops them immediately). It must fit inside the
+    /// supervisor's own stop timeout - see the config field's docs and
+    /// [`WalletActor::finish_accepted_sends`].
+    pub shutdown_drain: Duration,
     /// Mark wallet-authored transactions trusted at store time (`[spend]
     /// trust_own_transactions`, default on) - see [`mark_own_tx_trusted`]. Off = persist no
     /// trust marker, so a restore classifies identically to the authoring instance.
@@ -700,9 +851,13 @@ struct WalletActor {
     reconnect_at: Instant,
     sync_interval: Duration,
     rebroadcast_interval: Duration,
+    /// Whether the enhancement step fetches full transactions to recover memos (`[sync]
+    /// fetch_memos`). See [`request_in_scope`].
+    fetch_memos: bool,
     confirmations_policy: ConfirmationsPolicy,
-    /// Cap on Orchard actions per send (`[spend] orchard_action_limit`; 0 disables it).
-    orchard_action_limit: usize,
+    /// The `[spend]` limits a SIGHUP reload can change while the daemon runs. Read per send,
+    /// never cached, so a reload takes effect on the next send.
+    spend_limits: crate::config::SpendLimits,
     /// Change-splitting target and floor (`[spend]`), validated at config resolution.
     target_note_count: usize,
     /// See [`WalletActor::target_note_count`].
@@ -789,11 +944,20 @@ struct WalletActor {
     /// Shard members whose account does not exist yet. Importing one needs the tree state at its
     /// birthday, so it waits for a connected sync pass - the same shape as `pending_bootstrap`.
     shard_pending: Vec<shard::ShardMember>,
+    /// Shard members dropped from `shard_pending` because their import can never succeed (a
+    /// birthday no tree state can serve, or a database refusal), keyed by wallet name.
+    ///
+    /// Published on [`SyncStatus`] so `waitforsync` and `getwalletinfo` can report *why* a
+    /// wallet is being served but holds nothing. Without it such a member is indistinguishable
+    /// from one still queued: both have no account, so both read empty, and a caller waiting for
+    /// the import to land would wait forever on an error only the log carries. An entry is
+    /// cleared when the same name is queued again, which is what makes `loadwallet` a retry
+    /// after the manifest is fixed.
+    shard_import_errors: Arc<BTreeMap<String, String>>,
     /// When `Some`, the account must be (re)created from `keys.toml` at this birthday height once
     /// the seed is available and an upstream is connected. `None` once an account exists.
     pending_bootstrap: Option<(BlockHeight, BootstrapKey)>,
     db_data: WriteDb,
-    db_cache: FsBlockDb,
     client: Option<HubSource>,
     /// Whether the current connection has emitted its "connected ... chain tip N" log line.
     /// Set once per connection (on the first successful tip refresh, when the tip is known)
@@ -822,6 +986,9 @@ struct WalletActor {
     /// `[spend] trust_own_transactions`: mark wallet-authored transactions trusted at store
     /// time (see [`mark_own_tx_trusted`]). Off = the full-statelessness posture.
     trust_own_transactions: bool,
+    /// `[spend] shutdown_drain_secs`: how long to finish already-accepted sends once shutdown is
+    /// signalled. See [`Self::finish_accepted_sends`].
+    shutdown_drain: Duration,
     /// Whether a pipelined send's proof is currently running on a blocking thread. While `true`,
     /// new sends queue (in [`Self::send_queue`]) rather than starting - sends stay serialized.
     send_in_flight: bool,
@@ -869,6 +1036,25 @@ struct WalletActor {
     /// from the raw error to recovery guidance (see [`sync_failure_hint`]).
     last_sync_error: Option<String>,
     sync_error_streak: u32,
+    /// How far below a detected reorg to rewind, in blocks. Starts at
+    /// [`engine::REORG_BASE_MARGIN`], doubles while consecutive batches keep hitting a reorg, and
+    /// resets on the first clean batch - see [`engine::next_reorg_margin`].
+    reorg_margin: u32,
+    /// How many blocks one batch covers (`[sync] batch_size`).
+    batch_size: u32,
+    /// A download of the *next* range, running while the current one scans. See
+    /// [`engine::Prefetched`]. Only ever started for a wallet without transparent receiving -
+    /// see `sync_step`. Dropping it aborts the download.
+    prefetch: Option<engine::PrefetchTask>,
+    /// Cumulative block-scan cost by phase since this actor started, published on
+    /// [`SyncStatus`] and logged per batch. See [`crate::wallet::SyncTotals`].
+    sync_totals: crate::wallet::SyncTotals,
+    /// How many transaction fetches one enhancement pass keeps in flight, and services
+    /// (`[sync] enhance_concurrency`).
+    enhance_concurrency: usize,
+    /// Cumulative enhancement-drain cost since this actor started, the drain's counterpart of
+    /// `sync_totals`. See [`crate::wallet::EnhanceTotals`].
+    enhance_totals: crate::wallet::EnhanceTotals,
     /// Sync is stopped for this wallet because a failure that **cannot** succeed on retry was
     /// hit: an [`engine::UnrecoverableReorg`], where no truncation target below the conflict
     /// exists, so the conflicting block can never be removed and every batch re-hits it. The rest
@@ -960,10 +1146,13 @@ async fn spawn_inner(
 
     // Apply the configured external transparent gap limit only for transparent-enabled wallets, so
     // shielded-only wallets keep librustzcash's default and are completely unaffected.
-    let db_data = open::init_dbs_with_gap_limit(
+    let db_data = open::init_dbs_with(
         cfg.network,
         &cfg.engine_dir,
-        cfg.transparent_enabled.then_some(cfg.transparent_gap_limit),
+        &open::WriterOptions {
+            external_gap_limit: cfg.transparent_enabled.then_some(cfg.transparent_gap_limit),
+            cache_mib: cfg.writer_cache_mib,
+        },
     )?;
     if cfg.transparent_enabled {
         // (The "transparent receiving enabled" info line - including the effective recovery
@@ -998,7 +1187,43 @@ async fn spawn_inner(
             );
         }
     }
-    let db_cache = open::open_fsblockdb(&cfg.engine_dir)?;
+    if cfg.default_receivers.is_multi_receiver() {
+        // One line at spawn for the same reason as the memo-less case below: an operator reading
+        // history that does not contain the address they handed out should know it is the design,
+        // not a fault. Only fires when `getnewaddress` hands out a multi-receiver Unified Address
+        // by default; a single-receiver default cannot diverge, since the address issued and the
+        // receiver paid are then the same string. **Transparent receiving never trips this** -
+        // see `ReceiverSet::is_multi_receiver`: transparent receivers are handed out bare, so the
+        // address issued *is* the receiver paid. An `address_type` override can still build a
+        // multi-receiver address on any wallet whose `enabled` set allows one, so the message
+        // names that case rather than claiming the default is the only way in.
+        warn!(
+            "[pools] default_receivers = [{}] hands out multi-receiver Unified Addresses, and \
+             transaction history will NOT report them: listtransactions, gettransaction, \
+             listsinceblock and z_listtransactions name the single receiver each output actually \
+             paid (a single-receiver Unified Address for orchard, a bare zs address for sapling), \
+             incoming and outgoing alike. Only the receiver that was paid reaches the chain - \
+             which envelope the payer used does not - and zecd is stateless, so it keeps no \
+             recipient-side record of the address it issued and cannot echo one back. To match a \
+             payment to an address you handed out, deconstruct that address into its per-pool \
+             receivers and compare, or call getreceivedbyaddress, which accepts any encoding of \
+             an address this wallet owns. listreceivedbyaddress is unaffected and still \
+             enumerates addresses as getnewaddress hands them out. The same applies to any \
+             address issued with a multi-receiver address_type override.",
+            cfg.default_receivers.display_names()
+        );
+    }
+    if !cfg.fetch_memos {
+        // One line at spawn so an operator reading a memo-less history knows it is configured,
+        // not broken - and knows the way back (the skipped requests stay queued, so re-enabling
+        // backfills without a rescan).
+        info!(
+            "memo retrieval disabled ([sync] fetch_memos = false): memos, fees and the \
+             recipient/amount of the wallet's own sends are not backfilled for transactions \
+             seen only as compact blocks; transaction-status tracking and transparent address \
+             checks still run. Re-enable fetch_memos to backfill the skipped data later."
+        );
+    }
     // A shard has no `keys.toml`; stand in the values its wallets imply (watch-only, never
     // encrypted, birthday at the earliest member's so the scan covers all of them).
     let st = if is_shard {
@@ -1294,8 +1519,9 @@ async fn spawn_inner(
         reconnect_at: Instant::now(),
         sync_interval: cfg.sync_interval,
         rebroadcast_interval: cfg.rebroadcast_interval,
+        fetch_memos: cfg.fetch_memos,
         confirmations_policy: cfg.confirmations_policy,
-        orchard_action_limit: cfg.orchard_action_limit,
+        spend_limits: cfg.spend_limits.clone(),
         target_note_count: cfg.target_note_count,
         min_split_output_value: cfg.min_split_output_value,
         enabled_pools: cfg.enabled_pools.clone(),
@@ -1320,14 +1546,15 @@ async fn spawn_inner(
         is_shard,
         shard_accounts: Arc::new(shard_accounts),
         shard_pending,
+        shard_import_errors: Arc::new(BTreeMap::new()),
         pending_bootstrap,
         db_data,
-        db_cache,
         client: None,
         connected_logged: false,
         prover,
         orchard_keys: cfg.orchard_keys,
         pipeline_proving: cfg.pipeline_proving,
+        shutdown_drain: cfg.shutdown_drain,
         trust_own_transactions: cfg.trust_own_transactions,
         send_in_flight: false,
         send_queue: VecDeque::new(),
@@ -1348,6 +1575,12 @@ async fn spawn_inner(
         unsupported_upgrades: Vec::new(),
         last_sync_error: None,
         sync_error_streak: 0,
+        reorg_margin: engine::REORG_BASE_MARGIN,
+        batch_size: cfg.batch_size,
+        prefetch: None,
+        sync_totals: crate::wallet::SyncTotals::default(),
+        enhance_concurrency: cfg.enhance_concurrency,
+        enhance_totals: crate::wallet::EnhanceTotals::default(),
         sync_halted: false,
         force_sync: false,
         enhance_satisfied: std::collections::BTreeSet::new(),
@@ -1383,6 +1616,8 @@ async fn spawn_inner(
                 cfg.transparent_enabled,
                 cfg.transparent_default,
                 cfg.transparent_gap_limit,
+                cfg.fetch_memos,
+                is_shard,
                 first_seen.clone(),
                 handle_seed.clone(),
                 cmd_tx.clone(),
@@ -1576,7 +1811,7 @@ fn build_signed_transparent_tx(
     prover: &LocalTxProver,
     trust_own: bool,
 ) -> Result<(TxId, Vec<u8>), RpcError> {
-    use rand::rngs::OsRng;
+    use rand::{rand_core::UnwrapErr, rngs::SysRng};
 
     let fee_rule = Zip317FeeRule::standard();
     let mut builder = Builder::new(
@@ -1644,7 +1879,15 @@ fn build_signed_transparent_tx(
     }
 
     let result = builder
-        .build(&signing_set, &[], &[], OsRng, prover, prover, &fee_rule)
+        .build(
+            &signing_set,
+            &[],
+            &[],
+            UnwrapErr(SysRng),
+            prover,
+            prover,
+            &fee_rule,
+        )
         .map_err(|e| RpcError::wallet(format!("transparent transaction build failed: {e}")))?;
     let tx = result.transaction();
     let txid = tx.txid();
@@ -1695,10 +1938,15 @@ fn build_signed_transparent_tx(
     Ok((txid, raw))
 }
 
-/// The most transparent inputs one `z_mergetoaddress` call may select, mirroring librustzcash's
-/// shielding block-space bound (`shielding_max_inputs` at its default 10% of the 2,000,000-byte
-/// block over the ~150-byte P2PKH input size). Both the caller's `transparent_limit` and this
-/// cap apply; zcashd's `transparent_limit = 0` means "as many as will fit", which is this.
+/// The most transparent inputs one `z_mergetoaddress` call may select when `[spend]
+/// max_tx_bytes` is disabled, mirroring librustzcash's shielding block-space bound
+/// (`shielding_max_inputs` at its default 10% of the 2,000,000-byte block over the ~150-byte
+/// P2PKH input size).
+///
+/// With the size ceiling enabled - the default - it is the *smaller* bound that applies, and
+/// that is `max_tx_bytes`: 10% of a block is 200 KB, still short of what a node will relay, but
+/// only just. Both the caller's `transparent_limit` and whichever of these binds apply;
+/// zcashd's `transparent_limit = 0` means "as many as will fit", which is that minimum.
 const MERGE_MAX_TRANSPARENT_INPUTS: usize = (2_000_000 * 10 / 100) / 150;
 
 /// The exact ZIP-317 fee for a fully-transparent merge: `n_in` standard P2PKH inputs and ONE
@@ -1924,6 +2172,10 @@ fn transparent_only_recipients(
 fn spend_policy_for_source(source: SendSource) -> SpendPolicy {
     match source {
         SendSource::Unspecified | SendSource::Shielded => SpendPolicy::default(),
+        // One family only, so a shortfall in it is `-6` on the named source rather than a
+        // silent top-up from the other shielded pool - the same rule the transparent arms
+        // enforce with an empty shielded set, one level finer.
+        SendSource::ShieldedFamily(family) => SpendPolicy::shielded_pools(family.pools()),
         SendSource::Transparent(None) => SpendPolicy::shielded_pools(std::iter::empty())
             .with_transparent(
                 TransparentSpendPolicy::any_account_addr()
@@ -2087,6 +2339,7 @@ impl WalletActor {
             // Exit between sync batches once shutdown is signalled, so Ctrl-C/`stop` doesn't
             // wait out a long catch-up scan and the DB connection is dropped cleanly.
             if *self.shutdown.borrow() {
+                self.finish_accepted_sends().await;
                 info!("wallet actor shutting down");
                 return;
             }
@@ -2567,8 +2820,10 @@ impl WalletActor {
                 self.log_unsupported_upgrades();
             }
         }
-        // NB: do not call `update_status()` here - `get_wallet_summary`'s progress
-        // estimator underflows if invoked before the chain tip is set (see `refresh_tip`).
+        // NB: no `update_status()` here. The hazard that originally forbade it is gone (the
+        // publish no longer computes a wallet summary, so the progress estimator's
+        // before-the-tip underflow is out of the picture), but there is still nothing to
+        // publish: every caller refreshes the tip and publishes straight after.
         Ok(())
     }
 
@@ -2608,8 +2863,9 @@ impl WalletActor {
     /// backlog surfaced on `SyncStatus.pending_enhancements`. This is the work that remains
     /// *after* the block scan reaches the tip: compact blocks carry no memos, so each pending
     /// request is one full-transaction fetch + decrypt/store away from being served. Requests
-    /// already attempted this drain (`enhance_satisfied`) and unsupported ones
-    /// ([`is_serviceable_request`]) are excluded, so a clean drain converges to zero.
+    /// already attempted this drain (`enhance_satisfied`) and out-of-scope ones
+    /// ([`request_in_scope`] - unsupported variants, and memo `Enhancement` requests when
+    /// `[sync] fetch_memos` is off) are excluded, so a clean drain converges to zero.
     ///
     /// The second element is what [`SyncStatus::enhanced_through`] is derived from: the lowest
     /// block height any still-pending request refers to, so every height strictly below it is
@@ -2636,12 +2892,27 @@ impl WalletActor {
         };
         // Deduplicated (see `outstanding_requests`): the count is *distinct* outstanding
         // requests, so upstream's duplicate spend-search rows can't inflate it five-fold.
-        let pending = outstanding_requests(reqs, &self.enhance_satisfied);
+        let pending = outstanding_requests(
+            reqs,
+            &self.enhance_satisfied,
+            self.fetch_memos,
+            &self.spending_txids(),
+        );
+        self.summarize_backlog(pending.iter())
+    }
+
+    /// The `(pending_enhancements, enhanced_through)` pair for a set of outstanding requests -
+    /// shared by the fresh read above and by the drain, which publishes over the requests its
+    /// pass already read rather than reading the table a second time.
+    fn summarize_backlog<'a>(
+        &self,
+        pending: impl ExactSizeIterator<Item = &'a TransactionDataRequest>,
+    ) -> (u64, Option<u32>) {
         let count = pending.len() as u64;
-        if pending.is_empty() {
+        if count == 0 {
             return (0, None);
         }
-        if pending.len() > ENHANCED_THROUGH_MAX_PROBE {
+        if count > ENHANCED_THROUGH_MAX_PROBE as u64 {
             return (count, Some(0));
         }
         // Requests referring to no mined height are skipped rather than treated as a zero
@@ -2649,7 +2920,6 @@ impl WalletActor {
         // only mine at a future one), so it cannot make an already-scanned height un-enhanced.
         // `min` over `Option` would get this backwards, since `None` sorts below `Some`.
         let lowest = pending
-            .iter()
             .filter_map(|r| self.enhancement_request_height(r))
             .min();
         (count, lowest)
@@ -2676,6 +2946,29 @@ impl WalletActor {
               // "bounds nothing" - which would silently let the watermark run past work the new
               // variant represents. Match `is_serviceable_request`, which faces the same choice.
         }
+    }
+
+    /// The transactions this wallet spent in, which [`request_in_scope`] keeps enhancing when
+    /// `[sync] fetch_memos` is off (their outgoing records and fees exist nowhere else - see
+    /// that predicate's docs).
+    ///
+    /// Empty, without touching the database, whenever `fetch_memos` is on: the predicate
+    /// short-circuits on the flag before it consults the set, so a default wallet pays nothing
+    /// for this. Under the setting it is one indexed read over the four `*_spends` tables per
+    /// filter call, bounded by the wallet's own spend count - which for the deployments the
+    /// setting exists for (a deposit wallet whose history is nearly all receives) is a handful
+    /// of rows. It is read fresh rather than cached because a spend recorded between passes
+    /// must bring its transaction back into scope on the very next one, and a stale set would
+    /// hold it out; a read error is logged and treated as "nothing spent", which only leaves
+    /// more requests skipped for this pass - they stay queued either way.
+    fn spending_txids(&self) -> std::collections::BTreeSet<TxId> {
+        if self.fetch_memos {
+            return std::collections::BTreeSet::new();
+        }
+        read::wallet_spending_txids(&self.engine_dir).unwrap_or_else(|e| {
+            tracing::debug!("reading the wallet's spending transactions: {e}");
+            std::collections::BTreeSet::new()
+        })
     }
 
     /// Emit an enhancement-drain progress heartbeat, throttled to one line per
@@ -2721,11 +3014,30 @@ impl WalletActor {
     ///
     /// Returns `true` if serviceable requests still remain (so the caller should keep driving the
     /// drain), `false` when the backlog is empty, the client dropped, or shutdown was signalled.
-    /// On a from-birthday restore the backlog can be tens of thousands of requests (hours of work
-    /// at one upstream fetch each), so this services at most [`ENHANCE_BATCH`] per call and yields:
-    /// the actor loop services queued commands and republishes the shrinking
-    /// `pending_enhancements` count between batches, instead of disappearing into one monolithic
-    /// pass that hides the backlog and starves writers for hours.
+    /// On a from-birthday restore the backlog can be tens of thousands of requests, so this
+    /// services one *pass* per call - `[sync] enhance_concurrency` requests - and yields: the
+    /// actor loop services queued commands and republishes the shrinking `pending_enhancements`
+    /// count between passes, instead of disappearing into one monolithic pass that hides the
+    /// backlog and starves writers for hours.
+    ///
+    /// A pass is one round of concurrent fetches, not a batch of serial ones. Serviced one at a
+    /// time the drain's throughput is `1 / latency` however fast the host or the link (about 5
+    /// requests a second against a remote lightwalletd, measured), and the requests are
+    /// independent, so the txid-shaped ones (`GetStatus`, `Enhancement`: exactly one transaction
+    /// fetch each) go upstream together and are applied afterwards under one database
+    /// transaction (`WalletDb::transactionally` exists for exactly this - a pass of N stores was
+    /// N commits otherwise). The address searches (`TransactionsInvolvingAddress`) keep their
+    /// sequential path: each is an address-index query whose results are themselves fetched and
+    /// stored. Measured on a 7,546-request drain against a rack-local lightwalletd: 1303 s at
+    /// one in flight, 105 s at 256.
+    ///
+    /// The other half of that measurement was the pass's own bookkeeping. Reading and
+    /// de-duplicating the request table is a fixed cost per pass, and the status publish at the
+    /// end of each pass used to read and de-duplicate it *again* - two full passes over
+    /// thousands of rows to service a handful of requests, charged however few the pass
+    /// handled, which made the whole drain quadratic in the backlog (394 s deciding what to
+    /// fetch against 189 s fetching). The publish now reuses what the pass already read, with
+    /// one deliberate exception described inline.
     ///
     /// Mirrors zcash-devtool's `enhance` command and zkv's `enhance`. Best-effort: a transport
     /// failure drops the client (so the next loop reconnects/fails over) and ends the batch; the
@@ -2739,6 +3051,7 @@ impl WalletActor {
             return false;
         }
         let chain_tip = BlockHeight::from_u32(tip);
+        let t_requests = Instant::now();
         let requests = match self.db_data.transaction_data_requests() {
             Ok(r) => r,
             Err(e) => {
@@ -2753,147 +3066,416 @@ impl WalletActor {
         // because the upstream couldn't satisfy it) guarantees forward progress: the unattempted
         // set strictly shrinks every call, so the drain terminates instead of re-fetching the same
         // front-of-queue requests forever.
-        let pending = outstanding_requests(requests, &self.enhance_satisfied);
+        let pending = outstanding_requests(
+            requests,
+            &self.enhance_satisfied,
+            self.fetch_memos,
+            &self.spending_txids(),
+        );
+        self.enhance_totals.requests_ms += t_requests.elapsed().as_millis() as u64;
         if pending.is_empty() {
             self.enhance_progress = None;
         } else {
             self.maybe_log_enhance_progress(pending.len());
         }
-        let mut handled = 0usize;
-        for req in &pending {
-            // Bail promptly on Ctrl-C/`stop` rather than fetching out the rest of a long backlog.
-            if *self.shutdown.borrow() {
-                return false;
-            }
-            // Per-request visibility for a long drain, below DEBUG (a from-birthday restore
-            // services tens of thousands of these).
-            tracing::trace!(request = ?req, "servicing transaction data request");
-            if let Err(e) = self.service_data_request(req, chain_tip).await {
-                // A transport failure has already dropped the client (a DB-write error just ends
-                // the batch); either way stop here and retry the remainder on the next pass rather
-                // than spinning on a persistent failure.
-                tracing::debug!("transaction enhancement aborted: {e}");
-                self.update_status();
-                return false;
-            }
-            self.enhance_satisfied.insert(req.clone());
-            handled += 1;
-            if handled >= ENHANCE_BATCH {
-                break;
+
+        // The pass: the first `enhance_concurrency` requests, split by what servicing them
+        // costs. A txid-shaped request is one transaction fetch and goes upstream together
+        // with the others; an address search keeps the sequential path.
+        let pass = &pending[..pending.len().min(self.enhance_concurrency.max(1))];
+        let mut txid_reqs: Vec<TxidRequest<'_>> = Vec::new();
+        let mut address_reqs: Vec<(&TransactionDataRequest, &TransactionsInvolvingAddress)> =
+            Vec::new();
+        for req in pass {
+            match req {
+                TransactionDataRequest::GetStatus(txid) => txid_reqs.push(TxidRequest {
+                    req,
+                    txid: *txid,
+                    enhance: false,
+                }),
+                TransactionDataRequest::Enhancement(txid) => txid_reqs.push(TxidRequest {
+                    req,
+                    txid: *txid,
+                    enhance: true,
+                }),
+                TransactionDataRequest::TransactionsInvolvingAddress(addr) => {
+                    address_reqs.push((req, addr))
+                }
             }
         }
-        // Republish the shrinking backlog (now reflected by `enhance_satisfied`) so /status,
-        // getwalletinfo and readiness track the drain between batches.
-        self.update_status();
-        // More to do only if the batch cap stopped us short of the serviceable requests in hand.
-        pending.len() > handled
-    }
+        let kinds = (
+            txid_reqs.iter().filter(|r| r.enhance).count(),
+            txid_reqs.iter().filter(|r| !r.enhance).count(),
+            address_reqs.len(),
+        );
 
-    /// Handle one [`TransactionDataRequest`] for [`enhance_step`]. Returns `Err` only
-    /// for failures worth aborting the whole pass (transport, or a wallet-write error).
-    async fn service_data_request(
-        &mut self,
-        req: &TransactionDataRequest,
-        chain_tip: BlockHeight,
-    ) -> anyhow::Result<()> {
-        match req {
-            TransactionDataRequest::GetStatus(txid) => {
-                let status = self.fetch_full_tx(*txid, chain_tip).await?.map_or(
-                    TransactionStatus::TxidNotRecognized,
-                    |(_, mined)| {
-                        mined.map_or(TransactionStatus::NotInMainChain, TransactionStatus::Mined)
-                    },
-                );
-                self.db_data.set_transaction_status(*txid, status)?;
-            }
-            TransactionDataRequest::Enhancement(txid) => {
-                match self.fetch_full_tx(*txid, chain_tip).await? {
-                    None => self
-                        .db_data
-                        .set_transaction_status(*txid, TransactionStatus::TxidNotRecognized)?,
-                    Some((tx, mined)) => {
-                        decrypt_and_store_transaction(
-                            &self.network,
-                            &mut self.db_data,
-                            &tx,
-                            mined,
-                        )?;
+        let t_pass = Instant::now();
+        let mut handled = 0usize;
+        let mut aborted = false;
+
+        // Bail promptly on Ctrl-C/`stop` rather than fetching out the rest of a long backlog.
+        if *self.shutdown.borrow() {
+            return false;
+        }
+        if !txid_reqs.is_empty() {
+            let txids: Vec<TxId> = txid_reqs.iter().map(|r| r.txid).collect();
+            let t_upstream = Instant::now();
+            let fetched = Self::fetch_txs_concurrent(
+                Arc::clone(&self.hub),
+                self.network,
+                self.enhance_concurrency,
+                &txids,
+                chain_tip,
+            )
+            .await;
+            self.enhance_totals.upstream_ms += t_upstream.elapsed().as_millis() as u64;
+
+            // Sort the results before writing anything: a transport failure means the
+            // connection is gone and the rest of the pass waits for the next one, and that
+            // decision has to be made before a database transaction is opened. Everything
+            // that did come back is still applied.
+            let mut to_apply = Vec::with_capacity(txid_reqs.len());
+            let mut transport_error = None;
+            for (req, outcome) in txid_reqs.iter().zip(fetched) {
+                match outcome {
+                    Ok(found) => to_apply.push((req, found)),
+                    Err(e) => {
+                        transport_error = Some(e);
+                        break;
                     }
                 }
             }
-            // `TransactionsInvolvingAddress` discovers transactions that receive or spend funds at
-            // one of the wallet's transparent addresses. Compact blocks omit transparent I/O, so
-            // mined transparent receives/spends are invisible to the block scan - this is the only
-            // path that finds them. Query the upstream's address index for the requested range,
-            // fetch+store each tx (filling in the transparent outputs), then record the address as
-            // checked up to the range end so librustzcash stops re-requesting it.
-            TransactionDataRequest::TransactionsInvolvingAddress(addr_req) => {
-                use zcash_keys::encoding::AddressCodec as _;
-                // Check the address straight through to the chain tip, extending past the
-                // request's own ~40-block windowed end - see [`tia_check_range`] for why (one
-                // indexed zebra query replaces thousands of sequential window round trips per
-                // address on a deep restore). `None` means nothing is checkable yet (a
-                // spend-search request whose funding tx is still unmined): skip the query AND
-                // the notification - notifying would claim a check that never ran (and the
-                // backend's `as_of == block_range_end - 1` consistency check would reject any
-                // honest height anyway, aborting the whole pass). The request stays in the DB
-                // for a later pass; `enhance_step` marks it attempted for this drain, so it
-                // can't spin the batch loop or pin the backlog count above zero.
-                let Some((start, as_of)) = tia_check_range(
-                    u32::from(addr_req.block_range_start()),
-                    u32::from(chain_tip),
-                ) else {
-                    // Log the skip: an unserviceable spend-search is otherwise invisible, which
-                    // makes "the wallet never found the spend" indistinguishable from "the
-                    // request was never emitted" when reading a failing restore's logs.
-                    use zcash_keys::encoding::AddressCodec as _;
-                    tracing::debug!(
-                        "TIA: skipping address={} - range starts at {}, past the tip {}",
-                        addr_req.address().encode(&self.network),
-                        u32::from(addr_req.block_range_start()),
-                        u32::from(chain_tip),
-                    );
-                    return Ok(());
-                };
-                let address = addr_req.address().encode(&self.network);
-                tracing::debug!("TIA: address-txid query addr={address} range={start}..={as_of}");
-                let evidence = self
-                    .fetch_transparent_tx_evidence(vec![address], start, as_of)
-                    .await
-                    .map_err(|e| anyhow!("{e}"))?;
-                tracing::debug!(
-                    "TIA: address-txid query returned {} item(s)",
-                    evidence.len()
-                );
-                self.store_tx_evidence(evidence, chain_tip).await?;
-                // Record the address as checked up to `as_of` (the inclusive end), whether or not
-                // any txs were found, so the request converges instead of being re-emitted every
-                // caught-up pass. The backend insists the notified height equal the request's
-                // `block_range_end - 1`, so rebuild the request over the range actually checked
-                // (`notify_address_checked` reads only the address and the heights, and the
-                // extended claim is truthful - the query above covered the whole range).
-                let TransactionDataRequest::TransactionsInvolvingAddress(checked) =
-                    TransactionDataRequest::transactions_involving_address(
-                        addr_req.address(),
-                        addr_req.block_range_start(),
-                        Some(BlockHeight::from_u32(as_of + 1)),
-                        addr_req.request_at(),
-                        addr_req.tx_status_filter().clone(),
-                        addr_req.output_status_filter().clone(),
-                    )
-                else {
-                    unreachable!("transactions_involving_address builds that variant");
-                };
-                self.db_data
-                    .notify_address_checked(checked, BlockHeight::from_u32(as_of))?;
+            let t_apply = Instant::now();
+            let applied = self.apply_fetched_requests(&to_apply);
+            self.enhance_totals.apply_ms += t_apply.elapsed().as_millis() as u64;
+            match applied {
+                Ok(()) => {
+                    for (req, _) in &to_apply {
+                        self.enhance_satisfied.insert(req.req.clone());
+                    }
+                    handled += to_apply.len();
+                }
+                // A DB-write error ends the pass; the whole pass is retried next time, which is
+                // what the per-write version also did by stopping at the failing write.
+                Err(e) => {
+                    tracing::debug!("transaction enhancement aborted: {e}");
+                    aborted = true;
+                }
+            }
+            if let Some(e) = transport_error {
+                // Drop the connection so the next pass re-dials, and leave the remainder of the
+                // pass queued rather than hammering a dead upstream with it.
+                self.mark_disconnected(format!("transaction fetch failed: {e}"));
+                aborted = true;
             }
         }
+
+        if !aborted {
+            for (req, addr_req) in &address_reqs {
+                if *self.shutdown.borrow() {
+                    return false;
+                }
+                // Per-request visibility for a long drain, below DEBUG (a from-birthday
+                // restore services tens of thousands of these).
+                tracing::trace!(request = ?req, "servicing address request");
+                if let Err(e) = self.service_address_request(addr_req, chain_tip).await {
+                    // A transport failure has already dropped the client (a DB-write error
+                    // just ends the pass); either way stop here and retry the remainder on
+                    // the next pass rather than spinning on a persistent failure.
+                    tracing::debug!("transaction enhancement aborted: {e}");
+                    aborted = true;
+                    break;
+                }
+                self.enhance_satisfied.insert((*req).clone());
+                handled += 1;
+            }
+        }
+
+        self.enhance_totals.passes += 1;
+        self.enhance_totals.serviced += handled as u64;
+        if aborted {
+            // The pass ended early, so what it read is no longer a complete picture of what
+            // remains serviceable: republish from a fresh read.
+            self.update_status();
+            return false;
+        }
+        if handled > 0 {
+            // What the backlog is made of and what one pass cost, at DEBUG: a deep restore runs
+            // thousands of passes, and the three request kinds cost very different amounts, so
+            // a slow drain is unattributable from the pending count alone.
+            tracing::debug!(
+                serviced = handled,
+                pending = pending.len(),
+                enhancement = kinds.0,
+                get_status = kinds.1,
+                address = kinds.2,
+                pass_ms = t_pass.elapsed().as_millis() as u64,
+                "enhancement pass"
+            );
+        }
+        // Republish the shrinking backlog so /status, getwalletinfo and readiness track the
+        // drain between passes - from what this pass already read, not a second read of the
+        // same table. The remainder is exactly the requests this pass did not satisfy, and
+        // `enhanced_through` is computed over that same set the way a fresh read computes it.
+        //
+        // The one exception is a pass that cleared everything it saw. Storing a transaction can
+        // enqueue further requests (enhancing a transaction discovers more to enhance), which
+        // only a fresh read can see; publishing zero over them would flip readiness to synced
+        // and `waitforsync` to done with work still queued, for a whole idle interval, since the
+        // loop stops driving the drain on a `false` return. So that case reads the table again.
+        let remaining: Vec<&TransactionDataRequest> = pending
+            .iter()
+            .filter(|r| !self.enhance_satisfied.contains(*r))
+            .collect();
+        if remaining.is_empty() {
+            self.update_status();
+        } else {
+            let backlog = self.summarize_backlog(remaining.into_iter());
+            self.update_status_with_backlog(backlog);
+        }
+        // More to do only if the pass stopped short of the serviceable requests in hand.
+        pending.len() > handled
+    }
+
+    /// Fetch several transactions at once, for the enhancement drain: each request borrows its
+    /// own handle onto the shared connection ([`ChainHub::acquire`]), which a lightwalletd
+    /// multiplexes over one HTTP/2 connection and a zebra upstream serves from its pooled
+    /// client (capped at the client's own in-flight limit). Results come back in request
+    /// order, so applying them is deterministic. A transport failure here is reported per
+    /// handle against the connection generation it was issued for, so N concurrent failures
+    /// re-dial once.
+    ///
+    /// An associated function rather than a method: the actor is `!Sync`, so a future holding
+    /// `&self` across these awaits could not be spawned.
+    async fn fetch_txs_concurrent(
+        hub: Arc<ChainHub>,
+        network: ZNetwork,
+        concurrency: usize,
+        txids: &[TxId],
+        chain_tip: BlockHeight,
+    ) -> Vec<anyhow::Result<FetchedTransaction>> {
+        use futures_util::stream::{self, StreamExt as _};
+
+        stream::iter(txids.iter().copied())
+            .map(|txid| {
+                let hub = Arc::clone(&hub);
+                async move {
+                    let mut source = hub.acquire().await?;
+                    let fetched = tokio::time::timeout(UNARY_RPC_TIMEOUT, source.fetch_tx(txid))
+                        .await
+                        .map_err(|_| anyhow!("fetch_tx timed out after {UNARY_RPC_TIMEOUT:?}"))??;
+                    let Some(raw) = fetched else {
+                        return Ok(None);
+                    };
+                    let mined_height = raw.mined_height.map(BlockHeight::from_u32);
+                    // An unmined tx is assumed created under the current tip's consensus
+                    // branch, as `fetch_full_tx` assumes.
+                    let tx = Transaction::read(
+                        &raw.data[..],
+                        BranchId::for_height(&network, mined_height.unwrap_or(chain_tip)),
+                    )?;
+                    Ok(Some((tx, mined_height)))
+                }
+            })
+            .buffered(concurrency.max(1))
+            .collect()
+            .await
+    }
+
+    /// Apply a pass's fetched transactions under one database transaction. Each store is the
+    /// same `decrypt_and_store_transaction` (or `set_transaction_status`) the per-request path
+    /// ran; only the commit is shared. All-or-nothing: on an error nothing is recorded and the
+    /// pass is retried whole. Runs under `block_in_place` - it is a database write of up to a
+    /// pass's worth of transactions, and it must not hold a runtime worker while it does that.
+    fn apply_fetched_requests(
+        &mut self,
+        fetched: &[(&TxidRequest<'_>, FetchedTransaction)],
+    ) -> anyhow::Result<()> {
+        if fetched.is_empty() {
+            return Ok(());
+        }
+        let network = self.network;
+        tokio::task::block_in_place(|| {
+            self.db_data.transactionally(|wdb| -> anyhow::Result<()> {
+                for (req, found) in fetched {
+                    match (req.enhance, found) {
+                        (true, Some((tx, mined))) => {
+                            decrypt_and_store_transaction(&network, wdb, tx, *mined)?;
+                        }
+                        (true, None) => wdb.set_transaction_status(
+                            req.txid,
+                            TransactionStatus::TxidNotRecognized,
+                        )?,
+                        (false, found) => {
+                            let status = match found {
+                                None => TransactionStatus::TxidNotRecognized,
+                                Some((_, Some(height))) => TransactionStatus::Mined(*height),
+                                Some((_, None)) => TransactionStatus::NotInMainChain,
+                            };
+                            wdb.set_transaction_status(req.txid, status)?;
+                        }
+                    }
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// Finish the sends this wallet already accepted, before the actor stops.
+    ///
+    /// The HTTP layer starts refusing new requests the moment shutdown is triggered, so
+    /// whatever is queued here is exactly the set of sends a client was told would happen. The
+    /// actor used to exit at the top of its loop and drop them: their reply channels closed and
+    /// the operations failed with "actor stopped". Nothing had been stored or broadcast for
+    /// those, so no funds were at risk and no transaction was half-created - but the operator
+    /// lost the record of which in-flight sends happened, on exactly the restart boundary where
+    /// the in-memory operation registry already makes that hardest to reconstruct.
+    ///
+    /// So: commit a pipelined send whose proof is still running, then run the commands already
+    /// buffered on the channel. Both are bounded by `[spend] shutdown_drain_secs`, since a send
+    /// waiting on an upstream that is also going away must not hold the daemon open; anything
+    /// left when it expires is dropped exactly as before, with a warning naming what was lost.
+    /// New commands cannot arrive to extend this - `try_recv` takes only what is already
+    /// buffered - so this drains a set that can only shrink.
+    ///
+    /// The bound is configuration rather than a constant because the value that matters is not
+    /// how long a proof takes but how long the *supervisor* lets the process live after its
+    /// stop signal, and the common defaults straddle any number picked here (systemd 90s,
+    /// Kubernetes 30s, `docker stop` 10s). A drain longer than that is cut short by SIGKILL and
+    /// buys nothing. `0` skips the drain entirely.
+    async fn finish_accepted_sends(&mut self) {
+        let drain = self.shutdown_drain;
+        if drain.is_zero() {
+            return;
+        }
+        let deadline = Instant::now() + drain;
+        let mut finished = 0usize;
+
+        // A pipelined send is mid-proof on a blocking thread; its completion is the only thing
+        // that stores and broadcasts it.
+        while self.send_in_flight && Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline.into(), self.send_done_rx.recv()).await {
+                Ok(Some(done)) => {
+                    self.finish_send_caught(done).await;
+                    finished += 1;
+                }
+                // The sender is gone, or the deadline passed: nothing more will arrive.
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        while Instant::now() < deadline {
+            match self.cmd_rx.try_recv() {
+                Ok(cmd) => {
+                    if self.handle_command_caught(cmd).await {
+                        return;
+                    }
+                    finished += 1;
+                }
+                Err(_) => break,
+            }
+        }
+
+        if finished > 0 {
+            info!(
+                commands = finished,
+                "finished accepted work before shutting down"
+            );
+        }
+        let abandoned = self.send_queue.len() + usize::from(self.send_in_flight);
+        if abandoned > 0 {
+            warn!(
+                abandoned,
+                "shutting down with sends still unfinished after \
+                 {drain:?}; they were never broadcast"
+            );
+        }
+    }
+
+    /// Service one `TransactionsInvolvingAddress` request for [`enhance_step`]. Returns `Err`
+    /// only for failures worth aborting the whole pass (transport, or a wallet-write error).
+    ///
+    /// `TransactionsInvolvingAddress` discovers transactions that receive or spend funds at
+    /// one of the wallet's transparent addresses. librustzcash emits it only to find
+    /// *spends* of UTXOs the wallet already holds and to check ephemeral (ZIP-320)
+    /// addresses - ordinary receives, and the spends of receives zecd recorded itself, are
+    /// found by zecd's own block-scan matcher instead (the zebra backend parses each full
+    /// block; a versioned-protocol lightwalletd carries the transparent data in the compact
+    /// blocks). So this is the librustzcash-driven half of transparent discovery, not the
+    /// only path to it. Query the upstream's address index for the requested range,
+    /// fetch+store each tx (filling in the transparent outputs), then record the address as
+    /// checked up to the range end so librustzcash stops re-requesting it.
+    async fn service_address_request(
+        &mut self,
+        addr_req: &TransactionsInvolvingAddress,
+        chain_tip: BlockHeight,
+    ) -> anyhow::Result<()> {
+        use zcash_keys::encoding::AddressCodec as _;
+        // Check the address straight through to the chain tip, extending past the
+        // request's own ~40-block windowed end - see [`tia_check_range`] for why (one
+        // indexed zebra query replaces thousands of sequential window round trips per
+        // address on a deep restore). `None` means nothing is checkable yet (a
+        // spend-search request whose funding tx is still unmined): skip the query AND
+        // the notification - notifying would claim a check that never ran (and the
+        // backend's `as_of == block_range_end - 1` consistency check would reject any
+        // honest height anyway, aborting the whole pass). The request stays in the DB
+        // for a later pass; `enhance_step` marks it attempted for this drain, so it
+        // can't spin the batch loop or pin the backlog count above zero.
+        let Some((start, as_of)) = tia_check_range(
+            u32::from(addr_req.block_range_start()),
+            u32::from(chain_tip),
+        ) else {
+            // Log the skip: an unserviceable spend-search is otherwise invisible, which
+            // makes "the wallet never found the spend" indistinguishable from "the
+            // request was never emitted" when reading a failing restore's logs.
+            use zcash_keys::encoding::AddressCodec as _;
+            tracing::debug!(
+                "TIA: skipping address={} - range starts at {}, past the tip {}",
+                addr_req.address().encode(&self.network),
+                u32::from(addr_req.block_range_start()),
+                u32::from(chain_tip),
+            );
+            return Ok(());
+        };
+        let address = addr_req.address().encode(&self.network);
+        tracing::debug!("TIA: address-txid query addr={address} range={start}..={as_of}");
+        let evidence = self
+            .fetch_transparent_tx_evidence(vec![address], start, as_of)
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        tracing::debug!(
+            "TIA: address-txid query returned {} item(s)",
+            evidence.len()
+        );
+        self.store_tx_evidence(evidence, chain_tip).await?;
+        // Record the address as checked up to `as_of` (the inclusive end), whether or not
+        // any txs were found, so the request converges instead of being re-emitted every
+        // caught-up pass. The backend insists the notified height equal the request's
+        // `block_range_end - 1`, so rebuild the request over the range actually checked
+        // (`notify_address_checked` reads only the address and the heights, and the
+        // extended claim is truthful - the query above covered the whole range).
+        let TransactionDataRequest::TransactionsInvolvingAddress(checked) =
+            TransactionDataRequest::transactions_involving_address(
+                addr_req.address(),
+                addr_req.block_range_start(),
+                Some(BlockHeight::from_u32(as_of + 1)),
+                addr_req.request_at(),
+                addr_req.tx_status_filter().clone(),
+                addr_req.output_status_filter().clone(),
+            )
+        else {
+            unreachable!("transactions_involving_address builds that variant");
+        };
+        self.db_data
+            .notify_address_checked(checked, BlockHeight::from_u32(as_of))?;
         Ok(())
     }
 
     /// Store every transaction named by a batch of [`TxEvidence`] (from a transparent
     /// address-history query): parse-or-fetch, `decrypt_and_store_transaction`, and run the
-    /// transparent receive matcher. Shared by the TIA servicing arm and the offline-window sweep.
+    /// transparent receive matcher. Its one caller is the `TransactionsInvolvingAddress`
+    /// servicing arm above; it was shared with the offline-window sweep until that half of the
+    /// address-index fallback was deleted.
     ///
     /// The receive matcher runs belt-and-braces: librustzcash's `store_decrypted_tx` attributes
     /// transparent outputs against the `addresses` table itself on this line, but
@@ -3425,9 +4007,31 @@ impl WalletActor {
             }
         }
 
-        let outcome = {
-            let transparent = self.transparent_scripts.as_ref();
-            let unspent = self.transparent_unspent.as_ref();
+        // Collect whatever the previous batch started fetching. Joined here rather than polled
+        // so the ordering stays simple: at most one prefetch is ever in flight, and this batch
+        // either uses it or drops it.
+        let prefetched = match self.prefetch.take() {
+            Some(task) => task.finish().await,
+            None => None,
+        };
+        // Whether this batch may fetch the next range while it scans. A transparent wallet
+        // never does: the matcher checks each downloaded block against the address and
+        // outpoint sets as they stand, and a receive this batch records can extend both before
+        // the next batch scans - a detached download would have matched against stale sets.
+        // Gated on the configuration rather than on the sets having been built, so the very
+        // first batch (before they exist) cannot start one either.
+        let hub = Arc::clone(&self.hub);
+        let spawn_prefetch = move |range: zcash_client_backend::data_api::scanning::ScanRange| {
+            let hub = Arc::clone(&hub);
+            engine::PrefetchTask::spawn(async move {
+                let mut source = hub.acquire().await?;
+                engine::prefetch_range(&mut source, range).await
+            })
+        };
+        let prefetch: Option<engine::PrefetchSpawner<'_>> =
+            (!self.transparent_enabled).then_some(&spawn_prefetch);
+
+        let mut outcome = {
             let client = self
                 .client
                 .as_mut()
@@ -3435,14 +4039,44 @@ impl WalletActor {
             engine::sync_one_batch(
                 client,
                 &self.network,
-                &self.engine_dir,
-                &mut self.db_cache,
                 &mut self.db_data,
-                transparent,
-                unspent,
+                engine::BatchParams {
+                    transparent: self.transparent_scripts.as_ref(),
+                    unspent: self.transparent_unspent.as_ref(),
+                    reorg_margin: self.reorg_margin,
+                    batch_size: self.batch_size,
+                    prefetched,
+                    prefetch,
+                },
             )
             .await?
         };
+        // The batch started this while it was scanning; hold it for the next one.
+        self.prefetch = outcome.next_prefetch.take();
+        if outcome.worked {
+            // Where this batch's wall clock went. The two phases bill to different resources -
+            // the download to the upstream and the network, the scan to this host's CPU and
+            // wallet database - and they alternate, so a batch that is slow for one reason
+            // looks exactly like one slow for the other in a wall-clock-only log. One line per
+            // batch (a full mainnet restore emits a few hundred), so INFO.
+            let t = &outcome.timings;
+            self.sync_totals.add(t);
+            info!(
+                blocks = t.shape.blocks,
+                download_ms = t.download.as_millis() as u64,
+                tree_state_ms = t.tree_state.as_millis() as u64,
+                scan_ms = t.scan.as_millis() as u64,
+                transparent_ms = t.transparent.as_millis() as u64,
+                total_ms = t.total().as_millis() as u64,
+                blocks_per_sec = format_args!("{:.0}", t.blocks_per_sec()),
+                prefetch_hit = t.prefetch_hit,
+                bytes = t.shape.bytes,
+                txs = t.shape.txs,
+                sapling_outputs = t.shape.sapling_outputs,
+                orchard_actions = t.shape.orchard_actions,
+                "batch complete"
+            );
+        }
         // A recorded receive may have extended the transparent gap (exposing new indices), so
         // rebuild the address set before the next pass to cover them.
         if outcome.transparent_recorded > 0 {
@@ -3452,6 +4086,18 @@ impl WalletActor {
         // the membership set is stale, so rebuild it before the next pass.
         if outcome.transparent_recorded > 0 || outcome.transparent_spends_recorded > 0 {
             self.transparent_unspent_dirty = true;
+        }
+        // Grow the rewind margin while consecutive batches keep hitting a reorg, and reset it on
+        // the first clean one. A wallet only learns about a fork one block at a time at its own
+        // tip, so a fixed margin walks a deep rollback back a fixed step per round trip; doubling
+        // makes that walk logarithmic without changing what an ordinary shallow reorg costs.
+        let previous_margin = self.reorg_margin;
+        self.reorg_margin = engine::next_reorg_margin(previous_margin, outcome.reorged);
+        if outcome.reorged && self.reorg_margin != previous_margin {
+            info!(
+                margin = self.reorg_margin,
+                "consecutive reorgs; widening the rewind margin"
+            );
         }
         self.update_status();
         Ok(outcome.worked)
@@ -3589,7 +4235,10 @@ impl WalletActor {
     /// is nowhere for a foreign viewing key to go. Refused for a name the shard already serves,
     /// which would otherwise queue a second account under it.
     fn add_shard_member(&mut self, member: shard::ShardMember) -> Result<(), RpcError> {
-        if self.shard_accounts.is_empty() && self.shard_pending.is_empty() {
+        // Asked of `is_shard` rather than of the member maps: a shard whose only member was
+        // dropped for a bad manifest has both of them empty, and inferring from that would make
+        // the shard refuse the very re-queue that fixing the manifest is supposed to perform.
+        if !self.is_shard {
             return Err(RpcError::wallet(
                 "this wallet is not a fleet shard; view wallets are onboarded into the fleet"
                     .to_string(),
@@ -3604,8 +4253,33 @@ impl WalletActor {
             )));
         }
         info!(wallet = %member.name, "queued a view wallet for import into this shard");
+        // Queuing it again is the retry, so any recorded failure stops being the current answer.
+        self.clear_shard_import_error(&member.name);
         self.shard_pending.push(member);
         Ok(())
+    }
+
+    /// Record why `name`'s import can never succeed, and publish it (see
+    /// [`WalletActor::shard_import_errors`]).
+    fn record_shard_import_error(&mut self, name: &str, reason: String) {
+        let mut errors = (*self.shard_import_errors).clone();
+        errors.insert(name.to_string(), reason);
+        self.shard_import_errors = Arc::new(errors);
+        self.update_status();
+    }
+
+    /// Forget a recorded import failure for `name`, if there is one, and publish that.
+    ///
+    /// Publishing here is load-bearing rather than tidy: `waitforsync` returns *immediately* on a
+    /// recorded error instead of waiting, so a stale one would make the retry this clearing
+    /// represents look like it had failed again, for as long as it took the next pass to publish.
+    fn clear_shard_import_error(&mut self, name: &str) {
+        if self.shard_import_errors.contains_key(name) {
+            let mut errors = (*self.shard_import_errors).clone();
+            errors.remove(name);
+            self.shard_import_errors = Arc::new(errors);
+            self.update_status();
+        }
     }
 
     /// Import each shard member that has no account yet, one per pass.
@@ -3673,9 +4347,16 @@ impl WalletActor {
                         wallet = %member.name,
                         "shard import: could not derive an account birthday from the tree state \
                          at {prior}: {e}. Dropping this wallet from the shard - fix its manifest \
-                         birthday and restart."
+                         birthday, then loadwallet it again (or restart)."
                     );
                     self.shard_pending.remove(0);
+                    self.record_shard_import_error(
+                        &member.name,
+                        format!(
+                            "could not derive an account birthday from the tree state at \
+                             {prior}: {e}"
+                        ),
+                    );
                     return;
                 }
             };
@@ -3702,9 +4383,11 @@ impl WalletActor {
                 error!(
                     wallet = %member.name,
                     "shard import failed: {e}. Dropping this wallet from the shard - it would \
-                     fail identically on every retry. Fix its manifest entry and restart."
+                     fail identically on every retry. Fix its manifest entry, then loadwallet it \
+                     again (or restart)."
                 );
                 self.shard_pending.remove(0);
+                self.record_shard_import_error(&member.name, format!("{e:#}"));
             }
         }
     }
@@ -3916,21 +4599,41 @@ impl WalletActor {
         }
     }
 
+    /// Publish status, reading the enhancement backlog from the database.
     fn update_status(&self) {
-        // `get_wallet_summary`'s subtree progress estimator can underflow before the chain
-        // tip's tree size is known (it panics in debug, wraps in release at this librustzcash
-        // rev). Only call it once we have a tip, and isolate it with `catch_unwind` so a
-        // progress-estimation panic can never take down the actor.
-        let summary = if self.tip_height.is_some() {
-            SILENCE_PROGRESS_PANIC.with(|f| f.set(true));
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.db_data.get_wallet_summary(self.confirmations_policy)
-            }));
-            SILENCE_PROGRESS_PANIC.with(|f| f.set(false));
-            r.ok().and_then(|r| r.ok()).flatten()
-        } else {
-            None
-        };
+        self.update_status_inner(None)
+    }
+
+    /// Publish status with a backlog the caller already computed - the drain, which has just
+    /// read and de-duplicated the request table to choose what to service, and would otherwise
+    /// pay that fixed per-pass cost a second time here. See `enhance_step` for the one case
+    /// that must not use this.
+    fn update_status_with_backlog(&self, backlog: (u64, Option<u32>)) {
+        self.update_status_inner(Some(backlog))
+    }
+
+    fn update_status_inner(&self, known_backlog: Option<(u64, Option<u32>)>) {
+        // The one thing this needs from the wallet database is the fully-scanned height, so ask
+        // for exactly that. It used to come out of `get_wallet_summary`, which computes every
+        // account's balances and a note-weighted scan-progress estimate to produce it - real
+        // work on a large wallet, repeated on every publish, and the enhancement drain publishes
+        // once per batch of 16 serviced requests. It also brought the estimator's underflow
+        // (which panics in debug before the chain tip's tree size is known) close enough to need
+        // a `catch_unwind` around this call; `block_fully_scanned` reads a height and has no
+        // such hazard. The panic guard itself stays for the callers that still need a summary
+        // (`read::balance`, the insufficient-funds enrichment).
+        //
+        // Both database reads here run under `block_in_place`, like every other query the actor
+        // makes: this task holds a runtime worker while it queries, and on a large wallet the
+        // backlog read below is not free. Nesting is harmless if a caller is already in a
+        // blocking region.
+        let fully_scanned_height = tokio::task::block_in_place(|| {
+            self.db_data
+                .block_fully_scanned()
+                .ok()
+                .flatten()
+                .map(|meta| u32::from(meta.block_height()))
+        });
         // `scanning` and `scan_progress` are height-based (`fully_scanned` vs the chain tip), NOT
         // librustzcash's note-weighted `progress().scan()` ratio - that ratio covers only the
         // tip-priority range and reads 1.0 while historical ranges are still scanning (see
@@ -3938,17 +4641,15 @@ impl WalletActor {
         // status RPCs (`getwalletinfo.scanning`, `initialblockdownload`, `getpeerinfo.syncing`)
         // reported the scan done hours early, and `pending_enhancements` was measured (one DB
         // read per status update) throughout the scan it was designed to skip.
-        let (fully_scanned, scan_progress, scanning) = match (summary, self.tip_height) {
-            (Some(s), Some(tip)) => {
-                let scanned = u32::from(s.fully_scanned_height());
-                (
-                    Some(scanned),
-                    scan_progress_ratio(self.birthday, scanned, tip),
-                    scanned < tip,
-                )
-            }
-            // `summary` is only computed once a tip is known, so this is the "no summary yet"
-            // arm either way: heights unknown, conservatively still scanning.
+        let (fully_scanned, scan_progress, scanning) = match (fully_scanned_height, self.tip_height)
+        {
+            (Some(scanned), Some(tip)) => (
+                Some(scanned),
+                scan_progress_ratio(self.birthday, scanned, tip),
+                scanned < tip,
+            ),
+            // Either height still unknown (no tip yet, or nothing scanned): conservatively
+            // report still scanning rather than claiming a caught-up wallet.
             _ => (None, 0.0, true),
         };
 
@@ -3967,10 +4668,26 @@ impl WalletActor {
         let (pending_enhancements, enhanced_through) = if scanning {
             (0, None)
         } else {
-            let (count, lowest) = self.enhancement_backlog();
+            let (count, lowest) = match known_backlog {
+                Some(known) => known,
+                None => tokio::task::block_in_place(|| self.enhancement_backlog()),
+            };
             (
                 count,
-                fully_scanned.map(|scanned| enhanced_through(scanned, lowest)),
+                // With memo retrieval disabled (`[sync] fetch_memos = false`) the watermark is
+                // permanently unknown, not advanced. It promises "every transaction at or below
+                // here has had its full data fetched, so its memos are readable" - and the
+                // receive-side `Enhancement` requests this wallet skips mean that is never true
+                // of any height, however small the remaining backlog gets. Reporting a height
+                // would hand a memo-cursor consumer exactly the silent permanent skip the field
+                // exists to prevent; `None` makes it hold still. NB this is the field's own
+                // memo-specific contract failing closed, not a statement that history is
+                // incomplete: the sends and fees such a consumer would also read *are* fetched
+                // (see `request_in_scope`), and `getwalletinfo.fetch_memos` is what tells a
+                // consumer which kind of wallet it is talking to.
+                self.fetch_memos
+                    .then(|| fully_scanned.map(|scanned| enhanced_through(scanned, lowest)))
+                    .flatten(),
             )
         };
 
@@ -4003,8 +4720,11 @@ impl WalletActor {
             scanning,
             pending_enhancements,
             enhanced_through,
+            sync_totals: self.sync_totals,
+            enhance_totals: self.enhance_totals,
             encrypted: self.encrypted,
             accounts: self.published_accounts(),
+            import_errors: Arc::clone(&self.shard_import_errors),
             watch_only: self.watch_only,
             unlocked_until,
             transparent_frontier: self.transparent_frontier,
@@ -4723,11 +5443,28 @@ impl WalletActor {
         request: TransactionRequest,
         policy: ConfirmationsPolicy,
         privacy: SendPrivacy,
-    ) -> Result<(pczt::Pczt, SendShape, Duration), RpcError> {
+        spend_policy: &SpendPolicy,
+    ) -> Result<
+        (
+            pczt::Pczt,
+            Option<orchard::circuit::OrchardCircuitVersion>,
+            SendShape,
+            Duration,
+        ),
+        RpcError,
+    > {
+        // The PCZT prove+sign step has no transparent signing pass, so this path must never be
+        // handed a policy that could select a transparent input. `do_send` routes transparent
+        // sources to the fused path; this is the backstop that says so in code.
+        debug_assert!(
+            spend_policy.transparent().is_none(),
+            "the cached-PCZT path cannot sign transparent inputs"
+        );
         let account_id = self.require_account(None)?;
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
-        let orchard_action_limit = self.orchard_action_limit;
+        let orchard_action_limit = self.spend_limits.orchard_action_limit();
+        let max_tx_bytes = self.spend_limits.max_tx_bytes();
         let (target_note_count, min_split_output_value) =
             (self.target_note_count, self.min_split_output_value);
         let engine_dir = self.engine_dir.clone();
@@ -4756,13 +5493,18 @@ impl WalletActor {
                 &change_strategy,
                 request,
                 policy,
-                // Shielded-only input selection, always: `SpendPolicy`'s default permits every
-                // shielded pool with no transparent spending. A transparent-funded send
-                // (`SendSource::Transparent`) never reaches this path - `do_send` routes it to
-                // the fused path, whose `create_proposed_transactions` signs transparent inputs;
-                // the PCZT prove+sign step has no transparent signing pass, so keeping the
-                // default here makes an unsigned-transparent PCZT unconstructible by design.
-                &SpendPolicy::default(),
+                // The send's own source policy, which on this path is always shielded-only: a
+                // transparent-funded send (`SendSource::Transparent`) never reaches here, since
+                // `do_send` routes it to the fused path, whose `create_proposed_transactions`
+                // signs transparent inputs while the PCZT prove+sign step has no transparent
+                // signing pass. That routing is what makes an unsigned-transparent PCZT
+                // unconstructible, and it is asserted below rather than left to the reader.
+                //
+                // It is *not* enough to pass the default here. The default permits every
+                // shielded pool, so a source naming one pool family (`ANY_SAPLING`,
+                // `ANY_ORCHARD`) would silently select from the other - which is precisely the
+                // one-source-per-send guarantee those wildcards exist to make.
+                spend_policy,
                 // No input locking: zecd serializes sends through the single-writer actor, so
                 // there is no concurrent proposer to race for inputs.
                 None,
@@ -4775,8 +5517,14 @@ impl WalletActor {
             if privacy == SendPrivacy::FullPrivacy {
                 enforce_full_privacy(&proposal)?;
             }
-            enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
-            let shape = proposal_shape(&proposal);
+            enforce_orchard_action_limit(
+                &proposal,
+                proposal_branch(&net, &proposal),
+                orchard_action_limit,
+            )?;
+            enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
+            let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
+            let orchard_circuit = orchard_circuit_for_branch(proposal_branch(&net, &proposal));
             let pczt = create_pczt_from_proposal::<_, _, Infallible, _, Infallible, _>(
                 db,
                 &net,
@@ -4794,7 +5542,7 @@ impl WalletActor {
             .map_err(|e| {
                 enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_pczt_err(e))
             })?;
-            Ok((pczt, shape, start.elapsed()))
+            Ok((pczt, orchard_circuit, shape, start.elapsed()))
         })
     }
 
@@ -4904,7 +5652,7 @@ impl WalletActor {
         // must mean what it says, so it never takes this branch: its transparent recipients are
         // paid from shielded notes with shielded change, like any other policy's. Any other
         // policy, or any shielded recipient, falls through to the proposal path below.
-        if privacy == SendPrivacy::AllowFullyTransparent && source != SendSource::Shielded {
+        if privacy == SendPrivacy::AllowFullyTransparent && !source.is_shielded() {
             if let Some(recipients) = transparent_only_recipients(&self.network, &request)? {
                 // A t-address `fromaddress` narrows the t->t selection to that address's UTXOs
                 // (coin control); `ANY_TADDR` and the source-less Bitcoin-dialect sends spend
@@ -4946,7 +5694,12 @@ impl WalletActor {
         // Cached-Orchard PCZT path: phase A (select+build) -> phase B (prove+sign) -> phase C
         // (store), all on the actor. Each phase is timed so the send-latency log shows where the
         // cost lands on a large, note-fragmented wallet.
-        let (pczt, shape, build) = self.build_proposal_and_pczt(request, policy, privacy)?;
+        let (pczt, orchard_circuit, shape, build) = self.build_proposal_and_pczt(
+            request,
+            policy,
+            privacy,
+            &spend_policy_for_source(source),
+        )?;
         // Awaits the background keygen if this is the first send of a young daemon; a no-op once
         // it has finished. Only sends wait - reads and sync never touch the key.
         let keys = self
@@ -4961,23 +5714,28 @@ impl WalletActor {
         let (txid, raw, prove, store): (TxId, Vec<u8>, Duration, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let p0 = Instant::now();
-                let signed = prove_sign_pczt(pczt, &usk, &prover, &keys)?;
+                let signed = prove_sign_pczt(pczt, orchard_circuit, &usk, &prover, &keys)?;
                 let prove = p0.elapsed();
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, trust_own)?;
+                let txid = store_pczt(db, signed, orchard_circuit, &keys, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, prove, s0.elapsed()))
             })?;
 
+        // Read before `raw` is handed to the broadcast: the real serialized size is what
+        // the estimate that gated this send is judged against.
+        let tx_bytes = raw.len();
         let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        log_send_latency("inline", shape, build, prove, store, b0.elapsed());
+        log_send_latency("inline", shape, build, prove, store, b0.elapsed(), tx_bytes);
         Ok(txid)
     }
 
-    /// The legacy fused send path: librustzcash's `create_proposed_transactions` builds, proves,
-    /// and stores under one `&mut` (rebuilding the proving key per send). Used by a Sapling-
+    /// The fused send path: librustzcash's `create_proposed_transactions` builds, proves, and
+    /// stores under one `&mut`. It proves from the same cached keys as the PCZT path (the Zakura
+    /// fork's process-wide cells, which [`ProvingKeyCache`] warms), so what distinguishes it is
+    /// the absence of a prove/store seam, not a per-send keygen. Used by a Sapling-
     /// spending wallet (the PCZT path here signs only Orchard spends), by a transparent-funded
     /// send (`create_proposed_transactions` signs transparent inputs from the USK; the PCZT
     /// prove+sign step cannot), or when `cache_proving_key` is off. Not pipelined - there is no
@@ -4993,7 +5751,8 @@ impl WalletActor {
     ) -> Result<TxId, RpcError> {
         let net = self.network;
         let change_pool = self.enabled_pools.change_pool();
-        let orchard_action_limit = self.orchard_action_limit;
+        let orchard_action_limit = self.spend_limits.orchard_action_limit();
+        let max_tx_bytes = self.spend_limits.max_tx_bytes();
         let (target_note_count, min_split_output_value) =
             (self.target_note_count, self.min_split_output_value);
         let account_id = self.require_account(None)?;
@@ -5044,8 +5803,13 @@ impl WalletActor {
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
-                enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
-                let shape = proposal_shape(&proposal);
+                enforce_orchard_action_limit(
+                    &proposal,
+                    proposal_branch(&net, &proposal),
+                    orchard_action_limit,
+                )?;
+                enforce_max_tx_bytes(&proposal, proposal_branch(&net, &proposal), max_tx_bytes)?;
+                let shape = proposal_shape(&proposal, proposal_branch(&net, &proposal));
                 let build = start.elapsed();
                 let p0 = Instant::now();
                 let txids = create_proposed_transactions(
@@ -5074,10 +5838,21 @@ impl WalletActor {
                 Ok((txid, raw, shape, build, p0.elapsed()))
             })?;
 
+        // Read before `raw` is handed to the broadcast: the real serialized size is what
+        // the estimate that gated this send is judged against.
+        let tx_bytes = raw.len();
         let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        log_send_latency("fused", shape, build, prove, Duration::ZERO, b0.elapsed());
+        log_send_latency(
+            "fused",
+            shape,
+            build,
+            prove,
+            Duration::ZERO,
+            b0.elapsed(),
+            tx_bytes,
+        );
         Ok(txid)
     }
 
@@ -5127,11 +5902,12 @@ impl WalletActor {
                 request,
                 confirmations,
                 privacy,
+                source,
                 reply,
             });
             return;
         }
-        self.start_pipelined_send(request, confirmations, privacy, reply)
+        self.start_pipelined_send(request, confirmations, privacy, source, reply)
             .await;
     }
 
@@ -5144,6 +5920,7 @@ impl WalletActor {
         request: TransactionRequest,
         confirmations: Option<ConfirmationsPolicy>,
         privacy: SendPrivacy,
+        source: SendSource,
         reply: oneshot::Sender<Result<TxId, RpcError>>,
     ) {
         self.relock_if_expired();
@@ -5175,7 +5952,12 @@ impl WalletActor {
             }
         };
         let policy = confirmations.unwrap_or(self.confirmations_policy);
-        let (pczt, shape, build) = match self.build_proposal_and_pczt(request, policy, privacy) {
+        let (pczt, orchard_circuit, shape, build) = match self.build_proposal_and_pczt(
+            request,
+            policy,
+            privacy,
+            &spend_policy_for_source(source),
+        ) {
             Ok(v) => v,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -5217,7 +5999,7 @@ impl WalletActor {
             // Isolate a proving panic: a completion MUST always be sent, or the pipeline would
             // wedge with `send_in_flight` stuck true.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prove_sign_pczt(pczt, &usk, &prover, &keys)
+                prove_sign_pczt(pczt, orchard_circuit, &usk, &prover, &keys)
             }))
             .unwrap_or_else(|_| {
                 error!("send proof panicked off-actor; the actor continues");
@@ -5225,6 +6007,7 @@ impl WalletActor {
             });
             let _ = done_tx.blocking_send(SendCompletion {
                 result,
+                orchard_circuit,
                 policy,
                 shape,
                 build_elapsed: build,
@@ -5242,7 +6025,7 @@ impl WalletActor {
             let Some(p) = self.send_queue.pop_front() else {
                 break;
             };
-            self.start_pipelined_send(p.request, p.confirmations, p.privacy, p.reply)
+            self.start_pipelined_send(p.request, p.confirmations, p.privacy, p.source, p.reply)
                 .await;
         }
     }
@@ -5254,6 +6037,7 @@ impl WalletActor {
         self.send_in_flight = false;
         let SendCompletion {
             result,
+            orchard_circuit,
             policy,
             shape,
             build_elapsed,
@@ -5263,8 +6047,15 @@ impl WalletActor {
         let outcome = match result {
             Err(e) => Err(e),
             Ok(signed) => {
-                self.store_and_broadcast(signed, policy, shape, build_elapsed, prove_elapsed)
-                    .await
+                self.store_and_broadcast(
+                    signed,
+                    orchard_circuit,
+                    policy,
+                    shape,
+                    build_elapsed,
+                    prove_elapsed,
+                )
+                .await
             }
         };
         let _ = reply.send(outcome);
@@ -5276,25 +6067,45 @@ impl WalletActor {
     async fn store_and_broadcast(
         &mut self,
         signed: pczt::Pczt,
+        orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
         policy: ConfirmationsPolicy,
         shape: SendShape,
         build: Duration,
         prove: Duration,
     ) -> Result<TxId, RpcError> {
         let trust_own = self.trust_own_transactions;
+        // The pipeline only engages on the cached-key path, and the prove phase that just
+        // finished already awaited the keys, so this resolves immediately.
+        let keys = self
+            .orchard_keys
+            .clone()
+            .expect("pipelined sends run only on the cached-key path")
+            .get()
+            .await?;
         let db = &mut self.db_data;
         let _ = policy; // store rarely surfaces -6; kept for symmetry with the inline path.
         let (txid, raw, store): (TxId, Vec<u8>, Duration) =
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 let s0 = Instant::now();
-                let txid = store_pczt(db, signed, trust_own)?;
+                let txid = store_pczt(db, signed, orchard_circuit, &keys, trust_own)?;
                 let raw = read_raw_tx(db, txid)?;
                 Ok((txid, raw, s0.elapsed()))
             })?;
+        // Read before `raw` is handed to the broadcast: the real serialized size is what
+        // the estimate that gated this send is judged against.
+        let tx_bytes = raw.len();
         let b0 = Instant::now();
         self.broadcast_committed(txid, raw).await?;
         self.update_status();
-        log_send_latency("pipelined", shape, build, prove, store, b0.elapsed());
+        log_send_latency(
+            "pipelined",
+            shape,
+            build,
+            prove,
+            store,
+            b0.elapsed(),
+            tx_bytes,
+        );
         Ok(txid)
     }
 
@@ -5671,6 +6482,17 @@ impl WalletActor {
             }
         })?;
 
+        // A shield is bounded by size too, and by nothing else: its inputs are transparent
+        // (so they cost no Orchard actions and `orchard_action_limit` never binds), and
+        // `limit` is the caller's own argument rather than a ceiling. A pool sweeping a large
+        // backlog of coinbase outputs in one call is exactly the shape that reaches the relay
+        // limit through sheer input count.
+        enforce_max_tx_bytes(
+            &proposal,
+            proposal_branch(&net, &proposal),
+            self.spend_limits.max_tx_bytes(),
+        )?;
+
         let (shielding_utxos, shielding_value) = {
             let inputs = proposal.steps().head.transparent_inputs();
             (
@@ -5796,7 +6618,8 @@ impl WalletActor {
         let account_id = self.require_account(None)?;
         let net = self.network;
         let policy = self.confirmations_policy;
-        let orchard_action_limit = self.orchard_action_limit;
+        let orchard_action_limit = self.spend_limits.orchard_action_limit();
+        let max_tx_bytes = self.spend_limits.max_tx_bytes();
         let db = &mut self.db_data;
 
         let (target_height, anchor_height) = db
@@ -5865,14 +6688,39 @@ impl WalletActor {
                         "Could not find any funds to merge.",
                     ));
                 }
-                // Smallest-first (outpoint tiebreak for determinism), then the count limit and
-                // the block-space cap.
+                // Smallest-first (outpoint tiebreak for determinism), then the count limit,
+                // the block-space cap, and what a node will relay.
+                //
+                // The last of those truncates rather than refusing, as everywhere else in a
+                // merge: the call exists to be repeated, and its `remaining*` counts already
+                // say so. A transparent input is cheap next to a shielded one (~150 bytes
+                // against ~3.2 KB), so this binds only on a wallet with well over a thousand
+                // UTXOs - but that is exactly the wallet a merge is for.
+                let dest_shape = match &dest_transparent {
+                    Some(_) => tx_size::TxShape {
+                        transparent_outputs: 1,
+                        ..Default::default()
+                    },
+                    // A shielded payout is one Orchard-family action (or a Sapling output,
+                    // which is smaller); count the larger.
+                    None => tx_size::TxShape {
+                        ironwood_actions: 1,
+                        ..Default::default()
+                    },
+                };
                 utxos.sort_by_key(|u| (u.value(), *u.outpoint().hash(), u.outpoint().n()));
                 utxos.truncate(
                     transparent_limit
                         .unwrap_or(usize::MAX)
-                        .min(MERGE_MAX_TRANSPARENT_INPUTS),
+                        .min(MERGE_MAX_TRANSPARENT_INPUTS)
+                        .min(tx_size::max_transparent_inputs(max_tx_bytes, dest_shape)),
                 );
+                if utxos.is_empty() {
+                    return Err(RpcError::invalid_parameter(format!(
+                        "[spend] max_tx_bytes = {max_tx_bytes} is too small to merge even one \
+                         transparent output; raise it (0 disables the ceiling)"
+                    )));
+                }
                 let merging_count = utxos.len() as u64;
                 let merging_value: u64 = utxos.iter().map(|u| u64::from(u.value())).sum();
 
@@ -5995,7 +6843,16 @@ impl WalletActor {
                         ironwood_active,
                     )
                     .map_err(|e| RpcError::wallet(format!("merge proposal invalid: {e}")))?;
-                    enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    enforce_orchard_action_limit(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        orchard_action_limit,
+                    )?;
+                    enforce_max_tx_bytes(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        max_tx_bytes,
+                    )?;
                     MergeWork::UtxoProposal(proposal)
                 };
 
@@ -6038,13 +6895,45 @@ impl WalletActor {
                 }
 
                 let limit = shielded_limit.unwrap_or(usize::MAX);
+                // What the transaction costs before any input is selected, so the byte caps
+                // below are solved for the inputs alone.
+                let merge_dest_shape = tx_size::TxShape {
+                    // A transparent payout (z->t) adds an output; a shielded destination
+                    // shares an action with one of the spends and adds nothing.
+                    transparent_outputs: usize::from(dest_transparent.is_some()),
+                    // One spare Orchard-family bundle. A post-NU6.3 selection that draws
+                    // legacy Orchard V2 notes into an Ironwood output splits into *two*
+                    // bundles, and the second one's fixed fields and proof constant are not in
+                    // the per-action term the caps below solve against. A whole extra action
+                    // covers that constant with room over: it costs the selection one note,
+                    // where under-counting costs it the refusal this truncation exists to
+                    // avoid.
+                    orchard_actions: 1,
+                    ..Default::default()
+                };
                 // The Orchard-family action cap: one payment output at most, so the family's
                 // proposal actions = max(spends, 1) = spends; `enforce_orchard_action_limit`
                 // runs on the built proposal as a backstop.
                 let family_fits_action_limit =
                     orchard_action_limit == 0 || orchard_family_n <= orchard_action_limit;
+                // And the size ceiling, in the same shape. A merge is the one caller that
+                // deliberately selects as many inputs as it can, so `max_tx_bytes` binds here
+                // long before it binds on any ordinary send: at the shipped 250 KB about 78
+                // Orchard-family notes fit, against a `shielded_limit` default of 200. Unlike
+                // a send, a merge *truncates* to what fits rather than refusing - it exists to
+                // be called repeatedly, and its `remaining*` counts already tell the caller to
+                // call again - so an over-large selection takes the manual path below, which
+                // caps at the ceiling, instead of failing at `enforce_max_tx_bytes`.
+                let family_bytes_cap =
+                    tx_size::max_orchard_family_actions_alongside(max_tx_bytes, merge_dest_shape);
+                let sapling_bytes_cap = tx_size::max_sapling_spends(max_tx_bytes, merge_dest_shape);
+                let fits_size_ceiling =
+                    orchard_family_n <= family_bytes_cap && sapling_n <= sapling_bytes_cap;
 
-                if sapling_n + orchard_family_n <= limit && family_fits_action_limit {
+                if sapling_n + orchard_family_n <= limit
+                    && family_fits_action_limit
+                    && fits_size_ceiling
+                {
                     // No limit binds: delegate the whole proposal (selection, fee, pool
                     // routing, TEX rejection) to librustzcash's send-max primitive.
                     let proposal = propose_send_max_transfer::<_, _, _, Infallible>(
@@ -6075,7 +6964,16 @@ impl WalletActor {
                     if privacy == SendPrivacy::FullPrivacy {
                         enforce_full_privacy(&proposal)?;
                     }
-                    enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    enforce_orchard_action_limit(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        orchard_action_limit,
+                    )?;
+                    enforce_max_tx_bytes(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        max_tx_bytes,
+                    )?;
                     Ok(MergePlan {
                         work: MergeWork::NoteProposal(proposal),
                         merging_utxos: 0,
@@ -6092,12 +6990,21 @@ impl WalletActor {
                     // family holding more notes), smallest-first within it.
                     let family_is_sapling = sapling_n >= orchard_family_n;
                     let cap = if family_is_sapling {
-                        limit
+                        limit.min(sapling_bytes_cap)
                     } else if orchard_action_limit > 0 {
-                        limit.min(orchard_action_limit)
+                        limit.min(orchard_action_limit).min(family_bytes_cap)
                     } else {
-                        limit
+                        limit.min(family_bytes_cap)
                     };
+                    // A ceiling too small for even one note is a configuration error, not an
+                    // empty selection: truncating to zero would surface as "insufficient
+                    // funds" against a wallet that plainly has some.
+                    if cap == 0 {
+                        return Err(RpcError::invalid_parameter(format!(
+                            "[spend] max_tx_bytes = {max_tx_bytes} is too small to merge even \
+                             one note; raise it (0 disables the ceiling)"
+                        )));
+                    }
                     let mut fam: Vec<_> = notes
                         .into_vec(&RetainAllNotes)
                         .into_iter()
@@ -6111,20 +7018,6 @@ impl WalletActor {
                         .collect();
                     fam.sort_by_key(|n| u64::from(n.note().value()));
                     fam.truncate(cap);
-                    let merging_count = fam.len() as u64;
-                    let merging_value: u64 = fam.iter().map(|n| u64::from(n.note().value())).sum();
-                    let sapling_spends = fam
-                        .iter()
-                        .filter(|n| n.note().pool() == ShieldedPool::Sapling)
-                        .count();
-                    let orchard_spends = fam
-                        .iter()
-                        .filter(|n| n.note().pool() == ShieldedPool::Orchard)
-                        .count();
-                    let ironwood_spends = fam
-                        .iter()
-                        .filter(|n| n.note().pool() == ShieldedPool::Ironwood)
-                        .count();
 
                     let (dest_pool, out_sizes): (PoolType, Vec<usize>) = match dest_transparent {
                         Some(t) => (PoolType::Transparent, vec![transparent_txout_size(&t)]),
@@ -6133,14 +7026,66 @@ impl WalletActor {
                             vec![],
                         ),
                     };
-                    let (sapling_out, orchard_act, ironwood_act) = merge_action_counts(
-                        &net,
-                        target_height,
-                        dest_pool,
-                        sapling_spends,
-                        orchard_spends,
-                        ironwood_spends,
-                    )?;
+
+                    // Shrink the selection until the **built** action count fits the cap, rather
+                    // than assuming it equals the note count.
+                    //
+                    // `cap` above bounds notes, and those are the same number only while the
+                    // selection is one bundle. Post-NU6.3 they are not: a selection of legacy
+                    // Orchard V2 notes paying an Ironwood destination puts the spends in one
+                    // bundle and the payment output in another, so the payment costs an action
+                    // of its own instead of sharing one with a spend. A selection clamped to
+                    // exactly `orchard_action_limit` then builds one action over it - and
+                    // `enforce_orchard_action_limit`, which counts per bundle, refuses the
+                    // proposal this code just made. That is a wedge, not a retry: every round
+                    // clamps to the same number and fails the same way, on a wallet whose whole
+                    // reason for merging is that it has too many notes.
+                    //
+                    // So the loop asks `merge_action_counts` - the same function the fee is
+                    // priced from, and the counts the builder is configured with - and drops the
+                    // largest note until it fits. Bounded by the selection length, and normally
+                    // zero iterations: it bites only on a mixed-pool wallet at the cap.
+                    let (sapling_spends, sapling_out, orchard_act, ironwood_act) = loop {
+                        let sapling_spends = fam
+                            .iter()
+                            .filter(|n| n.note().pool() == ShieldedPool::Sapling)
+                            .count();
+                        let orchard_spends = fam
+                            .iter()
+                            .filter(|n| n.note().pool() == ShieldedPool::Orchard)
+                            .count();
+                        let ironwood_spends = fam
+                            .iter()
+                            .filter(|n| n.note().pool() == ShieldedPool::Ironwood)
+                            .count();
+                        let (sapling_out, orchard_act, ironwood_act) = merge_action_counts(
+                            &net,
+                            target_height,
+                            dest_pool,
+                            sapling_spends,
+                            orchard_spends,
+                            ironwood_spends,
+                        )?;
+                        if orchard_action_limit == 0
+                            || orchard_act + ironwood_act <= orchard_action_limit
+                        {
+                            break (sapling_spends, sapling_out, orchard_act, ironwood_act);
+                        }
+                        // One note that still does not fit means the cap cannot express any
+                        // merge of this shape at all - a configuration answer, not a smaller
+                        // selection.
+                        if fam.len() <= 1 {
+                            return Err(RpcError::invalid_parameter(format!(
+                                "[spend] orchard_action_limit = {orchard_action_limit} is too \
+                                 small to merge even one note into this destination, which \
+                                 needs {} actions; raise it (0 disables the cap)",
+                                orchard_act + ironwood_act
+                            )));
+                        }
+                        fam.pop();
+                    };
+                    let merging_count = fam.len() as u64;
+                    let merging_value: u64 = fam.iter().map(|n| u64::from(n.note().value())).sum();
                     let fee = StandardFeeRule::Zip317
                         .fee_required(
                             &net,
@@ -6201,7 +7146,16 @@ impl WalletActor {
                     if privacy == SendPrivacy::FullPrivacy {
                         enforce_full_privacy(&proposal)?;
                     }
-                    enforce_orchard_action_limit(&proposal, orchard_action_limit)?;
+                    enforce_orchard_action_limit(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        orchard_action_limit,
+                    )?;
+                    enforce_max_tx_bytes(
+                        &proposal,
+                        proposal_branch(&net, &proposal),
+                        max_tx_bytes,
+                    )?;
 
                     Ok(MergePlan {
                         work: MergeWork::NoteProposal(proposal),
@@ -6877,6 +7831,7 @@ fn request_pays_transparent_output(net: &ZNetwork, request: &TransactionRequest)
 /// [`store_pczt`] for phase C.
 fn prove_sign_pczt(
     pczt: pczt::Pczt,
+    orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
     usk: &zcash_keys::keys::UnifiedSpendingKey,
     sapling_prover: &LocalTxProver,
     keys: &ProvingKeyCache,
@@ -6884,12 +7839,22 @@ fn prove_sign_pczt(
     use pczt::roles::prover::Prover;
     use pczt::roles::signer::{Error as SignerError, Signer};
 
-    // Proofs. Every zecd send spends Orchard notes (Orchard proof always required); a Sapling
+    // Proofs. The Orchard-pool bundle is proved under the circuit its protocol version names,
+    // which is `PostNu6_3` from NU6.3 on (see `orchard_circuit_for_branch`): legacy Orchard
+    // notes spent there with the `FixedPostNu6_2` key fail with `InvalidInstances`. A Sapling
     // output proof is only needed when a recipient is a Sapling address.
     let prover = Prover::new(pczt);
     let prover = if prover.requires_orchard_proof() {
+        let pk = orchard_circuit
+            .and_then(|version| keys.pk_for(version))
+            .ok_or_else(|| {
+                RpcError::wallet(format!(
+                    "Orchard proof required but no proving key is cached for its circuit \
+                     ({orchard_circuit:?})"
+                ))
+            })?;
         prover
-            .create_orchard_proof(&keys.orchard_pk)
+            .create_orchard_proof(pk)
             .map_err(|e| RpcError::wallet(format!("Orchard proof generation failed: {e:?}")))?
     } else {
         prover
@@ -6902,7 +7867,7 @@ fn prove_sign_pczt(
     // it is always present when `requires_ironwood_proof()` is true; its absence would mean NU6.3
     // fired without the cache expecting it, which is a bug worth surfacing).
     let prover = if prover.requires_ironwood_proof() {
-        let ironwood_pk = keys.ironwood_pk.as_ref().ok_or_else(|| {
+        let ironwood_pk = keys.ironwood_pk.ok_or_else(|| {
             RpcError::wallet(
                 "Ironwood proof required but the PostNu6_3 proving key was not built \
                  (NU6.3 not expected on this network)",
@@ -7004,9 +7969,30 @@ fn prove_sign_pczt(
 /// node (the compact scan materializes the notes but carries no memos, and enhancement skips a tx
 /// whose raw bytes the send pre-stored). zecd covered that by re-decrypting the just-stored
 /// transaction here; the pass is gone with the version that made it unnecessary.
-fn store_pczt(db: &mut WriteDb, pczt: pczt::Pczt, trust_own: bool) -> Result<TxId, RpcError> {
+fn store_pczt(
+    db: &mut WriteDb,
+    pczt: pczt::Pczt,
+    orchard_circuit: Option<orchard::circuit::OrchardCircuitVersion>,
+    keys: &ProvingKeyCache,
+    trust_own: bool,
+) -> Result<TxId, RpcError> {
+    // The extractor verifies every shielded bundle before storing, and takes ONE Orchard
+    // verifying key for both the V2 Orchard and the V3 Ironwood bundle; handed `None` it runs a
+    // `VerifyingKey::build` per bundle on every send instead. So pass the cached key whenever the
+    // transaction carries a single bundle version (every send from a wallet holding only one of
+    // the two note kinds - the steady state post-NU6.3), and fall back to `None` only for the
+    // mixed case (legacy V2 spends plus Ironwood outputs in one transaction), where one key
+    // cannot serve both and the extractor's per-bundle keygen is the correct answer.
+    let has_orchard = !pczt.orchard().actions().is_empty();
+    let has_ironwood = !pczt.ironwood().actions().is_empty();
+    let orchard_vk = match (has_orchard, has_ironwood) {
+        // The Orchard-only case verifies under its own circuit: `PostNu6_3` after NU6.3.
+        (true, false) => orchard_circuit.and_then(|version| keys.vk_for(version)),
+        (false, true) => keys.ironwood_vk.as_ref(),
+        _ => None,
+    };
     let txid = extract_and_store_transaction_from_pczt::<_, zcash_client_sqlite::ReceivedNoteId>(
-        db, pczt, None, None,
+        db, pczt, None, orchard_vk,
     )
     .map_err(|e| RpcError::wallet(format!("storing transaction failed: {e}")))?;
     mark_own_tx_trusted(db, txid, trust_own);
@@ -7060,15 +8046,30 @@ struct SendShape {
     inputs: usize,
     /// Orchard actions built across all steps (`sum of max(spends, outputs)`).
     orchard_actions: usize,
+    /// What [`tx_size`] expected this send to serialize to, in bytes - the number
+    /// `[spend] max_tx_bytes` was applied to. Logged beside the transaction's real size so an
+    /// estimate that came in under what was built cannot pass unnoticed; see
+    /// [`log_send_latency`].
+    est_tx_bytes: usize,
 }
 
-/// Summarize a built proposal's spend/action counts for the send-latency log.
-fn proposal_shape<FeeRuleT, NoteRef>(proposal: &Proposal<FeeRuleT, NoteRef>) -> SendShape {
+/// Summarize a built proposal's spend/action counts and expected size for the send-latency log.
+fn proposal_shape<FeeRuleT, NoteRef>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+    branch: BranchId,
+) -> SendShape {
     let mut shape = SendShape::default();
     for step in proposal.steps() {
-        let (spends, outputs) = step_orchard_actions(step);
+        let (spends, _) = step_orchard_actions(step);
+        let step_shape = tx_size::step_shape(step, branch);
         shape.inputs += spends;
-        shape.orchard_actions += spends.max(outputs);
+        // The per-bundle sum, matching what the cap is enforced against and what the prover
+        // will actually run - not `max(spends, outputs)` over the family, which under-counts a
+        // two-bundle post-NU6.3 send.
+        shape.orchard_actions += step_shape.orchard_family_actions();
+        // Per *step*, because each step is its own transaction: the ceiling applies to the
+        // largest one, not to their sum.
+        shape.est_tx_bytes = shape.est_tx_bytes.max(tx_size::estimate_bytes(step_shape));
     }
     shape
 }
@@ -7096,6 +8097,7 @@ fn log_send_latency(
     prove: Duration,
     store: Duration,
     broadcast: Duration,
+    tx_bytes: usize,
 ) {
     // Fields, not prose: this is the line an operator graphs, so each phase duration and the
     // proposal shape must be queryable without a log parser.
@@ -7103,12 +8105,27 @@ fn log_send_latency(
         path,
         inputs = shape.inputs,
         orchard_actions = shape.orchard_actions,
+        tx_bytes,
+        est_tx_bytes = shape.est_tx_bytes,
         build_ms = build.as_millis() as u64,
         prove_ms = prove.as_millis() as u64,
         store_ms = store.as_millis() as u64,
         broadcast_ms = broadcast.as_millis() as u64,
         "send complete"
     );
+    // `[spend] max_tx_bytes` was applied to the estimate, so an estimate that came in under
+    // the real transaction is the one way this wallet still builds something a node may refuse
+    // to relay. It cannot be caught offline - only a real proposal, built against a real
+    // wallet, exercises the counts - so say so loudly where it can be: here, on every send.
+    if tx_bytes > shape.est_tx_bytes {
+        warn!(
+            tx_bytes,
+            est_tx_bytes = shape.est_tx_bytes,
+            "the built transaction is larger than estimated, so [spend] max_tx_bytes was \
+             applied to too small a number; please report this at \
+             forum.zcashcommunity.com with the zecd version"
+        );
+    }
 }
 
 /// Map a PCZT create/extract error to an `RpcError`, surfacing insufficient-funds conditions as
@@ -7206,51 +8223,133 @@ fn step_orchard_actions<NoteRef>(
     (orchard_spends, orchard_outputs)
 }
 
-/// Enforce `[spend] orchard_action_limit` on a built proposal: no step may exceed `limit` Orchard
-/// actions. `limit == 0` disables the cap. Returns `-8` naming whether inputs or outputs (or both)
-/// overflow, like Zallet's error, so an over-large `z_sendmany` is self-diagnosing rather than
-/// failing deep in proving. The check sits on the proposal because the input (spend) count is only
-/// known once note selection has run.
+/// Enforce `[spend] orchard_action_limit` on a built proposal: no step may exceed `limit`
+/// Orchard-family actions. `limit == 0` disables the cap. Returns `-8` naming whether inputs or
+/// outputs (or both) overflow, like Zallet's error, so an over-large `z_sendmany` is
+/// self-diagnosing rather than failing deep in proving. The check sits on the proposal because
+/// the input (spend) count is only known once note selection has run.
+///
+/// The count is **per bundle, summed** - what the builder will actually prove - rather than one
+/// `max(spends, outputs)` over the Orchard family. Post-NU6.3 those differ: the Orchard pool no
+/// longer lets a spend and an output share an action, so a send that draws legacy Orchard V2
+/// notes into Ironwood outputs builds two bundles whose actions add up. Counted family-wide, a
+/// 50-spend, 49-output send of that shape reads as 50 actions and passes the shipped cap while
+/// proving 99.
 fn enforce_orchard_action_limit<FeeRuleT, NoteRef>(
     proposal: &Proposal<FeeRuleT, NoteRef>,
+    branch: BranchId,
     limit: usize,
 ) -> Result<(), RpcError> {
     if limit == 0 {
         return Ok(());
     }
     for step in proposal.steps() {
+        let shape = tx_size::step_shape(step, branch);
         let (orchard_spends, orchard_outputs) = step_orchard_actions(step);
-        if let Some((count, kind)) = orchard_action_overflow(orchard_spends, orchard_outputs, limit)
+        if let Some((count, kind)) =
+            orchard_action_overflow(shape, orchard_spends, orchard_outputs, limit)
         {
+            // Only when it applies: on the ordinary single-bundle send this sentence would be
+            // noise, but where it does apply the count is otherwise inexplicable - the caller
+            // named far fewer recipients than the number they are being refused for.
+            let split = if shape.orchard_actions > 0 && shape.ironwood_actions > 0 {
+                format!(
+                    " This send carries two shielded bundles that are proved separately and \
+                     counted together: {} Orchard actions spending legacy notes, and {} \
+                     Ironwood actions.",
+                    shape.orchard_actions, shape.ironwood_actions
+                )
+            } else {
+                String::new()
+            };
             return Err(RpcError::invalid_parameter(format!(
                 "Including {count} Orchard {kind} would exceed the current limit of {limit} \
-                 actions, which exists to bound this send's memory and proving cost. Raise \
-                 [spend] orchard_action_limit (or set it to 0 to disable the cap) to allow this \
-                 transaction."
+                 actions, which exists to bound this send's memory and proving cost.{split} \
+                 Consolidate first with z_mergetoaddress ([\"ANY_ORCHARD\"], your own address, \
+                 repeatedly until remainingNotes is 0), which is usually what a wallet this \
+                 fragmented wants. Or raise [spend] orchard_action_limit (0 disables the cap) \
+                 and send SIGHUP to reload it without restarting."
             )));
         }
     }
     Ok(())
 }
 
-/// Decide whether an Orchard-action count overflows `limit` (assumed non-zero), and if so report
-/// the offending `(count, kind)` for the error message: blame `inputs` or `outputs` when only one
-/// side overflows, else `actions` (the `max`). Returns `None` when within the cap.
+/// Decide whether a step's Orchard-family action count overflows `limit` (assumed non-zero),
+/// and if so report the offending `(count, kind)` for the error message.
+///
+/// `count` is the action count the builder will produce - the per-bundle sum carried on
+/// `shape`, not `max(spends, outputs)`. `kind` blames `inputs` or `outputs` when one side alone
+/// overflows the cap and the step is a single bundle (where that attribution is meaningful),
+/// and is `actions` otherwise. Returns `None` when within the cap.
 fn orchard_action_overflow(
+    shape: tx_size::TxShape,
     spends: usize,
     outputs: usize,
     limit: usize,
 ) -> Option<(usize, &'static str)> {
-    if spends.max(outputs) <= limit {
+    let actions = shape.orchard_family_actions();
+    if actions <= limit {
         return None;
     }
-    Some(if outputs <= limit {
-        (spends, "inputs")
-    } else if spends <= limit {
-        (outputs, "outputs")
+    let one_bundle = shape.orchard_actions == 0 || shape.ironwood_actions == 0;
+    Some(if one_bundle && outputs <= limit && spends > limit {
+        (actions, "inputs")
+    } else if one_bundle && spends <= limit && outputs > limit {
+        (actions, "outputs")
     } else {
-        (spends.max(outputs), "actions")
+        (actions, "actions")
     })
+}
+
+/// The consensus branch a proposal will be built against: its target height decides the
+/// transaction version, and with it how many actions each Orchard-protocol bundle needs.
+fn proposal_branch<FeeRuleT, NoteRef>(
+    net: &ZNetwork,
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+) -> BranchId {
+    BranchId::for_height(net, BlockHeight::from(proposal.min_target_height()))
+}
+
+/// The circuit that proves and verifies the **Orchard-pool** bundle of a transaction built
+/// against `branch`, or `None` before NU5 (no Orchard protocol).
+///
+/// Not always the `FixedPostNu6_2` circuit: from NU6.3 the Orchard pool is on protocol V3,
+/// whose bundles must disable cross-address transfers (consensus-mandated), and only the
+/// `PostNu6_3` circuit constrains that flag. So a post-NU6.3 send that spends legacy Orchard
+/// notes proves its Orchard bundle with the same key as its Ironwood bundle; the
+/// `FixedPostNu6_2` key is refused there with `InvalidInstances`. This is the rule the fused
+/// builder applies too, deriving the circuit from the branch rather than from the pool.
+fn orchard_circuit_for_branch(branch: BranchId) -> Option<orchard::circuit::OrchardCircuitVersion> {
+    bundle_version_for_branch(branch, orchard::ValuePool::Orchard).map(|v| v.circuit_version())
+}
+
+/// Enforce `[spend] max_tx_bytes` on a built proposal: no step may serialize to more than
+/// `max_bytes`. `0` disables the ceiling.
+///
+/// This runs beside [`enforce_orchard_action_limit`] and catches what that cannot. The action
+/// cap bounds proving cost; this bounds what a *node* will relay, and the two are not
+/// proportional - a post-NU6.3 send carrying both an Orchard and an Ironwood bundle pays two
+/// proofs, so its bytes outrun its action count. Refusing here, before the prover runs, is the
+/// whole point: past this line the wallet spends minutes on a transaction the network would
+/// drop.
+fn enforce_max_tx_bytes<FeeRuleT, NoteRef>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+    branch: BranchId,
+    max_bytes: usize,
+) -> Result<(), RpcError> {
+    if max_bytes == 0 {
+        return Ok(());
+    }
+    for step in proposal.steps() {
+        let bytes = tx_size::estimate_bytes(tx_size::step_shape(step, branch));
+        if bytes > max_bytes {
+            return Err(RpcError::invalid_parameter(format!(
+                "This send would build a transaction of about {bytes} bytes, over the current                  limit of {max_bytes}, which exists because a node will not relay a transaction                  larger than its own mempool policy - such a transaction is proved at full cost                  and then never mined. Send to fewer recipients, or consolidate first with                  z_mergetoaddress ([\"ANY_ORCHARD\"], your own address, repeatedly until                  remainingNotes is 0), which spends fewer, larger notes. Or raise [spend]                  max_tx_bytes (0 disables the ceiling) and send SIGHUP to reload it without                  restarting - but only if every node between this wallet and a miner accepts                  the larger size."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient
@@ -7371,6 +8470,25 @@ fn coinbase_hint(zats: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn orchard_bundles_prove_under_the_circuit_their_branch_names() {
+        use super::orchard_circuit_for_branch;
+        use orchard::circuit::OrchardCircuitVersion as V;
+        use zcash_protocol::consensus::BranchId;
+        // NU6.3 moved the Orchard pool to protocol V3, which mandates the cross-address
+        // restriction only the post-NU6.3 circuit enforces. Proving legacy Orchard notes there
+        // with the NU6.2 key is what failed with `InvalidInstances`.
+        assert_eq!(
+            orchard_circuit_for_branch(BranchId::Nu6_3),
+            Some(V::PostNu6_3)
+        );
+        assert_eq!(
+            orchard_circuit_for_branch(BranchId::Nu6_2),
+            Some(V::FixedPostNu6_2)
+        );
+        assert_eq!(orchard_circuit_for_branch(BranchId::Canopy), None);
+    }
+
     use super::gap_slots_remaining;
     use super::horizon_slots_remaining;
     use super::preexpose_progress_stats;
@@ -7378,7 +8496,6 @@ mod tests {
     use super::select_transparent_inputs;
     use super::transparent_child_index;
     use super::DiversifierIndex;
-    use super::ProvingKeys;
 
     /// The halt is keyed on the failure *type*, and only the terminal one. A transport failure or
     /// a wallet-apply failure must stay retryable: reconnecting fixes the first, and updating
@@ -7404,26 +8521,6 @@ mod tests {
         assert!(
             !super::sync_failure_is_terminal(&anyhow::anyhow!("connection reset")),
             "a transport failure is fixed by reconnecting"
-        );
-    }
-
-    /// Every `get` shares one [`super::ProvingKeyCache`] rather than generating a key per send.
-    /// The regtest tier cannot catch a regression here - rebuilding per send is slower, not
-    /// wrong, and e2e send timings are noise-dominated.
-    ///
-    /// `#[ignore]` because a *debug* keygen is ~25 s (measured on 4 cores) - too slow for the
-    /// offline tier, whose value is being fast and always green. Run it with
-    /// `cargo test -- --include-ignored`, and after any `orchard`/`halo2_proofs` bump.
-    #[ignore = "runs a real Orchard keygen: ~25s in a debug build"]
-    #[tokio::test]
-    async fn proving_keys_are_built_once_and_shared() {
-        // `false`: skip the Ironwood keygen, which this assertion doesn't need.
-        let keys = ProvingKeys::new(false);
-        let first = keys.get().await.expect("keygen");
-        let second = keys.get().await.expect("keygen");
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
-            "each call rebuilt the proving key instead of sharing the cached one"
         );
     }
 
@@ -7828,6 +8925,55 @@ mod tests {
     /// `resolve_shielded_destination`: Orchard receivers take precedence and land in Ironwood
     /// once NU6.3 is active (else Orchard); Sapling-only recipients land in Sapling. Getting
     /// this wrong desynchronizes the hand-computed fee from the transaction the builder makes.
+    /// Post-NU6.3, a merge of legacy Orchard V2 notes into an Ironwood destination costs
+    /// **more actions than it selects notes**: the spends and the single payment output land in
+    /// different bundles, so the payment cannot share an action with a spend the way a
+    /// same-pool merge's does.
+    ///
+    /// That is the premise the selection loop in `do_propose_merge_to_address` exists for -
+    /// clamping the note count to `orchard_action_limit` would build one action over it, and
+    /// `enforce_orchard_action_limit` (which counts per bundle) would then refuse the proposal
+    /// the merge just planned, wedging every round. If this assertion ever flips to equality,
+    /// that loop is dead weight and should go.
+    #[test]
+    fn a_cross_bundle_merge_costs_one_more_action_than_it_selects() {
+        use super::merge_action_counts;
+        use crate::network::ZNetwork;
+        use zcash_client_backend::data_api::wallet::TargetHeight;
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+        use zcash_protocol::PoolType;
+
+        let net = ZNetwork::Test;
+        let nu6_3 = net
+            .activation_height(NetworkUpgrade::Nu6_3)
+            .expect("testnet activates NU6.3");
+        let target = TargetHeight::from(u32::from(nu6_3) + 1_000);
+
+        // 50 legacy Orchard V2 notes paying an Ironwood destination: two bundles.
+        let (_, orchard_act, ironwood_act) =
+            merge_action_counts(&net, target, PoolType::IRONWOOD, 0, 50, 0).expect("bundle shapes");
+        assert_eq!(orchard_act, 50, "the spends fill the Orchard bundle");
+        assert!(
+            ironwood_act >= 1,
+            "the payment output needs a bundle of its own: {ironwood_act}"
+        );
+        assert!(
+            orchard_act + ironwood_act > 50,
+            "the built action count must exceed the 50 notes selected, or the selection loop \
+             is unnecessary"
+        );
+
+        // The same selection paying an Ironwood destination from Ironwood notes is one bundle,
+        // where the payment does share an action - the case the loop must not shrink.
+        let (_, orchard_act, ironwood_act) =
+            merge_action_counts(&net, target, PoolType::IRONWOOD, 0, 0, 50).expect("bundle shapes");
+        assert_eq!(
+            orchard_act + ironwood_act,
+            50,
+            "a same-pool merge costs exactly its note count"
+        );
+    }
+
     #[test]
     fn merge_shielded_destination_pool_resolves_by_receiver_and_activation() {
         use super::merge_shielded_destination_pool;
@@ -7933,6 +9079,36 @@ mod tests {
         let shielded = spend_policy_for_source(SendSource::Shielded);
         assert!(shielded.transparent().is_none());
         assert!(!shielded.shielded().is_empty());
+
+        // A pool-restricted shielded source permits only its own family, so a shortfall is a
+        // `-6` on the named family rather than a top-up from the other pool - and it must still
+        // read as shielded to the routing that decides whether the t-to-t path engages.
+        for (family, expected) in [
+            (
+                crate::wallet::ShieldedFamily::Sapling,
+                vec![zcash_protocol::ShieldedPool::Sapling],
+            ),
+            (
+                crate::wallet::ShieldedFamily::Orchard,
+                vec![
+                    zcash_protocol::ShieldedPool::Orchard,
+                    zcash_protocol::ShieldedPool::Ironwood,
+                ],
+            ),
+        ] {
+            let source = SendSource::ShieldedFamily(family);
+            assert!(source.is_shielded(), "{family:?} is a shielded source");
+            let policy = spend_policy_for_source(source);
+            assert!(
+                policy.transparent().is_none(),
+                "{family:?}: never transparent inputs"
+            );
+            let mut got: Vec<_> = policy.shielded().iter().copied().collect();
+            got.sort_by_key(|p| format!("{p:?}"));
+            let mut want = expected.clone();
+            want.sort_by_key(|p| format!("{p:?}"));
+            assert_eq!(got, want, "{family:?}: one family only");
+        }
 
         let any = spend_policy_for_source(SendSource::Transparent(None));
         assert!(any.shielded().is_empty(), "one source per send");
@@ -8246,6 +9422,75 @@ mod tests {
         );
     }
 
+    /// `[sync] fetch_memos = false` takes **only** the `Enhancement` requests of transactions
+    /// the wallet did not spend in out of the drain's scope. That narrow cut is the whole
+    /// contract: for a pure receive the skipped fetch would have added nothing but the memo, so
+    /// the setting costs exactly the memos; for a transaction the wallet spent in, the fetch is
+    /// the only source of its outgoing records and its fee, so skipping it would make a
+    /// restored wallet's own sends vanish from `listtransactions` while the balance still moved.
+    ///
+    /// The correctness requests stay in under either flag: `GetStatus` (transaction
+    /// status/expiry tracking) and `TransactionsInvolvingAddress` (transparent spend detection
+    /// and ephemeral ZIP-320 checks) are not history detail, and skipping either would leave
+    /// the wallet's view of the chain wrong rather than merely memo-less. With the default
+    /// (`fetch_memos = true`) every serviceable request is in scope regardless of the set, so a
+    /// default wallet's behaviour cannot depend on it.
+    #[test]
+    fn fetch_memos_off_skips_only_receive_side_enhancement_requests() {
+        use super::request_in_scope;
+        use zcash_client_backend::data_api::{
+            OutputStatusFilter, TransactionDataRequest, TransactionStatusFilter,
+        };
+        use zcash_protocol::TxId;
+        use zcash_transparent::address::TransparentAddress;
+
+        let received = TxId::from_bytes([7u8; 32]);
+        let spent = TxId::from_bytes([9u8; 32]);
+        let spending = std::collections::BTreeSet::from([spent]);
+        let none: std::collections::BTreeSet<TxId> = std::collections::BTreeSet::new();
+
+        let recv_enhancement = TransactionDataRequest::Enhancement(received);
+        let spend_enhancement = TransactionDataRequest::Enhancement(spent);
+        let status = TransactionDataRequest::GetStatus(received);
+        let tia = TransactionDataRequest::transactions_involving_address(
+            TransparentAddress::PublicKeyHash([0u8; 20]),
+            zcash_protocol::consensus::BlockHeight::from_u32(100),
+            None,
+            None,
+            TransactionStatusFilter::All,
+            OutputStatusFilter::All,
+        );
+
+        // fetch_memos on: everything serviceable is in scope, and the spend set is not even
+        // consulted (pass the empty one, which would exclude both enhancements if it were).
+        for req in [&recv_enhancement, &spend_enhancement, &status, &tia] {
+            assert!(
+                request_in_scope(req, true, &none),
+                "with fetch_memos on, every serviceable request is in scope: {req:?}"
+            );
+        }
+
+        // fetch_memos off: only the receive-side enhancement is skipped.
+        assert!(
+            !request_in_scope(&recv_enhancement, false, &spending),
+            "fetch_memos off must skip the Enhancement of a transaction the wallet only \
+             received in - the fetch would have added nothing but its memo"
+        );
+        assert!(
+            request_in_scope(&spend_enhancement, false, &spending),
+            "fetch_memos off must still enhance a transaction the wallet spent in: its \
+             outgoing records and fee exist nowhere else"
+        );
+        assert!(
+            request_in_scope(&status, false, &spending),
+            "GetStatus is correctness, not history detail - never excluded"
+        );
+        assert!(
+            request_in_scope(&tia, false, &spending),
+            "TransactionsInvolvingAddress is correctness, not history detail - never excluded"
+        );
+    }
+
     /// `outstanding_requests` deduplicates the raw `transaction_data_requests()` read and drops
     /// already-attempted requests. Upstream's spend-search generation emits k identical
     /// `TransactionsInvolvingAddress` requests for a transaction with k unspent wallet outputs
@@ -8275,12 +9520,17 @@ mod tests {
         ];
 
         // No satisfied set: duplicates collapse, first-occurrence order is preserved.
-        let out = outstanding_requests(raw.clone(), &std::collections::BTreeSet::new());
+        let out = outstanding_requests(
+            raw.clone(),
+            &std::collections::BTreeSet::new(),
+            true,
+            &std::collections::BTreeSet::new(),
+        );
         assert_eq!(out, vec![a.clone(), b.clone(), c.clone()]);
 
         // Already-attempted requests are dropped entirely, duplicates included.
         let satisfied = std::collections::BTreeSet::from([a.clone()]);
-        let out = outstanding_requests(raw, &satisfied);
+        let out = outstanding_requests(raw, &satisfied, true, &std::collections::BTreeSet::new());
         assert_eq!(out, vec![b, c]);
     }
 
@@ -8399,7 +9649,12 @@ mod tests {
              outstanding_requests' docs"
         );
 
-        let deduped = outstanding_requests(reqs, &std::collections::BTreeSet::new());
+        let deduped = outstanding_requests(
+            reqs,
+            &std::collections::BTreeSet::new(),
+            true,
+            &std::collections::BTreeSet::new(),
+        );
         let distinct = deduped.iter().filter(|r| is_our_spend_search(r)).count();
         assert_eq!(
             distinct, K,
@@ -8448,23 +9703,62 @@ mod tests {
         assert!(single_pool_violated(true, false, false, true));
     }
 
-    /// The Orchard-action cap: `max(spends, outputs)` must not exceed the limit; the error blames
-    /// whichever side overflows (or `actions` when both do).
+    /// The Orchard-action cap counts what the builder will prove: the **per-bundle sum**. The
+    /// error blames whichever side overflows when a single bundle makes that meaningful, and
+    /// `actions` otherwise.
     #[test]
     fn orchard_action_overflow_decision() {
         use super::orchard_action_overflow;
+        use crate::tx_size::TxShape;
+
+        // One bundle, whose action count is `max(spends, outputs)`: the pre-NU6.3 shape, and
+        // the shape of any send whose notes and outputs are all in one pool.
+        let one = |actions| TxShape {
+            ironwood_actions: actions,
+            ..TxShape::default()
+        };
         // Within the cap - no overflow regardless of which side is larger.
-        assert_eq!(orchard_action_overflow(50, 50, 50), None);
-        assert_eq!(orchard_action_overflow(10, 50, 50), None);
-        assert_eq!(orchard_action_overflow(0, 0, 50), None);
+        assert_eq!(orchard_action_overflow(one(50), 50, 50, 50), None);
+        assert_eq!(orchard_action_overflow(one(50), 10, 50, 50), None);
+        assert_eq!(orchard_action_overflow(one(0), 0, 0, 50), None);
         // Only outputs overflow -> blame outputs.
-        assert_eq!(orchard_action_overflow(3, 51, 50), Some((51, "outputs")));
+        assert_eq!(
+            orchard_action_overflow(one(51), 3, 51, 50),
+            Some((51, "outputs"))
+        );
         // Only inputs overflow -> blame inputs.
-        assert_eq!(orchard_action_overflow(80, 2, 50), Some((80, "inputs")));
-        // Both overflow -> blame actions (the max).
-        assert_eq!(orchard_action_overflow(60, 70, 50), Some((70, "actions")));
+        assert_eq!(
+            orchard_action_overflow(one(80), 80, 2, 50),
+            Some((80, "inputs"))
+        );
+        // Both overflow -> blame actions.
+        assert_eq!(
+            orchard_action_overflow(one(70), 60, 70, 50),
+            Some((70, "actions"))
+        );
         // A tight cap of 1: a single extra output trips it.
-        assert_eq!(orchard_action_overflow(1, 2, 1), Some((2, "outputs")));
+        assert_eq!(
+            orchard_action_overflow(one(2), 1, 2, 1),
+            Some((2, "outputs"))
+        );
+
+        // The case a family-wide `max(spends, outputs)` misses. Post-NU6.3, a send spending 50
+        // legacy Orchard V2 notes into 49 Ironwood outputs builds two bundles - 50 actions and
+        // 49 - and proves 99. Counted family-wide it reads as 50 and slips under the shipped
+        // cap; counted per bundle it is refused, and blamed on neither side alone, because
+        // neither is what made it large.
+        let two_bundles = TxShape {
+            orchard_actions: 50,
+            ironwood_actions: 49,
+            ..TxShape::default()
+        };
+        assert_eq!(two_bundles.orchard_family_actions(), 99);
+        assert_eq!(
+            orchard_action_overflow(two_bundles, 50, 49, 50),
+            Some((99, "actions"))
+        );
+        // And it still passes when the cap genuinely covers both bundles.
+        assert_eq!(orchard_action_overflow(two_bundles, 50, 49, 99), None);
     }
 
     /// Resubmitting a tx the node already has must follow Bitcoin Core's idempotent

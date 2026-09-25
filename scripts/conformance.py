@@ -80,6 +80,31 @@ ZCASH = "zcash"
 BITCOIN = "bitcoin"
 BOTH = (ZCASH, BITCOIN)
 
+
+def read_together(first, second, key=lambda v: v, attempts=6, delay=0.5):
+    """Sample two live readings that are required to agree, bracketing the pair.
+
+    zecd is a live daemon under this script: the sync loop, the mempool stream and the
+    transaction-enhancement drain all keep running while the checks execute, so a value read
+    now and a value read twenty calls later describe two different wallets. Comparing them is
+    a race, not a conformance property, and it fired in CI: `getbalance` read 0.02932500 and,
+    moments later, `getbalances.mine.trusted` read 0 - re-queueing a range for scanning had
+    moved every note from spendable to pending-spendability. The wallet total was unchanged;
+    nothing was spent, and nothing about the wire format was wrong.
+
+    So read the pair back to back and bracket it with a second reading of `first`: when the
+    bracket agrees, the wallet did not move across the window and the caller's comparison is
+    authoritative. Otherwise re-sample. After `attempts` the last pair is returned anyway, so
+    a genuine mismatch is still reported rather than looped on forever.
+    """
+    for _ in range(attempts - 1):
+        a = first()
+        b = second()
+        if key(first()) == key(a):
+            return a, b
+        time.sleep(delay)
+    return first(), second()
+
 # The amount every Bitcoin-mode send check names: a valid amount (under the 21M cap, so it
 # parses) that no test wallet can afford. The checks are meant to be refused while their
 # arguments are parsed, and they are; this is the second guard, so a check whose refusal
@@ -169,9 +194,17 @@ def s_waitfor(ctx):
     ck("waitforsync returns the sync-state shape",
        isinstance(w, dict)
        and set(w) == {"hash", "height", "chain_tip", "synced",
-                      "pending_enhancements", "enhanced_through"}, w)
+                      "pending_enhancements", "enhanced_through", "imported"}, w)
     ck("waitforsync reports synced on a caught-up wallet", w["synced"] is True, w)
     ck("waitforsync drained backlog is 0", w["pending_enhancements"] == 0, w)
+    # `imported` says whether this wallet's own account exists in its database. A conventional
+    # wallet's does by the time it can be read at all; the field exists for fleet members, which
+    # are servable before their viewing key is imported and read empty until it is. `synced`
+    # folds it in, so this must be true wherever `synced` is.
+    ck("waitforsync reports a conventional wallet as imported", w["imported"] is True, w)
+    # `import_error` is emitted only when an import can never succeed, so a healthy wallet must
+    # not carry the key at all (the same only-when-it-applies rule as `fetch_memos`).
+    ck("waitforsync omits import_error on a healthy wallet", "import_error" not in w, w)
     # `height` is the scanned height and `chain_tip` is what it is measured against, which is
     # what lets a caller render progress without opening its own connection to the chain.
     # `synced` is exactly `scanned >= tip` (and is false while the tip is unknown), so on a
@@ -325,6 +358,9 @@ def s_getwalletinfo(ctx):
         if ctx.coin == ZCASH:
             ck("a Zcash birthday has no deferred date or anchor",
                bd.get("time") is None and anchor is None, bd)
+    # Only-when-it-applies rule: `import_error` names a fleet member whose viewing key the
+    # database refused, and must be absent on any wallet that is being served normally.
+    ck("getwalletinfo omits import_error on a healthy wallet", "import_error" not in wi, wi.keys())
     scanning = wi.get("scanning")
     if ctx.coin == ZCASH:
         # The transparent observability block appears only when [pools] transparent is enabled; this
@@ -399,9 +435,12 @@ def s_amounts(ctx):
 
     # minconf is honored: 1-conf balance includes at least everything the (stricter)
     # default spendability policy counts; an impossibly deep minconf excludes everything.
-    bal1 = rpc.call("getbalance", "*", 1)
+    # The two readings are sampled together (see read_together) because they are only
+    # comparable against one wallet state.
+    bal_now, bal1 = read_together(lambda: rpc.call("getbalance"),
+                                  lambda: rpc.call("getbalance", "*", 1))
     ck("getbalance('*',1) is Decimal", isinstance(bal1, decimal.Decimal), repr(bal1))
-    ck("getbalance('*',1) >= getbalance()", bal1 >= bal, f"{bal1} < {bal}")
+    ck("getbalance('*',1) >= getbalance()", bal1 >= bal_now, f"{bal1} < {bal_now}")
     ck("getbalance('*',99999999) == 0", rpc.call("getbalance", "*", 99999999) == 0)
     try:
         rpc.call("getbalance", "account1")
@@ -448,11 +487,18 @@ def s_getblockheader(ctx):
 @section("getbalances", *BOTH)
 def s_getbalances(ctx):
     rpc, ck, bal = ctx.rpc, ctx.ck, ctx.bal
-    gb = rpc.call("getbalances")
+    # `mine.trusted` and `getbalance` are the same read behind two method names, so they must
+    # report the same number. Sample them together (see read_together) rather than against the
+    # `getbalance` taken further up: the wallet moves between calls, and that comparison is
+    # what failed in CI while both RPCs were answering correctly.
+    gb, bal_now = read_together(lambda: rpc.call("getbalances"),
+                                lambda: rpc.call("getbalance"),
+                                key=lambda v: v.get("mine", {}).get("trusted"))
     mine = gb.get("mine", {})
     for f in ("trusted", "untrusted_pending", "immature"):
         ck(f"mine.{f} is Decimal", isinstance(mine.get(f), decimal.Decimal), repr(mine.get(f)))
-    ck("mine.trusted == getbalance", mine.get("trusted") == bal)
+    ck("mine.trusted == getbalance", mine.get("trusted") == bal_now,
+       f"{mine.get('trusted')} != {bal_now}")
     if ctx.coin == ZCASH:
         # zecd extension: mine.coinbase is the portion of trusted that is mature transparent
         # coinbase - spendable only via z_shieldcoinbase, so it is broken out for callers to see
@@ -514,6 +560,38 @@ def s_addresses(ctx):
            "address" not in bad and "scriptPubKey" not in bad and "isscript" not in bad)
         ck("invalid validateaddress has error fields",
            "error" in bad and "error_locations" in bad)
+        # z_validateaddress: zcashd's shielded-address validator. zecd's accepts every address kind
+        # rather than reporting a t-address invalid, and reports ownership - which is the reason it
+        # exists alongside validateaddress, whose contract carries no ismine.
+        zva = rpc.call("z_validateaddress", addr)
+        ck("z_validateaddress.isvalid", zva["isvalid"] is True)
+        ck("z_validateaddress echoes address", zva.get("address") == addr)
+        ck("z_validateaddress.address_type unified", zva.get("address_type") == "unified",
+           zva.get("address_type"))
+        ck("z_validateaddress.ismine on our own address", zva.get("ismine") is True)
+        # A unified address lists its receivers in zcashd's vocabulary: a transparent receiver is
+        # "p2pkh" there, never zecd's own "transparent" spelling.
+        ck("z_validateaddress lists receivers",
+           isinstance(zva.get("receivers"), list) and "orchard" in zva["receivers"],
+           zva.get("receivers"))
+        ck("z_validateaddress receivers use zcashd names",
+           "transparent" not in zva["receivers"], zva["receivers"])
+        bad_zva = rpc.call("z_validateaddress", "not-an-address")
+        ck("z_validateaddress invalid is the bare verdict",
+           bad_zva["isvalid"] is False and "address" not in bad_zva and "ismine" not in bad_zva,
+           bad_zva)
+        # A well-formed address that is not ours: valid, kind reported, not mine.
+        foreign = rpc.call("z_validateaddress", "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86")
+        if foreign["isvalid"]:
+            ck("z_validateaddress foreign t-addr is p2pkh", foreign["address_type"] == "p2pkh",
+               foreign["address_type"])
+            ck("z_validateaddress foreign t-addr is not mine", foreign["ismine"] is False)
+            ck("z_validateaddress bare address has no receiver list", "receivers" not in foreign)
+        try:
+            rpc.call("z_validateaddress", addr, "extra")
+            ck("z_validateaddress over-arity raises", False)
+        except JSONRPCException as e:
+            ck("z_validateaddress over-arity -> -1", e.code == -1, e.code)
         ai = rpc.call("getaddressinfo", addr)
         ck("getaddressinfo.ismine", ai["ismine"] is True)
         ck("getaddressinfo has no isvalid", "isvalid" not in ai)
@@ -729,6 +807,48 @@ def s_z_getaddressforaccount(ctx):
         ck("z_getaddressforaccount no args -> -1", e.code == -1, e.code)
 
 
+    # The three pieces a payment processor reconciles with, checked as one contract.
+    #
+    # (1) z_listunifiedreceivers takes a unified address apart into the per-receiver strings that
+    #     history reports for outputs paid to it. On this Orchard-only wallet a getnewaddress UA
+    #     is already single-receiver, so it takes apart into exactly itself under "orchard".
+    parts = rpc.call("z_listunifiedreceivers", addr)
+    ck("z_listunifiedreceivers on an orchard-only UA is {orchard: itself}",
+       parts == {"orchard": addr}, parts)
+    try:
+        rpc.call("z_listunifiedreceivers", "not-an-address")
+        ck("z_listunifiedreceivers invalid raises", False)
+    except JSONRPCException as e:
+        ck("z_listunifiedreceivers invalid -> -5", e.code == -5, e.code)
+    # (2) getaddressinfo reads a shielded address's diversifier index back, and it is the index
+    #     z_getaddressforaccount issued it at - so a site that stored the index at issuance can
+    #     resolve any address it later sees to that integer.
+    info_a = rpc.call("getaddressinfo", a["address"])
+    ck("getaddressinfo.diversifier_index is an int for an own shielded address",
+       isinstance(info_a.get("diversifier_index"), int), repr(info_a.get("diversifier_index")))
+    ck("getaddressinfo.diversifier_index round-trips z_getaddressforaccount's",
+       info_a.get("diversifier_index") == a["diversifier_index"],
+       (info_a.get("diversifier_index"), a["diversifier_index"]))
+    # (3) Every received history entry carries the index of the address it landed on, and sends
+    #     never do - the recipient's index is theirs. The funded wallet has receives by now.
+    hist = rpc.call("listtransactions", "*", 200)
+    receives = [t for t in hist if t.get("category") == "receive"]
+    sends = [t for t in hist if t.get("category") == "send"]
+    ck("history has receives to check", len(receives) > 0, len(hist))
+    ck("every received entry carries an int diversifier_index",
+       all(isinstance(t.get("diversifier_index"), int) for t in receives),
+       [t.get("diversifier_index") for t in receives][:5])
+    ck("no send entry carries diversifier_index",
+       all("diversifier_index" not in t for t in sends), len(sends))
+    # ...and the index on a receive resolves through getaddressinfo to the same value, from the
+    # address string the entry itself reports - the two read-backs agree.
+    if receives:
+        r = receives[0]
+        ri = rpc.call("getaddressinfo", r["address"])
+        ck("a receive entry's diversifier_index matches getaddressinfo on its address",
+           ri.get("diversifier_index") == r.get("diversifier_index"),
+           (ri.get("diversifier_index"), r.get("diversifier_index")))
+
 @section("received-by-address", *BOTH)
 def s_received_by_address(ctx):
     rpc, ck, addr = ctx.rpc, ctx.ck, ctx.addr
@@ -784,6 +904,35 @@ def s_received_by_address(ctx):
             ck("invalid address_filter raises", False)
         except JSONRPCException as e:
             ck("invalid address_filter -> code -5", e.code == -5, e.code)
+    # Everything listreceivedbyaddress reports must be an address the wallet answers for, and
+    # answers with the same total. The two RPCs share one aggregation but reach it by different
+    # routes (a whole-history walk vs a pushed-down per-address filter), so this is the check
+    # that the address identity they key on is the same one. It is what goes wrong when the
+    # reported spelling of an address and the looked-up spelling drift apart.
+    #
+    # Sampled through read_together, and the per-address probes are batched into ONE reading so
+    # the whole comparison is bracketed: the daemon is live, so a list read now against totals
+    # read a round trip later is a race rather than a property. Capped at a few addresses -
+    # each is a round trip, and an exchange wallet lists many.
+    def listed_with_totals():
+        pairs = []
+        for e in rpc.call("listreceivedbyaddress", 1, True)[:8]:
+            listed = e.get("address")
+            try:
+                pairs.append((listed, e.get("amount"), rpc.call("getreceivedbyaddress", listed, 1)))
+            except JSONRPCException as err:
+                pairs.append((listed, e.get("amount"), "error %s" % err.code))
+        return pairs
+
+    _, pairs = read_together(
+        lambda: rpc.call("listreceivedbyaddress", 1, True),
+        listed_with_totals,
+    )
+    for listed, amount, queried in pairs:
+        ck("every listed address is queryable (%s)" % listed,
+           not isinstance(queried, str), repr(queried))
+        ck("listed and queried totals agree for %s" % listed,
+           queried == amount, "%r vs %r" % (queried, amount))
 
 
 @section("stateless: label methods are removed", *BOTH)
@@ -1014,6 +1163,31 @@ def s_wallets(ctx):
     ck("the configured wallet is still served after the refusal",
        isinstance(rpc.call("getwalletinfo"), dict))
 
+    # load_on_startup: zecd keeps a fleet wallet's manifest when it unloads (that is what lets
+    # loadwallet restore it), so `true` is already the case and `false` is a promise this RPC
+    # cannot keep. It is refused rather than ignored - silently dropping it would have the wallet
+    # reappear at the next restart of a daemon the operator believes it was retired from.
+    try:
+        rpc.call("unloadwallet", configured, False)
+        ck("unloadwallet load_on_startup=false raises", False)
+    except JSONRPCException as e:
+        # -8, not the configured wallet's -4: arguments are validated before the wallet is
+        # resolved, so a malformed call answers the same way whichever wallet it names.
+        ck("unloadwallet load_on_startup=false -> -8", e.code == -8, e.code)
+    try:
+        rpc.call("unloadwallet", configured, True)
+        ck("unloadwallet load_on_startup=true raises (configured wallet)", False)
+    except JSONRPCException as e:
+        ck("unloadwallet load_on_startup=true is accepted, wallet still refused -> -4",
+           e.code == -4, e.code)
+    for label, params in (("wallet_name", (42,)), ("load_on_startup", (configured, "yes"))):
+        try:
+            rpc.call("unloadwallet", *params)
+            ck(f"unloadwallet non-typed {label} raises", False)
+        except JSONRPCException as e:
+            ck(f"unloadwallet {label} of the wrong type -> -3", e.code == -3, e.code)
+    ck("the configured wallet is still served after every argument refusal",
+       isinstance(rpc.call("getwalletinfo"), dict))
 
 @section("listunspent", *BOTH)
 def s_listunspent(ctx):
@@ -1412,6 +1586,25 @@ def s_errors(ctx):
     ck("z_sendmany ANY_TADDR op failed -6/-13 (no transparent funds)",
        st.get("status") == "failed"
        and st.get("error", {}).get("code") in (-6, -13), st)
+    # The shielded pool-family wildcards, the same vocabulary z_mergetoaddress takes. Each
+    # spawns (the source is valid and the wallet owns it) and then fails async on funds, since
+    # the amount is far above anything the wallet under test holds - so no money can move.
+    for wildcard in ("ANY_SAPLING", "ANY_ORCHARD"):
+        opid = rpc.call("z_sendmany", wildcard, [{"address": addr, "amount": "100.0"}])
+        ck(f"z_sendmany {wildcard} -> opid", opid.startswith("opid-"), opid)
+        st = rpc.call("z_waitforoperation", opid, 60)
+        ck(f"z_sendmany {wildcard} op finished", st.get("finished") is True, st)
+        ck(f"z_sendmany {wildcard} op failed -6/-13 (no funds in that family)",
+           st.get("status") == "failed"
+           and st.get("error", {}).get("code") in (-6, -13), st)
+    try:
+        # Sprout is named explicitly, so the answer says so rather than "not an address".
+        rpc.call("z_sendmany", "ANY_SPROUT", [{"address": addr, "amount": "0.1"}])
+        ck("z_sendmany ANY_SPROUT raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany ANY_SPROUT -> code -8", e.code == -8, e.code)
+        ck("z_sendmany ANY_SPROUT names Sprout", "Sprout" in str(e), str(e))
+
     # A shielded fromaddress under AllowRevealedSenders spawns too (the policy name is a real
     # rung now, not collapsed onto AllowRevealedRecipients); same guaranteed async failure.
     opid = rpc.call("z_sendmany", addr, [{"address": addr, "amount": "100.0"}],

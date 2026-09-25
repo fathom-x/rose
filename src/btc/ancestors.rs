@@ -40,7 +40,7 @@ use bdk_wallet::coin_selection::{
     InsufficientFunds,
 };
 use bdk_wallet::{Utxo, WeightedUtxo};
-use rand::RngCore;
+use rand_core::RngCore;
 
 /// One unconfirmed wallet transaction, as [`Ancestry::new`] takes it.
 #[derive(Debug, Clone)]

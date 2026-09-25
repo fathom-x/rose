@@ -334,6 +334,14 @@ pub fn render(config: &AppConfig) -> String {
     table(&mut s, "sync");
     kv(&mut s, "interval_secs", config.sync.interval_secs);
     kv(&mut s, "rebroadcast_secs", config.sync.rebroadcast_secs);
+    kv(&mut s, "fetch_memos", config.sync.fetch_memos);
+    kv(&mut s, "batch_size", config.sync.batch_size);
+    kv(&mut s, "writer_cache_mib", config.sync.writer_cache_mib);
+    kv(
+        &mut s,
+        "enhance_concurrency",
+        config.sync.enhance_concurrency,
+    );
 
     #[cfg(feature = "zcash")]
     {
@@ -365,6 +373,7 @@ pub fn render(config: &AppConfig) -> String {
             "orchard_action_limit",
             config.spend.orchard_action_limit,
         );
+        kv(&mut s, "max_tx_bytes", config.spend.max_tx_bytes);
         kv(&mut s, "cache_proving_key", config.spend.cache_proving_key);
         kv(&mut s, "pipeline_proving", config.spend.pipeline_proving);
         kv(&mut s, "target_note_count", config.spend.target_note_count);
@@ -372,6 +381,11 @@ pub fn render(config: &AppConfig) -> String {
             &mut s,
             "min_split_output_value",
             config.spend.min_split_output_value,
+        );
+        kv(
+            &mut s,
+            "shutdown_drain_secs",
+            config.spend.shutdown_drain_secs,
         );
 
         table(&mut s, "pools");

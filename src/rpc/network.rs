@@ -43,7 +43,8 @@ fn version_number() -> u64 {
 }
 
 /// `getnetworkinfo` - daemon version/identity in Bitcoin Core's shape; `connections` counts
-/// the single lightwalletd upstream (1 when connected, 0 otherwise).
+/// the single chain upstream (1 when connected, 0 otherwise). That upstream is a local zebrad in
+/// the default full mode, a lightwalletd in light mode; nothing here depends on which.
 pub(crate) fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
     Ok(networkinfo_json(connected(state)))
 }
@@ -71,16 +72,17 @@ pub(crate) fn networkinfo_json(up: bool) -> Value {
     })
 }
 
-/// `getconnectioncount` - 1 while the lightwalletd upstream is reachable, else 0.
+/// `getconnectioncount` - 1 while the chain upstream (zebrad or lightwalletd) is reachable,
+/// else 0.
 pub(crate) fn getconnectioncount(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(if connected(state) { 1 } else { 0 }))
 }
 
-/// `getpeerinfo` - the active lightwalletd upstream as the single "peer", with its
-/// `conn_state` (down|syncing|ready) as an extension field.
+/// `getpeerinfo` - the active chain upstream (zebrad or lightwalletd) as the single "peer",
+/// with its `conn_state` (down|syncing|ready) as an extension field.
 #[cfg(feature = "zcash")]
 pub(crate) fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
-    // zecd's single "peer" is the active lightwalletd upstream. Report it (with its connection
+    // zecd's single "peer" is the active chain upstream. Report it (with its connection
     // state) when connected; otherwise an empty peer list, as bitcoind does with no peers.
     let Ok(w) = state.registry.get(None) else {
         return Ok(Value::Array(vec![]));

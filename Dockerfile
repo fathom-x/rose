@@ -4,14 +4,16 @@
 # Dockerfile: every base image is full-source-bootstrapped and pinned by digest, the
 # binaries are statically linked against musl, and the build is deterministic
 # (SOURCE_DATE_EPOCH, codegen-units=1, --build-id=none) so independent builders can
-# reproduce the image bit-for-bit. (That requires the vendored i18n-embed-fl patch -
-# see [patch.crates-io] in Cargo.toml and the project docs "Gotchas".)
+# reproduce the image bit-for-bit. (Until `age` 0.12 that also required a vendored
+# i18n-embed-fl patch; age now depends on i18n-embed-fl 0.10, which carries the fix, so the
+# tree has no [patch.crates-io] entries at all.)
 #
 #   docker build -t zecd .                      # runtime image (zecd)
 #   docker build --target export -o ./out .     # extract the static binaries
 #
-# Dependencies are released librustzcash crates from crates.io (versions pinned by the
-# committed Cargo.lock), so the build needs network access to fetch them.
+# Dependencies are released crates from crates.io - the Zakura Common `zakura-*` forks of
+# librustzcash plus the upstream crates they leave in place (versions pinned by the committed
+# Cargo.lock), so the build needs network access to fetch them.
 
 FROM stagex/pallet-rust:1.91.1@sha256:4062550919db682ebaeea07661551b5b89b3921e3f3a2b0bc665ddea7f6af1ca AS pallet-rust
 # protoc (+ the abseil it links) is needed by zcash_client_backend's build script.

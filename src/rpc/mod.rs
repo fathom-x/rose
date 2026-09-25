@@ -92,9 +92,11 @@ pub const ALL_METHODS: &[&str] = &[
     "z_getoperationstatus",
     "z_getoperationresult",
     "z_listoperationids",
+    "z_validateaddress",
     "z_waitforoperation",
     // Wallet - address derivation (zcashd-style)
     "z_getaddressforaccount",
+    "z_listunifiedreceivers",
 ];
 
 /// Whether `name` is an RPC method zecd implements (see [`ALL_METHODS`]).
@@ -181,9 +183,11 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("z_getoperationstatus", 1),
     ("z_getoperationresult", 1),
     ("z_listoperationids", 1),
+    ("z_validateaddress", 1),
     ("z_waitforoperation", 2),
     // Wallet - address derivation (zcashd-style)
     ("z_getaddressforaccount", 3),
+    ("z_listunifiedreceivers", 1),
 ];
 
 /// Which coins a method serves.
@@ -202,9 +206,9 @@ enum MethodCoins {
 /// The coins that serve each dispatched method.
 ///
 /// Four tiers. `All` marks the wallet-independent shell (control methods and the registry
-/// list), which no engine is involved in serving. The nine `z_*` methods are Zcash-only by
-/// nature (shielded sends, the shielding/merge sweeps, the async-operation trio, zcashd's
-/// account address derivation). `BITCOIN_ONLY` holds the Core methods only the BDK engine
+/// list), which no engine is involved in serving. The ten `z_*` methods are Zcash-only by
+/// nature (shielded sends, the shielding/merge sweeps, the async-operation trio, address
+/// validation, zcashd's account address derivation). `BITCOIN_ONLY` holds the Core methods only the BDK engine
 /// serves (`listdescriptors`, a descriptor-wallet method; `abandontransaction`, whose
 /// release-the-inputs semantics the Zcash engine has no counterpart for - a shielded send
 /// expires on its own; `bumpfee`, BIP 125 replacement, which shielded transactions have no
@@ -310,9 +314,11 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("z_getoperationstatus", MethodCoins::Only(ZCASH_ONLY)),
     ("z_getoperationresult", MethodCoins::Only(ZCASH_ONLY)),
     ("z_listoperationids", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_validateaddress", MethodCoins::Only(ZCASH_ONLY)),
     ("z_waitforoperation", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - address derivation (zcashd-style)
     ("z_getaddressforaccount", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_listunifiedreceivers", MethodCoins::Only(ZCASH_ONLY)),
 ];
 
 /// The methods `METHOD_COINS` lists as served for Bitcoin wallets - the gate's half of the
@@ -397,6 +403,33 @@ pub(crate) async fn dispatch(
     dispatch_zecd(state, wallet, req).await
 }
 
+/// Run a synchronous handler without holding a runtime worker hostage.
+///
+/// Most read RPCs are plain functions that open a SQLite connection and query it, called inline
+/// from this async dispatcher. On a small wallet that is invisible. On a large one a single
+/// `getwalletinfo` or `listtransactions` is hundreds of milliseconds to seconds of blocking
+/// work, and `[rpc] work_queue` admits a hundred requests at once against a worker pool sized
+/// to the core count - so a monitoring poll with any concurrency can occupy every worker and
+/// starve everything else on the runtime, including the health server, whose handlers do no
+/// I/O at all and are only waiting to be polled. That shows up as `/status` and `/readyz`
+/// timing out for minutes while `/healthz`, which needs no work, keeps answering.
+///
+/// `block_in_place` hands this worker's remaining tasks to a replacement thread for the
+/// duration, so the rest of the runtime keeps running; the `work_queue` permit still bounds how
+/// many of these can be in flight.
+///
+/// It panics on a current-thread runtime, which is not this binary (`#[tokio::main]` builds the
+/// multi-thread scheduler) but may be an embedder's, and is every `#[tokio::test]` by default.
+/// So the flavor is checked and the work runs inline when there is no worker to release -
+/// nothing is lost there, since a current-thread runtime has no other worker to starve.
+#[cfg(feature = "zcash")]
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// zecd's method table.
 async fn dispatch_zecd(
     state: &AppState,
@@ -427,15 +460,15 @@ async fn dispatch_zecd(
 
         // Blockchain
         #[cfg(feature = "zcash")]
-        "getblockchaininfo" => blockchain::getblockchaininfo(state, wallet),
+        "getblockchaininfo" => blocking(|| blockchain::getblockchaininfo(state, wallet)),
         #[cfg(feature = "zcash")]
         "getblockcount" => blockchain::getblockcount(state, wallet),
         #[cfg(feature = "zcash")]
         "getbestblockhash" => blockchain::getbestblockhash(state, wallet),
         #[cfg(feature = "zcash")]
-        "getblockhash" => blockchain::getblockhash(state, wallet, req),
+        "getblockhash" => blocking(|| blockchain::getblockhash(state, wallet, req)),
         #[cfg(feature = "zcash")]
-        "getblockheader" => blockchain::getblockheader(state, wallet, req),
+        "getblockheader" => blocking(|| blockchain::getblockheader(state, wallet, req)),
         #[cfg(feature = "zcash")]
         "waitfornewblock" => blockchain::waitfornewblock(state, wallet, req).await,
         #[cfg(feature = "zcash")]
@@ -447,7 +480,7 @@ async fn dispatch_zecd(
 
         // Utility
         #[cfg(feature = "zcash")]
-        "validateaddress" => util::validateaddress(state, wallet, req),
+        "validateaddress" => blocking(|| util::validateaddress(state, wallet, req)),
         #[cfg(feature = "zcash")]
         "signmessage" => signmessage::signmessage(state, wallet, req).await,
         #[cfg(feature = "zcash")]
@@ -457,7 +490,7 @@ async fn dispatch_zecd(
         "estimatefee" => util::estimatefee(req),
         "getmempoolinfo" => util::getmempoolinfo(),
 
-        // Raw transactions (served via the wallet's lightwalletd connection)
+        // Raw transactions (served via the wallet's chain upstream connection)
         #[cfg(feature = "zcash")]
         "getrawtransaction" => rawtx::getrawtransaction(state, wallet, req).await,
         #[cfg(feature = "zcash")]
@@ -465,29 +498,35 @@ async fn dispatch_zecd(
 
         // Wallet - reads
         #[cfg(feature = "zcash")]
-        "getbalance" => wallet_methods::getbalance(state, wallet, req),
+        "getbalance" => blocking(|| wallet_methods::getbalance(state, wallet, req)),
         #[cfg(feature = "zcash")]
-        "getbalances" => wallet_methods::getbalances(state, wallet),
+        "getbalances" => blocking(|| wallet_methods::getbalances(state, wallet)),
         #[cfg(feature = "zcash")]
-        "getunconfirmedbalance" => wallet_methods::getunconfirmedbalance(state, wallet),
+        "getunconfirmedbalance" => {
+            blocking(|| wallet_methods::getunconfirmedbalance(state, wallet))
+        }
         #[cfg(feature = "zcash")]
-        "getwalletinfo" => wallet_methods::getwalletinfo(state, wallet),
+        "getwalletinfo" => blocking(|| wallet_methods::getwalletinfo(state, wallet)),
         #[cfg(feature = "zcash")]
-        "getaddressinfo" => wallet_methods::getaddressinfo(state, wallet, req),
+        "getaddressinfo" => blocking(|| wallet_methods::getaddressinfo(state, wallet, req)),
         #[cfg(feature = "zcash")]
-        "listtransactions" => wallet_methods::listtransactions(state, wallet, req),
+        "listtransactions" => blocking(|| wallet_methods::listtransactions(state, wallet, req)),
         #[cfg(feature = "zcash")]
-        "z_listtransactions" => wallet_methods::z_listtransactions(state, wallet, req),
+        "z_listtransactions" => blocking(|| wallet_methods::z_listtransactions(state, wallet, req)),
         #[cfg(feature = "zcash")]
-        "listsinceblock" => wallet_methods::listsinceblock(state, wallet, req),
+        "listsinceblock" => blocking(|| wallet_methods::listsinceblock(state, wallet, req)),
         #[cfg(feature = "zcash")]
         "gettransaction" => wallet_methods::gettransaction(state, wallet, req).await,
         #[cfg(feature = "zcash")]
-        "listunspent" => wallet_methods::listunspent(state, wallet, req),
+        "listunspent" => blocking(|| wallet_methods::listunspent(state, wallet, req)),
         #[cfg(feature = "zcash")]
-        "getreceivedbyaddress" => wallet_methods::getreceivedbyaddress(state, wallet, req),
+        "getreceivedbyaddress" => {
+            blocking(|| wallet_methods::getreceivedbyaddress(state, wallet, req))
+        }
         #[cfg(feature = "zcash")]
-        "listreceivedbyaddress" => wallet_methods::listreceivedbyaddress(state, wallet, req),
+        "listreceivedbyaddress" => {
+            blocking(|| wallet_methods::listreceivedbyaddress(state, wallet, req))
+        }
         "listwallets" => control::listwallets(state),
         "listwalletdir" => control::listwalletdir(state),
 
@@ -510,7 +549,7 @@ async fn dispatch_zecd(
 
         // Wallet - async operations (zcashd-style; the send itself runs on a background task)
         #[cfg(feature = "zcash")]
-        "z_sendmany" => wallet_methods::z_sendmany(state, wallet, req),
+        "z_sendmany" => blocking(|| wallet_methods::z_sendmany(state, wallet, req)),
         #[cfg(feature = "zcash")]
         "z_shieldcoinbase" => wallet_methods::z_shieldcoinbase(state, wallet, req).await,
         #[cfg(feature = "zcash")]
@@ -522,12 +561,18 @@ async fn dispatch_zecd(
         #[cfg(feature = "zcash")]
         "z_listoperationids" => wallet_methods::z_listoperationids(state, wallet, req),
         #[cfg(feature = "zcash")]
+        "z_validateaddress" => blocking(|| wallet_methods::z_validateaddress(state, wallet, req)),
+        #[cfg(feature = "zcash")]
         "z_waitforoperation" => wallet_methods::z_waitforoperation(state, wallet, req).await,
 
         // Wallet - address derivation (zcashd-style; exact-or-next diversified UA)
         #[cfg(feature = "zcash")]
         "z_getaddressforaccount" => {
             wallet_methods::z_getaddressforaccount(state, wallet, req).await
+        }
+        #[cfg(feature = "zcash")]
+        "z_listunifiedreceivers" => {
+            blocking(|| wallet_methods::z_listunifiedreceivers(state, wallet, req))
         }
 
         // Bitcoin-only, served by `btc_methods` above; for every other *loaded* wallet the
@@ -624,6 +669,30 @@ mod tests {
             declared.len(),
             "ALL_METHODS contains duplicate method names"
         );
+    }
+
+    /// [`super::blocking`] must run the work on both runtime flavors: releasing the worker on
+    /// a multi-thread runtime, and running inline on a current-thread one rather than panicking
+    /// (`block_in_place` does panic there, and an embedder is free to use one - as is every
+    /// `#[tokio::test]` that does not ask for a multi-thread runtime, including most of this
+    /// crate's).
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn blocking_runs_the_work_on_either_runtime_flavor() {
+        let current = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(current.block_on(async { super::blocking(|| 7) }), 7);
+
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        assert_eq!(multi.block_on(async { super::blocking(|| 7) }), 7);
+
+        // And outside a runtime altogether, which is where a synchronous caller of the library
+        // would land.
+        assert_eq!(super::blocking(|| 7), 7);
     }
 
     /// The arity table must name exactly the methods in `ALL_METHODS` - no gaps (an unlisted

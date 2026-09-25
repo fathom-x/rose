@@ -52,20 +52,23 @@ Funds are recoverable from **the mnemonic alone**. Everything else is convenienc
 | `identity.txt` (age identity) | `[keys] age_identity`, default `<datadir>/identity.txt` | Decrypts `keys.toml`. **This is spend authority** - store the backup separately from `keys.toml` backups. |
 | Birthday height | inside `keys.toml`; also worth recording with the mnemonic | Makes a from-seed restore fast. Any height at/before the wallet's first transaction works. |
 
-The SQLite databases (`data.sqlite`, `blocks/`) are caches derived from the chain; they do not
+The SQLite database (`data.sqlite`) is a cache derived from the chain; it does not
 need backup. zecd is **stateless** - it keeps no off-chain data the seed can't rebuild (there is
 no label store), so the whole data directory is disposable: with the mnemonic (and birthday) you
 can recreate everything via `zecd init --restore`.
 
 > **One exception, and only with the experimental fleet enabled.** `[fleet] enabled = true` adds
-> a manifest directory (`wallets.d/` by default) holding one file per watched wallet, each
+> a manifest directory (`<datadir>/fleet/zec/wallets.d/` by default) holding one file per
+> watched wallet, each
 > carrying a **viewing key that exists nowhere else in zecd**. It is operator-supplied key
 > material in the same class as `keys.toml`, not a cache - nothing on the chain can rebuild it -
 > and unlike `keys.toml` it is *written at runtime*, every time `createwallet` onboards a wallet.
 > So with a fleet, "the whole data directory is disposable" is no longer true: back up
-> `wallets.d/` on the same footing as `keys.toml`, and back it up continuously rather than once.
+> that directory on the same footing as `keys.toml`, and back it up continuously rather than
+> once.
 > Losing it means those wallets silently stop being watched, with nothing in the daemon to say
-> which ones went missing. The shard databases under `fleet/` *are* ordinary caches, rebuilt from
+> which ones went missing. The shard databases under `fleet/zec/shards/` *are* ordinary caches,
+> rebuilt from
 > the manifests plus the chain. If the viewing keys also live in a system upstream of zecd (the
 > usual arrangement for a service that watches keys on someone's behalf), that system is your
 > real backup and the manifest directory can be regenerated from it - but nothing in zecd
@@ -83,22 +86,37 @@ A running wallet's data directory holds the daemon-level files (`zecd.toml`, `.l
   zecd.toml  .lock  .cookie  identity.txt
   default/
     keys.toml
-    zec/lrz/    data.sqlite  blockmeta.sqlite  blocks/
+    zec/lrz/    data.sqlite
+  fleet/                                  # experimental fleet only
+    zec/
+      wallets.d/  <name>.toml
+      shards/     shard-0000/lrz/  ...
 ```
+
+The fleet is one subtree, and inside it everything is coin-scoped: a manifest holds a UFVK,
+which - unlike the mnemonic in `keys.toml` - serves exactly one currency, and which shard a
+wallet lands in is decided by its birthday, a height on one chain. The fleet is the outer unit
+and the coin sits inside it, the same shape as `<datadir>/<wallet>/<coin>/`.
+
+Because a wallet's directory is `<datadir>/<name>`, the name `fleet` is effectively reserved: a
+`[wallets.fleet]` entry would resolve to the fleet's own tree, and zecd refuses to start rather
+than let two owners share it (a warning from `zecd config check` while `[fleet] enabled` is
+false, an error once it is true).
 
 | Path | Role | Ship it? |
 |---|---|---|
 | `<dir>/keys.toml` | **Secret** - encrypted seed + birthday/network. Shared by every coin the wallet serves, which is why it sits above the per-coin directories. | Yes - mount as a Secret (relocate with `keys_file` / `ZECD_KEYS_FILE`). |
 | `identity.txt` | **Secret** - decrypts the seed (spend authority). | Yes, if auto-unlocking - mount as a Secret (`ZECD_AGE_IDENTITY`). |
 | `<dir>/zec/lrz/data.sqlite` (+ `-wal`/`-shm`) | Wallet state: the account plus scan progress, balances, and tx history. A **cache** - rebuilt from `keys.toml` + a rescan when absent (see bootstrap below). | No (disposable). |
-| `<dir>/zec/lrz/blocks/` | **Cache** - downloaded compact blocks. **Never ship this** - it can grow large and is fully re-derivable. | No. |
+| `<dir>/zec/lrz/blocks/`, `blockmeta.sqlite` | **Legacy cache** - the on-disk compact-block cache of a zecd before the batch being scanned lived in memory. Dead weight if present; `zecd rescan` removes it. | No. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup and removed on clean shutdown. | No. |
-| `<datadir>/wallets.d/` | **Secret**, and only with the experimental `[fleet] enabled = true` - one manifest per watched wallet, each holding a viewing key held nowhere else. Written at runtime by `createwallet`. See the note above. | Yes - back up continuously. |
-| `<datadir>/fleet/` | **Cache** - the shard databases, rebuilt from `wallets.d/` plus the chain. Experimental fleet only. | No (disposable). |
+| `<datadir>/fleet/zec/wallets.d/` | **Secret**, and only with the experimental `[fleet] enabled = true` - one manifest per watched wallet, each holding a viewing key held nowhere else. Written at runtime by `createwallet`. See the note above. | Yes - back up continuously. |
+| `<datadir>/fleet/zec/shards/` | **Cache** - the shard databases (each under a `shard-NNNN/lrz/`), rebuilt from the sibling `wallets.d/` plus the chain. Experimental fleet only. | No (disposable). |
 
 For a cloud deployment: put `keys.toml` (and `identity.txt`, if used) in a read-only Secret
-and point `ZECD_KEYS_FILE` / `ZECD_AGE_IDENTITY` at the mount. `blocks/` is always disposable -
-excluding it from any image/volume snapshot is the single biggest space win.
+and point `ZECD_KEYS_FILE` / `ZECD_AGE_IDENTITY` at the mount. The batch of compact blocks
+being scanned lives in memory, so nothing under the engine directory but `data.sqlite` is ever
+worth a snapshot.
 
 > **Upgrading from a data directory without `zec/lrz/`.** Older zecd kept the databases at the
 > wallet root (`<datadir>/default/data.sqlite`). The first `zecd run` (or `zecd init` / `zecd
@@ -141,7 +159,7 @@ on the custody model:
   `zecd init --ufvk` against an empty datadir.
 
 To opt out (fail fast on an empty datadir instead of rebuilding), set `bootstrap_from_keys =
-false`. Either way `blocks/` is always discardable.
+false`.
 
 ### Secret inputs without baking them into the config
 
@@ -221,7 +239,14 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
   reports done. While it drains, `conn_state` stays `syncing`, `getwalletinfo.scanning` and
   `getblockchaininfo.initialblockdownload` stay truthy, and `synced` readiness stays 503
   (`reason=enhancing`). Watch `pending_enhancements` trend to zero; if zebra's
-  `getrawtransaction` is slow, confirm its transaction index is enabled.
+  `getrawtransaction` is slow, confirm its transaction index is enabled. A deployment that
+  never reads memos (crediting deposits by address) can skip most of this drain with
+  `[sync] fetch_memos = false` and reach ready at scan-tip. Memos are all it costs - the
+  transactions the wallet spent in are still fetched, so its own sends keep their recipients
+  and fees, and every other RPC is unchanged - but memos are then withheld everywhere
+  (`memo`/`memoStr` omitted, `enhanced_through` null, `getwalletinfo.fetch_memos: false`), so
+  a memo-based deposit flow must keep it on. Reversible: setting it back to `true` backfills
+  the memos with no rescan.
 - `locked` (top-level on both `/readyz` and `/status`, plus per-wallet `locked`/`encrypted`)
  - `true` when a passphrase-encrypted wallet is synced and serving reads but still needs a
   `walletpassphrase` before it can spend. It is reported independently of readiness (a locked
@@ -282,10 +307,16 @@ work-queue 503s; daemon restarts.
 ## Reorgs
 
 zecd follows chain reorgs automatically: the scanner detects the fork via a block-hash
-continuity error, rewinds the wallet ~10 blocks below it, and rescans the replacement
-chain. Transactions in reorged-away blocks revert to unconfirmed (`confirmations: 0`)
-until re-mined - confirmation thresholds keep doing their job. Operator-visible
-consequences:
+continuity error, rewinds the wallet below it, and rescans the replacement chain. The first
+rewind goes 10 blocks below the break. That is all an ordinary reorg needs, but the wallet
+only learns of a fork one block at a time, at its own tip - it is never told how deep the
+disagreement goes - so if the replacement chain still disagrees, the next rewind goes twice as
+far, and so on until the scan comes back clean, at which point the distance resets to 10. A
+deep rollback therefore costs a handful of round trips rather than one per ten blocks: an
+1,835-block rollback takes about eight, where a fixed step took 62 and roughly ten minutes.
+
+Transactions in reorged-away blocks revert to unconfirmed (`confirmations: 0`) until re-mined -
+confirmation thresholds keep doing their job. Operator-visible consequences:
 
 - **A `listsinceblock` cursor pointing at a reorged-away block returns `-5 Block not
   found`** (zecd keeps no stale-header history to walk back through, unlike bitcoind).
@@ -325,13 +356,39 @@ zecd diagnoses the two known causes and says so in the log:
   # start the daemon again
   ```
 
-  `rescan` deletes only the wallet database and block cache; `keys.toml` (seed, network,
+  `rescan` deletes only the wallet database (and a legacy on-disk block cache, if one is
+  present); `keys.toml` (seed, network,
   birthday, UFVK pin) is kept, so the next start rebuilds the account from the seed and rescans
   from the wallet birthday - all funds and history are re-derived from the chain (zecd persists
   nothing a from-seed restore couldn't rebuild). Budget the same sync time as a server restore;
   `/readyz` stays 503 until it catches up. For an encrypted wallet the rebuild starts at the
   first `walletpassphrase`; a watch-only wallet has no seed to rebuild from - recreate it with
   `zecd init --ufvk` instead.
+
+## Shutdown and the send drain
+
+`z_sendmany` returns an opid immediately and does the proving on a background task. A stop
+signal arriving in that window used to discard the send: nothing had been broadcast, so no funds
+were at risk, but the record of whether it happened was lost - on exactly the restart boundary
+where the in-memory operation registry makes that hardest to reconstruct.
+
+On shutdown the wallet now finishes what it has already accepted, bounded by `[spend]
+shutdown_drain_secs` (default 60). Set it **below your supervisor's own stop timeout**, because
+that is what actually bounds it:
+
+| supervisor | default grace period | setting to raise |
+|---|---|---|
+| `docker stop` | 10s | `--time`, or compose's `stop_grace_period` |
+| Kubernetes | 30s | `terminationGracePeriodSeconds` |
+| systemd | 90s | `TimeoutStopSec` |
+
+Killed mid-drain nothing is corrupted - a send that had not been stored is simply lost, as it
+was before the drain existed - but the guarantee is silently gone, so raise the supervisor's
+timeout to match or lower `shutdown_drain_secs`. `zecd config check` warns when the value
+exceeds every common default. `0` disables the drain.
+
+Operation status objects are in-memory and do not survive the restart either way; reconcile by
+txid (`gettransaction`), not by opid.
 
 ## Upgrades
 
@@ -360,7 +417,8 @@ zecd diagnoses the two known causes and says so in the log:
    pin it: `./zecd-old config show --conf /etc/zecd/zecd.toml > effective.toml` renders the
    current settings as TOML you can adopt as the config file, with the values now explicit
    rather than inherited. Re-add the credential lines by hand - they are redacted, deliberately.
-2. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503.
+2. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503, and the
+   wallet finishes any send it had already accepted (see **Shutdown and the send drain**).
 3. Replace the binary / pull the new image.
 4. Start. Wallet DB migrations run automatically at open; the first start after a big
    librustzcash bump can take longer.

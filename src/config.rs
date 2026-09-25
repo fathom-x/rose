@@ -8,6 +8,10 @@ use std::net::IpAddr;
 #[cfg(feature = "zcash")]
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "zcash")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "zcash")]
+use std::sync::Arc;
 
 use anyhow::Context;
 #[cfg(feature = "cli")]
@@ -20,6 +24,7 @@ use crate::coin::{Coin, CoinNetwork};
 use crate::network::ZNetwork;
 #[cfg(feature = "zcash")]
 use crate::pools::{Receiver, ReceiverSet};
+use crate::secret::Password;
 
 /// Default chain upstream: a local zebrad's JSON-RPC ("full mode"). Public keeps the bare
 /// `zebra` shorthand as the default rather than spelling the authority out; `backend::resolve`
@@ -49,20 +54,110 @@ pub fn wallet_dir(datadir: &Path, name: &str) -> PathBuf {
     datadir.join(name)
 }
 
-/// Where `coin`'s state lives inside a wallet directory: `<wallet dir>/zec` for Zcash
-/// ([`Coin::data_dir`]).
+/// Where `coin`'s state lives inside `parent`: `<parent>/zec` for Zcash ([`Coin::data_dir`]).
 ///
-/// The seed in `keys.toml` serves every coin, so the coin sits *inside* the wallet rather than
-/// above it: one wallet, one seed, one subdirectory per coin underneath.
-pub fn coin_dir(wallet_dir: &Path, coin: Coin) -> PathBuf {
-    wallet_dir.join(coin.data_dir())
+/// `parent` is a wallet directory for a configured wallet, and the fleet root ([`fleet_root`])
+/// for the fleet. Either way the coin sits one level inside the unit that owns it, never above
+/// it: a wallet's `keys.toml` wraps a BIP-39 seed that serves every coin and so must sit above
+/// the per-coin directories, and the fleet keeps the same shape for a different reason - see
+/// [`fleet_root`].
+pub fn coin_dir(parent: &Path, coin: Coin) -> PathBuf {
+    parent.join(coin.data_dir())
+}
+
+/// The fleet's root: `<datadir>/fleet`, holding one coin directory
+/// ([`fleet_coin_dir`]) and nothing else.
+///
+/// The fleet is the outer unit and the coin sits inside it, mirroring
+/// `<datadir>/<wallet>/<coin>/` - so a datadir's top level is a list of *units* (wallets, plus
+/// the fleet) rather than a mix of units and currencies. That ordering also keeps the reserved
+/// names down to one: `wallet_dir` is `datadir.join(name)`, so anything zecd puts at the datadir
+/// root is a name a `[wallets.<name>]` entry could claim. One reserved `fleet` is checkable
+/// ([`fleet_path_conflict`]); a reserved name per coin token would mean a wallet called `zec`
+/// silently sharing a directory with the fleet.
+///
+/// Everything below is coin-scoped for the fleet's own reasons - see [`fleet_manifest_dir`] and
+/// [`fleet_dir`].
+pub fn fleet_root(datadir: &Path) -> PathBuf {
+    datadir.join(DEFAULT_FLEET_ROOT)
+}
+
+/// Where `coin`'s fleet state lives: `<datadir>/fleet/zec` for Zcash.
+pub fn fleet_coin_dir(datadir: &Path, coin: Coin) -> PathBuf {
+    coin_dir(&fleet_root(datadir), coin)
+}
+
+/// Where the fleet's wallet manifests live by default: `<datadir>/fleet/zec/wallets.d`.
+///
+/// Coin-scoped, unlike `keys.toml`, because a manifest holds a **UFVK** and a UFVK is not the
+/// cross-coin secret a mnemonic is: "unified" there means unified across Zcash's shielded pools,
+/// not across currencies, and no other coin's viewing key can be derived from one. A second coin
+/// therefore gets a sibling manifest directory with its own wallets, not a share of this one.
+///
+/// It is named under the fleet rather than beside it because `<datadir>/<wallet>/` directories
+/// are wallets too: at the datadir root, `wallets.d` would read as zecd's wallets in general
+/// rather than the fleet's.
+///
+/// A `[fleet] manifest_dir` override replaces this outright, exactly as `[wallets.<name>] dir`
+/// does for a wallet.
+pub fn fleet_manifest_dir(datadir: &Path, coin: Coin) -> PathBuf {
+    fleet_coin_dir(datadir, coin).join(DEFAULT_FLEET_MANIFEST_DIR)
+}
+
+/// Where the fleet's shard databases live by default: `<datadir>/fleet/zec/shards`, holding one
+/// `shard-NNNN/` directory per shard.
+///
+/// The coin sits **above** the shard index rather than below it. A shard is a scan domain, and
+/// which shard a wallet lands in is decided by its birthday - a block height on one chain - so
+/// `shard-0000` is a per-coin membership decision. Nesting the coin inside the shard would claim
+/// that shard numbering means the same thing on every chain, which it cannot.
+///
+/// The `shards` level of its own keeps that numbered namespace clean:
+/// [`crate::fleet::existing_shard_dirs`] enumerates `shard-NNNN` by pattern from index 0, so the
+/// series must not share a parent with a named directory like `wallets.d`.
+pub fn fleet_dir(datadir: &Path, coin: Coin) -> PathBuf {
+    fleet_coin_dir(datadir, coin).join(DEFAULT_FLEET_SHARD_DIR)
+}
+
+/// Where a shard's engine files live: `<shard dir>/lrz` for Zcash ([`Coin::engine_dir`]).
+///
+/// The coin level is already above the shards directory ([`fleet_dir`]), so a shard directory
+/// takes only the engine level - which it takes for the same reason a wallet does: what
+/// librustzcash owns stays separable from zecd's own shard-index namespace, so replacing the
+/// storage library is a sibling directory and a rescan.
+pub fn shard_engine_dir(shard_dir: &Path, coin: Coin) -> PathBuf {
+    shard_dir.join(coin.engine_dir())
+}
+
+/// The first wallet whose directory overlaps one of the fleet's, with the two paths.
+///
+/// `wallet_dir` is `datadir.join(name)`, so a wallet named after anything zecd puts at the
+/// datadir root claims that path - a wallet called `fleet` resolves to [`fleet_root`] itself.
+/// Nothing would be *overwritten* (the fleet's files sit deeper), but one directory would hold
+/// two owners' state, `zecd rescan` on that wallet would delete through it, and a backup scoped
+/// to the wallet would silently carry viewing keys. An explicit `[wallets.<name>] dir` or a
+/// `[fleet]` override can produce the same overlap from either side, so the test is containment
+/// in both directions rather than a reserved-name list.
+#[cfg(feature = "zcash")]
+pub fn fleet_path_conflict(
+    wallets: &BTreeMap<String, WalletEntry>,
+    fleet: &FleetConfig,
+) -> Option<(String, PathBuf, PathBuf)> {
+    for (name, entry) in wallets {
+        for fleet_path in [&fleet.manifest_dir, &fleet.dir] {
+            if fleet_path.starts_with(&entry.dir) || entry.dir.starts_with(fleet_path) {
+                return Some((name.clone(), entry.dir.clone(), fleet_path.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// Where the wallet-storage engine's own files live: `<wallet dir>/zec/lrz` for Zcash, holding
-/// everything librustzcash owns - `data.sqlite`, `blockmeta.sqlite`, `blocks/`
-/// ([`Coin::engine_dir`]).
+/// everything librustzcash owns - `data.sqlite`, plus the `blockmeta.sqlite` and `blocks/` an
+/// older zecd's on-disk block cache left behind ([`Coin::engine_dir`]).
 ///
-/// Nothing outside these three functions and [`crate::migrate`] should join a coin or engine
+/// Nothing outside these functions and [`crate::migrate`] should join a coin or engine
 /// directory name onto a path: callers take a wallet directory from [`WalletEntry::dir`] and an
 /// engine directory from [`WalletEntry::engine_dir`].
 pub fn engine_dir(wallet_dir: &Path, coin: Coin) -> PathBuf {
@@ -116,10 +211,10 @@ fn select_server_token(cli_server: Option<String>, file_server: Option<String>) 
 /// Read a single secret (e.g. the RPC password) from a file, trimming a trailing newline/CR
 /// (the common `echo "secret" > file` gotcha) but preserving any other surrounding whitespace.
 /// Used for `[rpc] password_file` so the secret can live in a mounted Secret, not the TOML.
-fn read_secret_file(path: &std::path::Path) -> anyhow::Result<String> {
+fn read_secret_file(path: &std::path::Path) -> anyhow::Result<Password> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading secret file {}", path.display()))?;
-    Ok(raw.trim_end_matches(['\n', '\r']).to_string())
+    Ok(Password::new(raw.trim_end_matches(['\n', '\r'])))
 }
 
 #[derive(Debug, Clone)]
@@ -162,10 +257,12 @@ pub struct AppConfig {
     pub fleet: FleetConfig,
 }
 
-/// Where the fleet's wallet manifests live, relative to the datadir.
+/// The fleet's root directory, relative to the datadir ([`fleet_root`]).
+pub const DEFAULT_FLEET_ROOT: &str = "fleet";
+/// The fleet's manifest directory, relative to its coin directory ([`fleet_manifest_dir`]).
 pub const DEFAULT_FLEET_MANIFEST_DIR: &str = "wallets.d";
-/// Where the fleet's shard databases live, relative to the datadir.
-pub const DEFAULT_FLEET_DIR: &str = "fleet";
+/// The fleet's shard-database directory, relative to its coin directory ([`fleet_dir`]).
+pub const DEFAULT_FLEET_SHARD_DIR: &str = "shards";
 /// Accounts per shard database.
 ///
 /// Sharding buys nothing in trial-decryption cost - that is the sum over viewing keys however
@@ -205,9 +302,20 @@ pub struct FleetConfig {
     /// datadir should not enrol a daemon into it.
     pub enabled: bool,
     /// Directory of per-wallet manifests, one small TOML each (absolute after resolution).
+    ///
+    /// Defaults to [`fleet_manifest_dir`] - under the fleet's own *coin* directory, since a
+    /// manifest holds a coin-specific viewing key.
     pub manifest_dir: PathBuf,
-    /// Directory holding the shard databases (absolute after resolution).
+    /// Directory holding the `shard-NNNN/` databases (absolute after resolution).
+    ///
+    /// Defaults to [`fleet_dir`], the sibling of the manifest directory under the same coin.
     pub dir: PathBuf,
+    /// The coin this fleet's wallets are watched on.
+    ///
+    /// Not a config key (nothing in `zecd.toml` selects it and `config show` renders nothing for
+    /// it), exactly like [`WalletEntry::coin`]: it is carried so the shard directories can be
+    /// laid out without the fleet code naming a currency itself.
+    pub coin: Coin,
     /// Accounts per shard - see [`DEFAULT_FLEET_SHARD_SIZE`].
     pub shard_size: usize,
     /// Cohort depth for placement - see [`DEFAULT_FLEET_COHORT_DEPTH`].
@@ -219,22 +327,29 @@ impl Default for FleetConfig {
     fn default() -> Self {
         FleetConfig {
             enabled: false,
-            manifest_dir: PathBuf::from(DEFAULT_FLEET_MANIFEST_DIR),
-            dir: PathBuf::from(DEFAULT_FLEET_DIR),
+            manifest_dir: fleet_manifest_dir(Path::new(""), Coin::Zcash),
+            dir: fleet_dir(Path::new(""), Coin::Zcash),
+            coin: Coin::Zcash,
             shard_size: DEFAULT_FLEET_SHARD_SIZE,
             cohort_depth: DEFAULT_FLEET_COHORT_DEPTH,
         }
     }
 }
 
-/// `[pools]` - the wallet's shielded pool configuration: which pools are enabled and which
-/// receivers the Unified Addresses it hands out include by default. A default receiver may never
-/// name a pool that isn't enabled (validated at startup). Per-wallet `[wallets.<name>]` entries
-/// can override either field; this is the global default.
+/// `[pools]` - the wallet's shielded **receiver** configuration: which receivers its addresses
+/// may carry, and which of those the Unified Addresses it hands out include by default. A default
+/// receiver may never name one that isn't enabled (validated at startup). Per-wallet
+/// `[wallets.<name>]` entries can override either field; this is the global default.
+///
+/// Both fields name receivers rather than value pools, so this list is shorter than the set of
+/// pools zecd reports funds in: ironwood has no receiver of its own (see `crate::pools`).
 #[cfg(feature = "zcash")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolsConfig {
-    /// Shielded pools the wallet receives into and spends from.
+    /// The shielded receivers the wallet may hand out, and so the pools it receives into. Also
+    /// picks the pool change is sent to (the strongest of them). It does **not** restrict
+    /// spending: a send draws on every pool the wallet holds notes in, ironwood and any
+    /// pool whose receiver is absent here included.
     pub enabled: ReceiverSet,
     /// Receivers included in the UAs handed out by `getnewaddress` when no per-call override is
     /// given. Always a subset of `enabled`.
@@ -945,7 +1060,7 @@ impl Default for MempoolConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ZebraConfig {
     pub rpc_user: Option<String>,
-    pub rpc_password: Option<String>,
+    pub rpc_password: Option<Password>,
     pub rpc_cookie: Option<PathBuf>,
 }
 
@@ -966,7 +1081,7 @@ pub struct RpcConfig {
     pub bind: IpAddr,
     pub port: u16,
     pub user: Option<String>,
-    pub password: Option<String>,
+    pub password: Option<Password>,
     /// Bitcoin-Core-style `rpcauth` entries (`<user>:<salt>$<hmac-sha256 hex>`), each an
     /// additional accepted credential; generate them with `zecd rpcauth <user> [password]`.
     pub auth: Vec<String>,
@@ -1040,7 +1155,96 @@ pub struct SyncConfig {
     pub interval_secs: u64,
     /// How often (at most) to re-broadcast wallet txs that are unmined and unexpired.
     pub rebroadcast_secs: u64,
+    /// Whether this wallet recovers **memos**. Default `true`.
+    ///
+    /// Compact blocks carry the whole note plaintext except its memo, so recovering memos means
+    /// fetching each received transaction's full data and trial-decrypting it - one upstream
+    /// round trip per transaction, which on a from-seed restore is the multi-hour backlog that
+    /// keeps `/readyz` at 503 long after the block scan has reached the tip. An operator who
+    /// never reads memos (an exchange crediting deposits by address, or by transparent
+    /// receives) sets `fetch_memos = false` and the wallet is ready at scan-tip instead.
+    ///
+    /// **Memos are the only thing it costs.** The fetch is skipped only for transactions the
+    /// wallet did not spend in, where the memo is genuinely all it would have added
+    /// (`actor::request_in_scope`); a transaction the wallet spent in is still fetched, because
+    /// its outgoing records and its fee exist nowhere else. So balances, receives, the wallet's
+    /// own sends with their recipients and amounts, fees, transaction-status tracking, the
+    /// transparent address checks and `gettransaction.hex` are all exactly as they would be
+    /// with the setting on - and identical whether the wallet caught a transaction live or
+    /// recovered it in a restore.
+    ///
+    /// Memos are then withheld **uniformly**, not just where the fetch was skipped: the history
+    /// RPCs omit `memo`/`memoStr` outright (`read::load_outputs`), and `enhanced_through` - the
+    /// watermark that promises "memos at or below here are readable" - reports `None`. Without
+    /// that, a memo's presence would depend on whether the mempool path happened to store a
+    /// transaction before the block scan reached it, so the same wallet would answer
+    /// differently before and after a restore. `getwalletinfo` reports `fetch_memos: false`, so
+    /// a consumer asserts the wallet's kind rather than inferring it from absent memo fields.
+    ///
+    /// Reversible: the skipped requests stay queued in the wallet database, so flipping this
+    /// back on drains the backlog and backfills the memos with no rescan. NB a deployment whose
+    /// shielded deposit flow identifies depositors *by memo* must keep it on.
+    pub fetch_memos: bool,
+    /// How many blocks one download-and-scan batch covers. Default
+    /// [`DEFAULT_BATCH_SIZE`](DEFAULT_BATCH_SIZE) (10,000).
+    ///
+    /// Each batch pays a fixed cost - one tree-state round trip, one scan-range query, one
+    /// `put_blocks` database transaction - so a bigger batch amortizes it over more blocks.
+    /// Measured on a 238k-block testnet restore: 2,000-block batches scanned in 294 s, 10,000 in
+    /// 226 s, 25,000 in 198 s, 50,000 in 207 s - the curve flattens past 25,000 and the memory
+    /// held per batch keeps growing. The batch lives in memory (`sync::memcache`), and one more
+    /// is fetched ahead while it scans, so two batches of compact blocks are resident at once;
+    /// on mainnet's densest ranges that is hundreds of megabytes at 25,000. The default stays
+    /// at 10,000 for that reason; a server with memory to spare sets 25,000. Also bounds how far
+    /// a reorg rewind will grow ([`REORG_MAX_MARGIN`](crate::sync::engine::REORG_MAX_MARGIN)).
+    pub batch_size: u32,
+    /// The SQLite page-cache ceiling of each wallet's writer connection, in MiB. Default
+    /// [`DEFAULT_WRITER_CACHE_MIB`](DEFAULT_WRITER_CACHE_MIB) (256).
+    ///
+    /// The writer is the connection the sync loop scans through, and SQLite's own default of
+    /// 2 MiB made it re-read the note-commitment tree pages from the operating system on
+    /// nearly every block; 256 MiB took a deep testnet restore's scan from 178 s to 152 s. It
+    /// is a ceiling, not an allocation - a small wallet never reaches it - but a cache that has
+    /// grown is kept for the connection's lifetime, and every writer has its own: one per
+    /// configured wallet and one per fleet shard. So the daemon-wide figure to size against is
+    /// this value times the number of wallets and shards, which `config check` warns about
+    /// past 2 GiB. Lower it on a small host or a large fleet; raising it past the wallet's
+    /// database size buys nothing. Durability does not depend on it.
+    pub writer_cache_mib: u32,
+    /// How many transaction fetches the enhancement drain keeps in flight at once, which is
+    /// also how many requests one drain pass services. Default [`DEFAULT_ENHANCE_CONCURRENCY`]
+    /// (16).
+    ///
+    /// The drain that follows the block scan is one upstream round trip per transaction, and
+    /// serviced one at a time its throughput is `1 / latency` however fast the host or the
+    /// link - about 5 requests a second against a remote lightwalletd, against a backlog that
+    /// on a busy wallet is tens of thousands. The requests are independent, so they go
+    /// upstream together, this many at a time, and the pass's results are applied under one
+    /// database transaction. Measured on a 7,546-request drain against a rack-local
+    /// lightwalletd: 1 in flight took 1303 s, 16 took 194 s, 64 took 136 s, 256 took 105 s.
+    /// Against a full node each fetch is its own JSON-RPC call, and the zebra client caps those
+    /// at its own in-flight limit whatever this is set to. `config check` warns above 64: a
+    /// public lightwalletd may throttle a client that opens that many streams at once.
+    ///
+    /// Only the fetches are concurrent. The results are applied on the wallet's single writer,
+    /// one after another, so this is also how many stores the actor performs before it next
+    /// services a queued command - the pass-sized window in which a send or `getnewaddress`
+    /// waits. At the default it is the same 16-store window the sequential drain had; at 256
+    /// on a wallet whose stores have grown to hundreds of milliseconds each it is a minute.
+    pub enhance_concurrency: usize,
 }
+
+/// The default blocks per download-and-scan batch, and the value `[sync] batch_size`
+/// overrides. Kept as a named constant because `sync::engine::REORG_MAX_MARGIN` is defined in
+/// terms of it: a rewind never usefully goes further back than one batch would re-scan.
+pub const DEFAULT_BATCH_SIZE: u32 = 10_000;
+
+/// The default `[sync] writer_cache_mib`: the writer connection's SQLite page-cache ceiling.
+/// See `wallet::open` for how it was measured and what it does (and does not) trade.
+pub const DEFAULT_WRITER_CACHE_MIB: u32 = 256;
+
+/// The default `[sync] enhance_concurrency`.
+pub const DEFAULT_ENHANCE_CONCURRENCY: usize = 16;
 
 /// `[spend]` - the wallet-wide confirmations policy (ZIP 315 defaults, like Zallet's
 /// `trusted_confirmations`/`untrusted_confirmations`): how deep an output must be before
@@ -1067,16 +1271,41 @@ pub struct SpendConfig {
     pub trust_own_transactions: bool,
     /// What sends are allowed to reveal on-chain. Default `AllowRevealedRecipients`.
     pub privacy: SendPrivacy,
-    /// Cap on the number of Orchard actions (`max(orchard inputs, orchard outputs)`) a single
-    /// send may build, mirroring Zallet's `[builder.limits] orchard_actions` (default 50). It
+    /// Cap on the number of Orchard-family actions a single send may build, mirroring Zallet's
+    /// `[builder.limits] orchard_actions` (default 50).
+    ///
+    /// Counted **per bundle and summed** - what the prover will run. Within one bundle that is
+    /// `max(spends, outputs)`, but post-NU6.3 a send that spends legacy Orchard V2 notes into
+    /// Ironwood outputs builds two bundles whose actions add up, and a single family-wide
+    /// `max` would report the larger of the two rather than their total. It
     /// bounds memory/proving cost and gives a clean `-8` instead of a deep librustzcash error
     /// when a `z_sendmany` has too many recipients. `0` disables the cap. Default 50.
     pub orchard_action_limit: usize,
-    /// Build the Orchard proving key once at startup and prove sends through the PCZT roles,
-    /// instead of librustzcash's fused `create_proposed_transactions` path which rebuilds the
-    /// proving key (a full `keygen_vk`+`keygen_pk`) on *every* transaction. On by default;
-    /// set `cache_proving_key = false` to fall back to the fused path (e.g. for benchmarking
-    /// or if a PCZT issue is suspected). Both paths produce identical transactions.
+    /// Ceiling on the serialized size, in bytes, of a transaction a send may build. `0`
+    /// disables it. Default [`DEFAULT_MAX_TX_BYTES`].
+    ///
+    /// This is a *relay* bound, not a consensus one, and it is the binding one: consensus only
+    /// requires a transaction to fit in a block (2 MB), while a node forwards a much smaller
+    /// one. A transaction over what nodes relay is not rejected so much as never mined - after
+    /// the wallet has paid for its proof - so the ceiling is applied when the proposal is
+    /// built, before proving.
+    ///
+    /// It bounds bytes where `orchard_action_limit` bounds actions, and neither implies the
+    /// other: an Orchard-family action costs ~3.2 KB, so the shipped action cap of 50 sits
+    /// comfortably inside a 250 KB ceiling, while a post-NU6.3 send carrying both an Orchard
+    /// and an Ironwood bundle pays two proofs and reaches the ceiling sooner than its action
+    /// count suggests. Raise it only if every node between this wallet and a miner raises its
+    /// own policy to match - relay is hop by hop, so a locally raised limit gets a transaction
+    /// into one mempool and no further.
+    pub max_tx_bytes: usize,
+    /// Prove sends through the PCZT roles with the Orchard proving keys warmed in the background
+    /// at startup (and their prepared commitment tables armed), instead of the fused
+    /// `create_proposed_transactions` path. On the Zakura stack both paths share one
+    /// process-wide key set, so the fused path no longer rebuilds a key per transaction; what
+    /// `false` gives up is the startup warm-up (the first fused send builds the key inline),
+    /// the cached verifying key at the extract step, and `pipeline_proving`. On by default; set
+    /// `cache_proving_key = false` to fall back to the fused path (e.g. for benchmarking or if
+    /// a PCZT issue is suspected). Both paths produce identical transactions.
     pub cache_proving_key: bool,
     /// Run a send's proving step *off* the single-writer actor so it no longer freezes the
     /// background sync (and reads/status/mempool) for the whole proof - which, on a large,
@@ -1102,6 +1331,18 @@ pub struct SpendConfig {
     /// faucet-funded testnet wallet, high-frequency low-value sends) should lower this to
     /// roughly its own typical payment size.
     pub min_split_output_value: u64,
+    /// How long, in seconds, the wallet actor spends finishing sends it has already accepted
+    /// when shutdown is signalled, before dropping whatever is left (see
+    /// `actor::WalletActor::finish_accepted_sends`). Default 60.
+    ///
+    /// This has to fit **inside** whatever grace period the supervisor allows between its
+    /// stop signal and `SIGKILL`, and the common ones are shorter than this default: `docker
+    /// stop` kills after 10s and Kubernetes' `terminationGracePeriodSeconds` after 30s, where
+    /// systemd's `DefaultTimeoutStopSec` is 90s. Killed mid-drain nothing is corrupted - a send
+    /// that had not been stored is simply lost, exactly as before this drain existed - but the
+    /// guarantee it buys is silently gone, so raise the supervisor's timeout or lower this.
+    /// `0` disables the drain and restores the old drop-on-shutdown behaviour.
+    pub shutdown_drain_secs: u64,
 }
 
 #[cfg(feature = "zcash")]
@@ -1113,10 +1354,12 @@ impl Default for SpendConfig {
             trust_own_transactions: true,
             privacy: SendPrivacy::AllowRevealedRecipients,
             orchard_action_limit: DEFAULT_ORCHARD_ACTION_LIMIT,
+            max_tx_bytes: DEFAULT_MAX_TX_BYTES,
             cache_proving_key: true,
             pipeline_proving: false,
             target_note_count: DEFAULT_TARGET_NOTE_COUNT,
             min_split_output_value: DEFAULT_MIN_SPLIT_OUTPUT_VALUE,
+            shutdown_drain_secs: DEFAULT_SHUTDOWN_DRAIN_SECS,
         }
     }
 }
@@ -1145,14 +1388,223 @@ impl SpendConfig {
     }
 }
 
+/// The `[spend]` values a running daemon can change without a restart.
+///
+/// Everything else in the resolved config is copied into per-actor fields at startup and is
+/// immutable for the process's life. These are not, because an operator needs to change them
+/// *while* a wallet is stuck: the Orchard-action cap is the one a fragmented wallet hits, where
+/// every payout fails until the cap moves and the backlog grows while it does not. A mining
+/// pool ran into exactly that and had to restart a live payment wallet to get out.
+///
+/// The cap is a shared cell rather than a per-call RPC argument on purpose. It bounds what a
+/// single call can make the daemon prove - CPU linear in actions across every core, memory in
+/// witness data, and the wait every queued send inherits - and the changelog leans on it as a
+/// security property, citing it as bounding how long one proof can run while a decrypted seed
+/// is resident. A knob an RPC caller could raise would not be that bound. So the only channel
+/// that changes it is one requiring process-level authority: SIGHUP, which re-reads the config
+/// file. See `Node::reload_config`.
+#[cfg(feature = "zcash")]
+#[derive(Debug, Clone)]
+pub struct SpendLimits {
+    orchard_action_limit: Arc<AtomicUsize>,
+    max_tx_bytes: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "zcash")]
+impl SpendLimits {
+    pub fn new(spend: &SpendConfig) -> Self {
+        Self {
+            orchard_action_limit: Arc::new(AtomicUsize::new(spend.orchard_action_limit)),
+            max_tx_bytes: Arc::new(AtomicUsize::new(spend.max_tx_bytes)),
+        }
+    }
+
+    /// The cap in force right now. Read per send rather than cached, so a reload takes effect on
+    /// the next send instead of the next restart.
+    pub fn orchard_action_limit(&self) -> usize {
+        self.orchard_action_limit.load(Ordering::Relaxed)
+    }
+
+    /// Apply a new cap. Returns the previous value, so a caller can report what changed.
+    pub fn set_orchard_action_limit(&self, limit: usize) -> usize {
+        self.orchard_action_limit.swap(limit, Ordering::Relaxed)
+    }
+
+    /// The transaction-size ceiling in force right now, in bytes (`0` = disabled). Reloadable
+    /// for the same reason the action cap is: it is the other setting that can leave a wallet
+    /// unable to pay out until it moves, and the operator needs it while that is happening.
+    pub fn max_tx_bytes(&self) -> usize {
+        self.max_tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Apply a new size ceiling. Returns the previous value.
+    pub fn set_max_tx_bytes(&self, bytes: usize) -> usize {
+        self.max_tx_bytes.swap(bytes, Ordering::Relaxed)
+    }
+}
+
+/// What a configuration reload changed, and what it could not.
+///
+/// A reload is deliberately narrow: only the keys on [`RELOADABLE_KEYS`] are applied, and
+/// everything else in a re-read config is reported as needing a restart rather than being
+/// silently ignored or half-applied. An operator who edits the wrong key should be told so by
+/// the daemon, not discover it when the behaviour does not change.
+#[cfg(feature = "zcash")]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReloadReport {
+    /// `(key, old, new)` for each setting this reload applied.
+    pub applied: Vec<(&'static str, String, String)>,
+    /// Keys whose value differs from the running config but that only a restart can change.
+    pub requires_restart: Vec<String>,
+}
+
+#[cfg(feature = "zcash")]
+impl ReloadReport {
+    /// Whether the reload found nothing to do - the file matches what is running.
+    pub fn is_empty(&self) -> bool {
+        self.applied.is_empty() && self.requires_restart.is_empty()
+    }
+}
+
+/// The configuration keys a running daemon applies on reload. Everything else needs a restart.
+///
+/// Deliberately a short list. Reloading a setting means it is safe to change under a running
+/// wallet actor, and most are not: an endpoint, a network, a wallet's pools or gap limits are
+/// all baked into state that exists by the time the daemon is serving. These two are here
+/// because an operator needs them *while* a wallet is stuck rather than at the next restart -
+/// a wallet that fails every payout on one of these bounds keeps failing, and its backlog
+/// grows, until the bound moves. Add to this list only when the same is true.
+#[cfg(feature = "zcash")]
+pub const RELOADABLE_KEYS: &[&str] = &["spend.orchard_action_limit", "spend.max_tx_bytes"];
+
+/// Compare a freshly resolved config against the one the daemon is running, apply what can be
+/// applied, and report the rest.
+#[cfg(feature = "zcash")]
+pub fn apply_reload(running: &AppConfig, fresh: &AppConfig, limits: &SpendLimits) -> ReloadReport {
+    let mut report = ReloadReport::default();
+
+    // The live keys. Compared against the cells rather than against `running`, so a second
+    // reload that changes nothing reports nothing even after the first one moved them.
+    let current = limits.orchard_action_limit();
+    if fresh.spend.orchard_action_limit != current {
+        limits.set_orchard_action_limit(fresh.spend.orchard_action_limit);
+        report.applied.push((
+            "spend.orchard_action_limit",
+            current.to_string(),
+            fresh.spend.orchard_action_limit.to_string(),
+        ));
+    }
+    let current = limits.max_tx_bytes();
+    if fresh.spend.max_tx_bytes != current {
+        limits.set_max_tx_bytes(fresh.spend.max_tx_bytes);
+        report.applied.push((
+            "spend.max_tx_bytes",
+            current.to_string(),
+            fresh.spend.max_tx_bytes.to_string(),
+        ));
+    }
+
+    // Everything else: report a difference rather than pretending it took effect.
+    //
+    // The comparison runs over `config_show::render`'s output rather than over the structs,
+    // which buys two things. It names the *key* that differs, using the same spelling an
+    // operator writes in the file (that renderer is already pinned to emit keys a config parse
+    // accepts). And it covers the whole config by construction, so adding a setting cannot
+    // create a change nobody is told about - which is the failure mode a hand-written field
+    // comparison has, and the one that matters here, since silently ignoring an edit is worse
+    // than refusing it.
+    for key in changed_keys(running, fresh) {
+        if !RELOADABLE_KEYS.contains(&key.as_str()) {
+            report.requires_restart.push(key);
+        }
+    }
+
+    report
+}
+
+/// The dotted config keys whose rendered values differ between two configs.
+///
+/// Works off `config_show::render`, whose output is the effective config as TOML using the real
+/// key names - so a differing line names the setting an operator would edit. Comment and blank
+/// lines are skipped; a `[table]` header sets the prefix for the keys under it. A secret is
+/// rendered as a commented-out key name, so a changed password reads as no change here: that is
+/// a deliberate limit of comparing the redacted rendering, and credentials need a restart
+/// anyway.
+#[cfg(feature = "zcash")]
+fn changed_keys(running: &AppConfig, fresh: &AppConfig) -> Vec<String> {
+    fn keyed(config: &AppConfig) -> Vec<(String, String)> {
+        let mut section = String::new();
+        let mut out = Vec::new();
+        for line in crate::config_show::render(config).lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = format!("{name}.");
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                out.push((format!("{section}{}", key.trim()), value.trim().to_string()));
+            }
+        }
+        out
+    }
+    let (a, b) = (keyed(running), keyed(fresh));
+    let bm: std::collections::BTreeMap<_, _> = b.iter().cloned().collect();
+    let mut changed: Vec<String> = a
+        .iter()
+        .filter(|(k, v)| bm.get(k).is_some_and(|other| other != v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    // A key present in one rendering and not the other (an optional setting gained or dropped)
+    // is a change too.
+    let am: std::collections::BTreeMap<_, _> = a.iter().cloned().collect();
+    changed.extend(
+        b.iter()
+            .filter(|(k, _)| !am.contains_key(k))
+            .map(|(k, _)| k.clone()),
+    );
+    changed.extend(
+        a.iter()
+            .filter(|(k, _)| !bm.contains_key(k))
+            .map(|(k, _)| k.clone()),
+    );
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
 /// Default Orchard-action cap, matching Zallet's `orchard_actions` default.
 pub const DEFAULT_ORCHARD_ACTION_LIMIT: usize = 50;
+
+/// Default `[spend] max_tx_bytes`: the largest transaction a send may build, in bytes.
+///
+/// 250 000, which is zakura's `[mempool] max_transaction_bytes` default
+/// (`DEFAULT_MAX_TRANSACTION_BYTES`, in its `crates/zakurad/src/components/mempool/config.rs`):
+/// the per-transaction ceiling a stock node applies before it will relay one. Matching it is
+/// the point, since a wallet that builds past what nodes forward has spent its proving time on
+/// a transaction that never reaches a miner.
+///
+/// It is a *policy* number rather than a consensus one, so it can move; but it cannot be
+/// treated as a local setting. Relay is hop by hop, so what bounds a transaction in practice is
+/// the default every unconfigured peer applies, not whatever the operator's own node is set to.
+/// Zebra and zcashd have no equivalent per-transaction cap - zcashd dropped its standard-size
+/// limit for shielded transactions - so on a network of those this ceiling costs a wallet only
+/// the consolidation rounds it would have taken anyway.
+pub const DEFAULT_MAX_TX_BYTES: usize = 250_000;
 
 /// Default change-splitting target, matching zcash-devtool's send defaults.
 pub const DEFAULT_TARGET_NOTE_COUNT: usize = 4;
 
 /// Default floor on a split change note (0.1 ZEC), matching zcash-devtool's send defaults.
 pub const DEFAULT_MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000;
+
+/// Default `[spend] shutdown_drain_secs`: how long the actor finishes accepted sends on
+/// shutdown. Comfortably above a single send's proof (a 50-note merge measured 29-35 s in the
+/// field) and below systemd's 90 s default stop timeout - but above `docker stop`'s 10 s and
+/// Kubernetes' 30 s, which is why it is configurable at all.
+pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 60;
 
 /// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea (zcash/zcash#6240) reduced to
 /// the leaks a zecd send can actually cause: whether a send may cross between shielded pools
@@ -1434,7 +1886,7 @@ struct BackendFile {
 #[serde(deny_unknown_fields)]
 struct ZebraFile {
     rpc_user: Option<String>,
-    rpc_password: Option<String>,
+    rpc_password: Option<Password>,
     rpc_cookie: Option<PathBuf>,
 }
 
@@ -1480,7 +1932,7 @@ struct RpcFile {
     bind: Option<String>,
     port: Option<u16>,
     user: Option<String>,
-    password: Option<String>,
+    password: Option<Password>,
     /// Read the RPC password from this file (trailing newline trimmed) instead of inlining it.
     /// Lets the password - which is spend-equivalent for clients - live in a Kubernetes Secret
     /// rather than the ConfigMap the rest of the config lands in. Overrides `password`; the
@@ -1514,6 +1966,14 @@ struct KeysFile {
 struct SyncFile {
     interval_secs: Option<u64>,
     rebroadcast_secs: Option<u64>,
+    /// See [`SyncConfig::fetch_memos`].
+    fetch_memos: Option<bool>,
+    /// See [`SyncConfig::batch_size`].
+    batch_size: Option<u32>,
+    /// See [`SyncConfig::writer_cache_mib`].
+    writer_cache_mib: Option<u32>,
+    /// See [`SyncConfig::enhance_concurrency`].
+    enhance_concurrency: Option<usize>,
 }
 
 #[cfg(feature = "zcash")]
@@ -1525,10 +1985,12 @@ struct SpendFile {
     trust_own_transactions: Option<bool>,
     privacy_policy: Option<String>,
     orchard_action_limit: Option<usize>,
+    max_tx_bytes: Option<usize>,
     cache_proving_key: Option<bool>,
     pipeline_proving: Option<bool>,
     target_note_count: Option<usize>,
     min_split_output_value: Option<u64>,
+    shutdown_drain_secs: Option<u64>,
 }
 
 #[cfg(feature = "zcash")]
@@ -1565,6 +2027,15 @@ struct PoolsFile {
 /// behavior on the corresponding [`Cli`] flags and do NOT apply here - a library caller sets
 /// the fields explicitly. `ZECD_DATADIR` still applies (it is resolved during resolution, not
 /// by clap).
+///
+/// Deliberately **not** `#[non_exhaustive]`, unlike the option structs elsewhere on the
+/// supported surface: that attribute forbids a struct literal outside this crate entirely, even
+/// with `..Default::default()`, so it would break every embedder rather than protect them. The
+/// contract is upheld by construction instead - fields only ever arrive, and always with a
+/// `Default` - so `ConfigOverrides { .., ..Default::default() }` stays source-compatible across
+/// versions. This mirrors the CLI's global flags one for one; a setting with no flag (the
+/// `[fleet]` section, `[sync] fetch_memos`, the `[pools]` knobs) is set on the resolved
+/// [`AppConfig`], whose fields are public for that reason.
 #[derive(Debug, Default, Clone)]
 pub struct ConfigOverrides {
     /// Path to the TOML config file (default: `<datadir>/zecd.toml`).
@@ -1584,7 +2055,7 @@ pub struct ConfigOverrides {
     /// RPC username (HTTP Basic auth).
     pub rpc_user: Option<String>,
     /// RPC password (HTTP Basic auth).
-    pub rpc_password: Option<String>,
+    pub rpc_password: Option<Password>,
     /// rpcauth credentials (`<user>:<salt>$<hmac-sha256 hex>`).
     pub rpc_auth: Vec<String>,
     /// Chain upstream token (`zebra`, `zebra://host:port`, `zecrocks`, `https://...`, ...).
@@ -1627,8 +2098,11 @@ impl From<&Cli> for ConfigOverrides {
 // command an operator reaches for when something is already wrong. (A normal comment, not a doc
 // comment: clap renders the doc comment as the command's help text, and this is a note for
 // readers of the source.)
+// `Clone` so the daemon can keep the parsed CLI for a SIGHUP reload: a reload must re-resolve
+// through exactly the path startup took (the same file, the same overrides, the same defaults),
+// which means holding on to the arguments rather than reconstructing them.
 #[cfg(feature = "cli")]
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(name = "zecd", version)]
 pub struct Cli {
     /// Path to the TOML config file (default: <datadir>/zecd.toml, else ./zecd.toml).
@@ -1671,7 +2145,7 @@ pub struct Cli {
         value_name = "PASS",
         env = "ZECD_RPC_PASSWORD"
     )]
-    pub rpc_password: Option<String>,
+    pub rpc_password: Option<Password>,
 
     /// rpcauth credential (`<user>:<salt>$<hmac-sha256 hex>`); may be repeated.
     #[arg(long = "rpcauth", global = true, value_name = "USER:SALT$HASH")]
@@ -1701,7 +2175,7 @@ pub struct Cli {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Subcommand)]
+#[derive(Debug, Clone, clap::Subcommand)]
 pub enum Command {
     /// Create and initialize a new wallet (mnemonic + accounts), then exit.
     Init(InitArgs),
@@ -1741,7 +2215,7 @@ pub enum Command {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ChainInfoArgs {
     /// Probe this endpoint instead of `[backend] server`, using the same token grammar, to
     /// test a candidate before committing it to a configuration file.
@@ -1754,7 +2228,7 @@ pub struct ChainInfoArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct InitArgs {
     /// Wallet name (selects/creates <datadir>/<name>).
     #[arg(long, default_value = "default")]
@@ -1803,17 +2277,17 @@ pub struct InitArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct RpcauthArgs {
     /// RPC username the credential is for.
     pub username: String,
 
     /// Password to hash. If omitted, a strong random password is generated and printed once.
-    pub password: Option<String>,
+    pub password: Option<Password>,
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ExampleConfigArgs {
     /// Write the config here instead of stdout. `-` also means stdout. Refuses to overwrite an
     /// existing file unless `--force`.
@@ -1826,7 +2300,7 @@ pub struct ExampleConfigArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Subcommand)]
+#[derive(Debug, Clone, clap::Subcommand)]
 pub enum ConfigCommand {
     /// Validate a configuration file against this zecd build without starting the daemon, and
     /// print the settings it resolves to. Exits non-zero if the daemon would refuse to start.
@@ -1837,7 +2311,7 @@ pub enum ConfigCommand {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ConfigCheckArgs {
     /// Treat warnings as errors, so a config that merely looks risky also exits non-zero
     /// (for CI gates on a deployment repository).
@@ -1853,11 +2327,11 @@ pub struct ConfigCheckArgs {
 /// `zecd config show` takes no options of its own - the configuration it renders is selected by
 /// the global flags (`--conf`, `--datadir`, `--network`, ...), exactly as the daemon selects it.
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ConfigShowArgs {}
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ExportUfvkArgs {
     /// Wallet name (selects <datadir>/<name>).
     #[arg(long, default_value = "default")]
@@ -1865,7 +2339,7 @@ pub struct ExportUfvkArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ExportXpubArgs {
     /// Wallet name (selects <datadir>/<name>); must be a `coin = "bitcoin"` wallet.
     #[arg(long, default_value = "default")]
@@ -1873,7 +2347,7 @@ pub struct ExportXpubArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct DeriveAddressArgs {
     /// Wallet name (selects <datadir>/<name>). The default key source is this wallet's
     /// `keys.toml`; with `--mnemonic`/`--ufvk` the wallet is only consulted for its receiver
@@ -1929,7 +2403,7 @@ pub struct DeriveAddressArgs {
 }
 
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct RescanArgs {
     /// Wallet name (selects <datadir>/<name>).
     #[arg(long, default_value = "default")]
@@ -2628,12 +3102,30 @@ impl AppConfig {
         let sync_file = file.sync.unwrap_or(SyncFile {
             interval_secs: None,
             rebroadcast_secs: None,
+            fetch_memos: None,
+            batch_size: None,
+            writer_cache_mib: None,
+            enhance_concurrency: None,
         });
         let sync = SyncConfig {
             // Clamp to >= 1s so a misconfigured `interval_secs = 0` can't make the actor busy-poll
             // the backend with no idle delay between passes (same guard as `rebroadcast_secs`).
             interval_secs: sync_file.interval_secs.unwrap_or(20).max(1),
             rebroadcast_secs: sync_file.rebroadcast_secs.unwrap_or(60).max(1),
+            fetch_memos: sync_file.fetch_memos.unwrap_or(true),
+            // A zero-block batch would make the scan loop spin without advancing.
+            batch_size: sync_file.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1),
+            // SQLite treats a zero cache as "no cache"; clamp so a typo cannot make every
+            // page read a syscall.
+            writer_cache_mib: sync_file
+                .writer_cache_mib
+                .unwrap_or(DEFAULT_WRITER_CACHE_MIB)
+                .max(1),
+            // Zero would stall the drain outright.
+            enhance_concurrency: sync_file
+                .enhance_concurrency
+                .unwrap_or(DEFAULT_ENHANCE_CONCURRENCY)
+                .max(1),
         };
 
         #[cfg(feature = "zcash")]
@@ -2652,6 +3144,7 @@ impl AppConfig {
             orchard_action_limit: spend_file
                 .orchard_action_limit
                 .unwrap_or(DEFAULT_ORCHARD_ACTION_LIMIT),
+            max_tx_bytes: spend_file.max_tx_bytes.unwrap_or(DEFAULT_MAX_TX_BYTES),
             cache_proving_key: spend_file.cache_proving_key.unwrap_or(true),
             pipeline_proving: spend_file.pipeline_proving.unwrap_or(false),
             target_note_count: spend_file
@@ -2660,6 +3153,9 @@ impl AppConfig {
             min_split_output_value: spend_file
                 .min_split_output_value
                 .unwrap_or(DEFAULT_MIN_SPLIT_OUTPUT_VALUE),
+            shutdown_drain_secs: spend_file
+                .shutdown_drain_secs
+                .unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECS),
         };
         // Fail at startup, not on the first balance/send call.
         #[cfg(feature = "zcash")]
@@ -2706,16 +3202,22 @@ impl AppConfig {
             cohort_depth: None,
         });
         #[cfg(feature = "zcash")]
+        // The fleet is Zcash's, like every wallet this build serves. Both defaults sit under the
+        // datadir's coin directory; an override is taken verbatim, so an operator's path keeps
+        // its meaning exactly as a `[wallets.<name>] dir` does.
+        let fleet_coin = Coin::Zcash;
+        #[cfg(feature = "zcash")]
         let fleet = FleetConfig {
             enabled: fleet_file.enabled.unwrap_or(false),
             manifest_dir: fleet_file
                 .manifest_dir
                 .map(|p| datadir.join(p))
-                .unwrap_or_else(|| datadir.join(DEFAULT_FLEET_MANIFEST_DIR)),
+                .unwrap_or_else(|| fleet_manifest_dir(&datadir, fleet_coin)),
             dir: fleet_file
                 .dir
                 .map(|p| datadir.join(p))
-                .unwrap_or_else(|| datadir.join(DEFAULT_FLEET_DIR)),
+                .unwrap_or_else(|| fleet_dir(&datadir, fleet_coin)),
+            coin: fleet_coin,
             shard_size: fleet_file.shard_size.unwrap_or(DEFAULT_FLEET_SHARD_SIZE),
             cohort_depth: fleet_file
                 .cohort_depth
@@ -2725,6 +3227,23 @@ impl AppConfig {
         #[cfg(feature = "zcash")]
         if fleet.shard_size == 0 {
             anyhow::bail!("[fleet] shard_size must be at least 1");
+        }
+        // A wallet directory that overlaps one of the fleet's would put two owners' state in one
+        // tree - see `fleet_path_conflict`. Refused only when the fleet actually runs: with
+        // `[fleet] enabled` false nothing reads or writes those paths, so a deployment that has
+        // long had a wallet called `fleet` keeps starting, and `zecd config check` reports the
+        // latent overlap as a warning instead.
+        #[cfg(feature = "zcash")]
+        if fleet.enabled {
+            if let Some((name, wallet_path, fleet_path)) = fleet_path_conflict(&wallets, &fleet) {
+                anyhow::bail!(
+                    "wallet '{name}' has its data directory at {}, which overlaps the fleet's \
+                     {}. Rename the wallet, or point [wallets.{name}] dir (or the [fleet] \
+                     manifest_dir/dir) somewhere else",
+                    wallet_path.display(),
+                    fleet_path.display(),
+                );
+            }
         }
 
         let log_file = file.log.unwrap_or(LogFile {
@@ -2823,8 +3342,8 @@ pub fn reject_placeholder_password(config: &AppConfig) -> anyhow::Result<()> {
     if config
         .rpc
         .password
-        .as_deref()
-        .is_some_and(|p| p.trim().eq_ignore_ascii_case("change-me"))
+        .as_ref()
+        .is_some_and(|p| p.expose().trim().eq_ignore_ascii_case("change-me"))
     {
         anyhow::bail!(
             "[rpc] password is still the example placeholder \"CHANGE-ME\"; set a real password \
@@ -3430,6 +3949,162 @@ mod tests {
         assert!(no_floor.validate_change_splitting().is_ok());
     }
 
+    /// A reload applies the reloadable key and reports everything else as needing a restart,
+    /// rather than silently dropping it - an operator who edits a key that cannot be reloaded
+    /// has to be told, not left to infer it from behaviour that did not change.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn reload_applies_the_live_key_and_names_the_rest() {
+        let running = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            ..Default::default()
+        })
+        .expect("resolve running config");
+        let limits = SpendLimits::new(&running.spend);
+
+        // Nothing changed: nothing applied, nothing to report.
+        let report = apply_reload(&running, &running, &limits);
+        assert!(
+            report.is_empty(),
+            "an identical config is a no-op: {report:?}"
+        );
+        assert_eq!(
+            limits.orchard_action_limit(),
+            running.spend.orchard_action_limit
+        );
+
+        // The live key.
+        let mut fresh = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            ..Default::default()
+        })
+        .expect("resolve fresh config");
+        fresh.spend.orchard_action_limit = 0;
+        let report = apply_reload(&running, &fresh, &limits);
+        assert_eq!(
+            report.applied,
+            vec![(
+                "spend.orchard_action_limit",
+                DEFAULT_ORCHARD_ACTION_LIMIT.to_string(),
+                "0".to_string()
+            )]
+        );
+        assert!(report.requires_restart.is_empty(), "{report:?}");
+        assert_eq!(
+            limits.orchard_action_limit(),
+            0,
+            "the cell took the new value"
+        );
+
+        // Applying the same value twice reports nothing the second time: the comparison is
+        // against the cell, not against the config the daemon started with.
+        let report = apply_reload(&running, &fresh, &limits);
+        assert!(
+            report.is_empty(),
+            "a repeated reload is a no-op: {report:?}"
+        );
+
+        // A key that cannot be reloaded is named, and does not take effect.
+        let mut fresh = fresh.clone();
+        fresh.rpc.work_queue = running.rpc.work_queue + 7;
+        let report = apply_reload(&running, &fresh, &limits);
+        assert!(
+            report
+                .requires_restart
+                .iter()
+                .any(|k| k == "rpc.work_queue"),
+            "the changed key must be named: {report:?}"
+        );
+
+        // Including another key in the same section as the reloadable one, which a
+        // section-level comparison would have hidden behind it.
+        let mut fresh = fresh.clone();
+        fresh.spend.target_note_count = running.spend.target_note_count + 1;
+        let report = apply_reload(&running, &fresh, &limits);
+        assert!(
+            report
+                .requires_restart
+                .iter()
+                .any(|k| k == "spend.target_note_count"),
+            "a non-reloadable key in the reloadable key's own section must still be named: \
+             {report:?}"
+        );
+    }
+
+    /// `[spend] shutdown_drain_secs` bounds how long a stopping wallet finishes sends it already
+    /// accepted. It is configuration rather than a constant because the value that binds is the
+    /// supervisor's own grace period, not any property of zecd - so the parse, the default, and
+    /// the disabling `0` all have to hold.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn shutdown_drain_parses_and_defaults_to_the_documented_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let default = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            ..Default::default()
+        })
+        .expect("resolve with no file");
+        assert_eq!(
+            default.spend.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS,
+            "the default is the documented 60s"
+        );
+
+        let path = dir.path().join("zecd.toml");
+        std::fs::write(&path, "[spend]\nshutdown_drain_secs = 0\n").expect("write config");
+        let disabled = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            conf: Some(path.clone()),
+            ..Default::default()
+        })
+        .expect("resolve with the drain disabled");
+        assert_eq!(
+            disabled.spend.shutdown_drain_secs, 0,
+            "0 is a legal value - it restores the drop-on-shutdown behaviour"
+        );
+
+        std::fs::write(&path, "[spend]\nshutdown_drain_secs = 25\n").expect("write config");
+        let short = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            conf: Some(path),
+            ..Default::default()
+        })
+        .expect("resolve with a shortened drain");
+        assert_eq!(short.spend.shutdown_drain_secs, 25);
+
+        // It is not reloadable: the drain is read once, when the actor is already stopping.
+        let limits = SpendLimits::new(&default.spend);
+        let report = apply_reload(&default, &short, &limits);
+        assert!(
+            report
+                .requires_restart
+                .iter()
+                .any(|k| k == "spend.shutdown_drain_secs"),
+            "a changed drain must be named as needing a restart: {report:?}"
+        );
+    }
+
+    /// Every key on the reloadable list must be one `apply_reload` actually applies, or the
+    /// list is a promise the code does not keep.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn reloadable_keys_are_all_applied() {
+        let running = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            ..Default::default()
+        })
+        .expect("resolve");
+        let limits = SpendLimits::new(&running.spend);
+        let mut fresh = running.clone();
+        // Move every reloadable key, so the report names all of them and the assertion below
+        // fails if the list grows without `apply_reload` growing with it.
+        fresh.spend.orchard_action_limit = running.spend.orchard_action_limit + 1;
+        fresh.spend.max_tx_bytes = running.spend.max_tx_bytes + 1;
+        let report = apply_reload(&running, &fresh, &limits);
+        let applied: Vec<&str> = report.applied.iter().map(|(k, _, _)| *k).collect();
+        assert_eq!(applied, RELOADABLE_KEYS, "the list and the code must agree");
+    }
+
     #[cfg(feature = "zcash")]
     #[test]
     fn orchard_action_limit_defaults_and_parses() {
@@ -3786,7 +4461,7 @@ mod tests {
         .unwrap();
         let z = f.zebra.unwrap();
         assert_eq!(z.rpc_user.as_deref(), Some("u"));
-        assert_eq!(z.rpc_password.as_deref(), Some("p"));
+        assert_eq!(z.rpc_password.as_ref().map(Password::expose), Some("p"));
         assert_eq!(z.rpc_cookie, Some(PathBuf::from("/tmp/.cookie")));
         // The section maps onto the zebra backend's auth type.
         let auth = ZebraConfig {
@@ -3921,6 +4596,76 @@ mod tests {
         assert_eq!(cfg.sync.interval_secs, 20);
     }
 
+    /// `[sync] writer_cache_mib` defaults to the measured 256 MiB, parses an override, and
+    /// clamps zero to one - SQLite would take a zero cache literally.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn writer_cache_mib_defaults_parses_and_clamps() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        for (body, expected) in [
+            ("[sync]\ninterval_secs = 20\n", DEFAULT_WRITER_CACHE_MIB),
+            ("[sync]\nwriter_cache_mib = 64\n", 64),
+            ("[sync]\nwriter_cache_mib = 0\n", 1),
+        ] {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cfg = AppConfig::resolve(&cli).unwrap();
+            assert_eq!(cfg.sync.writer_cache_mib, expected, "config body: {body:?}");
+        }
+    }
+
+    /// `[sync] fetch_memos` defaults on (memos are part of the standard history surface) and
+    /// parses both ways - `false` is the exchange-style opt-out that skips the memo-backfill
+    /// half of the enhancement drain.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn fetch_memos_defaults_on_and_parses_off() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+
+        for (body, want) in [
+            ("datadir = \"/tmp/zecd-x\"\n", true),
+            ("[sync]\ninterval_secs = 20\n", true),
+            ("[sync]\nfetch_memos = true\n", true),
+            ("[sync]\nfetch_memos = false\n", false),
+        ] {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cfg = AppConfig::resolve(&cli).unwrap();
+            assert_eq!(cfg.sync.fetch_memos, want, "config body: {body:?}");
+        }
+    }
+
+    /// The **embedded** resolution path defaults `fetch_memos` on, exactly as the daemon's does.
+    ///
+    /// The test above goes through `resolve`, which is clap's path; an embedder calls
+    /// `resolve_overrides`, and `ConfigOverrides` carries no `fetch_memos` field at all (it
+    /// mirrors the CLI's global flags, and there is no such flag). So a library consumer that
+    /// ships no `zecd.toml` - which is the common case, and what `examples/embedded.rs` does -
+    /// reaches the default through a seam the clap test never exercises. Pinning it here is what
+    /// makes "memos are on unless you asked otherwise" true of the library and not just the
+    /// binary: the two share one `unwrap_or(true)`, and this is the assertion that fails if a
+    /// future refactor gives the embedded path a resolver of its own.
+    #[test]
+    fn embedded_resolution_defaults_fetch_memos_on() {
+        // A datadir of our own, so a `zecd.toml` sitting in the default location cannot answer
+        // for the default we are trying to observe.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig::resolve_overrides(&ConfigOverrides {
+            regtest: true,
+            datadir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .expect("resolve with no config file");
+        assert!(
+            cfg.sync.fetch_memos,
+            "an embedded node with no config file must recover memos"
+        );
+    }
+
     /// The multi-spender opt-in defaults off, parses both ways, and - the load-bearing half -
     /// is refused by the daemon while an embedded node accepts it. That asymmetry is the
     /// mechanism keeping the option library-only, so it is asserted here rather than left to
@@ -4035,7 +4780,7 @@ mod tests {
         // The classic `echo "secret" > file` leaves a trailing newline; it must be stripped,
         // but interior/leading whitespace is preserved (a password may legitimately contain it).
         std::fs::write(&p, "  hunter2 spaces \n").unwrap();
-        assert_eq!(read_secret_file(&p).unwrap(), "  hunter2 spaces ");
+        assert_eq!(read_secret_file(&p).unwrap().expose(), "  hunter2 spaces ");
         // A missing file is an error (fail fast), not an empty password.
         assert!(read_secret_file(&dir.path().join("nope")).is_err());
     }
@@ -4060,7 +4805,10 @@ mod tests {
         // password_file overrides the inline [rpc] password...
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.rpc.password.as_deref(), Some("from-file"));
+        assert_eq!(
+            cfg.rpc.password.as_ref().map(Password::expose),
+            Some("from-file")
+        );
 
         // ...but an explicit --rpcpassword still wins over the file.
         let cli = Cli::parse_from([
@@ -4071,7 +4819,10 @@ mod tests {
             "from-cli",
         ]);
         let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.rpc.password.as_deref(), Some("from-cli"));
+        assert_eq!(
+            cfg.rpc.password.as_ref().map(Password::expose),
+            Some("from-cli")
+        );
 
         // A configured-but-missing password_file is a startup error.
         std::fs::write(
@@ -4723,5 +5474,87 @@ mod tests {
         ] {
             toml::from_str::<ConfigFile>(body).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+    }
+
+    /// `wallet_dir` is `datadir.join(name)`, so a wallet named after the fleet root claims it.
+    /// Nothing is overwritten - the fleet's own files sit deeper - which is exactly why this
+    /// needs catching: two owners would share a tree, `zecd rescan` on the wallet would delete
+    /// through it, and a backup scoped to the wallet would quietly carry viewing keys.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn a_wallet_named_after_the_fleet_root_is_refused_when_the_fleet_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.fleet]\n[fleet]\nenabled = true\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+
+        let err = AppConfig::resolve_overrides(&ConfigOverrides {
+            conf: Some(conf),
+            ..Default::default()
+        })
+        .expect_err("a wallet directory holding the fleet's own tree is refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wallet 'fleet'"), "names the wallet: {msg}");
+        assert!(msg.contains("overlaps the fleet"), "names the clash: {msg}");
+    }
+
+    /// The same config starts fine with the fleet off, because nothing then reads or writes
+    /// those paths - a deployment that has long had a wallet called `fleet` keeps working, and
+    /// `config check` reports the latent overlap instead.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn a_wallet_named_after_the_fleet_root_is_allowed_while_the_fleet_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.fleet]\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::resolve_overrides(&ConfigOverrides {
+            conf: Some(conf),
+            ..Default::default()
+        })
+        .expect("resolves with the fleet disabled");
+        assert!(!config.fleet.enabled);
+        assert!(fleet_path_conflict(&config.wallets, &config.fleet).is_some());
+    }
+
+    /// The ordinary shape: a wallet beside the fleet, sharing only the data directory itself.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn an_ordinary_wallet_does_not_overlap_the_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.default]\n[fleet]\nenabled = true\n",
+                dir.path()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::resolve_overrides(&ConfigOverrides {
+            conf: Some(conf),
+            ..Default::default()
+        })
+        .expect("resolves");
+        assert_eq!(
+            config.fleet.manifest_dir,
+            dir.path().join("fleet/zec/wallets.d")
+        );
+        assert_eq!(config.fleet.dir, dir.path().join("fleet/zec/shards"));
+        assert_eq!(fleet_path_conflict(&config.wallets, &config.fleet), None);
     }
 }

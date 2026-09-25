@@ -292,6 +292,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 nu6_3_height,
+                RegtestNode::from_env(),
             ),
         )
         .context("write zebrad.toml")?;
@@ -323,6 +324,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 self.nu6_3_height,
+                RegtestNode::from_env(),
             ),
         )
         .context("rewrite zebrad.toml for restart")?;
@@ -387,6 +389,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 nu6_3_height,
+                RegtestNode::from_env(),
             ),
         )
         .context("write zebrad.toml")?;
@@ -490,6 +493,7 @@ fn zebrad_toml(
     miner_address: &str,
     cache_dir: &str,
     nu6_3_height: u32,
+    node: RegtestNode,
 ) -> String {
     let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
     let lockbox_addr = LOCKBOX_DISBURSEMENT_ADDR;
@@ -497,6 +501,7 @@ fn zebrad_toml(
     // NU6.3 (ironwood) activation. Needs zebrad >= 6.2.2; older releases have no `"NU6.3"` key and
     // reject an unknown activation-height entry at startup.
     let nu6_3_line = format!("\"NU6.3\" = {nu6_3_height}\n");
+    let mempool_section = mempool_policy_section(node);
     format!(
         r#"[network]
 network = "Regtest"
@@ -533,7 +538,7 @@ addresses = []
 address = "{lockbox_addr}"
 amount = {lockbox_amount}
 
-[mining]
+{mempool_section}[mining]
 miner_address = "{miner_address}"
 
 [state]
@@ -549,6 +554,41 @@ enable_cookie_auth = false
 "#
     )
 }
+
+/// The node-local mempool policy this regtest chain needs, as a `zebrad.toml` section (empty for
+/// zebra).
+///
+/// zakura caps an individual mempool transaction at 250 000 bytes by default
+/// (`[mempool] max_transaction_bytes`) - a relay policy of its own, with no consensus force and
+/// no counterpart in zebra, which has no such key at all. A 200-input Orchard merge, which is
+/// exactly what `regtest_mergetoaddress_default_shielded_limit` builds to pin zcashd's default
+/// `shielded_limit`, serializes to ~634 KB, so on the zakura leg the node refused a transaction
+/// zecd had built correctly and the test read it as a wallet failure (every extended run since
+/// the zakura leg was promoted to the full test list).
+///
+/// Raising the policy to the consensus block limit lets the regtest node relay anything the
+/// wallet can legally build, which is what the suite is here to exercise - the same reason it
+/// disables proof-of-work. It hides nothing an operator would meet by default: zecd's own
+/// `[spend] orchard_action_limit` (default 50) binds long before 250 KB, and only a config that
+/// lifts that cap - as the merge e2e deliberately does - can build a transaction a stock zakura
+/// node would decline to relay.
+///
+/// Written for zakura only. Zebra's mempool config is `deny_unknown_fields`, so an unknown key
+/// there is a startup failure, not an ignored line.
+fn mempool_policy_section(node: RegtestNode) -> String {
+    match node {
+        RegtestNode::Zebra => String::new(),
+        RegtestNode::Zakura => format!(
+            "[mempool]\n\
+             # Relay anything that fits in a block; see mempool_policy_section().\n\
+             max_transaction_bytes = {MAX_BLOCK_BYTES}\n\n"
+        ),
+    }
+}
+
+/// The Zcash consensus maximum block size, and so the largest transaction that can ever be
+/// mined. Used as the regtest mempool's per-transaction ceiling.
+const MAX_BLOCK_BYTES: u64 = 2_000_000;
 
 // =============================== lightwalletd (indexer) ===============================
 
@@ -1433,11 +1473,27 @@ impl Drop for Funder {
 /// harmless - `z_shieldcoinbase` filters immature coinbase itself, so accruing more never breaks
 /// the shield.
 pub async fn start_funded_chain_live(node_bin: &Path) -> Result<(Zebrad, Funder)> {
+    start_funded_chain_live_at(node_bin, NU6_3_ACTIVATION_HEIGHT).await
+}
+
+/// [`start_funded_chain_live`] on a chain that activates NU6.3 at `nu6_3_height` instead of
+/// [`NU6_3_ACTIVATION_HEIGHT`].
+///
+/// With a height past the bring-up (which ends near block 140), the funder's shielded coinbase is
+/// a **legacy Orchard** note rather than an ironwood one, and so is anything it pays before the
+/// chain reaches that height: the only way to hold Orchard-pool value when NU6.3 activates, which
+/// every wallet funded before mainnet's activation does. zecd and the funder must be given the
+/// same height through `ZECD_REGTEST_NU63_HEIGHT`, or their consensus diverges from the node's.
+/// Always a live bring-up: the chain snapshot is built at the standard height.
+pub async fn start_funded_chain_live_at(
+    node_bin: &Path,
+    nu6_3_height: u32,
+) -> Result<(Zebrad, Funder)> {
     // Mine to index 0: exposed at account creation, so the funder's wallet will credit these
     // coinbases without ever issuing the address. (Its first *issued* address is index 1.)
     let miner_taddr = derive_funder_transparent_address(0)
         .context("derive the funder's miner address offline")?;
-    let zebrad = Zebrad::start_with_miner(node_bin, &miner_taddr)
+    let zebrad = Zebrad::start_inner(node_bin, &miner_taddr, nu6_3_height)
         .await
         .context("start the regtest node mining to the funder")?;
     zebrad
@@ -1924,6 +1980,9 @@ pub struct Zecd {
     /// The instance's RPC port - also its log tag (see [`forward_daemon_logs`]), so a
     /// respawn on the same datadir keeps the same discriminator.
     rpc_port: u16,
+    /// The `[health]` port this instance was configured with, so [`Zecd::health_get`] can
+    /// reach `/healthz`, `/readyz` and `/status` without the caller rebuilding the URL.
+    health_port: u16,
     base_url: String,
     user: String,
     password: String,
@@ -1958,6 +2017,11 @@ pub struct ZecdConfig {
     pub rpc_password: String,
     /// `[sync] rebroadcast_secs` - tight by default so outage tests don't idle a minute.
     pub rebroadcast_secs: u64,
+    /// `[sync] fetch_memos`: `Some(false)` disables memo retrieval (the memo-backfill half of
+    /// the enhancement drain), `None` omits the key (zecd defaults to `true`). The funded e2e's
+    /// memo-less twin phase runs a watch-only restore with it off, then flips it back on over
+    /// the same data directory to prove the skipped memos backfill without a rescan.
+    pub fetch_memos: Option<bool>,
     /// Additional **spending** `[wallets.<name>]` entries beyond `default` (each gets its own
     /// `zecd init --wallet <name>` before the daemon starts). NB: zecd permits only ONE
     /// spending wallet, so configuring any of these alongside the spending `default` makes the
@@ -1977,8 +2041,9 @@ pub struct ZecdConfig {
     /// its own).
     pub birthday: Option<u32>,
     /// `[spend] cache_proving_key`: `Some(true/false)` writes the knob explicitly, `None`
-    /// omits it (zecd defaults to `true`). The proving-key-cache benchmark runs one instance
-    /// each way.
+    /// omits it (zecd defaults to `true`). No test sets it today - both routes prove from one
+    /// shared key set since the Zakura forks, so the binary that flipped it was removed - but
+    /// the knob is still real, and this is how a test would pin the fused route deliberately.
     pub cache_proving_key: Option<bool>,
     /// `[spend] privacy_policy`: `Some("AllowFullyTransparent")` etc. writes the knob explicitly,
     /// `None` omits it (zecd defaults to `AllowRevealedRecipients`). The fully-transparent spend
@@ -1992,6 +2057,11 @@ pub struct ZecdConfig {
     /// (zecd defaults to 50). The stress test lifts the cap so its big fan-out/sweep sends aren't
     /// rejected.
     pub orchard_action_limit: Option<usize>,
+    /// `[spend] max_tx_bytes`: `Some(n)` writes the transaction-size ceiling (`0` disables it),
+    /// `None` omits it (zecd defaults to 250000, matching zakura's relay policy). The merge e2e
+    /// disables it for the same reason it disables the action cap: it is measuring a third
+    /// limit, `shielded_limit`, and a 200-note merge is larger than any node relays.
+    pub max_tx_bytes: Option<usize>,
     /// Optional `[pools]` section as `(enabled, default_receivers)`. `None` omits the section
     /// (the Orchard-only default). Used by the multi-pool (Sapling) e2e.
     pub pools: Option<(Vec<String>, Vec<String>)>,
@@ -2022,7 +2092,7 @@ pub struct ZecdConfig {
     /// spend-search backlog transiently rises.
     pub readiness: Option<String>,
     /// View wallets the daemon monitors as a **fleet**: each becomes a manifest under
-    /// `<datadir>/wallets.d/`, and the daemon groups them into shard databases that scan once for
+    /// `<datadir>/fleet/zec/wallets.d/`, and the daemon groups them into shard databases that scan once for
     /// all of their accounts. Empty (the default) writes no manifests and no `[fleet]` section,
     /// so the daemon behaves exactly as it always has.
     pub fleet: Vec<ViewWallet>,
@@ -2052,6 +2122,7 @@ impl ZecdConfig {
             rpc_user: "user".to_string(),
             rpc_password: "pass".to_string(),
             rebroadcast_secs: 2,
+            fetch_memos: None,
             extra_wallets: Vec::new(),
             extra_watch_only_wallets: Vec::new(),
             restore_mnemonic: None,
@@ -2061,6 +2132,7 @@ impl ZecdConfig {
             privacy_policy: None,
             pipeline_proving: None,
             orchard_action_limit: None,
+            max_tx_bytes: None,
             pools: None,
             transparent: false,
             transparent_gap_limit: None,
@@ -2113,6 +2185,7 @@ impl Zecd {
         let zecd = Zecd {
             child,
             rpc_port: cfg.rpc_port,
+            health_port: cfg.health_port,
             base_url: format!("http://127.0.0.1:{}/", cfg.rpc_port),
             user: cfg.rpc_user.clone(),
             password: cfg.rpc_password.clone(),
@@ -2191,7 +2264,10 @@ impl Zecd {
         // Fleet manifests, before the daemon starts: one small TOML per view wallet, which is
         // all a monitored wallet is (a name, a viewing key, a birthday).
         if !cfg.fleet.is_empty() {
-            let manifest_dir = datadir.path().join("wallets.d");
+            // The fleet's default paths sit under its own coin directory, like the wallet
+            // data - so provision where the daemon will actually look, rather than relying on
+            // the one-time layout migration to move them.
+            let manifest_dir = datadir.path().join("fleet").join("zec").join("wallets.d");
             std::fs::create_dir_all(&manifest_dir).context("create the fleet manifest dir")?;
             for wallet in &cfg.fleet {
                 std::fs::write(
@@ -2244,8 +2320,9 @@ impl Zecd {
     }
 
     /// Wallet `name`'s Zcash **engine** directory: `<datadir>/<name>/zec/lrz`, holding
-    /// everything librustzcash owns - `data.sqlite`, `blockmeta.sqlite`, `blocks/`. This, not
-    /// [`Zecd::wallet_dir`], is where a test tampering with the wallet database looks.
+    /// everything librustzcash owns - `data.sqlite` (and, from an older zecd, the on-disk block
+    /// cache's `blockmeta.sqlite` and `blocks/`). This, not [`Zecd::wallet_dir`], is where a
+    /// test tampering with the wallet database looks.
     pub fn engine_dir(&self, name: &str) -> PathBuf {
         self.wallet_dir(name).join("zec").join("lrz")
     }
@@ -2410,9 +2487,9 @@ impl Zecd {
 
     /// Gracefully stop the daemon (via the `stop` RPC) and relaunch it against the *same*
     /// datadir/wallet with a (possibly different) config - e.g. flipping
-    /// `[spend] cache_proving_key`. The wallet DB, keys, and funds persist across the restart;
+    /// `[sync] fetch_memos`. The wallet DB, keys, and funds persist across the restart;
     /// `cfg` must keep the same RPC port so this handle's `base_url` stays valid. Used by the
-    /// proving-key-cache benchmark to measure both paths on one funded wallet.
+    /// funded e2e's memo-less phase to re-open one funded wallet under a changed knob.
     pub async fn restart(&mut self, cfg: &ZecdConfig) -> Result<()> {
         let _ = self.call("stop", json!([])).await;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -2446,6 +2523,58 @@ impl Zecd {
         self.password = cfg.rpc_password.clone();
         self.wait_until_rpc_up().await?;
         Ok(())
+    }
+
+    /// Send `SIGHUP` to the daemon, which makes it re-read its `zecd.toml` and apply the
+    /// settings that can change under a running wallet. Pairs with [`Zecd::edit_config`].
+    ///
+    /// Unix-only, like the signal; the daemon is spawned as a child process, so this needs no
+    /// privileges beyond owning it.
+    pub fn reload_config(&self) -> Result<()> {
+        let pid = self.child.id();
+        // Shelling out to `kill` rather than pulling in a libc dependency and an unsafe block
+        // for one signal. The harness already runs on Linux CI runners, where this is present.
+        let status = std::process::Command::new("kill")
+            .args(["-HUP", &pid.to_string()])
+            .status()
+            .context("run kill -HUP")?;
+        anyhow::ensure!(status.success(), "kill -HUP {pid} failed: {status}");
+        Ok(())
+    }
+
+    /// Rewrite the daemon's `zecd.toml`, applying `edit` to its current text. For testing a
+    /// configuration reload: change the file, then [`Zecd::reload_config`].
+    pub fn edit_config(&self, edit: impl FnOnce(String) -> String) -> Result<()> {
+        let path = self._datadir.path().join("zecd.toml");
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        std::fs::write(&path, edit(text)).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// GET one of the health endpoints (`"/healthz"`, `"/readyz"`, `"/status"`) and return its
+    /// JSON body. These are a separate, unauthenticated listener, so this bypasses the RPC port
+    /// and its credentials entirely - which is the point of probing them: they are what a
+    /// monitoring stack watches, and they must keep answering while the RPC side is busy.
+    ///
+    /// `/readyz` answers 503 when not ready and `/healthz` returns plain text rather than JSON;
+    /// both are reported as `Ok` with the body parsed where it can be, so a caller can assert on
+    /// the status as data instead of on a transport error.
+    pub async fn health_get(&self, path: &str) -> Result<(reqwest::StatusCode, Value)> {
+        let url = format!("http://127.0.0.1:{}{path}", self.health_port);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .with_context(|| format!("body of {url}"))?;
+        let json = serde_json::from_str(&body).unwrap_or(Value::String(body));
+        Ok((status, json))
     }
 
     /// Issue a JSON-RPC call, returning the `result` on success or an error carrying the
@@ -3012,9 +3141,10 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         Some(_) => "assume_transparent_in_compact_blocks = true\n",
         None => "",
     };
-    // Optional `[spend]` knobs: `cache_proving_key` (proving-key-cache benchmark),
+    // Optional `[spend]` knobs: `cache_proving_key` (no current test - see the field's docs),
     // `privacy_policy` (fully-transparent spend e2e), `pipeline_proving` and
-    // `orchard_action_limit` (stress test). Emit the section only if at least one is set.
+    // `orchard_action_limit` (stress test), `max_tx_bytes` (merge e2e). Emit the section only
+    // if at least one is set.
     let spend_section = {
         let mut lines = String::new();
         if let Some(b) = cfg.cache_proving_key {
@@ -3028,6 +3158,9 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         }
         if let Some(n) = cfg.orchard_action_limit {
             lines.push_str(&format!("orchard_action_limit = {n}\n"));
+        }
+        if let Some(n) = cfg.max_tx_bytes {
+            lines.push_str(&format!("max_tx_bytes = {n}\n"));
         }
         if lines.is_empty() {
             String::new()
@@ -3128,7 +3261,7 @@ auto_unlock = true
 [sync]
 interval_secs = 2
 rebroadcast_secs = {rebroadcast}
-
+{fetch_memos}
 [health]
 enabled = true
 bind = "127.0.0.1"
@@ -3141,6 +3274,10 @@ port = {health_port}
         user = cfg.rpc_user,
         password = cfg.rpc_password,
         rebroadcast = cfg.rebroadcast_secs,
+        fetch_memos = match cfg.fetch_memos {
+            Some(b) => format!("fetch_memos = {b}\n"),
+            None => String::new(),
+        },
         health_port = cfg.health_port(),
         readiness = cfg
             .readiness
@@ -3201,6 +3338,32 @@ mod tests {
         }
         let unique: std::collections::HashSet<u16> = picked.iter().map(|(p, _)| *p).collect();
         assert_eq!(unique.len(), picked.len(), "duplicate ports handed out");
+    }
+
+    /// The zakura-only mempool relay policy: present, naming the consensus block limit, on the
+    /// zakura leg and absent on zebra - where the key does not exist and zebra's
+    /// `deny_unknown_fields` config would refuse to start on it.
+    #[test]
+    fn the_mempool_relay_policy_is_written_for_zakura_only() {
+        assert_eq!(mempool_policy_section(RegtestNode::Zebra), "");
+        let zakura = mempool_policy_section(RegtestNode::Zakura);
+        assert!(zakura.starts_with("[mempool]\n"), "{zakura}");
+        assert!(
+            zakura.contains(&format!("max_transaction_bytes = {MAX_BLOCK_BYTES}")),
+            "{zakura}"
+        );
+        // A trailing blank line: the section is spliced straight in front of `[mining]`.
+        assert!(zakura.ends_with("\n\n"), "{zakura}");
+
+        // And it lands in the rendered config as its own top-level table, ahead of `[mining]`.
+        let render = |node| zebrad_toml(1, 2, SEED_MINER_ADDRESS, "/tmp/state", 8, node);
+        let zakura_toml = render(RegtestNode::Zakura);
+        let mempool_at = zakura_toml
+            .find("\n[mempool]\n")
+            .expect("[mempool] section");
+        let mining_at = zakura_toml.find("\n[mining]\n").expect("[mining] section");
+        assert!(mempool_at < mining_at, "{zakura_toml}");
+        assert!(!render(RegtestNode::Zebra).contains("[mempool]"));
     }
 
     #[test]

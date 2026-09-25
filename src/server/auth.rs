@@ -8,11 +8,15 @@ use std::str::FromStr;
 use anyhow::{anyhow, Context};
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 use subtle::{Choice, ConstantTimeEq};
 
 use crate::config::RpcConfig;
+// Only `run_rpcauth` names the type; the `Authenticator` path reaches the plaintext through
+// `Password::expose`, an inherent method.
+#[cfg(feature = "cli")]
+use crate::secret::Password;
 
 /// A salted password hash in Bitcoin Core's `rpcauth` format: `<salt>$<hex>` where the
 /// hex digest is `HMAC-SHA256(key = salt, msg = password)`, as produced by bitcoind's
@@ -35,7 +39,7 @@ pub fn generate_rpcauth(username: &str, password: Option<&str>) -> (String, Opti
         None => {
             // 32 random bytes, URL-safe base64 - the same shape rpcauth.py mints.
             let mut buf = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut buf);
+            rand::rng().fill_bytes(&mut buf);
             let p = base64::engine::general_purpose::URL_SAFE.encode(buf);
             (p.clone(), Some(p))
         }
@@ -49,7 +53,8 @@ pub fn generate_rpcauth(username: &str, password: Option<&str>) -> (String, Opti
 /// password to keep when one is generated. No daemon, config, or external script needed.
 #[cfg(feature = "cli")]
 pub fn run_rpcauth(args: &crate::config::RpcauthArgs) -> anyhow::Result<()> {
-    let (line, generated) = generate_rpcauth(&args.username, args.password.as_deref());
+    let (line, generated) =
+        generate_rpcauth(&args.username, args.password.as_ref().map(Password::expose));
 
     println!("Add this line to your zecd config under [rpc]:");
     println!();
@@ -162,7 +167,7 @@ impl Authenticator {
         let mut users = parse_auth_entries(rpc)?;
 
         if let (Some(user), Some(password)) = (&rpc.user, &rpc.password) {
-            users.push((user.clone(), PasswordHash::from_bare(password)));
+            users.push((user.clone(), PasswordHash::from_bare(password.expose())));
         } else {
             let cookiefile = rpc.cookiefile.as_ref().ok_or_else(|| {
                 anyhow!("no RPC auth configured: set [rpc] user+password, auth, or a cookiefile")
@@ -229,7 +234,7 @@ pub fn basic_auth_username(header: Option<&str>) -> Option<String> {
 
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     hex::encode(buf)
 }
 

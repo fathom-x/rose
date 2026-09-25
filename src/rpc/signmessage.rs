@@ -196,10 +196,10 @@ mod tests {
 
     /// A random secp256k1 keypair, for the sign→verify round-trips.
     fn test_keypair() -> (secp256k1::SecretKey, secp256k1::PublicKey) {
-        use rand::RngCore;
+        use rand::Rng;
         let secp = Secp256k1::new();
         let mut secret_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret_bytes);
+        rand::rng().fill_bytes(&mut secret_bytes);
         let secret_key = secp256k1::SecretKey::from_slice(&secret_bytes)
             .expect("32 random bytes should be a valid secret key");
         let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
@@ -215,24 +215,11 @@ mod tests {
         assert!(verified, "Valid signature should verify successfully");
     }
 
-    #[test]
-    fn verify_wrong_message_fails() {
-        let verified = verify_message(&mainnet(), TEST_ADDRESS, TEST_SIGNATURE, "wrongmessage")
-            .expect("verification call should succeed");
-        assert!(!verified, "Wrong message should fail verification");
-    }
-
-    #[test]
-    fn verify_wrong_address_fails() {
-        let verified = verify_message(
-            &mainnet(),
-            "t1VtArtnn1dGPiD2WFfMXYXW5mHM3q1GpgV",
-            TEST_SIGNATURE,
-            TEST_MESSAGE,
-        )
-        .expect("verification call should succeed");
-        assert!(!verified, "Wrong address should fail verification");
-    }
+    // The wrong-message and wrong-address rejections are not repeated against this vector:
+    // `sign_verify_wrong_message_fails` and `sign_verify_wrong_address_fails` below assert the
+    // same `Ok(false)` outcomes on a generated keypair, and the branch is the same either way.
+    // What only this vector can prove is the positive above - that zecd verifies a signature it
+    // did not produce, i.e. cross-implementation compatibility.
 
     #[test]
     fn verify_invalid_address_returns_error() {

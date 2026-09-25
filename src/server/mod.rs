@@ -21,6 +21,8 @@ use axum::response::{IntoResponse, Response};
 #[cfg(feature = "server")]
 use axum::routing::post;
 #[cfg(feature = "server")]
+use axum::Extension;
+#[cfg(feature = "server")]
 use axum::Router;
 #[cfg(feature = "server")]
 use serde_json::Value;
@@ -77,7 +79,7 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 fn router(state: HttpState) -> Router {
     Router::new()
         .route("/", post(handle_root))
-        .route("/wallet/:name", post(handle_wallet))
+        .route("/wallet/{name}", post(handle_wallet))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -85,7 +87,7 @@ fn router(state: HttpState) -> Router {
 #[cfg(feature = "server")]
 async fn handle_root(
     State(state): State<HttpState>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -95,7 +97,7 @@ async fn handle_root(
 #[cfg(feature = "server")]
 async fn handle_wallet(
     State(state): State<HttpState>,
-    peer: Option<ConnectInfo<SocketAddr>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -103,11 +105,17 @@ async fn handle_wallet(
     handle(state, peer_addr(peer), Some(name), headers, body).await
 }
 
-/// Unwrap the optional `ConnectInfo` extractor into the peer socket address, if known. It is
+/// Unwrap the optional connection-info extension into the peer socket address, if known. It is
 /// `None` for requests that arrive without connection info (the in-process `oneshot` tests).
+///
+/// The extension is read through `Option<Extension<ConnectInfo<_>>>` rather than
+/// `Option<ConnectInfo<_>>`: since axum 0.8 an `Option<T>` extractor needs
+/// `T: OptionalFromRequestParts`, which `ConnectInfo` does not implement while `Extension` does.
+/// `into_make_service_with_connect_info` inserts exactly this extension, so the two read the
+/// same value.
 #[cfg(feature = "server")]
-fn peer_addr(peer: Option<ConnectInfo<SocketAddr>>) -> Option<SocketAddr> {
-    peer.map(|ConnectInfo(addr)| addr)
+fn peer_addr(peer: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<SocketAddr> {
+    peer.map(|Extension(ConnectInfo(addr))| addr)
 }
 
 #[cfg(feature = "server")]
@@ -197,6 +205,12 @@ async fn handle(
     }
 }
 
+/// A successful call at or above this many milliseconds is logged at INFO rather than DEBUG.
+/// Every RPC zecd serves is meant to be interactive; seconds means something has outgrown its
+/// query, which an operator should be able to see without turning on DEBUG for everything.
+#[cfg(feature = "server")]
+const SLOW_RPC_MS: u64 = 2_000;
+
 /// HTTP status for an RPC error, matching Bitcoin Core's `JSONErrorReply`.
 #[cfg(feature = "server")]
 fn status_for(err: &crate::error::RpcError) -> StatusCode {
@@ -229,11 +243,30 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
             let elapsed_ms = start.elapsed().as_millis() as u64;
             match result {
                 Ok(value) => {
-                    tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok");
+                    // A successful call is one line per request, so DEBUG - except a slow one.
+                    // A read that takes seconds is the signal that a wallet has outgrown some
+                    // query, and it is invisible at the default level: without this line an
+                    // operator has to measure `getwalletinfo` or `listtransactions` from the
+                    // client, because nothing in the daemon's log says so.
+                    if elapsed_ms >= SLOW_RPC_MS {
+                        tracing::info!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok (slow)");
+                    } else {
+                        tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok");
+                    }
                     (jsonrpc::success(req.id, value), StatusCode::OK)
                 }
                 Err(err) => {
-                    tracing::info!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, code = err.code, message = %err.message, "rpc error");
+                    // A method-not-found is a client-side probe, not an operational event: a
+                    // client whose dialect fallback polls an absent method (zcashd's
+                    // `z_gettotalbalance` is the one field operators hit) would otherwise write
+                    // one INFO line per poll cycle, forever. Same event name and field set at
+                    // both levels, so a JSON consumer's join to the `rpc` span still works.
+                    // Every other code stays at INFO: a `-6` on a send is worth seeing.
+                    if err.code == crate::error::codes::RPC_METHOD_NOT_FOUND {
+                        tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, code = err.code, message = %err.message, "rpc error");
+                    } else {
+                        tracing::info!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, code = err.code, message = %err.message, "rpc error");
+                    }
                     (jsonrpc::error(req.id, &err), status_for(&err))
                 }
             }
@@ -344,6 +377,10 @@ mod tests {
             sync: SyncConfig {
                 interval_secs: 20,
                 rebroadcast_secs: 60,
+                fetch_memos: true,
+                batch_size: crate::config::DEFAULT_BATCH_SIZE,
+                writer_cache_mib: crate::config::DEFAULT_WRITER_CACHE_MIB,
+                enhance_concurrency: crate::config::DEFAULT_ENHANCE_CONCURRENCY,
             },
             #[cfg(feature = "zcash")]
             spend: crate::config::SpendConfig::default(),
@@ -374,6 +411,10 @@ mod tests {
                 operations: Arc::new(crate::operations::OperationRegistry::new()),
                 #[cfg(feature = "zcash")]
                 fleet: None,
+                #[cfg(feature = "zcash")]
+                spend_limits: crate::config::SpendLimits::new(
+                    &crate::config::SpendConfig::default(),
+                ),
             },
         }
     }
@@ -611,6 +652,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(r).await["result"].as_u64(), Some(500));
+    }
+
+    /// `unloadwallet` takes its wallet from the positional argument *or* the `/wallet/<name>`
+    /// route, and refuses the call when the two name different wallets (Bitcoin Core's rule).
+    /// Preferring either one silently unloads a wallet the caller did not name, and the route is
+    /// only visible to the handler over HTTP - hence an end-to-end test rather than a unit one.
+    #[cfg(feature = "zcash")]
+    #[tokio::test]
+    async fn unloadwallet_refuses_a_route_that_contradicts_its_argument() {
+        use crate::network::ZNetwork;
+        use crate::wallet::{CoinWallet, SyncStatus, WalletHandle};
+
+        let reg = WalletRegistry::new("default".into());
+        for name in ["default", "w2"] {
+            reg.insert(CoinWallet::Zcash(WalletHandle::for_test(
+                name,
+                ZNetwork::Test,
+                SyncStatus::default(),
+            )));
+        }
+        let mut state = test_state();
+        state.app.registry = Arc::new(reg);
+
+        let call = |state: HttpState, uri: &'static str, params: &'static str| async move {
+            let body = format!(r#"{{"method":"unloadwallet","params":{params},"id":1}}"#);
+            let r = router(state)
+                .oneshot(req_to(uri, &body, Some(("u", "p"))))
+                .await
+                .unwrap();
+            body_json(r).await
+        };
+
+        // The endpoint says one wallet, the argument says another: -8, and nothing is unloaded.
+        let v = call(state.clone(), "/wallet/w2", r#"["default"]"#).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-8), "{v}");
+        assert!(state.app.registry.contains("default"), "{v}");
+        assert!(state.app.registry.contains("w2"), "{v}");
+
+        // `load_on_startup = false` is refused before any wallet is touched, so it answers the
+        // same way whichever wallet it names.
+        let v = call(state.clone(), "/", r#"["w2",false]"#).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-8), "{v}");
+        assert!(state.app.registry.contains("w2"), "{v}");
+
+        // The route alone unloads the routed wallet, and reports what it did not do.
+        let v = call(state.clone(), "/wallet/w2", "[]").await;
+        assert_eq!(v["result"]["name"], serde_json::json!("w2"), "{v}");
+        assert!(
+            v["result"]["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("still")),
+            "the warning must say the account is still scanned: {v}"
+        );
+        assert!(!state.app.registry.contains("w2"), "{v}");
+        assert!(state.app.registry.contains("default"), "{v}");
     }
 
     /// A state whose default wallet publishes `status`, plus the sender - so a test can move the
@@ -1223,6 +1319,7 @@ mod tests {
             r#"{"method":"getbalances","id":1,"params":[]}"#,
             r#"{"method":"getrawtransaction","id":1,"params":["00"]}"#,
             r#"{"method":"sendrawtransaction","id":1,"params":["00"]}"#,
+            r#"{"method":"z_validateaddress","id":1,"params":["tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86"]}"#,
         ] {
             let code = call_err_code(body).await;
             assert!(
@@ -1237,29 +1334,19 @@ mod tests {
         }
     }
 
-    /// zecd is stateless: the off-chain label store is gone entirely, so the label-dedicated
-    /// methods are not implemented at all and must surface as method-not-found (-32601), like any
-    /// other unknown method - never reach a handler.
+    /// zecd is stateless: it keeps no off-chain label store, so `getnewaddress` stays available
+    /// but rejects a non-empty label argument with `-8`.
+    ///
+    /// The label-dedicated methods (`setlabel`, `getaddressesbylabel`, `listlabels`,
+    /// `getreceivedbylabel`, `listreceivedbylabel`) used to be probed here for `-32601` as well.
+    /// That is structural rather than behavioural: they are absent from `rpc::ALL_METHODS` and
+    /// from the dispatch `match`, which `rpc::tests::all_methods_matches_dispatch_tables` pins
+    /// against each other, and every unlisted method falls to the same catch-all arm that
+    /// `unknown_method_is_404_with_error_code` covers. Re-implementing one without adding a
+    /// dispatch arm is not a reachable regression.
     #[cfg(feature = "zcash")]
     #[tokio::test]
-    async fn label_methods_are_not_implemented() {
-        use crate::error::codes::RPC_METHOD_NOT_FOUND;
-        for body in [
-            r#"{"method":"setlabel","id":1,"params":["uaddr","x"]}"#,
-            r#"{"method":"getaddressesbylabel","id":1,"params":["x"]}"#,
-            r#"{"method":"listlabels","id":1,"params":[]}"#,
-            r#"{"method":"getreceivedbylabel","id":1,"params":["x"]}"#,
-            r#"{"method":"listreceivedbylabel","id":1,"params":[]}"#,
-        ] {
-            let code = call_err_code(body).await;
-            assert_eq!(
-                code,
-                Some(RPC_METHOD_NOT_FOUND as i64),
-                "label method must be unimplemented: {body}"
-            );
-        }
-        // getnewaddress stays available, but a non-empty label argument is rejected (-8): a label
-        // would be off-chain state zecd doesn't keep.
+    async fn a_label_argument_to_getnewaddress_is_rejected() {
         let code = call_err_code(r#"{"method":"getnewaddress","id":1,"params":["mylabel"]}"#).await;
         assert_eq!(
             code,

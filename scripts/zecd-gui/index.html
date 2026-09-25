@@ -155,7 +155,7 @@
               title="one recipient: the whole spendable balance, fee taken from it">send all</button>
     </div>
     <div class="feerow">
-      <label>fee rate (sat/vB &mdash; prefilled with zecd's estimate for the target; edit to override, clear to let zecd price the send itself)
+      <label>fee rate (sat/vB &mdash; prefilled with zecd's estimate for the target, or its test-network fallback; edit to override, clear to let zecd price the send itself)
         <input type="text" id="feerate" placeholder="" inputmode="decimal"></label>
       <label>confirm within
         <select id="feetarget">
@@ -228,6 +228,8 @@
       </div>
       <div id="xpub" style="color:var(--dim)">&ndash;</div>
     </div>
+    <label style="margin:.4rem 0" title="an address that was issued but has never appeared in a transaction">
+      <input type="checkbox" id="hideunused"> hide addresses with no transactions</label>
     <div class="tablewrap">
       <table>
         <thead><tr><th>index</th><th>address</th><th style="text-align:right">balance</th>
@@ -330,8 +332,12 @@ function renderAddresses(received, descriptors, unspent) {
   }
   const balance = new Map();   // address -> unspent satoshis
   for (const u of unspent || []) balance.set(u.address, (balance.get(u.address) || 0) + toSats(u.amount));
-  const rows = (received || []).slice().sort((a, b) => a.address_index - b.address_index)
-    .map(a => {
+  // The hide-unused toggle drops addresses that have never been in a transaction (the txs
+  // column is 0): issued and never paid. A swept address keeps its history and stays.
+  const hideUnused = $("hideunused").checked;
+  const all = (received || []).slice().sort((a, b) => a.address_index - b.address_index);
+  const shown = hideUnused ? all.filter(a => (a.txids || []).length > 0) : all;
+  const rows = shown.map(a => {
       const bal = balance.get(a.address) || 0;
       return `<tr>
         <td>${a.address_index ?? ""}</td>
@@ -341,9 +347,19 @@ function renderAddresses(received, descriptors, unspent) {
         <td>${(a.txids || []).length}</td>
       </tr>`;
     });
-  $("addrs").innerHTML = rows.length ? rows.join("")
-    : `<tr><td colspan="5" style="color:var(--dim)">${received ? "no addresses issued yet" : "unavailable (listreceivedbyaddress failed)"}</td></tr>`;
+  const hidden = all.length - shown.length;
+  const empty = !received ? "unavailable (listreceivedbyaddress failed)"
+    : !all.length ? "no addresses issued yet"
+    : `all ${all.length} addresses have no transactions (hidden)`;
+  $("addrs").innerHTML = (rows.length ? rows.join("") : `<tr><td colspan="5" style="color:var(--dim)">${empty}</td></tr>`)
+    + (rows.length && hidden ? `<tr><td colspan="5" style="color:var(--dim)">${hidden} unused address${hidden === 1 ? "" : "es"} hidden</td></tr>` : "");
 }
+// The last data the Addresses tab rendered, so the hide-unused toggle re-renders at once
+// instead of waiting for the next refresh.
+let lastAddresses = null;
+$("hideunused").addEventListener("change", () => {
+  if (lastAddresses) renderAddresses(...lastAddresses);
+});
 
 async function refresh() {
   try {
@@ -461,6 +477,7 @@ async function refresh() {
         <td colspan="3"></td>
         <td class="amt ${net < 0 ? "neg" : "pos"}" style="text-align:right" title="credits - debits">${fmtSats(net)}</td>
       </tr>` : "";
+    lastAddresses = [received, descriptors, unspent];
     renderAddresses(received, descriptors, unspent);
   } catch (e) {
     $("conn").className = "dot err";
@@ -479,9 +496,12 @@ async function loadInfo() {
     for (const el of document.querySelectorAll(".unit")) el.textContent = unit;
     for (const el of document.querySelectorAll(".r-to")) el.placeholder = unit === "BTC" ? "bc1\u2026" : "tb1\u2026";
     const mode = watchOnly ? " · watch-only" : "";
+    // The machine this page is served from, which is what tells two open tabs apart; the
+    // config file it read rides on the tooltip.
     $("cfgbadge").textContent =
-      `${i.network} · ${i.backend} · ${i.wallet}${mode}  (${i.conf})`;
-    document.title = `zecd btc – ${i.network}/${i.backend}${mode}`;
+      `${i.network} · ${i.backend} · ${i.wallet}${mode}  (on ${i.machine || "unknown host"})`;
+    $("cfgbadge").title = `config: ${i.conf}`;
+    document.title = `zecd btc – ${i.network}/${i.backend}${mode}${i.machine ? " @ " + i.machine : ""}`;
     refreshFee();
   } catch (e) { $("cfgbadge").textContent = ""; }
 }
@@ -498,8 +518,11 @@ async function loadInfo() {
 // seconds later. It is carried at sat/kvB precision (3 decimals of sat/vB), which is what
 // the estimate is and what fee_rate accepts. Refreshes keep overwriting the field only while
 // it still holds a prefilled value (data-auto); a value the user typed is left alone. With
-// no estimate the field is cleared, so a blank send lets zecd apply its own rule (1 sat/vB
-// on a test network, a refusal on mainnet).
+// no estimate the field shows what a send would pay anyway: zecd's 1 sat/vB test-network
+// fallback. On mainnet there is no fallback (a send without a rate is refused), so the
+// field is cleared and the user has to name a rate.
+const TESTNET_FALLBACK_SAT_PER_VB = "1";
+function noEstimatePrefill() { return unit === "BTC" ? null : TESTNET_FALLBACK_SAT_PER_VB; }
 function setFeePrefill(value) {
   const f = $("feerate");
   if (f.value && !f.dataset.auto) return;  // user-typed: keep it
@@ -524,12 +547,14 @@ async function refreshFee() {
       const why = (r.errors || []).join("; ") || "no estimate";
       $("feeest").textContent = `fee estimate: none (${why}); ` + (unit === "BTC"
         ? "a send without a fee rate is refused on mainnet"
-        : "a send without a fee rate pays zecd's 1 sat/vB test-network fallback");
-      setFeePrefill(null);
+        : `prefilled with zecd's ${TESTNET_FALLBACK_SAT_PER_VB} sat/vB test-network fallback`);
+      setFeePrefill(noEstimatePrefill());
     }
   } catch (e) {
-    $("feeest").textContent = "fee estimate: unavailable (" + e.message + ")";
-    setFeePrefill(null);
+    $("feeest").textContent = "fee estimate: unavailable (" + e.message + "); " + (unit === "BTC"
+      ? "a send without a fee rate is refused on mainnet"
+      : `prefilled with zecd's ${TESTNET_FALLBACK_SAT_PER_VB} sat/vB test-network fallback`);
+    setFeePrefill(noEstimatePrefill());
   }
 }
 // Choosing a target asks for that target's estimate, replacing whatever the field held.

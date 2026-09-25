@@ -49,6 +49,7 @@ import http.server
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -158,6 +159,21 @@ ALLOWED_METHODS = frozenset({
     "sendmany",
     "sendtoaddress",
 })
+
+
+def machine_name(flag):
+    """The name of the machine this proxy runs on, for the page header: the --machine flag,
+    else ZECD_GUI_MACHINE, else the hostname. A container on a bridge network has a random
+    container id for a hostname, which names nothing an operator would recognise, so the
+    compose stacks pass ZECD_GUI_MACHINE through from deploy/.env; a host-network container
+    (the mainnet stack) already sees the host's own name."""
+    name = (flag or os.environ.get("ZECD_GUI_MACHINE") or "").strip()
+    if name:
+        return name
+    host = socket.gethostname()
+    if Path("/.dockerenv").exists() and re.fullmatch(r"[0-9a-f]{12}", host):
+        return f"container {host} (set ZECD_GUI_MACHINE to name the host)"
+    return host
 
 
 def rpc_error(code, message):
@@ -276,6 +292,12 @@ def main():
     ap.add_argument("--port", type=int, default=8080, help="port to serve the UI on")
     ap.add_argument("--wallet", default="", help="route RPCs via /wallet/<name> (empty = default wallet)")
     ap.add_argument(
+        "--machine",
+        default="",
+        help="the name the page header shows for the machine this proxy runs on (default: "
+             "ZECD_GUI_MACHINE, else the hostname)",
+    )
+    ap.add_argument(
         "--rpc-user",
         default="",
         help="zecd RPC username, overriding [rpc] user from the config. Env: ZECD_RPC_USER. "
@@ -382,6 +404,7 @@ def main():
     net = os.environ.get("ZECD_NETWORK") or config.get("btc_testnet") or config.get("network") or "?"
     Handler.info_json = json.dumps({
         "conf": conf_label,
+        "machine": machine_name(args.machine),
         "network": net,
         "wallet": wallet_name,
         "backend": backend,
@@ -396,7 +419,8 @@ def main():
     cred_src = "environment" if os.environ.get("ZECD_RPC_PASSWORD") else conf_label
     print(f"zecd: {Handler.upstream_url}  (user={user!r}, credentials from {cred_src})")
     print("fee:  zecd's estimatesmartfee through /rpc (the same estimate a send uses)")
-    print(f"cfg:  {conf_label}  net={net}  wallet={wallet_name}  backend={backend}")
+    print(f"cfg:  {conf_label}  net={net}  wallet={wallet_name}  backend={backend}  "
+          f"machine={machine_name(args.machine)}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

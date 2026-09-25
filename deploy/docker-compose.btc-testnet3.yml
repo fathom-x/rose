@@ -82,6 +82,9 @@ services:
       - bitcoind
     environment:
       - ZECD_RPC_PASSWORD=zecd
+      # The name the page header shows for this machine: a bridged container's own hostname is
+      # a random id, so set ZECD_GUI_MACHINE (e.g. to `hostname`'s output) in deploy/.env.
+      - ZECD_GUI_MACHINE=${ZECD_GUI_MACHINE:-}
     ports:
       - "127.0.0.1:8081:8080"  # UI on loopback only for dev (different port from testnet4)
     volumes:

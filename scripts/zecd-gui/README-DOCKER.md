@@ -207,6 +207,11 @@ with the flags and the config.
   Bitcoin-wallet RPC reports the network; falls back to `[btc_testnet]`/`network` from the config.
 - `ZECD_BACKEND` - `kyoto` or `bitcoind`, the chain backend the info panel shows. Set it env-only;
   falls back to detecting `kyoto` from the config's `server` token.
+- `ZECD_GUI_MACHINE` - the name the page header shows for the machine the UI runs on (also
+  `--machine`). Defaults to the hostname, which is the host's own name under host networking
+  (the mainnet stack) but a random container id on a bridge network, so the testnet stacks
+  pass it through from `deploy/.env`. The config file the proxy read is on the header's
+  tooltip.
 
 ### Command-line Arguments
 
@@ -225,6 +230,7 @@ Full options:
 - `--bind ADDR` - Server bind address (default: `0.0.0.0` in container)
 - `--port PORT` - Server port (default: `8080`)
 - `--wallet NAME` - Route RPC via `/wallet/<name>` (default: default wallet)
+- `--machine NAME` - the machine name the page header shows (env: `ZECD_GUI_MACHINE`; default: the hostname)
 - `--rpc-user NAME` - zecd RPC username, overriding `[rpc] user` (env: `ZECD_RPC_USER`)
 - `--rpc-url URL` - whole zecd JSON-RPC base URL, overriding the config's `[rpc]` bind/port (env: `ZECD_RPC_URL`)
 - `--rpc-host HOST` / `--rpc-port PORT` / `--rpc-scheme SCHEME` - compose the base URL from parts

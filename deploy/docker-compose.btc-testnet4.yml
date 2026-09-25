@@ -135,6 +135,9 @@ services:
       # refuses to start the service while it is unset or empty rather than sending a wrong
       # credential on every request.
       - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:?set ZECD_RPC_PASSWORD in deploy/.env to the password the host zecd runs with}
+      # The name the page header shows for this machine: a bridged container's own hostname is
+      # a random id, so set ZECD_GUI_MACHINE (e.g. to `hostname`'s output) in deploy/.env.
+      - ZECD_GUI_MACHINE=${ZECD_GUI_MACHINE:-}
     ports:
       - "127.0.0.1:8080:8080"  # UI on loopback only for dev
     volumes:

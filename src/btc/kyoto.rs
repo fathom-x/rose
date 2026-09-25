@@ -716,6 +716,7 @@ impl KyotoEndpoint {
         info!(
             upstream = %self.describe(),
             scan = ?scan_type,
+            from = tree_start,
             "kyoto light client started"
         );
         Ok(KyotoConn {
@@ -728,6 +729,7 @@ impl KyotoEndpoint {
             birthday_time,
             tree_start,
             fee_sampler: None,
+            started: Some(Instant::now()),
         })
     }
 
@@ -1061,6 +1063,9 @@ pub struct KyotoConn {
     tree_start: u32,
     /// The background fee sampler, once an estimate armed it ([`Self::arm_fee_sampler`]).
     fee_sampler: Option<JoinHandle<()>>,
+    /// When the node started, until the first update is delivered: what the "caught up"
+    /// line reports, so a restart's cost is visible in the log.
+    started: Option<Instant>,
 }
 
 impl KyotoConn {
@@ -1090,7 +1095,18 @@ impl KyotoConn {
     /// bitcoind transport error and reconnects with backoff, the latter deeper each time.
     pub fn try_next_update(&mut self) -> Result<Option<Update>, KyotoFailure> {
         match self.updates.try_recv() {
-            Ok(Ok(update)) => Ok(Some(update)),
+            Ok(Ok(update)) => {
+                if let Some(started) = self.started.take() {
+                    info!(
+                        from = self.tree_start,
+                        tip = update.chain.as_ref().map(|cp| cp.height()),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "the light client caught up: headers and filters synced from `from` \
+                         (a restart of a synced wallet resumes a few blocks below its tip)"
+                    );
+                }
+                Ok(Some(update))
+            }
             Ok(Err(e)) => Err(e),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(mpsc::error::TryRecvError::Disconnected) => Err(KyotoFailure::Stream(

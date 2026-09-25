@@ -233,6 +233,13 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
   with `coin`, `server`, `conn_state`, `synced_height`. A first sync is 503 `reason=syncing`;
   a dropped or hung upstream 503 `reason=upstream_down`. No `scan_lag` or enhancement
   backlog on this path.
+- **A kyoto wallet's `<wallet>/btc/kyoto/` directory stays empty.** The light client keeps its
+  header chain in memory, and a restart does not rebuild it from genesis: a synced wallet
+  resumes a few blocks below its own recorded tip, so a restart costs a peer handshake and a
+  handful of headers and filters. The log's `kyoto light client started ... from=<height>` and
+  `the light client caught up ... elapsed_ms=<n>` lines show where that time goes. The
+  exception is a *first* sync (or a rescan) interrupted before it reaches the tip, which
+  starts that scan over.
 - **Kyoto wallets with the `[mempool]` feed on** (the default, unless `sources = []`) report it under
   `getwalletinfo.mempool_feed`: `state` (`disabled` / `connecting` / `connected`), the
   endpoint (`p2p://<ip>:<port> (relay[ + mempool snapshots])` or the websocket URL),

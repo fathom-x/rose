@@ -2972,8 +2972,37 @@ impl BtcActor {
         let requester = match self.conn.as_mut() {
             // Blocking and synchronous: answer here, before any await exists.
             Some(Conn::Bitcoind { rpc, .. }) => {
+                let network = self.network;
                 return tokio::task::block_in_place(|| {
-                    rpc.estimate_fee_rate_blocking(target, conservative)
+                    let rate = rpc.estimate_fee_rate_blocking(target, conservative)?;
+                    // A test network's estimator can be broken while staying under the
+                    // sanity ceiling (testnet4: 361 sat/vB at every target). A
+                    // flat curve there is "no estimate", which the send's test-network
+                    // fallback prices at 1 sat/vB. Mainnet keeps its answer: a missing
+                    // estimate there refuses the send, and its estimator is sane.
+                    if rate.is_none() || network == BitcoinNetwork::Main {
+                        return Ok(rate);
+                    }
+                    use crate::btc::chain::{
+                        fee_curve_is_flat, FEE_CURVE_LONG_TARGET, FEE_CURVE_SHORT_TARGET,
+                    };
+                    let short =
+                        rpc.estimate_fee_rate_blocking(FEE_CURVE_SHORT_TARGET, conservative)?;
+                    let long =
+                        rpc.estimate_fee_rate_blocking(FEE_CURVE_LONG_TARGET, conservative)?;
+                    if let (Some(short), Some(long)) = (short, long) {
+                        if fee_curve_is_flat(short, long) {
+                            warn!(
+                                short_sat_per_kwu = short.to_sat_per_kwu(),
+                                long_sat_per_kwu = long.to_sat_per_kwu(),
+                                "the node's fee estimate is flat across targets, which a \
+                                 working estimator never is above the floor; treating it as \
+                                 no estimate on this test network"
+                            );
+                            return Ok(None);
+                        }
+                    }
+                    Ok(rate)
                 })
                 .map(|rate| rate.map(|rate| (rate, "estimatesmartfee")));
             }

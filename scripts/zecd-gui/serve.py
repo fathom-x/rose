@@ -261,6 +261,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     bitcoind_auth = None
     backend = "bitcoind"  # "bitcoind" | "kyoto", from the config
     fee_tiers = ()  # ordered (source, url) HTTP fee tiers, mirroring [fees] (set by main)
+    network = "?"  # "main" | "test" | "testnet4" | "regtest"..., from the config (set by main)
     info_json = b"{}"  # which config this proxy is serving (set by main)
 
     def do_GET(self):
@@ -288,29 +289,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.serve_feerate_kyoto()
         if not self.bitcoind_url:
             return self.relay(200, json.dumps({"error": "no [bitcoind] credentials in config"}).encode())
-        body = json.dumps({"jsonrpc": "1.0", "id": 1, "method": "estimatesmartfee", "params": [6]}).encode()
+        try:
+            sat_per_vb, blocks = self.estimatesmartfee(6)
+            # zecd's test-network rule (btc/chain.rs::fee_curve_is_flat): a curve flat above
+            # 1 sat/vB - the 1008-block estimate at least 90% of the 2-block one - is an
+            # estimator with no usable data (testnet4 answered 361 sat/vB at every target),
+            # so it is no estimate and the send takes the 1 sat/vB fallback. The page must
+            # agree: it passes its number back as the send's explicit fee_rate.
+            if sat_per_vb is not None and self.network not in ("main", "?"):
+                short, _ = self.estimatesmartfee(2)
+                long, _ = self.estimatesmartfee(1008)
+                if short is not None and long is not None and short > 1 and long * 100 >= short * 90:
+                    sat_per_vb = None
+        except (urllib.error.HTTPError, OSError, ValueError) as e:
+            return self.relay(200, json.dumps({"error": f"bitcoind unreachable: {e}"}).encode())
+        if sat_per_vb is not None:
+            out = {"sat_per_vb": sat_per_vb, "source": "estimatesmartfee", "blocks": blocks}
+        else:
+            out = {"sat_per_vb": 1.0, "source": "fallback"}  # test-network floor
+        self.relay(200, json.dumps(out).encode())
+
+    def estimatesmartfee(self, target):
+        """The node's estimate at `target` as whole sat/vB (or None), and the blocks it
+        answered for. BTC/kvB -> sat/vB is ceiling-divided and floored at 1, exactly as
+        zecd's bitcoind path does (btc/chain.rs::estimate_fee_rate_blocking) - the page
+        passes this number back as the send's explicit fee_rate, so it must be the same
+        number. Decimal via repr so 0.00001 does not become 999.9999 sat/kvB on the way."""
+        body = json.dumps({"jsonrpc": "1.0", "id": 1, "method": "estimatesmartfee", "params": [target]}).encode()
         req = urllib.request.Request(
             self.bitcoind_url, data=body,
             headers={"Content-Type": "application/json", "Authorization": self.bitcoind_auth},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                r = json.loads(resp.read())
-        except (urllib.error.HTTPError, OSError, ValueError) as e:
-            return self.relay(200, json.dumps({"error": f"bitcoind unreachable: {e}"}).encode())
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            r = json.loads(resp.read())
         result = (r or {}).get("result") or {}
-        if result.get("feerate"):
-            # BTC/kvB -> whole sat/vB, ceiling-divided and floored at 1, exactly as zecd's
-            # bitcoind path does (btc/chain.rs::estimate_fee_rate_blocking) - the page passes
-            # this number back as the send's explicit fee_rate, so it must be the same number.
-            # Decimal via repr so 0.00001 does not become 999.9999 sat/kvB on the way.
-            sat_per_kvb = int(Decimal(repr(result["feerate"])) * 100_000_000)
-            sat_per_vb = max(1, -(-sat_per_kvb // 1000))
-            out = {"sat_per_vb": sat_per_vb, "source": "estimatesmartfee", "blocks": result.get("blocks")}
-        else:
-            out = {"sat_per_vb": 1.0, "source": "fallback"}  # test-network floor
-        self.relay(200, json.dumps(out).encode())
+        if not result.get("feerate"):
+            return None, result.get("blocks")
+        sat_per_kvb = int(Decimal(repr(result["feerate"])) * 100_000_000)
+        return max(1, -(-sat_per_kvb // 1000)), result.get("blocks")
 
     def serve_feerate_kyoto(self):
         """A kyoto wallet walks the [fees] oracle chain at send time (src/btc/fees.rs): each
@@ -532,6 +549,7 @@ def main():
         backend = "kyoto" if (srv or "").lower().startswith("kyoto") else "bitcoind"
     net = os.environ.get("ZECD_NETWORK") or config.get("btc_testnet") or config.get("network") or "?"
     Handler.backend = backend
+    Handler.network = net
     Handler.fee_tiers = kyoto_fee_tiers(config, net)
     Handler.info_json = json.dumps({
         "conf": conf_label,

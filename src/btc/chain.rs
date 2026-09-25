@@ -508,9 +508,43 @@ impl BitcoindRpc {
     }
 }
 
+/// The short and long ends of the curve [`fee_curve_is_flat`] reads: Core's fastest
+/// target and its longest.
+pub const FEE_CURVE_SHORT_TARGET: u16 = 2;
+pub const FEE_CURVE_LONG_TARGET: u16 = 1008;
+
+/// How close, in percent, the long-horizon estimate may come to the short one before the
+/// curve counts as flat.
+const FEE_CURVE_FLAT_PERCENT: u64 = 90;
+
+/// Whether a node's fee-estimate curve is flat above the relay floor: its 1008-block
+/// estimate at least [`FEE_CURVE_FLAT_PERCENT`] of its 2-block one, and the 2-block one
+/// above 1 sat/vB. A working estimator prices the long horizon well below the short one
+/// unless both sit at the floor; a curve flat at hundreds of sat/vB is an estimator with no
+/// usable data. Testnet4's min-difficulty blocks do exactly this: sparse, contested blocks
+/// carrying fee-bidding spam gave 361 sat/vB at every target while blocks cleared at 1.
+/// The caller treats it as "no estimate" on test networks only.
+pub fn fee_curve_is_flat(short: FeeRate, long: FeeRate) -> bool {
+    short > FeeRate::from_sat_per_vb_u32(1)
+        && long.to_sat_per_kwu() * 100 >= short.to_sat_per_kwu() * FEE_CURVE_FLAT_PERCENT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flat_curve_above_the_floor_is_no_estimate() {
+        let vb = FeeRate::from_sat_per_vb_u32;
+        // Testnet4's broken estimator: the same rate at every target.
+        assert!(fee_curve_is_flat(vb(361), vb(361)));
+        assert!(fee_curve_is_flat(vb(361), vb(330)));
+        // A working curve slopes down to the long horizon.
+        assert!(!fee_curve_is_flat(vb(40), vb(8)));
+        assert!(!fee_curve_is_flat(vb(12), vb(10)));
+        // Flat at the floor is a quiet market, and the fallback would say the same.
+        assert!(!fee_curve_is_flat(vb(1), vb(1)));
+    }
 
     #[test]
     fn bare_token_resolves_to_the_network_standard_port() {

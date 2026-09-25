@@ -1312,6 +1312,19 @@ def s_errors(ctx):
         ck("sendmany fee_rate raises", False)
     except JSONRPCException as e:
         ck("sendmany fee_rate -> code -8", e.code == -8, e.code)
+    # fee_split is the Bitcoin engine's extension over subtractfeefrom; a ZIP-317 send refuses
+    # it rather than ignore it (sendtoaddress position 12, sendmany position 10).
+    try:
+        rpc.call("sendtoaddress", addr, "0.1", "", "", None, None, None, None, None, None, None,
+                 "output")
+        ck("sendtoaddress fee_split raises", False)
+    except JSONRPCException as e:
+        ck("sendtoaddress fee_split -> code -8", e.code == -8, e.code)
+    try:
+        rpc.call("sendmany", "", {addr: "0.1"}, 1, "", [], None, None, "", None, None, "output")
+        ck("sendmany fee_split raises", False)
+    except JSONRPCException as e:
+        ck("sendmany fee_split -> code -8", e.code == -8, e.code)
     # Arity: like Bitcoin Core, a call with more positional arguments than the method accepts is
     # rejected (-1, the help error) rather than silently ignoring the trailing junk. A no-arg
     # method with one extra arg, and a one-arg method with a second, both trip it.
@@ -1765,6 +1778,39 @@ def s_errors_bitcoin(ctx):
         ck("sendrawtransaction undecodable raises", False)
     except JSONRPCException as e:
         ck("sendrawtransaction undecodable -> code -22", e.code == -22, e.code)
+    # fee_split, zecd's extension over subtractfeefrom: position 12 on sendtoaddress (after the
+    # Zcash engine's memo at 11), 10 on sendmany. Each case is refused while parsing.
+    for label, call, code in (
+        ("sendtoaddress unknown fee_split",
+         ["sendtoaddress", addr, UNAFFORDABLE, "", "", True, None, None, None, None, None, None,
+          None, "by-weight"], -8),
+        ("sendtoaddress non-string fee_split",
+         ["sendtoaddress", addr, UNAFFORDABLE, "", "", True, None, None, None, None, None, None,
+          None, 5], -3),
+        ("sendtoaddress fee_split output with no paying recipient",
+         ["sendtoaddress", addr, UNAFFORDABLE, "", "", False, None, None, None, None, None, None,
+          None, "output"], -8),
+        ("sendtoaddress memo on a Bitcoin wallet",
+         ["sendtoaddress", addr, UNAFFORDABLE, "", "", False, None, None, None, None, None,
+          None, "f600"], -8),
+        ("sendtoaddress past fee_split (arity)",
+         ["sendtoaddress", addr, UNAFFORDABLE, "", "", True, None, None, None, None, None, None,
+          None, "output", "extra"], -1),
+        ("sendmany unknown fee_split",
+         ["sendmany", "", {addr: UNAFFORDABLE}, None, "", [addr], None, None, None, None, None,
+          "by-weight"], -8),
+        ("sendmany fee_split output with no paying recipient",
+         ["sendmany", "", {addr: UNAFFORDABLE}, None, "", [], None, None, None, None, None,
+          "output"], -8),
+        ("sendmany past fee_split (arity)",
+         ["sendmany", "", {addr: UNAFFORDABLE}, None, "", [addr], None, None, None, None, None,
+          "output", "extra"], -1),
+    ):
+        try:
+            rpc.call(*call)
+            ck(f"{label} raises", False)
+        except JSONRPCException as e:
+            ck(f"{label} -> code {code}", e.code == code, e.code)
     # Everything the engine does not serve is method-not-found, whatever the dialect: Zcash's
     # block lookups and fee stubs, the passphrase pair, and the z_* extensions alike.
     for m, params in (

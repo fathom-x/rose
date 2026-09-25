@@ -1810,6 +1810,13 @@ pub(crate) async fn sendtoaddress(
         Some(Value::String(s)) => Some(s.as_str()),
         Some(_) => return Err(RpcError::type_error("memo must be a hex string")),
     };
+    // Param 12 (fee_split) is a Bitcoin-wallet extension over subtractfeefromamount, which a
+    // ZIP-317 send never takes.
+    if req.param(12).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "fee_split is not supported (fees are ZIP-317, paid by the sender)",
+        ));
+    }
     let handle = state.registry.get(wallet)?.clone();
     let payment = build_payment(
         handle.coin(),
@@ -1867,6 +1874,13 @@ pub(crate) async fn sendmany(
         ));
     }
     let verbose = verbose_param(req.param(9))?;
+    // Param 10 (fee_split) is a Bitcoin-wallet extension over subtractfeefrom, which a
+    // ZIP-317 send never takes.
+    if req.param(10).is_some_and(param_engaged) {
+        return Err(RpcError::invalid_parameter(
+            "fee_split is not supported (fees are ZIP-317, paid by the sender)",
+        ));
+    }
     let handle = state.registry.get(wallet)?.clone();
     let mut payments = Vec::new();
     for (addr, amount) in recipients {

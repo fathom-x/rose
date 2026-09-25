@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 
 use crate::amount::{signed_zats_to_value, value_to_sat_per_kvb, value_to_zats, zats_to_value};
 use crate::btc::actor::{
-    BtcBumpOptions, BtcConnState, BtcReceipt, BtcSendOptions, BtcSent, BtcTxDetail, BtcTxRecord,
-    BtcWalletHandle,
+    BtcBumpOptions, BtcConnState, BtcFeeSplit, BtcReceipt, BtcSendOptions, BtcSent, BtcTxDetail,
+    BtcTxRecord, BtcWalletHandle,
 };
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
@@ -833,9 +833,21 @@ async fn sendtoaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Val
     // (fee_rate) is an explicit rate in sat/vB, honored verbatim instead of the
     // upstream's estimate (Core's argument, Core's 3-decimal precision).
     reject_fee_estimation_params(req)?;
+    // Param 11 is the Zcash engine's memo extension; a Bitcoin output carries none, and
+    // dropping one silently would lose what the caller meant to send.
+    if req
+        .param(11)
+        .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+    {
+        return Err(RpcError::invalid_parameter(
+            "memo is not supported (a Bitcoin output carries no memo)",
+        ));
+    }
+    let subtract_fee_from = if subtract { vec![0] } else { Vec::new() };
     let options = BtcSendOptions {
         fee_rate_sat_per_kvb: parse_fee_rate(req.param(9))?,
-        subtract_fee_from: if subtract { vec![0] } else { Vec::new() },
+        fee_split: parse_fee_split(req.param(12), &subtract_fee_from)?,
+        subtract_fee_from,
         non_replaceable: !parse_replaceable(req.param(5))?,
     };
     // Param 10 (verbose) is validated before the send, so a malformed flag never moves funds.
@@ -844,6 +856,36 @@ async fn sendtoaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Val
         .send(vec![(addr.to_string(), amount)], options)
         .await?;
     Ok(send_result(sent, verbose))
+}
+
+/// Parse zecd's `fee_split` extension (position 12 on `sendtoaddress`, 10 on `sendmany`):
+/// how the recipients named to pay the fee share it. `"equal"` (or absent) is Core's
+/// `subtractfeefrom`: the whole fee, divided equally. `"output"` charges each paying
+/// recipient only its own output's block space at the send's rate, and the sender's change
+/// pays the rest (inputs, overhead, change, unconfirmed parents). An unknown value is `-8`,
+/// and so is `"output"` with no paying recipient, which would otherwise change nothing
+/// without saying so.
+fn parse_fee_split(v: Option<&Value>, payers: &[usize]) -> Result<BtcFeeSplit, RpcError> {
+    let split = match v {
+        None | Some(Value::Null) => return Ok(BtcFeeSplit::Equal),
+        Some(Value::String(s)) => match s.as_str() {
+            "" | "equal" => BtcFeeSplit::Equal,
+            "output" => BtcFeeSplit::Output,
+            other => {
+                return Err(RpcError::invalid_parameter(format!(
+                    "Invalid fee_split \"{other}\" (expected \"equal\" or \"output\")"
+                )))
+            }
+        },
+        Some(_) => return Err(RpcError::type_error("fee_split must be a string")),
+    };
+    if split == BtcFeeSplit::Output && payers.is_empty() {
+        return Err(RpcError::invalid_parameter(
+            "fee_split \"output\" needs recipients that pay the fee (subtractfeefromamount / \
+             subtractfeefrom)",
+        ));
+    }
+    Ok(split)
 }
 
 /// Parse the optional `verbose` flag of the send methods (position 10 on `sendtoaddress`, 9
@@ -989,6 +1031,7 @@ async fn sendmany(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, R
     reject_fee_estimation_params(req)?;
     let options = BtcSendOptions {
         fee_rate_sat_per_kvb: parse_fee_rate(req.param(8))?,
+        fee_split: parse_fee_split(req.param(10), &subtract_fee_from)?,
         subtract_fee_from,
         non_replaceable: !parse_replaceable(req.param(5))?,
     };

@@ -416,11 +416,26 @@ pub struct BtcSendOptions {
     /// keys on output order, not the order the `subtractfeefrom` array listed them.
     /// Empty = the sender's change pays, as ever.
     pub subtract_fee_from: Vec<usize>,
+    /// How the recipients in `subtract_fee_from` share the fee (zecd's `fee_split`).
+    pub fee_split: BtcFeeSplit,
     /// Core's `replaceable = false`: build every input with `nSequence = 0xFFFFFFFE`
     /// (locktime still enforced for anti-fee-sniping, no BIP 125 signal) instead of BDK's
     /// RBF-signalling default. `false` - the `Default` - keeps that default, which is also
     /// Core's own `-walletrbf` default.
     pub non_replaceable: bool,
+}
+
+/// How the recipients that pay a send's fee share it (zecd's `fee_split` extension).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BtcFeeSplit {
+    /// Core's `subtractfeefrom`: the whole fee, divided equally among the paying recipients.
+    #[default]
+    Equal,
+    /// Each paying recipient pays for its own output's block space at the send's rate
+    /// (`output_fee_share`); the sender's change pays everything else - the header, the
+    /// inputs, the change output, and any unconfirmed parents the send pays for. A
+    /// recipient's charge is then independent of which coins the sender happened to spend.
+    Output,
 }
 
 /// What a completed send reports: the txid, and Core's `fee_reason` - where the fee rate
@@ -3401,7 +3416,16 @@ impl BtcActor {
         let sequence = options
             .non_replaceable
             .then_some(bdk_wallet::bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF);
-        let (psbt, ancestor_fee) = if options.subtract_fee_from.is_empty() {
+        // `fee_split = "output"`: each paying recipient's amount is cut by its own output's
+        // share up front, and the send is then an ordinary one - the sender's change pays the
+        // rest of the fee, so there is no fixed point to walk.
+        let by_output = options.fee_split == BtcFeeSplit::Output;
+        let parsed = if by_output {
+            subtract_output_shares(&parsed, &options.subtract_fee_from, fee_rate)?
+        } else {
+            parsed
+        };
+        let (psbt, ancestor_fee) = if options.subtract_fee_from.is_empty() || by_output {
             let selection = AncestorAware::new(Arc::clone(&ancestry), fee_rate);
             let paid = selection.paid();
             let mut builder = self.wallet.build_tx().coin_selection(selection);
@@ -4303,6 +4327,46 @@ fn subtract_fee_from_amounts(
     Ok(out)
 }
 
+/// What one output costs at `rate`: its serialized size (8-byte value, the script's length
+/// prefix, the script - all non-witness, so weight is 4x the bytes) priced by weight and
+/// rounded up, the same way BDK prices the transaction. `fee_split = "output"` charges
+/// each paying recipient exactly this.
+fn output_fee_share(rate: FeeRate, script: &bdk_wallet::bitcoin::Script) -> u64 {
+    let weight = bdk_wallet::bitcoin::TxOut {
+        value: Amount::ZERO,
+        script_pubkey: script.to_owned(),
+    }
+    .weight()
+    .to_wu();
+    (rate.to_sat_per_kwu() * weight).div_ceil(1_000)
+}
+
+/// Cut each paying recipient's amount by its own output's share ([`output_fee_share`]):
+/// `fee_split = "output"`. A cut that would leave nothing is Core's `-4` for a fee the
+/// amount cannot cover; one that leaves dust is refused by the builder as usual.
+fn subtract_output_shares(
+    parsed: &[(Address, Amount)],
+    payers: &[usize],
+    rate: FeeRate,
+) -> Result<Vec<(Address, Amount)>, RpcError> {
+    let mut out = parsed.to_vec();
+    for idx in payers {
+        let entry = out
+            .get_mut(*idx)
+            .ok_or_else(|| RpcError::invalid_parameter("subtractfeefrom index out of range"))?;
+        let cut = output_fee_share(rate, &entry.0.script_pubkey());
+        let have = entry.1.to_sat();
+        if have <= cut {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "The transaction amount is too small to pay the fee",
+            ));
+        }
+        entry.1 = Amount::from_sat(have - cut);
+    }
+    Ok(out)
+}
+
 /// The wallet key at one derivation, in the forms Core reports it: the inferred
 /// single-key descriptor (`listunspent.desc`, `getaddressinfo.desc`) with its checksum, the
 /// compressed public key, and the master fingerprint.
@@ -4664,6 +4728,39 @@ mod tests {
     /// `subtractfeefrom` array named them - Core keys on output order), unlisted
     /// recipients untouched, and an amount that cannot cover its share refusing rather
     /// than underflowing.
+    #[test]
+    fn an_output_pays_for_its_own_block_space() {
+        let addr = |s: &str| Address::from_str(s).unwrap().assume_checked();
+        // P2WPKH: 8 + 1 + 22 = 31 bytes; P2TR: 8 + 1 + 34 = 43 bytes.
+        let wpkh = addr("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        let tr = addr("bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0");
+        let rate = FeeRate::from_sat_per_vb_u32(10);
+        assert_eq!(output_fee_share(rate, &wpkh.script_pubkey()), 310);
+        assert_eq!(output_fee_share(rate, &tr.script_pubkey()), 430);
+        // A fractional rate rounds up: 1.001 sat/vB is 251 sat/kwu (ceil), 31 vB -> 32 sat.
+        assert_eq!(
+            output_fee_share(FeeRate::from_sat_per_kwu(251), &wpkh.script_pubkey()),
+            32
+        );
+
+        let parsed = vec![
+            (wpkh.clone(), Amount::from_sat(10_000)),
+            (tr.clone(), Amount::from_sat(20_000)),
+            (wpkh.clone(), Amount::from_sat(30_000)),
+        ];
+        let out = subtract_output_shares(&parsed, &[0, 1], rate).unwrap();
+        assert_eq!(out[0].1.to_sat(), 10_000 - 310);
+        assert_eq!(out[1].1.to_sat(), 20_000 - 430);
+        assert_eq!(
+            out[2].1.to_sat(),
+            30_000,
+            "a non-paying recipient is untouched"
+        );
+        // An amount its own share would consume is refused, as Core refuses one the fee would.
+        let tiny = vec![(wpkh.clone(), Amount::from_sat(310))];
+        assert!(subtract_output_shares(&tiny, &[0], rate).is_err());
+    }
+
     #[test]
     fn subtract_fee_from_amounts_splits_like_core() {
         let addr = |s: &str| Address::from_str(s).unwrap().assume_checked();

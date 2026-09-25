@@ -107,7 +107,7 @@ pub fn is_known_method(name: &str) -> bool {
 /// `RPC_MISC_ERROR`/-1); zecd mirrors that via [`check_arity`] in dispatch, closing the gap where
 /// handlers silently ignored trailing junk. Counts follow Bitcoin Core's / zcashd's argument
 /// lists, plus zecd's own trailing extension args where they exist (e.g. `sendtoaddress`'s
-/// `memo` at index 11 → arity 12). Object params are unaffected: an object request body yields
+/// `memo` at index 11 and `fee_split` at 12 → arity 13). Object params are unaffected: an object request body yields
 /// zero positional params, so an object-shaped call never trips the bound.
 ///
 /// Kept in lockstep with [`ALL_METHODS`] by the `arity_table_matches_all_methods` test.
@@ -168,8 +168,8 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("unloadwallet", 2),
     // Wallet - writes / async
     ("getnewaddress", 2),
-    ("sendtoaddress", 12),
-    ("sendmany", 10),
+    ("sendtoaddress", 13),
+    ("sendmany", 11),
     ("walletpassphrase", 2),
     ("walletlock", 0),
     ("signmessage", 2),

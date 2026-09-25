@@ -169,6 +169,11 @@
         </select></label>
     </div>
     <div class="sub" id="feeest" style="margin-top:.3rem">fee estimate: &ndash;</div>
+    <label>recipients who pay the fee share it
+      <select id="feesplit">
+        <option value="equal" selected>equally, the whole fee (Bitcoin Core's subtractfeefrom)</option>
+        <option value="output">each pays its own output's size at the rate; you pay the rest</option>
+      </select></label>
     <div class="row">
       <label style="margin:0" title="BIP 125: lets bumpfee replace the send with a higher-fee version later">
         <input type="checkbox" id="replaceable" checked> replaceable (can be fee-bumped)</label>
@@ -597,6 +602,9 @@ $("send").onclick = async () => {
   const feerate = $("feerate").value.trim();
   if (feerate && !/^\d+(\.\d{1,3})?$/.test(feerate)) return fail("fee rate must be sat/vB with at most 3 decimals");
   const replaceable = $("replaceable").checked;
+  // zecd's fee_split extension, sent only when it changes something: "output" with at least
+  // one paying recipient (zecd refuses "output" with none).
+  const byOutput = $("feesplit").value === "output" && recips.some(r => r.subfee);
   // Amounts and the fee rate ride as raw JSON placeholders, so zecd parses exactly the
   // decimals typed (no float round trip on the send path).
   const raw = {};
@@ -606,20 +614,24 @@ $("send").onclick = async () => {
   if (recips.length === 1) {
     // sendtoaddress "address" amount comment comment_to subtractfeefromamount
     //               replaceable conf_target estimate_mode avoid_reuse fee_rate verbose
+    //               (memo, a Zcash extension) fee_split
     const r = recips[0];
     raw.__AMT0__ = r.amount;
     method = "sendtoaddress";
     params = [r.to, "__AMT0__", null, null, r.subfee, replaceable, null, null, null, feeParam, true];
+    if (byOutput) params.push(null, "output");
   } else {
     // sendmany "" {"address": amount, ...} minconf comment [subtractfeefrom]
-    //          replaceable conf_target estimate_mode fee_rate verbose
+    //          replaceable conf_target estimate_mode fee_rate verbose fee_split
     const amounts = {};
     recips.forEach((r, i) => { amounts[r.to] = `__AMT${i}__`; raw[`__AMT${i}__`] = r.amount; });
     method = "sendmany";
     params = ["", amounts, null, null, recips.filter(r => r.subfee).map(r => r.to),
               replaceable, null, null, feeParam, true];
+    if (byOutput) params.push("output");
   }
-  const summary = recips.map(r => `  ${r.amount} ${unit} -> ${r.to}${r.subfee ? " (pays fee)" : ""}`).join("\n");
+  const pays = byOutput ? " (pays its output's share of the fee)" : " (pays fee)";
+  const summary = recips.map(r => `  ${r.amount} ${unit} -> ${r.to}${r.subfee ? pays : ""}`).join("\n");
   const rate = feerate ? `${feerate} sat/vB` : "zecd's own estimate";
   if (!confirm(`Send\n${summary}\nat ${rate}${replaceable ? "" : ", not replaceable"}?`)) return;
   $("send").disabled = true; msg.textContent = "sending...";

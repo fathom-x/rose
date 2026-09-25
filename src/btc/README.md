@@ -468,7 +468,12 @@ differ between the two methods, as in Core):
   subtract-fee send), then rate-priced rebuilds over those pinned inputs walk the fee to a
   fixed point, accepting a changeless build whose fee overshoots by at most a dust bound
   (the no-fixed-point shape where BDK folds a sub-dust surplus into the fee, as Core
-  does).
+  does). zecd's **`fee_split`** extension (position 12 on `sendtoaddress`, after the Zcash
+  memo at 11; 10 on `sendmany`) picks another share: `"output"` charges each paying
+  recipient its own output's serialized size at the send's rate (`output_fee_share`: 310 sat
+  for a P2WPKH output at 10 sat/vB, 430 for P2TR), and the sender's change pays the rest -
+  header, inputs, change, unconfirmed parents - so a recipient's charge no longer depends on
+  which coins the sender spent. `"equal"` (the default) is Core's split.
 - **`verbose`** (position 10 on `sendtoaddress`, 9 on `sendmany`) answers Core's
   `{txid, fee_reason}`: Core's own strings where zecd prices the same way (`PayTxFee set`
   for an explicit `fee_rate`, `Fallback fee` for the test-network floor), else the source

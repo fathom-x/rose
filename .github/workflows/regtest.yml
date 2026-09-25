@@ -528,7 +528,8 @@ jobs:
   # regtest_btc_kyoto_fees runs the kyoto fee chain against stand-in oracles (an implausible
   # one skipped, non-full blocks pricing the peer tier at the relay floor);
   # regtest_btc_fee_curve gives the node a flat estimate curve, which a test network's
-  # bitcoind wallet must treat as no estimate.
+  # bitcoind wallet must treat as no estimate; regtest_btc_fee_split checks that
+  # fee_split "output" charges each paying recipient exactly its own output's share.
   # Its own small job
   # rather than a leg of the `regtest` matrix: it needs
   # neither zebra, nor the funder, nor the chain snapshot, and the matrix legs' zecd is the
@@ -610,6 +611,7 @@ jobs:
             --test regtest_btc_birthday_block --test regtest_btc_send_outcomes \
             --test regtest_btc_bumpfee --test regtest_btc_ancestors \
             --test regtest_btc_kyoto_fees --test regtest_btc_fee_curve \
+            --test regtest_btc_fee_split \
             -- --nocapture 2>&1 | tee btc-e2e.log
           # Every suite self-skips (printing `skipping:`, see the harness's `provisioned`)
           # without a bitcoind or against a feature-less zecd. This job supplies both, so a

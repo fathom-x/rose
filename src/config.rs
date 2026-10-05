@@ -227,7 +227,16 @@ pub struct AppConfig {
     #[cfg(feature = "bitcoin")]
     pub btc_testnet: crate::coin::BitcoinTestnet,
     pub datadir: PathBuf,
+    /// Where an un-prefixed request (`/` rather than `/wallet/<name>`) routes: the file's
+    /// `default_wallet`; else the one declared wallet when exactly one is; else the literal
+    /// `default` (an implicit wallet of the build's default coin, filled in at resolve).
     pub default_wallet: String,
+    /// The wallet a subcommand acts on when its `--wallet` is omitted
+    /// ([`wallet_or_default`](Self::wallet_or_default)): [`default_wallet`](Self::default_wallet)
+    /// whenever the file names one or declares at most one wallet, and `None` when it
+    /// declares several and names none - nothing singles a wallet out then, so the flag is
+    /// required rather than quietly meaning the literal `default`.
+    pub implied_wallet: Option<String>,
     pub wallets: BTreeMap<String, WalletEntry>,
     pub backend: BackendConfig,
     #[cfg(feature = "zcash")]
@@ -716,6 +725,7 @@ impl WalletBackendOverride {
             connect_timeout_secs: global.connect_timeout_secs,
             reconnect_base_secs: global.reconnect_base_secs,
             reconnect_max_secs: global.reconnect_max_secs,
+            p2p_receive_window_bytes: global.p2p_receive_window_bytes,
             rfc1918_is_local: global.rfc1918_is_local,
             allow_remote_cleartext: global.allow_remote_cleartext,
             proxy: global.proxy.clone(),
@@ -735,6 +745,12 @@ pub struct BackendConfig {
     pub reconnect_base_secs: u64,
     /// Reconnect backoff maximum delay (seconds).
     pub reconnect_max_secs: u64,
+    /// `[backend] p2p_receive_window_bytes`: the socket receive buffer of every outbound
+    /// Bitcoin P2P connection (kyoto peers, the P2P mempool feed), which bounds the window
+    /// a peer may have in flight. `None` leaves the kernel's autotuned default. At 1448 a
+    /// peer sends one half-size segment per round trip and never two back-to-back, for
+    /// paths that lose back-to-back packets (`btc::net`). Kyoto needs explicit peers for it.
+    pub p2p_receive_window_bytes: Option<u32>,
     /// Treat private / non-globally-routable ranges (RFC1918, link-local, CGNAT, IPv6 unique-local
     /// and link-local) as "local" for the cleartext-credential gate, so a credentialed connect to
     /// a container/LAN zebra is allowed without an override. Default `true` (the self-hosted
@@ -1859,6 +1875,7 @@ struct BackendFile {
     connect_timeout_secs: Option<u64>,
     reconnect_base_secs: Option<u64>,
     reconnect_max_secs: Option<u64>,
+    p2p_receive_window_bytes: Option<u32>,
     rfc1918_is_local: Option<bool>,
     allow_remote_cleartext: Option<bool>,
     /// lightwalletd TLS mode: `auto` (default) / `yes` / `no`.
@@ -2210,8 +2227,9 @@ pub enum Command {
     /// it answers "can this deployment reach its backend?" and "what birthday should a wallet
     /// created now get?" before `zecd init` has run.
     ChainInfo(ChainInfoArgs),
-    /// Run the JSON-RPC daemon (default).
-    Run,
+    /// Run the JSON-RPC daemon (default). Takes the boot-time options a shell-less
+    /// deployment needs (`--restore-if-empty`).
+    Run(RunArgs),
 }
 
 #[cfg(feature = "cli")]
@@ -2230,9 +2248,11 @@ pub struct ChainInfoArgs {
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, clap::Args)]
 pub struct InitArgs {
-    /// Wallet name (selects/creates <datadir>/<name>).
-    #[arg(long, default_value = "default")]
-    pub wallet: String,
+    /// Wallet name (selects/creates <datadir>/<name>). Defaults to the config's
+    /// `default_wallet`, so a config whose only wallet is `[wallets.btc]` with
+    /// `default_wallet = "btc"` needs no flag.
+    #[arg(long, value_name = "NAME")]
+    pub wallet: Option<String>,
 
     /// Restore from an existing mnemonic instead of generating a new one. The phrase is read
     /// from `--mnemonic-file`, else the `ZECD_MNEMONIC` env var, else stdin.
@@ -2273,6 +2293,47 @@ pub struct InitArgs {
     /// current chain tip for new wallets. Dates are refused on regtest, whose block
     /// timestamps mean nothing.
     #[arg(long, value_name = "HEIGHT|YYYY-MM-DD", value_parser = crate::init::Birthday::parse)]
+    pub birthday: Option<crate::init::Birthday>,
+}
+
+/// `zecd run`'s own flags: what the daemon does before it serves. Every one of them exists
+/// for a deployment with no shell to script `init` first - an enclave, or the `FROM scratch`
+/// container images - where the whole "restore into an empty data directory, then serve"
+/// sequence has to be one command.
+#[cfg(feature = "cli")]
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct RunArgs {
+    /// Before serving, create `--wallet` if it is not yet initialized (its `keys.toml` is
+    /// absent): `init --restore` from the phrase in `ZECD_MNEMONIC` or `--mnemonic-file`
+    /// (a spending wallet), or `init --xpub` from the account xpub in `ZECD_XPUB` (a
+    /// watch-only Bitcoin wallet) - non-interactively, never stdin, and both set is refused.
+    /// An initialized wallet is left exactly as it is and no secret is read at all. A
+    /// restore that fails is fatal for the daemon - it exists to serve that wallet.
+    #[arg(long)]
+    pub restore_if_empty: bool,
+
+    /// The wallet `--restore-if-empty` restores (a `[wallets.<name>]` entry, or the default
+    /// layout for a name the config does not mention - exactly `init --wallet`). Defaults to
+    /// the config's implied wallet: `default_wallet`, else its one declared wallet.
+    #[arg(long, value_name = "NAME", requires = "restore_if_empty")]
+    pub wallet: Option<String>,
+
+    /// For `--restore-if-empty`: read the mnemonic phrase from this file (trailing newline
+    /// trimmed) when `ZECD_MNEMONIC` is unset. `ZECD_MNEMONIC` takes precedence, as for
+    /// `init --restore`.
+    #[arg(long, value_name = "FILE", requires = "restore_if_empty")]
+    pub mnemonic_file: Option<PathBuf>,
+
+    /// For `--restore-if-empty`: the restored wallet's birthday, exactly as `init --birthday`
+    /// (a height, or a UTC date as YYYY-MM-DD; erring early is safe). Without it a restore
+    /// scans from the earliest block the wallet could hold funds in - slow, and on Bitcoin
+    /// mainnet refused, as `init --restore` documents.
+    #[arg(
+        long,
+        value_name = "HEIGHT|YYYY-MM-DD",
+        value_parser = crate::init::Birthday::parse,
+        requires = "restore_if_empty"
+    )]
     pub birthday: Option<crate::init::Birthday>,
 }
 
@@ -2333,17 +2394,18 @@ pub struct ConfigShowArgs {}
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, clap::Args)]
 pub struct ExportUfvkArgs {
-    /// Wallet name (selects <datadir>/<name>).
-    #[arg(long, default_value = "default")]
-    pub wallet: String,
+    /// Wallet name (selects <datadir>/<name>); defaults to the config's `default_wallet`.
+    #[arg(long, value_name = "NAME")]
+    pub wallet: Option<String>,
 }
 
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, clap::Args)]
 pub struct ExportXpubArgs {
-    /// Wallet name (selects <datadir>/<name>); must be a `coin = "bitcoin"` wallet.
-    #[arg(long, default_value = "default")]
-    pub wallet: String,
+    /// Wallet name (selects <datadir>/<name>); must be a `coin = "bitcoin"` wallet. Defaults
+    /// to the config's `default_wallet`.
+    #[arg(long, value_name = "NAME")]
+    pub wallet: Option<String>,
 }
 
 #[cfg(feature = "cli")]
@@ -2405,9 +2467,9 @@ pub struct DeriveAddressArgs {
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, clap::Args)]
 pub struct RescanArgs {
-    /// Wallet name (selects <datadir>/<name>).
-    #[arg(long, default_value = "default")]
-    pub wallet: String,
+    /// Wallet name (selects <datadir>/<name>); defaults to the config's `default_wallet`.
+    #[arg(long, value_name = "NAME")]
+    pub wallet: Option<String>,
 
     /// Skip the interactive confirmation prompt (for non-interactive/automated recovery).
     #[arg(long)]
@@ -2432,6 +2494,27 @@ impl AppConfig {
 
     /// Resolve the effective configuration from clap-free overrides and the TOML file, using
     /// zecd's file/port defaults - the library consumer's entry point ([`Cli`] converts into
+    /// The wallet a `--wallet` flag names, or the config's [`implied_wallet`](Self::implied_wallet)
+    /// when it was omitted - the one rule for every subcommand's `--wallet` (init,
+    /// export-ufvk, export-xpub, rescan, `run --restore-if-empty`). A config that declares
+    /// one wallet (`[wallets.btc]`, say) makes every subcommand address it with no flag; one
+    /// that declares several and names no `default_wallet` makes the flag required, with an
+    /// error listing the candidates. Before this the flags defaulted to the literal
+    /// `"default"`, which on a Bitcoin-only config silently meant a phantom Zcash wallet.
+    pub fn wallet_or_default(&self, wallet: Option<&str>) -> anyhow::Result<String> {
+        if let Some(wallet) = wallet {
+            return Ok(wallet.to_owned());
+        }
+        self.implied_wallet.clone().ok_or_else(|| {
+            let names: Vec<&str> = self.wallets.keys().map(String::as_str).collect();
+            anyhow::anyhow!(
+                "--wallet is required: this configuration declares several wallets ({}) and \
+                 sets no `default_wallet`, so none is implied",
+                names.join(", ")
+            )
+        })
+    }
+
     /// [`ConfigOverrides`], so this and [`resolve`](Self::resolve) cannot disagree).
     pub fn resolve_overrides(overrides: &ConfigOverrides) -> anyhow::Result<AppConfig> {
         Self::resolve_overrides_with(overrides, &ZECD_DEFAULTS)
@@ -2552,10 +2635,22 @@ impl AppConfig {
             }
         };
 
+        // The wallet meant when none is named. An explicit `default_wallet` wins; a file
+        // that declares exactly one wallet means that one (so a Bitcoin-only config with just
+        // `[wallets.btc]` gets no phantom Zcash "default" beside it); and with several
+        // declared and none named, routing keeps the literal `default` while the
+        // subcommands' `--wallet` becomes required (`implied_wallet` is `None`).
+        let sole_declared = match file.wallets.keys().collect::<Vec<_>>().as_slice() {
+            [only] => Some((*only).clone()),
+            _ => None,
+        };
         let default_wallet = file
             .default_wallet
             .clone()
+            .or(sole_declared)
             .unwrap_or_else(|| "default".to_string());
+        let implied_wallet = (file.default_wallet.is_some() || file.wallets.len() <= 1)
+            .then(|| default_wallet.clone());
 
         // keys.toml location override (so the encrypted seed can be a mounted Secret, separate
         // from the disposable datadir). The global `[keys] keys_file` / `ZECD_KEYS_FILE` /
@@ -2762,6 +2857,7 @@ impl AppConfig {
             connect_timeout_secs: None,
             reconnect_base_secs: None,
             reconnect_max_secs: None,
+            p2p_receive_window_bytes: None,
             rfc1918_is_local: None,
             allow_remote_cleartext: None,
             tls: None,
@@ -2811,6 +2907,14 @@ impl AppConfig {
         }
         let server = select_server_token(cli.server.clone(), backend_file.server);
         let reconnect_base_secs = backend_file.reconnect_base_secs.unwrap_or(1).max(1);
+        if let Some(bytes) = backend_file.p2p_receive_window_bytes {
+            if !(512..=65535).contains(&bytes) {
+                anyhow::bail!(
+                    "[backend] p2p_receive_window_bytes must be between 512 and 65535 (one \
+                     segment is 1448; leave it unset for the kernel's default), got {bytes}"
+                );
+            }
+        }
         let backend = BackendConfig {
             server,
             connect_timeout_secs: backend_file.connect_timeout_secs.unwrap_or(10).max(1),
@@ -2819,6 +2923,7 @@ impl AppConfig {
                 .reconnect_max_secs
                 .unwrap_or(60)
                 .max(reconnect_base_secs),
+            p2p_receive_window_bytes: backend_file.p2p_receive_window_bytes,
             rfc1918_is_local: backend_file.rfc1918_is_local.unwrap_or(true),
             allow_remote_cleartext: backend_file.allow_remote_cleartext.unwrap_or(false),
             tls: match backend_file.tls.as_deref() {
@@ -3273,6 +3378,7 @@ impl AppConfig {
             btc_testnet,
             datadir,
             default_wallet,
+            implied_wallet,
             wallets,
             backend,
             #[cfg(feature = "zcash")]
@@ -4253,6 +4359,9 @@ mod tests {
         assert_eq!(f.connect_timeout_secs, Some(5));
         assert_eq!(f.reconnect_base_secs, Some(2));
         assert_eq!(f.reconnect_max_secs, Some(30));
+        assert_eq!(f.p2p_receive_window_bytes, None);
+        let f: BackendFile = toml::from_str("p2p_receive_window_bytes = 1448").unwrap();
+        assert_eq!(f.p2p_receive_window_bytes, Some(1448));
         // The cleartext-gate knobs default to unset (-> rfc1918_is_local true, remote override
         // false) and parse when present.
         assert_eq!(f.rfc1918_is_local, None);
@@ -4269,6 +4378,56 @@ mod tests {
         assert_eq!(f.proxy, None);
         let f: BackendFile = toml::from_str("proxy = \"socks5://127.0.0.1:9050\"").unwrap();
         assert_eq!(f.proxy.as_deref(), Some("socks5://127.0.0.1:9050"));
+    }
+
+    /// What a subcommand acts on when `--wallet` is omitted, and where un-prefixed RPCs
+    /// route: an explicit `default_wallet`; else the one declared wallet; else - several
+    /// declared, none named - the literal `default` for routing while the flag becomes
+    /// required, since nothing singles a wallet out. The middle case is what stops a
+    /// Bitcoin-only config from growing a phantom Zcash wallet.
+    #[test]
+    fn the_implied_wallet_follows_default_wallet_then_the_sole_declared_wallet() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        let resolve = |body: &str| {
+            std::fs::write(
+                &conf,
+                format!(
+                    "network = \"test\"\ndatadir = {:?}\n{body}[rpc]\nuser = \"u\"\npassword = \"p\"\n",
+                    dir.path()
+                ),
+            )
+            .unwrap();
+            AppConfig::resolve_overrides(&ConfigOverrides {
+                conf: Some(conf.clone()),
+                ..Default::default()
+            })
+            .expect("resolves")
+        };
+        // Nothing declared: the implicit wallet, by its literal name.
+        let c = resolve("");
+        assert_eq!(c.default_wallet, "default");
+        assert_eq!(c.wallet_or_default(None).unwrap(), "default");
+        // One declared wallet is the implied one, for routing and for the flag - and no
+        // phantom "default" is filled in beside it.
+        let c = resolve("[wallets.w1]\n");
+        assert_eq!(c.default_wallet, "w1");
+        assert_eq!(c.wallet_or_default(None).unwrap(), "w1");
+        assert_eq!(c.wallets.keys().collect::<Vec<_>>(), ["w1"]);
+        // Several, none named: routing keeps the literal, the flag is required and the
+        // error lists the candidates; an explicit flag is honored as given.
+        let c = resolve("[wallets.w1]\n[wallets.w2]\n");
+        assert_eq!(c.default_wallet, "default");
+        let err = c.wallet_or_default(None).unwrap_err().to_string();
+        assert!(
+            err.contains("--wallet is required") && err.contains("w1") && err.contains("w2"),
+            "{err}"
+        );
+        assert_eq!(c.wallet_or_default(Some("w2")).unwrap(), "w2");
+        // An explicit default_wallet settles both, however many are declared.
+        let c = resolve("default_wallet = \"w2\"\n[wallets.w1]\n[wallets.w2]\n");
+        assert_eq!(c.default_wallet, "w2");
+        assert_eq!(c.wallet_or_default(None).unwrap(), "w2");
     }
 
     /// The library entry point carries the proxy the same way the binary's flag does, and it
@@ -4371,6 +4530,7 @@ mod tests {
             connect_timeout_secs: 10,
             reconnect_base_secs: 1,
             reconnect_max_secs: 60,
+            p2p_receive_window_bytes: None,
             rfc1918_is_local: true,
             allow_remote_cleartext: false,
             tls: None,
@@ -4857,6 +5017,7 @@ mod tests {
             &conf,
             "network = \"test\"\ndatadir = \"/d\"\n\
              [keys]\nkeys_file = \"/secrets/keys.toml\"\n\
+             [wallets.default]\n\
              [wallets.other]\nkeys_file = \"/secrets/other.toml\"\n",
         )
         .unwrap();
@@ -4898,7 +5059,7 @@ mod tests {
         let conf = dir.path().join("zecd.toml");
         std::fs::write(
             &conf,
-            "network = \"test\"\ndatadir = \"/d\"\n[wallets.other]\n",
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.default]\n[wallets.other]\n",
         )
         .unwrap();
         let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
@@ -5011,7 +5172,7 @@ mod tests {
             // testnet4 selects the other public testnet for every Bitcoin wallet.
             let cfg = resolve(
                 "network = \"test\"\ndatadir = \"/d\"\nbtc_testnet = \"testnet4\"\n\
-                 [wallets.btc]\ncoin = \"bitcoin\"\n",
+                 [wallets.default]\n[wallets.btc]\ncoin = \"bitcoin\"\n",
             )
             .unwrap();
             assert_eq!(cfg.btc_testnet, BitcoinTestnet::Testnet4);
@@ -5127,7 +5288,11 @@ mod tests {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
         let conf = dir.path().join("zecd.toml");
-        std::fs::write(&conf, "datadir = \"/d\"\n[wallets.other]\n").unwrap();
+        std::fs::write(
+            &conf,
+            "datadir = \"/d\"\n[wallets.default]\n[wallets.other]\n",
+        )
+        .unwrap();
 
         for (flag, env) in [("test", ZNetwork::Test), ("main", ZNetwork::Main)] {
             let cli = Cli::parse_from([

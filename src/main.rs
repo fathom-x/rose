@@ -72,17 +72,37 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::ChainInfo(args)) => zecd::chain_probe::run(&config, args).await,
         #[cfg(not(feature = "zcash"))]
         Some(Command::ChainInfo(_)) => Err(unsupported_without_zcash("chain-info")),
-        _ => {
-            // SIGHUP re-resolves through exactly the path the daemon started with, so a reload
-            // sees what a restart would - the same file, the same CLI overrides, the same
-            // defaults.
+        // The daemon, with `run`'s boot-time options; a bare `zecd` is `zecd run` with none.
+        // SIGHUP re-resolves through exactly the path the daemon started with, so a reload
+        // sees what a restart would - the same file, the same CLI overrides, the same
+        // defaults.
+        Some(Command::Run(args)) => {
+            let restore = zecd::init::restore_if_empty_from_args(&config, args)?;
             let cli_for_reload = cli.clone();
             daemon::run_with_reload(
                 config,
+                restore,
                 Some(Box::new(move || AppConfig::resolve(&cli_for_reload))),
             )
             .await
         }
+        None => {
+            let cli_for_reload = cli.clone();
+            daemon::run_with_reload(
+                config,
+                None,
+                Some(Box::new(move || AppConfig::resolve(&cli_for_reload))),
+            )
+            .await
+        }
+        // Dispatched above, before `resolve`; spelled out so a new subcommand is a compile
+        // error here rather than a silent fall-through into the daemon.
+        Some(
+            Command::Rpcauth(_)
+            | Command::ExampleConfig(_)
+            | Command::Licenses
+            | Command::Config(_),
+        ) => unreachable!("handled before configuration resolution"),
     }
 }
 

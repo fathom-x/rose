@@ -247,15 +247,38 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
     eprintln!("[{}] converged on the replacement chain", backend.label());
 
     // 4. The receive: orphaned, resubmitted by the wallet once its tip passed the locktime,
-    //    and confirmed again above the birthday by one more block. Balance unchanged.
+    //    and confirmed again above the birthday on the new chain. Balance unchanged.
+    //    Usually the resubmission lands in the node's mempool once the replacement tail is
+    //    mined, and one more block confirms it. But the wallet's rebroadcast pass fires as
+    //    soon as its *own* tip passes the locktime, and the node's `generatetoaddress` for
+    //    the tail is not atomic from the wallet's side - a sync pass can land mid-tail, at a
+    //    node tip already past the locktime, so the resubmitted receive rides the tail's
+    //    next block and is confirmed before this step looks (seen in CI: the mempool wait
+    //    timing out with `testmempoolaccept` answering `txn-already-known`, the wallet at the
+    //    tip with the balance). Both are the behaviour under test, so accept either: what is
+    //    asserted below is the block the receive ended up in, not how it got there.
     let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
+    let confirmed_block = loop {
+        // The node's own wallet signed and broadcast the receive, so its view of it is
+        // authoritative for "in a block on the active chain" (confirmations >= 1) versus
+        // orphaned (negative or zero).
+        let node_view = node
+            .call("gettransaction", json!([receive_txid]))
+            .await
+            .expect("node gettransaction");
+        if node_view["confirmations"].as_i64().unwrap_or(0) >= 1 {
+            eprintln!(
+                "[{}] the receive was re-mined into the replacement tail itself",
+                backend.label()
+            );
+            break node_view["blockhash"].as_str().unwrap().to_string();
+        }
         if node
             .mempool()
             .await
             .contains(&receive_txid.as_str().unwrap().to_string())
         {
-            break;
+            break node.mine_to(&replacement_miner, 1).await.remove(0);
         }
         if Instant::now() >= deadline {
             // What the node would say to the transaction right now, for the report.
@@ -288,9 +311,17 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
             );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    let new_block = node.mine_to(&replacement_miner, 1).await.remove(0);
-    zecd.wait_height(new_tip + 1).await;
+    };
+    // Above the birthday on the new chain, whichever block it was.
+    let header = node
+        .call("getblockheader", json!([confirmed_block]))
+        .await
+        .expect("getblockheader");
+    assert!(
+        header["height"].as_u64() >= Some(birthday),
+        "the receive must confirm above the birthday: {header}"
+    );
+    zecd.wait_height(node.height().await).await;
     zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
     zecd.wait_wallet_balance("btc", 1.0).await;
@@ -299,7 +330,7 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
         "gettransaction",
         json!([receive_txid]),
         "the receive is re-anchored on the new chain",
-        |tx| tx["blockhash"] == json!(new_block) && tx["confirmations"] == json!(1),
+        |tx| tx["blockhash"] == json!(confirmed_block) && tx["confirmations"].as_u64() >= Some(1),
     )
     .await;
     let unspent = zecd
@@ -315,7 +346,10 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
         .await
         .expect("gettransaction");
     let node_hex = node
-        .call("getrawtransaction", json!([receive_txid, false, new_block]))
+        .call(
+            "getrawtransaction",
+            json!([receive_txid, false, confirmed_block]),
+        )
         .await
         .expect("getrawtransaction");
     assert_eq!(

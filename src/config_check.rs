@@ -464,6 +464,7 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
                         &config.mempool,
                         btc_network,
                         kyoto.peers(),
+                        kyoto.receive_window(),
                     )
                     .is_none()
                     {

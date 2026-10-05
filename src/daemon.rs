@@ -44,9 +44,16 @@ pub fn init_tracing(log: &config::LogConfig) {
     }
 }
 
+/// Run the daemon. `restore` is `zecd run --restore-if-empty`'s request
+/// ([`crate::init::restore_if_empty`]): honored between the banner and the node's fail-fast
+/// phase, so a restore that happens is attributable to this build and datadir in the log,
+/// and one that fails ends the daemon before it has bound anything or spawned any wallet.
 #[cfg(feature = "server")]
-pub async fn run(config: AppConfig) -> anyhow::Result<()> {
-    run_with_reload(config, None).await
+pub async fn run(
+    config: AppConfig,
+    restore: Option<crate::init::RestoreIfEmpty>,
+) -> anyhow::Result<()> {
+    run_with_reload(config, restore, None).await
 }
 
 /// [`run`], with an optional way to re-read the configuration on SIGHUP.
@@ -58,6 +65,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 #[cfg(feature = "server")]
 pub async fn run_with_reload(
     config: AppConfig,
+    restore: Option<crate::init::RestoreIfEmpty>,
     reresolve: Option<Box<dyn Fn() -> anyhow::Result<AppConfig> + Send + Sync>>,
 ) -> anyhow::Result<()> {
     // One identifying line before anything can fail or connect - ahead of even the datadir
@@ -83,6 +91,9 @@ pub async fn run_with_reload(
     // custody problem. Refused before the datadir lock so it costs nothing and cannot be
     // mistaken for a locking failure.
     config::reject_multiple_spenders_in_daemon(&config)?;
+    if let Some(restore) = restore {
+        restore_wallet_if_empty(&config, restore).await?;
+    }
     let prepared = crate::node::NodeBuilder::new(config).prepare()?;
     let auth = server::auth::Authenticator::from_config(&prepared.config().rpc)?;
     log_auth_mode(
@@ -200,6 +211,50 @@ pub async fn run_with_reload(
         }
     }
     result
+}
+
+/// `--restore-if-empty`, in the daemon: restore the named wallet if it has no `keys.toml`,
+/// or log that it is already initialized. Runs *before* the node takes the datadir lock,
+/// because [`crate::init::init_wallet`] takes and releases that same lock itself. The
+/// placeholder-password refusal is checked first - the node checks it again a moment later,
+/// but a refused daemon should not have restored a wallet on its way out. The restore is a
+/// seed exposure, so its record rides the audit target; nothing about the phrase is logged.
+#[cfg(feature = "server")]
+async fn restore_wallet_if_empty(
+    config: &AppConfig,
+    restore: crate::init::RestoreIfEmpty,
+) -> anyhow::Result<()> {
+    config::reject_placeholder_password(config)?;
+    let wallet = restore.wallet.clone();
+    match crate::init::restore_if_empty(config, restore).await {
+        Ok(Some(outcome)) => {
+            info!(
+                target: "zecd::audit",
+                wallet = %outcome.wallet,
+                birthday = outcome.birthday,
+                dir = %outcome.wallet_dir.display(),
+                watch_only = outcome.watch_only,
+                "{} (--restore-if-empty); it will sync from the birthday",
+                if outcome.watch_only {
+                    "created the watch-only wallet from its xpub"
+                } else {
+                    "restored the wallet from its mnemonic"
+                }
+            );
+            Ok(())
+        }
+        Ok(None) => {
+            info!(
+                wallet = %wallet,
+                "wallet is already initialized; --restore-if-empty leaves it alone"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.context(format!(
+            "--restore-if-empty: restoring wallet '{wallet}' failed, and the daemon exists \
+             to serve it"
+        ))),
+    }
 }
 
 /// Await the first termination signal and return so the caller can trigger a graceful shutdown.

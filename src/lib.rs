@@ -58,6 +58,7 @@
 //!   sends and rides through [`node::Node::call`], so the typed surface cannot drift from the
 //!   wire contract; response structs are `#[non_exhaustive]` and use exact-zatoshi amounts.
 //! - The CLI cores, one data-returning function per subcommand: [`init::init_wallet`],
+//!   [`init::restore_if_empty`] (`run --restore-if-empty`'s restore-unless-initialized),
 //!   [`init::rescan_wallet`], [`init::export_ufvk_string`], [`derive_address::derive`],
 //!   [`config_check::check`] (and [`config_check::inspect`]), [`config_show::render`],
 //!   [`chain_probe::probe`], [`example_config::EXAMPLE_CONFIG`],

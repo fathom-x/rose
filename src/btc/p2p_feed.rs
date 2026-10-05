@@ -57,7 +57,6 @@ use bdk_wallet::bitcoin::p2p::message_network::VersionMessage;
 use bdk_wallet::bitcoin::p2p::{Address, Magic, ServiceFlags};
 use bdk_wallet::bitcoin::Txid;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, trace};
 
@@ -359,6 +358,7 @@ pub async fn run_peer(
     peer: SocketAddr,
     network: BitcoinNetwork,
     snapshot: Option<Duration>,
+    receive_window: Option<u32>,
     events: &mpsc::Sender<FeedEvent>,
     refetch: &mut watch::Receiver<u64>,
 ) -> anyhow::Result<()> {
@@ -366,7 +366,7 @@ pub async fn run_peer(
     // A refetch asked for before this connection existed is already served by it: the
     // snapshot at connect fetches everything.
     refetch.borrow_and_update();
-    let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(peer))
+    let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, super::net::connect(peer, receive_window))
         .await
         .map_err(|_| anyhow!("no connection to {peer} within {HANDSHAKE_TIMEOUT:?}"))?
         .with_context(|| format!("connect to {peer}"))?;

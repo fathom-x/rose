@@ -19,10 +19,12 @@
 #       init --wallet btc --birthday 2026-08-01
 #   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4.toml
 #
-# `--wallet btc` is REQUIRED on init: it defaults to the literal wallet name "default" and
-# does NOT follow `default_wallet` below, so omitting it initializes a "default" Zcash
-# wallet (which dials zebra and fails here) instead of this file's [wallets.btc]. The daemon
-# line below needs no --wallet - it serves `default_wallet` for un-prefixed RPCs.
+# `--wallet btc` above is optional: every subcommand's `--wallet` (init, export-xpub, rescan,
+# `run --restore-if-empty`) defaults to `default_wallet` below, which names this file's
+# [wallets.btc]. It is spelled out here only so the command reads on its own. (Older
+# releases defaulted to the literal name "default", i.e. a phantom Zcash wallet - on those,
+# the flag was required.) The daemon line needs no --wallet either - it serves
+# `default_wallet` for un-prefixed RPCs.
 #
 # `init` resolves the wallet's birthday four ways, and only two of them are offline. An
 # explicit `--birthday <height>` is taken verbatim; a `--birthday <YYYY-MM-DD>` date is

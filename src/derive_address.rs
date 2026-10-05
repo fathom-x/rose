@@ -67,10 +67,6 @@ use crate::pools::ReceiverSet;
 use crate::wallet::store::WalletStore;
 use crate::wallet::ReceiverRequest;
 
-/// The wallet whose configuration (and `keys.toml`) is used when `--wallet` is omitted, matching
-/// the `--wallet` default of every other zecd subcommand.
-const DEFAULT_WALLET: &str = "default";
-
 /// Where the viewing key came from, for the report and for the pin cross-check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
@@ -181,8 +177,10 @@ impl std::fmt::Display for DeriveNote {
 }
 
 /// What to derive - the library-facing form of the `derive-address` flags. `wallet: None`
-/// selects the `default` wallet's configuration, and (unlike `Some("default")`) skips the
-/// pin cross-check for supplied key material, exactly as the omitted `--wallet` flag does.
+/// selects the config's default wallet's configuration (`default_wallet`: explicit, else the
+/// one declared wallet, else `default` - never an error here, since derivation needs no
+/// wallet on disk), and (unlike naming that wallet) skips the pin cross-check for supplied
+/// key material, exactly as the omitted `--wallet` flag does.
 pub struct DeriveOptions<'a> {
     pub wallet: Option<&'a str>,
     pub key: KeyInput,
@@ -298,7 +296,7 @@ pub fn derive(config: &AppConfig, opts: DeriveOptions<'_>) -> anyhow::Result<Der
     if opts.count == 0 {
         bail!("--count must be at least 1");
     }
-    let wallet = opts.wallet.unwrap_or(DEFAULT_WALLET);
+    let wallet = opts.wallet.unwrap_or(&config.default_wallet);
     // No layout fallback is needed here (unlike `export-ufvk`): derivation reads `keys.toml`
     // and nothing else, and `keys.toml` sits at the wallet root, where no layout migration
     // moves it.

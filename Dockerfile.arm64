@@ -74,11 +74,19 @@ COPY . .
 # --features bitcoin: the BDK wallet engine, off by default for `cargo build`; the shipped
 # images carry both engines (see the amd64 Dockerfile) and the license bundle is generated
 # with the same feature set.
-RUN cargo install --locked --path . --bin zecd --target ${TARGET_ARCH} --features mimalloc-secure,bitcoin --root /usr/local \
+ARG ZECD_CARGO_FEATURES="--features mimalloc-secure,bitcoin"
+RUN cargo install --locked --path . --bin zecd --target ${TARGET_ARCH} ${ZECD_CARGO_FEATURES} --root /usr/local \
     # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the unprivileged
     # runtime user can write its datadirs (and SQLite its temp files).
     && install -d -m 0755 /rootfs/var/lib/zecd \
-    && install -d -m 1777 /rootfs/tmp
+    && install -d -m 1777 /rootfs/tmp \
+    # The license texts, staged with their modes pinned in-container: a file COPY'd straight
+    # from the build context keeps the mode git checked it out with, which is the build
+    # host's umask (0644 or 0664) - identical content, one mode bit apart, and any
+    # measurement over the image (a Nitro enclave's PCR, say) differs by host. `install -m`
+    # is immune; the runtime stage copies this directory rather than the context files.
+    && install -d -m 0755 /licenses \
+    && install -m 0644 LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt /licenses/
 
 # --- layer for local binary extraction ---
 FROM scratch AS export
@@ -88,7 +96,7 @@ COPY --from=builder /usr/local/bin/zecd /zecd
 FROM scratch AS runtime
 COPY --from=export /zecd /usr/local/bin/zecd
 # License texts - zecd is statically linked, so the third-party notices ship with it.
-COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt /usr/share/doc/zecd/
+COPY --from=builder /licenses/ /usr/share/doc/zecd/
 # CA bundle so native TLS roots can validate public lightwalletd endpoints (e.g. zec.rocks).
 # Comes from the digest-pinned base image (Alpine ships ca-certificates-bundle in the base),
 # so no extra apk pin is needed and the bundle is as reproducible as the base itself.

@@ -98,6 +98,14 @@ services:
       # Accept inbound P2P. Implicit in Core's defaults, stated here because publishing 8333
       # below only matters if the node is listening.
       - -listen=1
+      # Inbound headroom and protection for the host's own clients: the default 125-connection
+      # ceiling fills with random inbound peers, after which every new inbound (the paced relay
+      # in front of this port, which the enclave wallet dials) gets a handshake and is dropped.
+      # Host-originated connections arrive from the compose network's gateway (172.28.0.1 for
+      # the network below); BTC_WHITELIST_SUBNET in deploy/.env overrides the subnet when a
+      # host's compose network differs, BTC_MAXCONNECTIONS the ceiling.
+      - -maxconnections=${BTC_MAXCONNECTIONS:-200}
+      - -whitelist=noban@${BTC_WHITELIST_SUBNET:-172.28.0.0/24}
       # Persistent peers: the project's own mainnet replicas (this file, deployed on the
       # 216.230.225.43 and 216.230.225.42 hosts). Running this compose elsewhere (a laptop)
       # keeps those nodes wired in alongside the ~10 auto-managed outbound slots, so blocks

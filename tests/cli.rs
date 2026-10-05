@@ -1490,14 +1490,16 @@ fn the_bitcoin_sample_configs_need_the_engine_they_select() {
         );
         let stderr = stderr_of(&out);
         // A build without the engine refuses a bitcoin sample for the missing engine one of
-        // four ways: the `[bitcoind]` section trips deny_unknown_fields at parse (the
-        // full-node samples), as does the engine-only `[mempool]` section (the testnet4 kyoto
-        // view sample, which opts into the p2p feed); for a kyoto sample with neither, since
-        // kyoto needs no credentials, `btc_testnet` is refused at resolve behind the feature;
-        // and a mainnet kyoto sample, which has none of those keys, reaches the coin doctrine
-        // check itself, which names the engines this build carries.
+        // five ways: the `[bitcoind]` section trips deny_unknown_fields at parse (the
+        // full-node samples), as do the engine-only `[mempool]` section (the testnet4 kyoto
+        // view sample, which opts into the p2p feed) and `[fees]` (a config that narrows the
+        // fee chain, as the enclave deployment's does); for a kyoto sample with none of
+        // those, since kyoto needs no credentials, `btc_testnet` is refused at resolve behind
+        // the feature; and a mainnet kyoto sample with none of those keys reaches the coin
+        // doctrine check itself, which names the engines this build carries.
         let refused_for_missing_engine = stderr.contains("unknown field `bitcoind`")
             || stderr.contains("unknown field `mempool`")
+            || stderr.contains("unknown field `fees`")
             || stderr.contains("requires a zecd build with the `bitcoin` feature")
             || stderr.contains("unsupported coin \"bitcoin\"");
         assert!(
@@ -2301,4 +2303,577 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
         .unwrap();
     assert!(!out.status.success());
     assert!(stderr_of(&out).contains("--xpub"), "{}", stderr_of(&out));
+}
+
+/// `derive-address` with no `--wallet` follows the config's default wallet like every other
+/// subcommand: a Bitcoin-only config with just `[wallets.btc]` (no `default_wallet`) routes
+/// to the Bitcoin deriver and yields a bech32 address - where the literal `default` would
+/// have named a phantom Zcash wallet and derived (or refused) for the wrong coin.
+#[cfg(feature = "bitcoin")]
+#[test]
+fn derive_address_without_a_wallet_flag_follows_the_configs_default_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("zecd.toml"),
+        "network = \"main\"\n[wallets.btc]\ncoin = \"bitcoin\"\n",
+    )
+    .unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC).args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "derive-address",
+                "--mnemonic",
+            ]);
+            c
+        },
+        Duration::from_secs(20),
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let address = stdout_of(&out).trim().to_string();
+    assert!(
+        address.starts_with("bc1q"),
+        "expected a BIP 84 mainnet address from the Bitcoin deriver, got {address:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `zecd run --restore-if-empty`: restore-then-serve as one command
+// ---------------------------------------------------------------------------
+//
+// A deployment with no shell (an enclave image, the `FROM scratch` containers) cannot script
+// "`init --restore`, then run", so the daemon does both: with `--restore-if-empty`, a wallet
+// whose `keys.toml` is absent is restored from `ZECD_MNEMONIC`/`--mnemonic-file` before the
+// daemon serves, and an initialized one is left alone without the secret ever being read.
+
+/// The committed development mnemonic, as a fixed key source for the restore round trip (the
+/// Zcash-gated `TEST_MNEMONIC` above is the same phrase; this one exists for every build).
+const RESTORE_MNEMONIC: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
+    midnight culture idea mountain fame park social drip bid doctor scatter glance defy moment \
+    stage";
+
+/// A daemon under test: spawned with both pipes drained by reader threads (as
+/// `run_with_timeout`), polled until `ready` holds or it exits, then killed. Returns the exit
+/// status if it exited on its own (`None` if it was still running and had to be killed) with
+/// everything it wrote.
+#[cfg(feature = "bitcoin")]
+fn run_daemon_until(
+    mut cmd: Command,
+    timeout: Duration,
+    ready: impl Fn() -> bool,
+) -> (Option<std::process::ExitStatus>, Output) {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawning zecd");
+    let mut out_pipe = child.stdout.take().expect("piped stdout");
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let readers = (
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut out_pipe, &mut buf).expect("reading stdout");
+            buf
+        }),
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut err_pipe, &mut buf).expect("reading stderr");
+            buf
+        }),
+    );
+    let deadline = Instant::now() + timeout;
+    let exited = loop {
+        if let Some(status) = child.try_wait().expect("polling zecd") {
+            break Some(status);
+        }
+        if ready() || Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let status = exited.unwrap_or_else(|| child.wait().expect("reaping zecd"));
+    (
+        exited,
+        Output {
+            status,
+            stdout: readers.0.join().expect("stdout reader"),
+            stderr: readers.1.join().expect("stderr reader"),
+        },
+    )
+}
+
+/// Every stream a restore writes must stay free of the phrase - as a whole and as any run
+/// of its words, so a partial echo (an error quoting "the phrase starting mechanic vehicle
+/// ...") is caught too.
+fn assert_no_mnemonic_leak(out: &Output, what: &str) {
+    let text = format!("{}{}", stdout_of(out), stderr_of(out));
+    let words: Vec<&str> = RESTORE_MNEMONIC.split_whitespace().collect();
+    for pair in words.windows(2) {
+        let bigram = pair.join(" ");
+        assert!(
+            !text.contains(&bigram),
+            "{what}: the mnemonic (\"{bigram} ...\") leaked into a stream:\n{text}"
+        );
+    }
+}
+
+/// The companion flags mean nothing without `--restore-if-empty`, so clap refuses them
+/// rather than letting a birthday or a file path be silently ignored.
+#[test]
+fn run_restore_companion_flags_require_the_restore_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    for extra in [
+        &["--birthday", "100"][..],
+        &["--mnemonic-file", "/dev/null"][..],
+        &["--wallet", "btc"][..],
+    ] {
+        let out = run_with_timeout(
+            {
+                let mut c = zecd();
+                c.args([
+                    "--datadir",
+                    dir.path().to_str().unwrap(),
+                    "--regtest",
+                    "run",
+                ])
+                .args(extra);
+                c
+            },
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{extra:?} without --restore-if-empty should be a usage error; stderr: {}",
+            stderr_of(&out)
+        );
+        assert!(
+            stderr_of(&out).contains("--restore-if-empty"),
+            "stderr should name the flag it requires: {}",
+            stderr_of(&out)
+        );
+    }
+}
+
+/// With several wallets declared and no `default_wallet`, nothing singles one out, so a
+/// subcommand's omitted `--wallet` is refused naming the flag and the candidates - rather
+/// than acting on the literal `default`, a wallet the config never mentions. Naming a
+/// `default_wallet` lifts the refusal and the command proceeds to its own checks (here
+/// `rescan`'s, which refuses an uninitialized wallet by name). `rescan` because it exists
+/// and behaves the same in every build.
+#[test]
+fn an_omitted_wallet_flag_is_refused_when_the_config_implies_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("zecd.toml");
+    let write = |body: &str| {
+        std::fs::write(
+            &conf,
+            format!(
+                "network = \"regtest\"\ndatadir = {:?}\n[rpc]\nuser = \"u\"\npassword = \"p\"\n{body}",
+                dir.path()
+            ),
+        )
+        .unwrap()
+    };
+    let rescan = || {
+        run_with_timeout(
+            {
+                let mut c = zecd();
+                c.args(["--conf", conf.to_str().unwrap(), "rescan", "--yes"]);
+                c
+            },
+            Duration::from_secs(10),
+        )
+    };
+
+    write("[wallets.w1]\n[wallets.w2]\n");
+    let out = rescan();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("--wallet is required") && stderr.contains("w1") && stderr.contains("w2"),
+        "the refusal should name the flag and the candidates: {stderr}"
+    );
+
+    write("default_wallet = \"w2\"\n[wallets.w1]\n[wallets.w2]\n");
+    let out = rescan();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        !stderr.contains("--wallet is required") && stderr.contains("w2"),
+        "default_wallet should have implied w2: {stderr}"
+    );
+}
+
+/// A failed restore is fatal and secret-free. Here the wallet is a Zcash one, whose restore
+/// must dial the upstream to anchor its birthday - pointed at a closed port, so the dial is
+/// refused at once - and the daemon must exit non-zero with the wallet still uninitialized,
+/// without the phrase reaching either stream. (The mnemonic is deliberately supplied: the
+/// point is that even with it in hand, an unreachable upstream ends the daemon rather than
+/// leaving it up to serve nothing.)
+#[cfg(feature = "zcash")]
+#[test]
+fn run_restore_if_empty_is_fatal_when_the_restore_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC).args([
+                "--datadir",
+                dir.path().to_str().unwrap(),
+                "--regtest",
+                "--server",
+                "zebra://127.0.0.1:1",
+                "--rpcport",
+                "0",
+                "run",
+                "--restore-if-empty",
+                "--birthday",
+                "1",
+            ]);
+            c
+        },
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failed restore must end the daemon; stderr: {}",
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("--restore-if-empty") && stderr.contains("restoring wallet 'default'"),
+        "the error should say which restore failed: {stderr}"
+    );
+    assert!(
+        !dir.path().join("default").join("keys.toml").exists(),
+        "no wallet may be left half-initialized"
+    );
+    assert_no_mnemonic_leak(&out, "failed restore");
+}
+
+/// No mnemonic source is a refusal naming what to set, not a daemon blocked on a prompt
+/// (stdin is closed here, as it is under an init system, and `init --restore` would have
+/// read an empty line from it and failed on the phrase instead). A Bitcoin kyoto wallet
+/// reaches the phrase without touching the network, so the refusal is the only thing that
+/// can happen. `--wallet` is omitted on purpose: the refusal must name `btc`, the config's
+/// `default_wallet`, and not the literal `default` (a phantom Zcash wallet on this config).
+#[cfg(feature = "bitcoin")]
+#[test]
+fn run_restore_if_empty_refuses_without_a_mnemonic_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_kyoto_restore_config(dir.path());
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.env_remove("ZECD_MNEMONIC").args([
+                "--conf",
+                conf.to_str().unwrap(),
+                "run",
+                "--restore-if-empty",
+                "--birthday",
+                "0",
+            ]);
+            c
+        },
+        Duration::from_secs(30),
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("ZECD_MNEMONIC") && stderr.contains("--mnemonic-file"),
+        "the refusal should name both mnemonic sources: {stderr}"
+    );
+    assert!(
+        stderr.contains("wallet 'btc'"),
+        "--wallet omitted must resolve to default_wallet (btc): {stderr}"
+    );
+    assert!(!dir.path().join("btc").join("keys.toml").exists());
+}
+
+/// A regtest Bitcoin kyoto wallet pinned to a closed port: the restore is offline, and the
+/// daemon that then serves it only ever retries a peer that is not there. RPC and health
+/// bind ephemeral ports so parallel tests cannot collide. No `default_wallet`: the sole
+/// declared wallet is the implied one, which is what lets the tests above omit `--wallet`.
+#[cfg(feature = "bitcoin")]
+fn write_kyoto_restore_config(dir: &std::path::Path) -> std::path::PathBuf {
+    let conf = dir.join("zecd.toml");
+    std::fs::write(
+        &conf,
+        format!(
+            "network = \"regtest\"\ndatadir = {:?}\n\
+             [wallets.btc]\ncoin = \"bitcoin\"\nserver = \"kyoto://127.0.0.1:1\"\n\
+             [rpc]\nport = 0\nuser = \"u\"\npassword = \"p\"\n\
+             [health]\nport = 0\n\
+             [keys]\nauto_unlock = true\n",
+            dir
+        ),
+    )
+    .unwrap();
+    conf
+}
+
+/// The whole promise, on the wallet the enclave deployment runs: an empty data directory plus
+/// `ZECD_MNEMONIC` comes up as a restored, serving wallet - the same wallet `init --restore`
+/// builds from that phrase (asserted by xpub, the key material rather than an address) - with
+/// the phrase on no stream. And a second start of the identical command, *without* the
+/// variable, finds the wallet initialized and serves it as it is: the secret is not needed,
+/// so it is not read.
+#[cfg(feature = "bitcoin")]
+#[test]
+fn run_restore_if_empty_restores_a_kyoto_wallet_then_serves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_kyoto_restore_config(dir.path());
+    let keys = dir.path().join("btc").join("keys.toml");
+    let run_cmd = |with_mnemonic: bool| {
+        let mut c = zecd();
+        if with_mnemonic {
+            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC);
+        } else {
+            c.env_remove("ZECD_MNEMONIC");
+        }
+        c.args([
+            "--conf",
+            conf.to_str().unwrap(),
+            "run",
+            "--restore-if-empty",
+            "--wallet",
+            "btc",
+            "--birthday",
+            "0",
+        ]);
+        c
+    };
+
+    // First boot: nothing on disk, the phrase in the environment. Wait past the restore
+    // itself for the wallet's actor to come up, so the kill lands on a daemon that was
+    // serving the restored wallet rather than one still on its way there.
+    let (exited, out) = run_daemon_until(run_cmd(true), Duration::from_secs(60), || {
+        kyoto_actor_connected(&dir.path().join("btc"))
+    });
+    assert!(
+        exited.is_none(),
+        "the daemon should have kept running after the restore; it exited {:?}:\n{}",
+        out.status,
+        stderr_of(&out)
+    );
+    assert!(keys.exists(), "the restore must have written keys.toml");
+    assert!(
+        stderr_of(&out).contains("restored the wallet from its mnemonic"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+    assert_no_mnemonic_leak(&out, "first boot");
+
+    // The restored wallet is the phrase's wallet: same account xpub as a plain `init
+    // --restore` of the same mnemonic on a fresh datadir.
+    let export = |datadir: &std::path::Path| {
+        let out = run_with_timeout(
+            {
+                let mut c = zecd();
+                c.args([
+                    "--datadir",
+                    datadir.to_str().unwrap(),
+                    "--regtest",
+                    "export-xpub",
+                    "--wallet",
+                    "btc",
+                ]);
+                c
+            },
+            Duration::from_secs(20),
+        );
+        assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+        stdout_of(&out).trim().to_string()
+    };
+    let reference = tempfile::tempdir().unwrap();
+    let reference_conf = write_kyoto_restore_config(reference.path());
+    let init = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC).args([
+                "--conf",
+                reference_conf.to_str().unwrap(),
+                "init",
+                "--wallet",
+                "btc",
+                "--restore",
+                "--birthday",
+                "0",
+            ]);
+            c
+        },
+        Duration::from_secs(30),
+    );
+    assert!(init.status.success(), "stderr: {}", stderr_of(&init));
+    let restored_xpub = export(dir.path());
+    assert!(
+        restored_xpub.contains("pub"),
+        "not an xpub: {restored_xpub}"
+    );
+    assert_eq!(
+        restored_xpub,
+        export(reference.path()),
+        "the daemon's restore and `init --restore` must derive the same account"
+    );
+
+    // Second boot, no phrase available: the wallet is already there, so none is needed.
+    let before = std::fs::read(&keys).unwrap();
+    // A fresh datadir would carry the marker over from the first boot; the restore's output
+    // is what a repeat can be told apart by, so clear the marker first.
+    std::fs::remove_dir_all(dir.path().join("btc").join("btc").join("kyoto")).unwrap();
+    let (exited, out) = run_daemon_until(run_cmd(false), Duration::from_secs(60), || {
+        kyoto_actor_connected(&dir.path().join("btc"))
+    });
+    assert!(
+        exited.is_none(),
+        "the second boot should have served the initialized wallet; it exited {:?}:\n{}",
+        out.status,
+        stderr_of(&out)
+    );
+    assert!(
+        stderr_of(&out).contains("already initialized; --restore-if-empty leaves it alone"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        std::fs::read(&keys).unwrap(),
+        before,
+        "an initialized wallet's keys.toml must be untouched"
+    );
+}
+
+#[test]
+#[cfg(feature = "bitcoin")]
+fn run_restore_if_empty_creates_a_watch_only_wallet_from_zecd_xpub() {
+    // The xpub: a reference `init --restore` of the test phrase, exported.
+    let reference = tempfile::tempdir().unwrap();
+    let reference_conf = write_kyoto_restore_config(reference.path());
+    let init = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC).args([
+                "--conf",
+                reference_conf.to_str().unwrap(),
+                "init",
+                "--wallet",
+                "btc",
+                "--restore",
+                "--birthday",
+                "0",
+            ]);
+            c
+        },
+        Duration::from_secs(30),
+    );
+    assert!(init.status.success(), "stderr: {}", stderr_of(&init));
+    let export = |datadir: &std::path::Path| {
+        let out = run_with_timeout(
+            {
+                let mut c = zecd();
+                c.args([
+                    "--datadir",
+                    datadir.to_str().unwrap(),
+                    "--regtest",
+                    "export-xpub",
+                    "--wallet",
+                    "btc",
+                ]);
+                c
+            },
+            Duration::from_secs(20),
+        );
+        assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+        stdout_of(&out).trim().to_string()
+    };
+    let xpub = export(reference.path());
+
+    // First boot with only ZECD_XPUB, delivered wrapped in quotes the way Caution's secret
+    // export hands values over: a watch-only wallet of that account comes up and serves.
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_kyoto_restore_config(dir.path());
+    let keys = dir.path().join("btc").join("keys.toml");
+    let (exited, out) = run_daemon_until(
+        {
+            let mut c = zecd();
+            c.env_remove("ZECD_MNEMONIC")
+                .env("ZECD_XPUB", format!("'{xpub}'"))
+                .args([
+                    "--conf",
+                    conf.to_str().unwrap(),
+                    "run",
+                    "--restore-if-empty",
+                    "--wallet",
+                    "btc",
+                    "--birthday",
+                    "0",
+                ]);
+            c
+        },
+        Duration::from_secs(60),
+        || kyoto_actor_connected(&dir.path().join("btc")),
+    );
+    assert!(
+        exited.is_none(),
+        "the daemon should have kept running after creating the wallet; it exited {:?}:\n{}",
+        out.status,
+        stderr_of(&out)
+    );
+    assert!(keys.exists(), "the boot must have written keys.toml");
+    assert!(
+        stderr_of(&out).contains("created the watch-only wallet from its xpub"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        export(dir.path()),
+        xpub,
+        "the watch-only wallet must be the xpub's account"
+    );
+
+    // Both a phrase and an xpub: ambiguous, refused by name, nothing created.
+    let both = tempfile::tempdir().unwrap();
+    let both_conf = write_kyoto_restore_config(both.path());
+    let out = run_with_timeout(
+        {
+            let mut c = zecd();
+            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC)
+                .env("ZECD_XPUB", &xpub)
+                .args([
+                    "--conf",
+                    both_conf.to_str().unwrap(),
+                    "run",
+                    "--restore-if-empty",
+                    "--wallet",
+                    "btc",
+                    "--birthday",
+                    "0",
+                ]);
+            c
+        },
+        Duration::from_secs(30),
+    );
+    assert!(!out.status.success(), "both sources set must be refused");
+    assert!(
+        stderr_of(&out).contains("has both ZECD_XPUB and a mnemonic"),
+        "stderr: {}",
+        stderr_of(&out)
+    );
+    assert!(!both.path().join("btc").join("keys.toml").exists());
+}
+
+/// "The daemon is serving the wallet": the kyoto light client creates its header/filter
+/// store under the wallet directory on its first dial, which the actor makes as it spawns -
+/// after the restore hook has run and the node has taken over - so the directory's
+/// appearance is the signal to stop the daemon. (`init` never creates it; only a running
+/// actor does.)
+#[cfg(feature = "bitcoin")]
+fn kyoto_actor_connected(wallet_dir: &std::path::Path) -> bool {
+    wallet_dir.join("btc").join("kyoto").exists()
 }

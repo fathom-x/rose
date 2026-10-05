@@ -50,6 +50,13 @@ ENV RUSTFLAGS="\
 -C link-arg=-Wl,--build-id=none"
 WORKDIR /usr/src/zecd
 COPY . .
+# The cargo feature flags of the shipped binary. The default is the image everyone gets:
+# both engines, so one image serves a Zcash or a Bitcoin wallet. A deployment that needs
+# one engine builds a smaller binary faster by overriding this ARG - an enclave deployment,
+# for instance, renders its Dockerfile from this one with the Bitcoin-only set,
+# `--no-default-features --features mimalloc-secure,bitcoin,server,cli`, dropping the Zcash
+# stack's ~190 crates. Only features change; the runtime contract below does not.
+ARG ZECD_CARGO_FEATURES="--features mimalloc-secure,bitcoin"
 
 # Fetch dependencies
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -76,12 +83,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         # stays byte-identical to a pre-BDK one; the shipped image carries both engines so one
         # image serves a Zcash or a Bitcoin wallet (a binary without it refuses
         # `coin = "bitcoin"` at config resolve). THIRD-PARTY-LICENSES.txt is generated with
-        # the same feature set - keep scripts/generate-licenses.sh in step with this line.
-        --features mimalloc-secure,bitcoin \
+        # the same feature set - keep scripts/generate-licenses.sh in step with the ARG's
+        # default (a narrower build embeds the same superset of notices; nothing is missing).
+        ${ZECD_CARGO_FEATURES} \
     # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the
     # unprivileged runtime user can write its datadirs (and SQLite its temp files).
     && install -d -m 0755 /rootfs/var/lib/zecd \
-    && install -d -m 1777 /rootfs/tmp
+    && install -d -m 1777 /rootfs/tmp \
+    # The license texts, staged with their modes pinned in-container: a file COPY'd straight
+    # from the build context keeps the mode git checked it out with, which is the build
+    # host's umask (0644 or 0664) - identical content, one mode bit apart, and any
+    # measurement over the image (a Nitro enclave's PCR, say) differs by host. `install -m`
+    # is immune; the runtime stage copies this directory rather than the context files.
+    && install -d -m 0755 /licenses \
+    && install -m 0644 LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt /licenses/
 
 # --- Stage 2: layer for local binary extraction ---
 FROM scratch AS export
@@ -93,7 +108,7 @@ COPY --from=builder /usr/local/cargo/bin/zecd /zecd
 FROM scratch AS runtime
 COPY --from=export /zecd /usr/local/bin/zecd
 # License texts - zecd is statically linked, so the third-party notices ship with it.
-COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt /usr/share/doc/zecd/
+COPY --from=builder /licenses/ /usr/share/doc/zecd/
 # CA bundle so native TLS roots can validate public lightwalletd endpoints (e.g. zec.rocks).
 COPY --from=ca-certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt

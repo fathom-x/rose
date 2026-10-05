@@ -440,20 +440,54 @@ pub(crate) fn read_mnemonic_phrase(
     file: Option<&Path>,
     prompt: &str,
 ) -> anyhow::Result<Mnemonic<English>> {
-    let phrase = if let Some(p) = std::env::var_os("ZECD_MNEMONIC") {
-        p.to_string_lossy().trim().to_string()
-    } else if let Some(path) = file {
-        std::fs::read_to_string(path)
-            .with_context(|| format!("reading mnemonic file {}", path.display()))?
-            .trim()
-            .to_string()
-    } else {
-        eprintln!("{prompt}");
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        line.trim().to_string()
+    let phrase = match mnemonic_phrase_from_env_or_file(file)? {
+        Some(phrase) => phrase,
+        None => {
+            eprintln!("{prompt}");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line.trim().to_string()
+        }
     };
     Ok(<Mnemonic<English>>::from_phrase(&phrase)?)
+}
+
+/// The non-interactive sources of [`read_mnemonic_phrase`] alone - `ZECD_MNEMONIC`, else
+/// `file` - and `None` when neither is set, never a prompt. `run --restore-if-empty` reads
+/// through this: a daemon has no operator at a terminal, so where `init` would prompt it
+/// refuses instead. The value goes through [`unquote_phrase`].
+#[cfg(feature = "cli")]
+fn mnemonic_phrase_from_env_or_file(file: Option<&Path>) -> anyhow::Result<Option<String>> {
+    if let Some(p) = std::env::var_os("ZECD_MNEMONIC") {
+        return Ok(Some(unquote_phrase(&p.to_string_lossy())));
+    }
+    match file {
+        Some(path) => Ok(Some(unquote_phrase(
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("reading mnemonic file {}", path.display()))?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Trim a phrase and strip one pair of matching surrounding quotes, single or double.
+///
+/// A phrase that reaches the daemon through a secret manager can arrive shell-quoted: a
+/// store that keeps values shell-ready wraps anything with spaces in single quotes, and the
+/// exporter that hands it to the process may quote it once more, so the daemon sees
+/// `'word1 ... word24'` with the quotes as characters. A quote is never part of a BIP-39
+/// phrase, so unwrapping one matching pair loses nothing and refuses nothing it should
+/// accept. Only an outer pair is taken, and only when both ends match.
+#[cfg(feature = "cli")]
+fn unquote_phrase(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let unwrapped = match (trimmed.chars().next(), trimmed.chars().last()) {
+        (Some(q), Some(r)) if q == r && (q == '\'' || q == '"') && trimmed.len() >= 2 => {
+            &trimmed[1..trimmed.len() - 1]
+        }
+        _ => trimmed,
+    };
+    unwrapped.trim().to_string()
 }
 
 /// Resolve the [`WalletEntry`] for `wallet`: the configured `[wallets.<name>]` entry, or the
@@ -576,6 +610,29 @@ pub struct InitOutcome {
     pub generated_mnemonic: Option<Mnemonic<English>>,
 }
 
+/// What `zecd run --restore-if-empty` restores - the library form of those flags, and the
+/// one shape a boot-time restore takes: a seed wallet under age-identity custody, so it can
+/// serve unattended from the moment it exists (a passphrase-encrypted wallet would start
+/// locked with nobody to unlock it, and a watch-only one has nothing to restore from).
+pub struct RestoreIfEmpty {
+    pub wallet: String,
+    /// What to create the wallet from, or a callback that decides - resolved only when the
+    /// wallet actually needs creating, so an initialized wallet never causes a secret to be
+    /// read.
+    pub key: RestoreKey,
+    /// As [`InitOptions::birthday`].
+    pub birthday: Option<Birthday>,
+}
+
+/// The key `--restore-if-empty` creates the wallet from: a mnemonic (a spending wallet,
+/// [`InitKey::Restore`]) or an account xpub (a watch-only Bitcoin wallet,
+/// [`InitKey::Xpub`]), ready or decided later. [`InitKey::Generate`] is refused: a daemon
+/// that silently minted a seed nobody recorded would be a wallet nobody can recover.
+pub enum RestoreKey {
+    Ready(InitKey),
+    Deferred(Box<dyn FnOnce() -> anyhow::Result<InitKey> + Send>),
+}
+
 #[cfg(feature = "cli")]
 pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     // Map the flags onto the library options. The interactive inputs stay shell-side, behind
@@ -604,7 +661,7 @@ pub async fn run(config: &AppConfig, args: &InitArgs) -> anyhow::Result<()> {
     let outcome = init_wallet(
         config,
         InitOptions {
-            wallet: args.wallet.clone(),
+            wallet: config.wallet_or_default(args.wallet.as_deref())?,
             key,
             encryption,
             birthday: args.birthday,
@@ -682,6 +739,106 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
             init_bitcoin_wallet(config, entry, wallet, key, encryption, birthday_opt).await
         }
     }
+}
+
+/// The library core of `zecd run --restore-if-empty`: restore `opts.wallet` from its mnemonic
+/// **only if it is not initialized** - its `keys.toml` is absent, the same test the node uses
+/// to decide which wallets to spawn - and otherwise touch nothing, returning `None` without
+/// resolving the mnemonic. A wallet that *is* initialized but has lost its database is not
+/// this function's case: `[keys] bootstrap_from_keys` rebuilds that one from `keys.toml` at
+/// spawn. Between the two, "keys.toml present, database missing" and "nothing present,
+/// mnemonic in the environment" both come up to a serving wallet from one command, which is
+/// what a deployment with ephemeral storage and no shell (an enclave) needs.
+///
+/// Everything else is [`init_wallet`] with [`InitKey::Restore`] and
+/// [`EncryptionInput::AgeIdentity`]: the datadir lock is taken for the restore and released
+/// before it returns (the daemon takes it again for its own lifetime), a Zcash wallet dials
+/// its upstream to anchor the birthday (so its restore needs the upstream reachable at boot),
+/// and a Bitcoin kyoto wallet restores offline. A failure is the caller's to treat as fatal:
+/// the daemon exists to serve this wallet.
+pub async fn restore_if_empty(
+    config: &AppConfig,
+    opts: RestoreIfEmpty,
+) -> anyhow::Result<Option<InitOutcome>> {
+    let RestoreIfEmpty {
+        wallet,
+        key,
+        birthday,
+    } = opts;
+    let entry = resolve_wallet_entry(config, &wallet);
+    if WalletStore::exists(&entry.keys_path()) {
+        return Ok(None);
+    }
+    let key = match key {
+        RestoreKey::Ready(key) => key,
+        RestoreKey::Deferred(decide) => decide()?,
+    };
+    if matches!(key, InitKey::Generate) {
+        bail!(
+            "--restore-if-empty never generates a wallet: it restores one from a mnemonic or \
+             creates a watch-only one from an xpub"
+        );
+    }
+    init_wallet(
+        config,
+        InitOptions {
+            wallet,
+            key,
+            encryption: EncryptionInput::AgeIdentity,
+            birthday,
+        },
+    )
+    .await
+    .map(Some)
+}
+
+/// Map `zecd run`'s flags onto [`RestoreIfEmpty`]: `None` unless `--restore-if-empty` was
+/// given. The wallet is `--wallet`, else the config's `default_wallet`. The key stays behind
+/// a deferred callback that reads the environment only if the wallet needs creating:
+/// `ZECD_XPUB` makes a watch-only Bitcoin wallet, `ZECD_MNEMONIC` (else `--mnemonic-file`)
+/// restores a spending one, both set is refused as ambiguous, and neither set fails naming
+/// what it needs instead of blocking a daemon on a stdin nobody is at. Either value may
+/// arrive wrapped in one pair of quotes (see [`unquote_phrase`]).
+#[cfg(feature = "cli")]
+pub fn restore_if_empty_from_args(
+    config: &AppConfig,
+    args: &crate::config::RunArgs,
+) -> anyhow::Result<Option<RestoreIfEmpty>> {
+    if !args.restore_if_empty {
+        return Ok(None);
+    }
+    let file = args.mnemonic_file.clone();
+    let wallet = config.wallet_or_default(args.wallet.as_deref())?;
+    Ok(Some(RestoreIfEmpty {
+        wallet: wallet.clone(),
+        key: RestoreKey::Deferred(Box::new(move || {
+            let xpub = std::env::var("ZECD_XPUB")
+                .ok()
+                .map(|raw| unquote_phrase(&raw))
+                .filter(|xpub| !xpub.is_empty());
+            let phrase = mnemonic_phrase_from_env_or_file(file.as_deref())?;
+            match (xpub, phrase) {
+                (Some(_), Some(_)) => bail!(
+                    "wallet '{wallet}' is not initialized and --restore-if-empty has both \
+                     ZECD_XPUB and a mnemonic (ZECD_MNEMONIC or --mnemonic-file): set one, \
+                     a watch-only wallet or a spending one"
+                ),
+                (Some(xpub), None) => Ok(InitKey::Xpub(xpub)),
+                (None, Some(phrase)) => {
+                    Ok(InitKey::Restore(MnemonicInput::Phrase(
+                        <Mnemonic<English>>::from_phrase(&phrase)?,
+                    )))
+                }
+                (None, None) => bail!(
+                    "wallet '{wallet}' is not initialized and --restore-if-empty has nothing \
+                     to create it from: set ZECD_MNEMONIC or pass --mnemonic-file (a spending \
+                     wallet), or set ZECD_XPUB (a watch-only Bitcoin wallet); a daemon does \
+                     not prompt"
+                ),
+            }
+        })),
+        birthday: args.birthday,
+    }))
 }
 
 /// [`init_wallet`] for a Zcash wallet: the librustzcash account, its `keys.toml`, and the
@@ -1521,11 +1678,11 @@ fn existing_bitcoin_spending_wallet(config: &AppConfig, exclude: &str) -> Option
 /// alike and never touches spending material. Offline: no upstream connection is made.
 #[cfg(feature = "cli")]
 pub fn export_ufvk(config: &AppConfig, args: &ExportUfvkArgs) -> anyhow::Result<()> {
-    let encoded = export_ufvk_string(config, &args.wallet)?;
+    let wallet = config.wallet_or_default(args.wallet.as_deref())?;
+    let encoded = export_ufvk_string(config, &wallet)?;
     eprintln!(
-        "Unified Full Viewing Key for wallet '{}' (grants full VIEW access - balances and \
-         all transaction history - but cannot spend):",
-        args.wallet
+        "Unified Full Viewing Key for wallet '{wallet}' (grants full VIEW access - balances \
+         and all transaction history - but cannot spend):"
     );
     println!("{encoded}");
     Ok(())
@@ -1597,11 +1754,11 @@ pub fn export_ufvk_string(config: &AppConfig, wallet: &str) -> anyhow::Result<St
 /// wallets alike and never touches spending material. Offline: no upstream connection.
 #[cfg(feature = "cli")]
 pub fn export_xpub(config: &AppConfig, args: &ExportXpubArgs) -> anyhow::Result<()> {
-    let encoded = export_xpub_string(config, &args.wallet)?;
+    let wallet = config.wallet_or_default(args.wallet.as_deref())?;
+    let encoded = export_xpub_string(config, &wallet)?;
     eprintln!(
-        "Account xpub for wallet '{}' (grants full VIEW access - balances and all \
-         transaction history - but cannot spend):",
-        args.wallet
+        "Account xpub for wallet '{wallet}' (grants full VIEW access - balances and all \
+         transaction history - but cannot spend):"
     );
     println!("{encoded}");
     Ok(())
@@ -1700,7 +1857,8 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
     // start of this build deletes the database that is actually in use. See `crate::migrate`.
     crate::migrate::migrate(config)?;
 
-    let entry = resolve_wallet_entry(config, &args.wallet);
+    let wallet = config.wallet_or_default(args.wallet.as_deref())?;
+    let entry = resolve_wallet_entry(config, &wallet);
     // Resolve a moved birthday first - before the prompt, and before anything is deleted:
     // a failed upstream dial is then a clean refusal, and the prompt names the birthday the
     // rebuild will actually start from rather than the one keys.toml still holds.
@@ -1746,7 +1904,7 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
              kept).\nOn the next start zecd rebuilds the account from keys.toml and rescans \
              from {from}, which re-derives all funds and history but can take a while.{warning}\
              \nType 'yes' to continue:",
-            args.wallet,
+            wallet.clone(),
             entry.dir.display(),
         );
         let mut line = String::new();
@@ -1760,7 +1918,7 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
         #[cfg(feature = "zcash")]
         crate::coin::Coin::Zcash => rescan_wallet(
             entry.zcash_network(),
-            &args.wallet,
+            &wallet,
             None,
             &entry.keys_path(),
             &entry.engine_dir(),
@@ -1769,7 +1927,7 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
         #[cfg(feature = "bitcoin")]
         crate::coin::Coin::Bitcoin => rescan_bitcoin_wallet(
             config.network,
-            &args.wallet,
+            &wallet,
             None,
             &entry.keys_path(),
             &entry.engine_dir(),
@@ -1782,19 +1940,19 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
         eprintln!(
             "Wallet '{}' has no database files at {}; nothing to delete. The next daemon start \
              will build it fresh from keys.toml.",
-            args.wallet,
+            wallet.clone(),
             entry.dir.display()
         );
     } else {
         eprintln!(
             "Wallet '{}' database removed ({}).",
-            args.wallet,
+            wallet.clone(),
             removed.join(", ")
         );
     }
     if let Some((height, time)) = new_birthday {
         WalletStore::set_birthday(&entry.keys_path(), height, time)?;
-        eprintln!("Wallet '{}' birthday set to {height}.", args.wallet);
+        eprintln!("Wallet '{}' birthday set to {height}.", wallet);
     }
     let st = WalletStore::read(&entry.keys_path())?;
     eprintln!(
@@ -2173,6 +2331,31 @@ async fn ensure_identity(path: &Path) -> anyhow::Result<Vec<Box<dyn age::Recipie
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cli")]
+    #[test]
+    fn unquote_phrase_strips_one_matching_pair_of_quotes_only() {
+        use super::unquote_phrase;
+        let phrase =
+            "abandon ability able about above absent absorb abstract absurd abuse access accident";
+        assert_eq!(unquote_phrase(phrase), phrase);
+        assert_eq!(unquote_phrase(&format!("  {phrase}\n")), phrase);
+        assert_eq!(unquote_phrase(&format!("'{phrase}'")), phrase);
+        assert_eq!(unquote_phrase(&format!("\"{phrase}\"")), phrase);
+        assert_eq!(unquote_phrase(&format!(" ' {phrase} ' \n")), phrase);
+        // Mismatched or lone quotes are left alone: they are not a wrapping.
+        assert_eq!(
+            unquote_phrase(&format!("'{phrase}\"")),
+            format!("'{phrase}\"")
+        );
+        assert_eq!(unquote_phrase("'"), "'");
+        assert_eq!(unquote_phrase("''"), "");
+        // Only one pair: a doubly quoted value is still wrong and stays visibly so.
+        assert_eq!(
+            unquote_phrase(&format!("\"'{phrase}'\"")),
+            format!("'{phrase}'")
+        );
+    }
+
     use super::*;
     #[cfg(feature = "zcash")]
     use zcash_client_backend::data_api::AccountBirthday;
@@ -3702,7 +3885,7 @@ mod tests {
         .unwrap()
         .export();
         let args = |birthday| RescanArgs {
-            wallet: "btc".to_string(),
+            wallet: Some("btc".to_string()),
             yes: true,
             birthday,
         };
@@ -3788,7 +3971,7 @@ mod tests {
         rescan(
             &config,
             &RescanArgs {
-                wallet: "default".to_string(),
+                wallet: Some("default".to_string()),
                 yes: true,
                 birthday: Some(Birthday::Height(3)),
             },

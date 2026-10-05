@@ -68,7 +68,7 @@
 //! birthday anchor or the shipped floor) - never genesis. A delivered update resets the count.
 //! While it lasts the outage is honest: the wallet reports `Down`/`Syncing`, not `Ready`.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -101,6 +101,21 @@ const UPDATE_CHANNEL_BOUND: usize = 2;
 /// How long a peer has to answer before kyoto drops it. The default is tuned for local
 /// networks; P2P peers over the open internet want more headroom.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The same deadline with `[backend] p2p_receive_window_bytes` set: a 2000-header answer
+/// then arrives one half-segment per round trip (`btc::net`), which is a long way past
+/// five seconds on anything but a LAN. bip157's own 20 s per filter batch is not ours to
+/// move, so this only buys the header batches time.
+const RESPONSE_TIMEOUT_BOUNDED_WINDOW: Duration = Duration::from_secs(120);
+
+/// How long a TCP connect to a peer may take before kyoto counts the peer unreachable.
+/// bip157's default is two seconds, sized for a LAN; the same as the P2P mempool feed's
+/// handshake deadline, so the two clients agree on which peers are reachable. From an
+/// enclave whose egress crosses a proxy and an ocean, the default lost every whitelisted
+/// peer: bip157 then ends its node task (`NoReachablePeers`), the actor drops the
+/// connection and redials, and the wallet sits at `down` while the feed on the same
+/// host and port stays connected.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long [`broadcast`] waits for a peer to ask for the transaction before giving up.
 ///
@@ -425,6 +440,10 @@ pub struct KyotoEndpoint {
     /// Explicit trusted peers from `kyoto://host:port[,host:port...]` tokens. Empty means
     /// discovery through the network's DNS seeds, which is the bare `kyoto` token's meaning.
     peers: Vec<(IpAddr, Option<u16>)>,
+    /// `[backend] p2p_receive_window_bytes`: dial every peer through a loopback relay whose
+    /// outbound socket has this receive buffer, so the peer never has more than one window
+    /// in flight (`btc::net`). `None` is an ordinary dial.
+    receive_window: Option<u32>,
     /// Where kyoto is *told* to keep its store, beside the BDK wallet database at
     /// `<wallet>/btc/kyoto`.
     ///
@@ -484,7 +503,20 @@ impl KyotoEndpoint {
             peers,
             data_dir,
             required_peers,
+            receive_window: None,
         }
+    }
+
+    /// Bound the peers' receive window (`[backend] p2p_receive_window_bytes`); see
+    /// [`crate::btc::net`] for what that buys and costs.
+    pub fn with_receive_window(mut self, bytes: Option<u32>) -> Self {
+        self.receive_window = bytes;
+        self
+    }
+
+    /// The bounded receive window, if configured - the P2P mempool feed dials with it too.
+    pub fn receive_window(&self) -> Option<u32> {
+        self.receive_window
     }
 
     /// The explicit trusted peers (`kyoto://host:port`), empty for DNS discovery. The
@@ -505,6 +537,14 @@ impl KyotoEndpoint {
     /// unreachable-by-construction case is a network with no peers to find: regtest has no
     /// DNS seeds, so the bare `kyoto` token can never discover anything there.
     pub fn preflight(&self) -> anyhow::Result<()> {
+        if self.receive_window.is_some() && self.peers.is_empty() {
+            bail!(
+                "[backend] p2p_receive_window_bytes needs explicit kyoto peers \
+                 ('kyoto://host:port[,host:port]'): the bounded window is applied by a \
+                 loopback relay per named peer, and peers found through the DNS seeds \
+                 cannot be relayed"
+            );
+        }
         if self.network == BitcoinNetwork::Regtest && self.peers.is_empty() {
             bail!(
                 "the bare 'kyoto' token cannot work on regtest: the light client finds peers \
@@ -555,10 +595,45 @@ impl KyotoEndpoint {
             )
         })?;
 
+        // With a bounded window the peers are dialed through loopback stand-ins
+        // (`btc::net::WindowRelay`): bound here so their ports are known before the
+        // builder sees them, served once the runtime below exists.
+        let mut relay = match self.receive_window {
+            Some(bytes) => {
+                let targets: Vec<SocketAddr> = self
+                    .peers
+                    .iter()
+                    .map(|(ip, port)| {
+                        SocketAddr::new(
+                            *ip,
+                            port.unwrap_or(super::p2p_feed::default_port(self.network)),
+                        )
+                    })
+                    .collect();
+                Some(
+                    crate::btc::net::WindowRelay::bind(&targets, bytes)
+                        .context("bind the loopback relay for the bounded receive window")?,
+                )
+            }
+            None => None,
+        };
+        let dial_peers: Vec<(IpAddr, Option<u16>)> = match &relay {
+            Some(relay) => relay
+                .loopback_peers()
+                .map(|addr| (addr.ip(), Some(addr.port())))
+                .collect(),
+            None => self.peers.clone(),
+        };
+        let response_timeout = if self.receive_window.is_some() {
+            RESPONSE_TIMEOUT_BOUNDED_WINDOW
+        } else {
+            RESPONSE_TIMEOUT
+        };
         let mut builder = Builder::new(network)
             .data_dir(self.data_dir.clone())
             .required_peers(self.required_peers)
-            .response_timeout(RESPONSE_TIMEOUT)
+            .handshake_timeout(DIAL_TIMEOUT)
+            .response_timeout(response_timeout)
             // bip157 requests blocks as `MSG_BLOCK` by default, which a peer serves
             // witness-stripped (BIP 144): every received transaction would then be stored
             // without its witness - `gettransaction.hex` incomplete, and a rebroadcast of it
@@ -567,7 +642,7 @@ impl KyotoEndpoint {
             // with a 113-byte, witness-less transaction it then dropped). `MSG_WITNESS_BLOCK`
             // costs the witness bytes on the block download and nothing else.
             .fetch_witness_data();
-        for (ip, port) in &self.peers {
+        for (ip, port) in &dial_peers {
             // `AddrV2` is the P2P address encoding; it has no blanket `From<IpAddr>`, so pick
             // the variant per family.
             let addr = match ip {
@@ -598,6 +673,11 @@ impl KyotoEndpoint {
             .build()
             .context("start the kyoto light client's runtime")?;
         let entered = runtime.enter();
+        if let Some(relay) = relay.as_mut() {
+            relay
+                .serve()
+                .context("serve the loopback relay for the bounded receive window")?;
+        }
         let (client, logging, mut updates) = client.subscribe();
         let client = client.start();
         let requester = client.requester();
@@ -725,6 +805,7 @@ impl KyotoEndpoint {
             bridge,
             logs,
             anchor,
+            _relay: relay,
             runtime: Some(runtime),
             birthday_time,
             tree_start,
@@ -1048,6 +1129,9 @@ pub struct KyotoConn {
     requester: Requester,
     bridge: JoinHandle<()>,
     logs: JoinHandle<()>,
+    /// The loopback stand-ins for the peers under `[backend] p2p_receive_window_bytes`,
+    /// held so their listeners live as long as the connection; the tasks are on `runtime`.
+    _relay: Option<crate::btc::net::WindowRelay>,
     /// The light client's own runtime. `Option` only so `Drop` can take it: shutting a
     /// runtime down consumes it.
     runtime: Option<tokio::runtime::Runtime>,
@@ -1622,6 +1706,25 @@ mod tests {
 
     fn endpoint(network: BitcoinNetwork, peers: Vec<(IpAddr, Option<u16>)>) -> KyotoEndpoint {
         KyotoEndpoint::new(network, peers, PathBuf::from("/tmp/zecd-kyoto-test"))
+    }
+
+    #[test]
+    fn bounded_window_needs_explicit_peers() {
+        let one = vec![("192.0.2.7".parse().unwrap(), Some(8333))];
+        assert!(endpoint(BitcoinNetwork::Main, vec![])
+            .with_receive_window(Some(1448))
+            .preflight()
+            .is_err());
+        assert!(endpoint(BitcoinNetwork::Main, one.clone())
+            .with_receive_window(Some(1448))
+            .preflight()
+            .is_ok());
+        assert_eq!(
+            endpoint(BitcoinNetwork::Main, one)
+                .with_receive_window(Some(1448))
+                .receive_window(),
+            Some(1448)
+        );
     }
 
     #[test]

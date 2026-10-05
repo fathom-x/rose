@@ -40,7 +40,21 @@ Usage, from the repository root:
     ZECD_RPC_USER=view ZECD_RPC_PASSWORD=... ZECD_RPC_HOST=zecd-btc ZECD_RPC_PORT=18232 \
         python3 scripts/zecd-gui/serve.py
 
+    # a zecd inside a Caution enclave: every call rides an attested STEVE session
+    ZECD_RPC_USER=btc ZECD_RPC_PASSWORD=... python3 scripts/zecd-gui/serve.py \
+        --conf <deployment>/zecd.toml --rpc-url http://<enclave-ip>/ \
+        --steve-pcrs <deployment>/.caution/trusted_hashes.json
+
 Then open http://127.0.0.1:8080/.
+
+Enclave mode (--steve-pcrs / ZECD_STEVE_PCRS): the enclave's RPC answers only through
+STEVE, the attested end-to-end channel, so the proxy hands each call to `steve-cli`
+(--steve-cli / ZECD_STEVE_CLI, default on PATH) with the PCR file the deployment's
+runner committed; steve-cli verifies the enclave's attestation against it, opens a
+session, sends the one request and prints the answer. About a second per call, which a
+dashboard tolerates; a session per call is what the one-request CLI offers, and nothing
+here keeps a key. The credentials still go in an Authorization header, inside the
+encrypted channel.
 """
 
 import argparse
@@ -49,7 +63,9 @@ import http.server
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -205,6 +221,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # Filled in by main() before the server starts.
     upstream_url = None
     auth_header = None
+    steve = None  # (steve-cli path, trusted-hashes file) in enclave mode, else None
     info_json = b"{}"  # which config this proxy is serving (set by main)
 
     def do_GET(self):
@@ -241,6 +258,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not isinstance(method, str) or method not in ALLOWED_METHODS:
             self.log_error("refused /rpc method %r", method if isinstance(call, dict) else "<batch>")
             return self.relay(403, rpc_error(-32601, "Method not allowed through this proxy"))
+        if self.steve:
+            return self.relay_via_steve(body)
         req = urllib.request.Request(
             self.upstream_url,
             data=body,
@@ -265,6 +284,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     {"result": None, "error": {"code": -1, "message": f"zecd unreachable: {e}"}, "id": None}
                 ).encode(),
             )
+
+    def relay_via_steve(self, body):
+        """One attested request through steve-cli. It prints the response body alone (no
+        status line), so a JSON answer is relayed as 200 whatever zecd's HTTP status was -
+        the page reads the JSON-RPC error object, not the status - and anything else is a
+        502 naming steve-cli's complaint (a PCR mismatch, an unreachable enclave)."""
+        cli, pcrs = self.steve
+        try:
+            out = subprocess.run(
+                [cli, "--pcrs", pcrs, "-H", f"Authorization: {self.auth_header}",
+                 "--json", body.decode("utf-8", "replace"), self.upstream_url],
+                capture_output=True, timeout=120, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return self.relay(502, rpc_error(-1, f"steve-cli failed to run: {e}"))
+        answer = out.stdout.strip()
+        try:
+            json.loads(answer)
+        except ValueError:
+            # steve-cli's stderr starts with its trust verdict ("PCR trust: Pinned"), which is
+            # not the failure; the complaint, if any, follows it. No complaint and no body is
+            # zecd answering 401: the credentials, not the enclave.
+            detail = [l for l in out.stderr.decode("utf-8", "replace").splitlines()
+                      if l.strip() and not l.startswith("PCR trust:")]
+            why = detail[-1] if detail else "the enclave answered with no body (credentials refused?)"
+            self.log_error("steve-cli gave no JSON answer: %s", why)
+            return self.relay(502, rpc_error(-1, f"enclave call failed: {why}"))
+        self.relay(200, answer)
 
     def relay(self, status, body):
         self.send_response(status)
@@ -311,6 +358,17 @@ def main():
              "http://host.docker.internal:48242 to reach a host zecd from a container, or "
              "http://zecd:18232 for a compose sibling). Credentials still come from the "
              "config/env. Env: ZECD_RPC_URL",
+    )
+    ap.add_argument(
+        "--steve-pcrs",
+        default="",
+        help="enclave mode: the deployment's trusted-hashes file (PCRs); every call then goes "
+             "through steve-cli's attested session to --rpc-url. Env: ZECD_STEVE_PCRS",
+    )
+    ap.add_argument(
+        "--steve-cli",
+        default="",
+        help="path to steve-cli for --steve-pcrs; default: steve-cli on PATH. Env: ZECD_STEVE_CLI",
     )
     ap.add_argument(
         "--rpc-host",
@@ -382,6 +440,14 @@ def main():
     Handler.upstream_url = base.rstrip("/") + path
     token = base64.b64encode(f"{user}:{password}".encode()).decode()
     Handler.auth_header = f"Basic {token}"
+    pcrs = args.steve_pcrs or os.environ.get("ZECD_STEVE_PCRS", "")
+    if pcrs:
+        if not os.path.isfile(pcrs):
+            sys.exit(f"--steve-pcrs: no such file: {pcrs}")
+        cli = args.steve_cli or os.environ.get("ZECD_STEVE_CLI", "") or shutil.which("steve-cli")
+        if not cli or not os.path.isfile(cli):
+            sys.exit("--steve-pcrs needs steve-cli (on PATH, --steve-cli, or ZECD_STEVE_CLI)")
+        Handler.steve = (cli, pcrs)
 
     bd = config.get("bitcoind", {})
 

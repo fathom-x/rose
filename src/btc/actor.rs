@@ -1856,7 +1856,12 @@ impl BtcActor {
             }
             return;
         };
-        let Some(target) = feed_target(&self.mempool, self.network, kyoto.peers()) else {
+        let Some(target) = feed_target(
+            &self.mempool,
+            self.network,
+            kyoto.peers(),
+            kyoto.receive_window(),
+        ) else {
             if !self.mempool.sources.is_empty() {
                 warn!(
                     network = self.network.name(),

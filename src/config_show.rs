@@ -92,6 +92,9 @@ pub fn render(config: &AppConfig) -> String {
     kv(&mut s, "connect_timeout_secs", b.connect_timeout_secs);
     kv(&mut s, "reconnect_base_secs", b.reconnect_base_secs);
     kv(&mut s, "reconnect_max_secs", b.reconnect_max_secs);
+    if let Some(bytes) = b.p2p_receive_window_bytes {
+        kv(&mut s, "p2p_receive_window_bytes", bytes);
+    }
     kv(&mut s, "rfc1918_is_local", b.rfc1918_is_local);
     kv(&mut s, "allow_remote_cleartext", b.allow_remote_cleartext);
     #[cfg(feature = "zcash")]
@@ -768,15 +771,10 @@ mod tests {
                 "{absent:?} must not render for a bitcoin wallet:\n{first}"
             );
         }
-        // The implicit default wallet is untouched: no `coin` line (it is the default), the
-        // Zcash keys present as ever.
-        let default_section = first
-            .split("[wallets.default]")
-            .nth(1)
-            .map(|rest| rest.split("[wallets.").next().unwrap())
-            .expect("default wallet section rendered");
-        assert!(!default_section.contains("coin ="), "{first}");
-        assert!(default_section.contains("transparent = false"), "{first}");
+        // A lone declared wallet is the config's only wallet: `default_wallet` resolves to it
+        // and renders explicitly, and no implicit Zcash `default` is filled in beside it.
+        assert!(first.contains("default_wallet = \"btc\""), "{first}");
+        assert!(!first.contains("[wallets.default]"), "{first}");
 
         let round_trip = tempfile::tempdir().unwrap();
         let second = render(&resolve_from(&first, round_trip.path()));

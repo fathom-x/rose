@@ -346,7 +346,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         make_legacy_wallet(&dir.path().join("default"));
         make_legacy_wallet(&dir.path().join("watcher"));
-        let config = config_with(dir.path(), "[wallets.watcher]\n");
+        // Both declared: a lone declared wallet would be the config's only wallet (no implicit
+        // `default` beside it), and an undeclared one is not migrated any more than served.
+        let config = config_with(dir.path(), "[wallets.default]\n[wallets.watcher]\n");
 
         assert_eq!(migrate(&config).unwrap().len(), 2);
         assert_migrated(&dir.path().join("default"));

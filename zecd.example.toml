@@ -24,7 +24,10 @@ network = "test"
 # age identity. Each wallet lives in its own subdirectory.
 datadir = "./data"
 
-# Wallet selected when a request hits "/" rather than "/wallet/<name>".
+# Wallet selected when a request hits "/" rather than "/wallet/<name>", and the one every
+# subcommand's --wallet defaults to (init, export-ufvk, export-xpub, rescan,
+# run --restore-if-empty). Unset, it is the one declared wallet when exactly one is; with
+# several declared, "/" routes to "default" and the subcommands require --wallet.
 default_wallet = "default"
 
 # One section per wallet. The directory holds keys.toml plus one subdirectory per coin, so a
@@ -100,6 +103,15 @@ connect_timeout_secs = 10
 # Reconnect backoff (seconds): start at base, double up to max, with full jitter.
 reconnect_base_secs = 1
 reconnect_max_secs = 60
+# Bound the receive window of the Bitcoin P2P connections (kyoto peers and the P2P mempool
+# feed) by setting their socket receive buffer, for a network path that loses packets
+# arriving back-to-back but passes spaced ones (an enclave whose network is tunneled over a
+# byte stream without packet framing). At 1448 a peer sends one half-size segment per
+# round trip and never two together; 2048 already lets pairs through. The cost is
+# throughput, 724 bytes per round trip, so this wants peers close by and is no use for a
+# mainnet first sync. Kyoto then needs explicit peers (`kyoto://host:port`). Unset: the
+# kernel's autotuned window.
+# p2p_receive_window_bytes = 1448
 # lightwalletd TLS mode: "auto" (default - locality heuristic), "yes", or "no". An explicit
 # https:// or http:// scheme on `server` wins over this. zebra:// endpoints ignore it
 # (always plaintext HTTP, local-only by policy).

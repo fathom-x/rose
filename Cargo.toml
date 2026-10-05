@@ -107,7 +107,9 @@ tokio-socks = "0.5"
 tower-service = "0.3"
 # rusqlite 0.37 is `zcash_client_sqlite`'s own requirement; zecd opens connections to the
 # same database, so the two must be the same crate version, not merely compatible ones.
-rusqlite = { version = "0.37", features = ["time"] }
+# `bundled` compiles SQLite in: the Zcash wallet crate asks for it anyway, and a Bitcoin-only
+# static build has no system libsqlite3 to link against.
+rusqlite = { version = "0.37", features = ["time", "bundled"] }
 time = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -305,6 +307,7 @@ mimalloc-secure = ["mimalloc", "mimalloc/secure"]
 # that pin the crypto family. Both move together, on a wallet-layer release.
 
 [dev-dependencies]
+socket2 = "0.6"   # tests: read SO_RCVBUF back on the bounded P2P sockets (btc/net.rs)
 tempfile = "3"
 # Frontier bookkeeping for the fabricated-chain reorg test (matches librustzcash's version).
 incrementalmerkletree = "0.8"

@@ -345,9 +345,10 @@ pub fn resolve_for_wallet(
     if is_kyoto_token(token) {
         let peers = resolve_kyoto_peers(token)?;
         let data_dir = crate::config::btc_kyoto_dir(&entry.dir);
-        return Ok(BtcEndpoint::Kyoto(crate::btc::kyoto::KyotoEndpoint::new(
-            network, peers, data_dir,
-        )));
+        return Ok(BtcEndpoint::Kyoto(
+            crate::btc::kyoto::KyotoEndpoint::new(network, peers, data_dir)
+                .with_receive_window(config.backend.p2p_receive_window_bytes),
+        ));
     }
     let (host, port) = resolve(token, network)?;
     Ok(BtcEndpoint::Bitcoind(BitcoindEndpoint {

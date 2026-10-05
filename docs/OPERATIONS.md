@@ -161,6 +161,20 @@ on the custody model:
 To opt out (fail fast on an empty datadir instead of rebuilding), set `bootstrap_from_keys =
 false`.
 
+**Nothing on disk at all - not even `keys.toml`.** That is the enclave shape (ephemeral
+storage, and a `FROM scratch` image with no shell to run `init` before the daemon), and
+`zecd run --restore-if-empty` covers it: when the named wallet (`--wallet`, else the
+config's implied wallet - `default_wallet`, or its one declared wallet) has no `keys.toml`,
+the daemon runs the `init --restore` path first - the phrase
+from `ZECD_MNEMONIC`, else `--mnemonic-file`, never a prompt; the birthday from
+`--birthday`, as for `init` - and then serves the wallet under age-identity custody
+(`auto_unlock`), rescanning from the birthday. An initialized wallet is left exactly as it
+is and the phrase is not read, so the same command is safe to run on every boot. A failed
+restore ends the daemon rather than leaving it up to serve nothing. A kyoto Bitcoin wallet
+restores offline; a Zcash wallet's restore dials the upstream to anchor its birthday, so
+that upstream must be reachable at boot. The restore is logged on the `zecd::audit` target
+without the phrase. A Caution enclave deployment is built on it.
+
 ### Secret inputs without baking them into the config
 
 The RPC password is spend-equivalent for clients, and the seed/identity are spend authority,
@@ -176,7 +190,8 @@ Secret file instead of the TOML:
   or per-wallet `[wallets.<name>] keys_file`.
 - **age identity** - `ZECD_AGE_IDENTITY` / `--age-identity` / `[keys] age_identity`.
 - **Non-interactive `init --restore`** - `ZECD_MNEMONIC` or `--mnemonic-file` (else stdin);
-  `ZECD_WALLET_PASSPHRASE` for `init --encrypt` (else prompted).
+  `ZECD_WALLET_PASSPHRASE` for `init --encrypt` (else prompted). `run --restore-if-empty`
+  takes the same two mnemonic sources and refuses without one (a daemon never prompts).
 
 ## Restore procedures
 

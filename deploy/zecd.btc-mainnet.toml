@@ -27,7 +27,7 @@
 #   ./target/release/zecd --conf deploy/zecd.btc-mainnet.toml init --wallet btc
 #   ./target/release/zecd --conf deploy/zecd.btc-mainnet.toml
 #
-# `--wallet btc` is REQUIRED on init (it defaults to a "default" Zcash wallet otherwise). A
+# `--wallet btc` is optional (it defaults to `default_wallet`, which names [wallets.btc]). A
 # freshly generated kyoto wallet's birthday defaults to today (funds cannot predate the
 # wallet) and the first sync resolves it against the node's headers - from the shipped scan
 # floor that is a few thousand filters, minutes. Pass `--birthday <height|YYYY-MM-DD>` only

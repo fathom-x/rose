@@ -19,7 +19,7 @@
 # docker-compose.btc-testnet4.yml does): that publishes the RPC to the LAN behind the RPC
 # password, acceptable for valueless testnet4 coins and nothing else.
 #
-# `--wallet btc` is REQUIRED on init (it defaults to a "default" Zcash wallet otherwise;
+# `--wallet btc` is optional (it defaults to `default_wallet`, which names [wallets.btc];
 # see the note in deploy/zecd.btc-testnet4.toml). Kyoto cannot dial a node to anchor a
 # birthday, so a freshly generated wallet defaults to **today** (funds cannot predate the
 # wallet); `--birthday` takes a height or a YYYY-MM-DD date, resolved offline against the

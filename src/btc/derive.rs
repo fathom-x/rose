@@ -36,14 +36,11 @@ use crate::wallet::store::WalletStore;
 
 use super::keys::AccountKeys;
 
-/// The wallet whose configuration is used when `--wallet` is omitted, as in every other
-/// zecd subcommand.
-const DEFAULT_WALLET: &str = "default";
-
-/// Whether `derive-address` for `wallet` (`None` = the default wallet) is this module's to
-/// answer: the wallet's configured coin is Bitcoin. The CLI dispatches on it.
+/// Whether `derive-address` for `wallet` (`None` = the config's default wallet, so a
+/// Bitcoin-only config with just `[wallets.btc]` routes here with no flag) is this module's
+/// to answer: the wallet's configured coin is Bitcoin. The CLI dispatches on it.
 pub fn serves(config: &AppConfig, wallet: Option<&str>) -> bool {
-    crate::init::resolve_wallet_entry(config, wallet.unwrap_or(DEFAULT_WALLET)).coin
+    crate::init::resolve_wallet_entry(config, wallet.unwrap_or(&config.default_wallet)).coin
         == Coin::Bitcoin
 }
 
@@ -199,7 +196,7 @@ pub fn derive(config: &AppConfig, opts: DeriveOptions<'_>) -> anyhow::Result<Der
     if opts.count == 0 {
         bail!("--count must be at least 1");
     }
-    let wallet = opts.wallet.unwrap_or(DEFAULT_WALLET);
+    let wallet = opts.wallet.unwrap_or(&config.default_wallet);
     let entry = crate::init::resolve_wallet_entry(config, wallet);
     if entry.coin != Coin::Bitcoin {
         bail!("wallet '{wallet}' is not a Bitcoin wallet");

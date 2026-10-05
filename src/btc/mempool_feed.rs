@@ -162,6 +162,8 @@ pub enum FeedTarget {
         peer: SocketAddr,
         network: BitcoinNetwork,
         snapshot: Option<Duration>,
+        /// `[backend] p2p_receive_window_bytes`, the same bound the kyoto peers dial with.
+        receive_window: Option<u32>,
     },
 }
 
@@ -196,6 +198,7 @@ pub fn target_for(
     source: MempoolSource,
     network: BitcoinNetwork,
     kyoto_peers: &[(IpAddr, Option<u16>)],
+    receive_window: Option<u32>,
 ) -> Option<FeedTarget> {
     match source {
         MempoolSource::MempoolSpace => {
@@ -208,6 +211,7 @@ pub fn target_for(
                 snapshot: config
                     .p2p_snapshot
                     .then(|| Duration::from_secs(config.p2p_snapshot_interval_secs)),
+                receive_window,
             })
         }
     }
@@ -221,11 +225,12 @@ pub fn feed_target(
     config: &MempoolConfig,
     network: BitcoinNetwork,
     kyoto_peers: &[(IpAddr, Option<u16>)],
+    receive_window: Option<u32>,
 ) -> Option<FeedTarget> {
     config
         .sources
         .iter()
-        .find_map(|&source| target_for(config, source, network, kyoto_peers))
+        .find_map(|&source| target_for(config, source, network, kyoto_peers, receive_window))
 }
 
 /// Refuse a `[mempool]` URL override that could never be dialed, at config-resolution time.
@@ -594,11 +599,13 @@ impl MempoolFeed {
                             peer,
                             network,
                             snapshot,
+                            receive_window,
                         } => {
                             super::p2p_feed::run_peer(
                                 *peer,
                                 *network,
                                 *snapshot,
+                                *receive_window,
                                 &tx,
                                 &mut refetch_rx,
                             )
@@ -874,15 +881,15 @@ mod tests {
 
     #[test]
     fn the_feed_is_off_unless_a_source_is_named_and_can_run() {
-        assert!(feed_target(&MempoolConfig::default(), BitcoinNetwork::Main, &[]).is_none());
+        assert!(feed_target(&MempoolConfig::default(), BitcoinNetwork::Main, &[], None).is_none());
         assert_eq!(
-            feed_target(&ws_only(), BitcoinNetwork::Testnet4, &[]),
+            feed_target(&ws_only(), BitcoinNetwork::Testnet4, &[], None),
             Some(FeedTarget::WebSocket {
                 url: "wss://mempool.space/testnet4/api/v1/ws".to_string()
             })
         );
         // Named but nothing public serves regtest: off, not an error.
-        assert!(feed_target(&ws_only(), BitcoinNetwork::Regtest, &[]).is_none());
+        assert!(feed_target(&ws_only(), BitcoinNetwork::Regtest, &[], None).is_none());
         // An override supplies the endpoint the network lacks, and wins where it has one.
         let hosted = MempoolConfig {
             mempool_space_url: Some("ws://mempool.internal:8999/api/v1/ws".into()),
@@ -890,7 +897,7 @@ mod tests {
         };
         for network in [BitcoinNetwork::Regtest, BitcoinNetwork::Main] {
             assert_eq!(
-                feed_target(&hosted, network, &[]).unwrap().describe(),
+                feed_target(&hosted, network, &[], None).unwrap().describe(),
                 "ws://mempool.internal:8999/api/v1/ws"
             );
         }
@@ -907,20 +914,21 @@ mod tests {
         };
         let ip: IpAddr = "192.0.2.7".parse().unwrap();
         assert_eq!(
-            feed_target(&p2p, BitcoinNetwork::Testnet4, &[(ip, Some(48333))]),
+            feed_target(&p2p, BitcoinNetwork::Testnet4, &[(ip, Some(48333))], None),
             Some(FeedTarget::Peer {
                 peer: "192.0.2.7:48333".parse().unwrap(),
                 network: BitcoinNetwork::Testnet4,
                 snapshot: None,
+                receive_window: None,
             })
         );
         assert_eq!(
-            feed_target(&p2p, BitcoinNetwork::Main, &[(ip, None)])
+            feed_target(&p2p, BitcoinNetwork::Main, &[(ip, None)], None)
                 .unwrap()
                 .describe(),
             "p2p://192.0.2.7:8333 (relay)"
         );
-        assert!(feed_target(&p2p, BitcoinNetwork::Main, &[]).is_none());
+        assert!(feed_target(&p2p, BitcoinNetwork::Main, &[], None).is_none());
         let pinned = MempoolConfig {
             p2p_peer: Some("10.0.0.9:18444".parse().unwrap()),
             p2p_snapshot: true,
@@ -928,7 +936,7 @@ mod tests {
             ..p2p.clone()
         };
         assert_eq!(
-            feed_target(&pinned, BitcoinNetwork::Regtest, &[(ip, Some(1))])
+            feed_target(&pinned, BitcoinNetwork::Regtest, &[(ip, Some(1))], None)
                 .unwrap()
                 .describe(),
             "p2p://10.0.0.9:18444 (relay + mempool snapshots every 45s)"
@@ -940,11 +948,11 @@ mod tests {
             ..MempoolConfig::default()
         };
         assert!(matches!(
-            feed_target(&both, BitcoinNetwork::Main, &[]),
+            feed_target(&both, BitcoinNetwork::Main, &[], None),
             Some(FeedTarget::WebSocket { .. })
         ));
         assert!(matches!(
-            feed_target(&both, BitcoinNetwork::Main, &[(ip, None)]),
+            feed_target(&both, BitcoinNetwork::Main, &[(ip, None)], None),
             Some(FeedTarget::Peer { .. })
         ));
         let reversed = MempoolConfig {
@@ -952,11 +960,11 @@ mod tests {
             ..MempoolConfig::default()
         };
         assert!(matches!(
-            feed_target(&reversed, BitcoinNetwork::Main, &[(ip, None)]),
+            feed_target(&reversed, BitcoinNetwork::Main, &[(ip, None)], None),
             Some(FeedTarget::WebSocket { .. })
         ));
         assert!(matches!(
-            feed_target(&reversed, BitcoinNetwork::Regtest, &[(ip, None)]),
+            feed_target(&reversed, BitcoinNetwork::Regtest, &[(ip, None)], None),
             Some(FeedTarget::Peer { .. })
         ));
     }
@@ -1293,6 +1301,7 @@ mod tests {
                 peer,
                 network,
                 snapshot: Some(Duration::from_secs(300)),
+                receive_window: None,
             },
             Duration::from_millis(200),
             Duration::from_millis(200),
@@ -1355,7 +1364,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network access to mempool.space"]
     async fn the_public_feed_still_answers_in_the_shape_we_parse() {
-        let target = feed_target(&ws_only(), BitcoinNetwork::Testnet4, &[]).unwrap();
+        let target = feed_target(&ws_only(), BitcoinNetwork::Testnet4, &[], None).unwrap();
         let url = target.describe();
         let mut feed = MempoolFeed::start(target, Duration::from_secs(1), Duration::from_secs(1));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(180);

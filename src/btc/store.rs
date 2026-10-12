@@ -230,11 +230,73 @@ impl Persister {
             })
             .context("read birthday anchor")
     }
+
+    /// Record a pending kyoto rescan: the checkpoint the light client must be rebuilt
+    /// from with a wider script set, because the scan so far revealed addresses past the
+    /// scripts it matched filters against (`btc::kyoto`'s `ScriptWatch::rescan_from`).
+    /// Kept here so a daemon restart in the middle of the discovery loop resumes it
+    /// rather than syncing on from the wallet's tip with the band below it unscanned -
+    /// the funds past the set would be lost silently, which is the failure the loop
+    /// exists to end. One row, overwritten by the next pending rescan; cleared by the
+    /// first applied update that needs none ([`Persister::clear_rescan`]).
+    ///
+    /// Chain-derived cache like the anchor: deleting it costs at most a rescan from the
+    /// scan start on the next restart, never funds.
+    pub fn save_rescan(&mut self, height: u32, hash: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch(RESCAN_TABLE_SQL)
+            .context("create kyoto_rescan table")?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO kyoto_rescan (id, height, hash) VALUES (0, ?1, ?2)",
+                rusqlite::params![height, hash],
+            )
+            .context("record pending rescan")?;
+        Ok(())
+    }
+
+    /// Forget the pending rescan: the scan is complete (see [`Persister::save_rescan`]).
+    pub fn clear_rescan(&mut self) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch(RESCAN_TABLE_SQL)
+            .context("create kyoto_rescan table")?;
+        self.conn
+            .execute("DELETE FROM kyoto_rescan", [])
+            .context("clear pending rescan")?;
+        Ok(())
+    }
+
+    /// The pending rescan checkpoint, if any - see [`Persister::save_rescan`].
+    pub fn load_rescan(&self) -> anyhow::Result<Option<(u32, String)>> {
+        self.conn
+            .execute_batch(RESCAN_TABLE_SQL)
+            .context("create kyoto_rescan table")?;
+        self.conn
+            .query_row(
+                "SELECT height, hash FROM kyoto_rescan WHERE id = 0",
+                [],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+            .context("read pending rescan")
+    }
 }
 
 /// The single-row birthday-anchor table (see [`Persister::save_birthday_anchor`]). The
 /// `CHECK (id = 0)` pins it to one row so a re-resolution replaces rather than accumulates.
 const ANCHOR_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS birthday_anchor (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    height INTEGER NOT NULL,
+    hash TEXT NOT NULL
+)";
+
+/// The single-row pending-rescan table (see [`Persister::save_rescan`]), the anchor
+/// table's shape.
+const RESCAN_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS kyoto_rescan (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     height INTEGER NOT NULL,
     hash TEXT NOT NULL
@@ -526,6 +588,27 @@ mod tests {
             persister.load_birthday_anchor().unwrap(),
             Some((146_600, "cc".to_string()))
         );
+    }
+
+    /// The pending kyoto rescan is the same single overwritten row, surviving a close and
+    /// reopen (a restart mid-loop resumes the rescan) and reading as `None` once cleared.
+    #[test]
+    fn pending_rescan_round_trips_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_dir = dir.path().join("btc").join("bdk");
+        {
+            let mut persister = Persister::open(&engine_dir).unwrap();
+            assert_eq!(persister.load_rescan().unwrap(), None);
+            persister.save_rescan(200, "aa").unwrap();
+            persister.save_rescan(180, "bb").unwrap();
+        }
+        let mut persister = Persister::open(&engine_dir).unwrap();
+        assert_eq!(
+            persister.load_rescan().unwrap(),
+            Some((180, "bb".to_string()))
+        );
+        persister.clear_rescan().unwrap();
+        assert_eq!(persister.load_rescan().unwrap(), None);
     }
 
     /// A retired transaction whose anchor reorged out is not canonical after a reload - the

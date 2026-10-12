@@ -144,6 +144,21 @@ pub struct TransparentInfo {
     pub initial_sync: Option<TransparentInitialSync>,
 }
 
+/// `getwalletinfo.recovery` - what a from-seed restore of a Bitcoin wallet under its
+/// configuration would recover (zecd extension, Bitcoin wallets only;
+/// `rpc/btc_methods.rs::getwalletinfo`). `horizon` is the highest external index a restore
+/// re-derives without further funding, and `restorable` is false once `getnewaddress` has
+/// issued past it: raise `[wallets.<name>] initial_scan` past `issued_through`.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BtcRecoveryInfo {
+    pub initial_scan: u32,
+    pub lookahead: u32,
+    pub horizon: u32,
+    pub issued_through: Option<u32>,
+    pub restorable: bool,
+}
+
 /// `getwalletinfo` (`rpc/wallet_methods.rs::getwalletinfo`).
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -183,6 +198,8 @@ pub struct WalletInfo {
     pub import_error: Option<String>,
     /// Present only when transparent receiving is enabled.
     pub transparent: Option<TransparentInfo>,
+    /// Present on Bitcoin wallets only.
+    pub recovery: Option<BtcRecoveryInfo>,
 }
 
 /// `getaddressinfo` (`rpc/wallet_methods.rs::addressinfo_json`).
@@ -1141,6 +1158,41 @@ mod tests {
         let w: WalletInfo = serde_json::from_value(idle).unwrap();
         assert!(!w.scanning.is_scanning());
         assert!(w.transparent.is_none() && w.unlocked_until.is_none());
+        assert!(
+            w.recovery.is_none(),
+            "a Zcash wallet carries no Bitcoin recovery block"
+        );
+        // Fixture: the Bitcoin handler's `recovery` block after `getnewaddress` went past
+        // the horizon.
+        let bitcoin = serde_json::json!({
+            "walletname": "btc",
+            "walletversion": 169900,
+            "format": "sqlite",
+            "balance": 0.00000000,
+            "unconfirmed_balance": 0.00000000,
+            "immature_balance": 0.00000000,
+            "txcount": 0,
+            "keypoolsize": 1,
+            "keypoolsize_hd_internal": 0,
+            "paytxfee": 0.00000000,
+            "private_keys_enabled": true,
+            "avoid_reuse": false,
+            "scanning": false,
+            "descriptors": true,
+            "recovery": {
+                "initial_scan": 30,
+                "lookahead": 25,
+                "horizon": 54,
+                "issued_through": 55,
+                "restorable": false,
+            },
+            "coin": "bitcoin",
+        });
+        let w: WalletInfo = serde_json::from_value(bitcoin).unwrap();
+        let r = w.recovery.unwrap();
+        assert_eq!((r.initial_scan, r.lookahead, r.horizon), (30, 25, 54));
+        assert_eq!(r.issued_through, Some(55));
+        assert!(!r.restorable);
         assert!(
             w.import_error.is_none(),
             "a healthy wallet carries no import failure, and the key is absent rather than empty"

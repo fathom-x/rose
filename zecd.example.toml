@@ -57,6 +57,19 @@ dir = "./data/default"
 # payments; a restore that misses funds this way recovers nothing until a rescan with it
 # raised. The Zcash equivalent is [pools] transparent_gap_limit.
 # lookahead = 25
+# Bitcoin wallets only: the initial scan depth, the counterpart of [pools]
+# transparent_initial_scan. External addresses 0..N are revealed once, at startup, so a
+# restore (or an xpub import) watches a pre-issued address set from its first pass - every
+# gap inside it bridged - while `lookahead` stays small; getnewaddress continues past N. Set
+# it to your issuance high-water mark (an exchange that assigned 10000 deposit addresses sets
+# 10000) rather than widening the lookahead, which costs every block for the wallet's life;
+# above 10000 the daemon warns. A from-seed restore re-derives external indexes through
+# max(initial_scan, highest paid index + 1) + lookahead - 1 (the "recovery horizon"), so
+# getnewaddress WARNS when it issues past that and getwalletinfo.recovery reports
+# restorable = false. Such funds are not lost - a restore with initial_scan raised past the
+# index finds them - but raise it in the configuration a restore will run with before relying
+# on one.
+# initial_scan = 0
 
 [backend]
 # The chain upstream: a LOCAL zebrad's JSON-RPC ("full mode", the default and the

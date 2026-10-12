@@ -527,6 +527,7 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
                 .fresh_wallet_birthday_margin
                 .unwrap_or(FRESH_WALLET_BIRTHDAY_MARGIN),
             lookahead: crate::config::DEFAULT_LOOKAHEAD,
+            initial_scan: 0,
         })
 }
 
@@ -2434,6 +2435,7 @@ mod tests {
             birthday: 0,
             birthday_time: None,
             lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
+            initial_scan: 0,
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),
@@ -2545,6 +2547,7 @@ mod tests {
             birthday: 0,
             birthday_time: None,
             lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
+            initial_scan: 0,
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),
@@ -3438,6 +3441,7 @@ mod tests {
                 transparent_gap_warn_threshold: 5,
                 fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
                 lookahead: crate::config::DEFAULT_LOOKAHEAD,
+                initial_scan: 0,
             },
         );
         wallets.insert(
@@ -3458,6 +3462,7 @@ mod tests {
                 transparent_gap_warn_threshold: 5,
                 fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
                 lookahead: crate::config::DEFAULT_LOOKAHEAD,
+                initial_scan: 0,
             },
         );
 
@@ -3509,6 +3514,7 @@ mod tests {
                     transparent_gap_warn_threshold: 5,
                     fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
                     lookahead: crate::config::DEFAULT_LOOKAHEAD,
+                    initial_scan: 0,
                 },
             );
         }

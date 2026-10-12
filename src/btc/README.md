@@ -34,12 +34,60 @@ that window; a payment found at an unrevealed index reveals up to it and pushes 
 on. On a restore or an `init --xpub` import nothing is revealed yet, so the lookahead is
 the BIP-44 gap limit: the longest run of never-paid addresses the scan can bridge. A
 wallet whose history skipped more than that between payments **silently misses** the later
-funds - over kyoto too, where the recovery scan asks the node to watch 100 scripts per
-keychain but the wallet's own index still decides what an output belongs to. Set
-`[wallets.<name>] lookahead` above the wallet's widest gap before restoring (the engine
-applies it at every load, and kyoto's recovery hint follows it upward);
-`regtest_btc_lookahead.rs` pins both halves. The Zcash side's knob is
-`[pools] transparent_gap_limit`.
+funds - over kyoto too, where the light client is told to watch the same `lookahead`
+scripts per keychain past the last revealed index (one knob: the node fetching a block is
+worth nothing unless the wallet's own index attributes the output, and it attributes only
+within its lookahead). Set `[wallets.<name>] lookahead` above the wallet's widest gap
+before restoring (the engine applies it at every load); `regtest_btc_lookahead.rs` pins
+both halves. The Zcash side's knob is `[pools] transparent_gap_limit`.
+
+The gap is the only ceiling. Over bitcoind every output of every block meets the index, so
+a history of any length restores. Over kyoto the light client matches filters against a
+script set fixed when it is built - `lookahead` per keychain past the last revealed index,
+from index 0, widened after each delivered update but never over the blocks already
+passed - so a restore used to stop at about index 100 of a wallet paid at consecutive
+addresses (the fixed 100-script recovery set zecd passed then), and report synced with the
+rest of the funds missing. The
+actor now keeps a `ScriptWatch` per connection: the highest index the client watches per
+keychain, tracked exactly as bdk_kyoto builds and widens its set. After every applied
+update it asks whether the set bdk_kyoto would build for the index as it now stands
+(`last_revealed + lookahead` scripts) reaches past that; if so the scan is not complete,
+and the client is rebuilt as a recovery scan from the wallet's checkpoint just below the
+earliest block that could hold a payment the set missed (the first block that paid an
+index whose reveal put an unwatched one in the window; the scan's own start when the
+reveals came from `getnewaddress`), with the set the index now gives, until a pass reveals
+nothing past its set - as many passes as the history is lookaheads long, so a wider
+`lookahead` or an `initial_scan` floor means fewer. The pending checkpoint is persisted (`Persister::save_rescan`) so a restart
+mid-loop resumes it, and the wallet reports `Syncing` while one is pending. The same
+check covers the steady state: addresses `getnewaddress` reveals past the set a running
+connection watches (bdk_kyoto's copy of the index never sees them) trigger the same
+rebuild on the next update. It is measured by bdk_kyoto's own formula on purpose: that
+set ends one index short of the window the wallet attributes within, so held to the
+wallet's window every fresh connection would rebuild once for nothing; until upstream
+watches that last index, the gap a kyoto wallet bridges is one address narrower than its
+lookahead. The second test in `regtest_btc_lookahead.rs` restores a 140-address history
+over kyoto at the default.
+
+**The floor: `[wallets.<name>] initial_scan`** (default 0), the counterpart of the Zcash
+side's `transparent_initial_scan`. External indexes `0..N` are revealed once at spawn
+(persisted, so the cursor continues past `N`), which makes a restore watch a pre-issued
+address set from its first pass - every gap inside it bridged, and over kyoto the whole
+floor in the first recovery set, since bdk_kyoto builds it from the last revealed index -
+while `lookahead` stays small. The two windows the Zcash side keeps apart exist here too:
+the **live window** is BDK's, `lookahead` past the last revealed index, and follows
+issuance; the **recovery horizon** is what a from-seed restore under the same configuration
+re-derives without further funding, `max(initial_scan, highest paid index + 1) + lookahead
+- 1` (`actor::recovery_horizon_for`), and follows funding only, because issuance leaves no
+trace on chain. `getnewaddress` issuing past the horizon warns (`zecd::audit`) that a
+restore under the current configuration would miss funds received there - not that they
+are lost: the seed controls them, and a restore with `initial_scan` raised past the index
+finds them - and `getwalletinfo.recovery` reports `initial_scan`, `lookahead`, `horizon`,
+`issued_through` and `restorable` (false exactly when an issued index lies past the
+horizon): the fix is raising `initial_scan` past `issued_through` in the configuration a
+restore will run with (`lookahead` works too, but is matched on every block for the
+wallet's life, where a floor is derived once). `regtest_btc_lookahead.rs` restores the gap case at the default
+lookahead with `initial_scan = 30` over both backends, and watches the original's readout
+flip as it issues past the horizon and as the payment there leads a restore on.
 
 ## The two backends are not equivalent
 

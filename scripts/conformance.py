@@ -341,6 +341,21 @@ def s_getwalletinfo(ctx):
     if ctx.coin == BITCOIN:
         ck("getwalletinfo.descriptors is True", wi.get("descriptors") is True,
            repr(wi.get("descriptors")))
+        # zecd extension, Bitcoin wallets only: what a from-seed restore under this config
+        # would recover. The horizon is at least the lookahead's worth of indexes, and a
+        # wallet that has not issued past it is restorable.
+        rec = wi.get("recovery")
+        ck("getwalletinfo has a recovery object", isinstance(rec, dict), repr(rec))
+        if isinstance(rec, dict):
+            ck("recovery.horizon >= lookahead - 1",
+               isinstance(rec.get("horizon"), int) and rec["horizon"] >= rec.get("lookahead", 0) - 1,
+               rec)
+            ck("recovery.issued_through is an index or None",
+               rec.get("issued_through") is None or isinstance(rec["issued_through"], int), rec)
+            ck("recovery.restorable is a bool", isinstance(rec.get("restorable"), bool), rec)
+            ck("recovery.restorable agrees with the horizon",
+               rec.get("restorable") == (rec.get("issued_through") is None
+                                         or rec["issued_through"] <= rec["horizon"]), rec)
     # zecd extension, same shape on both engines: the recorded birthday height, its date as a
     # UTC midnight when known (the operator's, or the mainnet per-day table's) or None, and the
     # resolved scan anchor {height, hash} or None (always None on Zcash and bitcoind wallets).

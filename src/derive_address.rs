@@ -754,6 +754,7 @@ mod tests {
             transparent_gap_warn_threshold: 5,
             fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
             lookahead: crate::config::DEFAULT_LOOKAHEAD,
+            initial_scan: 0,
         };
 
         assert_eq!(

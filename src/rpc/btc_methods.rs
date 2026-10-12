@@ -341,6 +341,7 @@ async fn getunconfirmedbalance(handle: &BtcWalletHandle) -> Result<Value, RpcErr
 async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
     let b = handle.balance().await?;
     let status = handle.status();
+    let recovery = handle.recovery().await?;
     // Core's txcount: every wallet transaction, visible history entry or not - counted,
     // not built.
     let txcount = handle.tx_count().await?;
@@ -427,6 +428,22 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
                 }
                 obj
             }
+        },
+        // zecd extension: what a from-seed restore under this wallet's configuration would
+        // recover, the Bitcoin counterpart of the Zcash handler's `transparent` block (see
+        // `src/btc/README.md`, "Restores and the address lookahead"). `horizon` is the
+        // highest external index such a restore re-derives without further funding
+        // (`max(initial_scan, highest paid index + 1) + lookahead - 1`), `issued_through`
+        // the highest index handed out so far (null before the first), and `restorable`
+        // whether every issued address lies within the horizon - false exactly when
+        // `getnewaddress` has gone past it, which the daemon also warns about at the time;
+        // the fix is raising `[wallets.<name>] initial_scan` past `issued_through`.
+        "recovery": {
+            "initial_scan": recovery.initial_scan,
+            "lookahead": recovery.lookahead,
+            "horizon": recovery.horizon,
+            "issued_through": recovery.issued_through,
+            "restorable": recovery.restorable,
         },
         // zecd extension: which engine serves this wallet. The Zcash handler reports its own
         // extensions (pools, transparent) here; `coin` is the field a mixed-coin deployment
@@ -1287,6 +1304,7 @@ mod tests {
             birthday: 0,
             birthday_time: None,
             lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
+            initial_scan: 0,
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),

@@ -105,6 +105,27 @@ pub struct BtcBalance {
     pub immature: u64,
 }
 
+/// What a from-seed restore under this wallet's configuration would recover
+/// (`getwalletinfo.recovery`): the Bitcoin counterpart of the Zcash side's recovery horizon.
+/// A restore reveals external indexes `0..initial_scan` at spawn and attributes `lookahead`
+/// past the last revealed index, and every payment it finds reveals through that index, so
+/// the highest index it re-derives without further funding is [`recovery_horizon_for`].
+/// An address issued past that is credited by this running wallet but missed by a restore
+/// of the same seed under the same configuration - not lost: a restore with `initial_scan`
+/// raised past it finds the funds - which is what `restorable` reports and `getnewaddress`
+/// warns about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BtcRecovery {
+    pub initial_scan: u32,
+    pub lookahead: u32,
+    /// The highest external index a restore re-derives without further funding.
+    pub horizon: u32,
+    /// The highest external index handed out so far; `None` before the first.
+    pub issued_through: Option<u32>,
+    /// Whether every issued address lies within the horizon.
+    pub restorable: bool,
+}
+
 /// One unspent output, in wire-friendly primitives (the handle's callers are RPC handlers,
 /// which must not see engine types).
 #[derive(Clone, Debug)]
@@ -363,6 +384,10 @@ enum BtcCommand {
     TxCount {
         reply: oneshot::Sender<Result<usize, RpcError>>,
     },
+    /// The restore coverage readout (`getwalletinfo.recovery`).
+    Recovery {
+        reply: oneshot::Sender<Result<BtcRecovery, RpcError>>,
+    },
     GetTransaction {
         txid: String,
         reply: oneshot::Sender<Result<Option<BtcTxRecord>, RpcError>>,
@@ -598,6 +623,11 @@ impl BtcWalletHandle {
         self.dispatch(|reply| BtcCommand::TxCount { reply }).await
     }
 
+    /// What a from-seed restore under this wallet's configuration would recover.
+    pub async fn recovery(&self) -> Result<BtcRecovery, RpcError> {
+        self.dispatch(|reply| BtcCommand::Recovery { reply }).await
+    }
+
     pub async fn get_transaction(&self, txid: String) -> Result<Option<BtcTxRecord>, RpcError> {
         self.dispatch(|reply| BtcCommand::GetTransaction { txid, reply })
             .await
@@ -681,6 +711,24 @@ impl std::error::Error for BtcBindingMismatch {}
 /// unset. Re-exported so the config layer and tests name one number.
 pub const DEFAULT_LOOKAHEAD: u32 = bdk_wallet::chain::keychain_txout::DEFAULT_LOOKAHEAD;
 
+/// An `initial_scan` above this draws a warning at spawn: the revealed scripts are matched
+/// against every block filter for the wallet's life (over kyoto the whole set is handed to
+/// the node; over bitcoind every output meets the index), so the depth should be the
+/// issuance high-water mark and no more. Never a cap.
+pub const INITIAL_SCAN_WARN_ABOVE: u32 = 10_000;
+
+/// The highest external index a from-seed restore re-derives without further funding: the
+/// restore reveals `0..initial_scan` at spawn and the index attributes `lookahead` past the
+/// last revealed one, and every payment it finds (the highest at `last_used`) reveals
+/// through that index and moves the window on. With nothing revealed the window is the
+/// first `lookahead` indexes, which the same arithmetic gives for `initial_scan = 0`.
+fn recovery_horizon_for(initial_scan: u32, last_used: Option<u32>, lookahead: u32) -> u32 {
+    initial_scan
+        .max(last_used.map_or(0, |used| used.saturating_add(1)))
+        .saturating_add(lookahead)
+        .saturating_sub(1)
+}
+
 /// What `spawn` needs to bring a Bitcoin wallet up.
 pub struct BtcActorConfig {
     pub name: String,
@@ -728,6 +776,11 @@ pub struct BtcActorConfig {
     /// scan can bridge, since a payment found at an unrevealed index reveals up to it and
     /// pushes the window on. Not persisted; applied at every load.
     pub lookahead: u32,
+    /// External indexes `0..N` to reveal once at spawn (`[wallets.<name>] initial_scan`),
+    /// so a restore watches a pre-issued address set from its first pass while `lookahead`
+    /// stays small; the reveal persists, and `getnewaddress` continues past it. `0` reveals
+    /// nothing. The Bitcoin counterpart of `transparent_initial_scan`.
+    pub initial_scan: u32,
     /// How often to poll the upstream once caught up (`[sync] interval_secs`).
     pub sync_interval: Duration,
     /// Reconnect backoff bounds (`[backend] reconnect_base_secs`/`reconnect_max_secs`).
@@ -758,6 +811,7 @@ pub fn spawn(
         birthday,
         birthday_time,
         lookahead,
+        initial_scan,
         sync_interval,
         reconnect_base,
         reconnect_max,
@@ -835,6 +889,41 @@ pub fn spawn(
         }
     };
 
+    // The initial scan depth: reveal external indexes `0..initial_scan` the first time the
+    // wallet comes up short of it, so the scan - and a kyoto recovery's script set, which
+    // bdk_kyoto builds from the last revealed index - covers the operator's pre-issued
+    // addresses from the first pass, whatever the lookahead. Persisted like any reveal,
+    // so it costs one derivation pass once; the address cursor moves past it, as the
+    // Zcash pre-exposure's does.
+    let mut wallet = wallet;
+    if let Some(target) = initial_scan.checked_sub(1) {
+        let revealed = wallet
+            .spk_index()
+            .last_revealed_index(KeychainKind::External);
+        if revealed.is_none_or(|r| r < target) {
+            if initial_scan > INITIAL_SCAN_WARN_ABOVE {
+                warn!(
+                    initial_scan,
+                    "a wide initial_scan: every one of these scripts is matched against \
+                     every block filter for the wallet's life; set it to the issuance \
+                     high-water mark, not above"
+                );
+            }
+            let revealed_now = wallet
+                .reveal_addresses_to(KeychainKind::External, target)
+                .count();
+            wallet.persist(&mut persister).map_err(|e| {
+                anyhow::anyhow!("persist the initial scan's revealed addresses: {e:#}")
+            })?;
+            info!(
+                initial_scan,
+                from = revealed.map_or(0, |r| r + 1),
+                revealed = revealed_now,
+                "revealed the external addresses below initial_scan for the scan to watch"
+            );
+        }
+    }
+
     // The recorded birthday anchor, when one exists (written by init against a bitcoind, or
     // by an earlier kyoto first sync's resolution): what lets a kyoto first scan start at
     // the birthday instead of the shipped floor. An unparseable stored hash is treated as
@@ -849,6 +938,26 @@ pub fn spawn(
         }),
         Err(e) => {
             warn!("could not read the recorded birthday anchor: {e:#}");
+            None
+        }
+    };
+    // A kyoto rescan left pending by an earlier run (see `BtcActor::rescan_from`): the
+    // first connection resumes the discovery loop from it. Unreadable is treated as
+    // absent, like the anchor; the loss is the band below the tip, so it is said loudly.
+    let rescan_from = match persister.load_rescan() {
+        Ok(rescan) => rescan.and_then(|(height, hash)| match hash.parse() {
+            Ok(hash) => Some(bdk_kyoto::HashCheckpoint::new(height, hash)),
+            Err(e) => {
+                warn!(
+                    height,
+                    "ignoring an unparseable pending rescan checkpoint ({e}); addresses \
+                     revealed past the last scan's script set may hold unseen funds - rescan"
+                );
+                None
+            }
+        }),
+        Err(e) => {
+            warn!("could not read the pending rescan: {e:#}");
             None
         }
     };
@@ -897,10 +1006,12 @@ pub fn spawn(
         next_attempt: Instant::now(),
         reconnect_warned: false,
         header_sync_failures: 0,
+        rescan_from,
         rebroadcast_tip: None,
         node_mempool: None,
         rebroadcast_rejections: HashMap::new(),
         lookahead,
+        initial_scan,
         unconfirmed_since: HashMap::new(),
         fee_samples: Default::default(),
         sync_interval,
@@ -1028,6 +1139,12 @@ struct BtcActor {
     /// client cannot reorg onto from 7 blocks back is retried from further down the
     /// wallet's own chain rather than from the same stale tip forever.
     header_sync_failures: u32,
+    /// Kyoto only: a pending rescan, the checkpoint the next connection rebuilds the light
+    /// client from with a wider script set because the last one's scan revealed addresses
+    /// past the scripts it watched (`kyoto::ScriptWatch::rescan_from`). Loaded from the
+    /// engine database at spawn and kept there until an applied update needs none, so a
+    /// restart mid-loop resumes it; the wallet reports `Syncing` while one is pending.
+    rescan_from: Option<bdk_kyoto::HashCheckpoint>,
     /// The wallet tip the last rebroadcast pass ran at; `None` until the first pass after a
     /// (re)connect. A pass runs when a sync pass reaches a tip that differs, which makes
     /// the cadence one attempt per new block plus one per reconnect.
@@ -1042,6 +1159,8 @@ struct BtcActor {
     rebroadcast_rejections: HashMap<Txid, String>,
     /// See [`BtcActorConfig::lookahead`]; needed again by [`BtcActor::reload_wallet`].
     lookahead: u32,
+    /// See [`BtcActorConfig::initial_scan`]; the floor of the recovery horizon.
+    initial_scan: u32,
     /// Kyoto only: the wallet tip at which each once-confirmed received transaction was
     /// first seen unconfirmed again - a reorg unwound it - for [`BtcActor::expire_reorged_receives`].
     unconfirmed_since: HashMap<Txid, u32>,
@@ -1468,6 +1587,11 @@ impl BtcActor {
         // Kyoto: the redial that just failed header sync had already restarted from the
         // recorded birthday anchor, so the anchor is on a dead branch.
         let mut anchor_suspect = false;
+        // Kyoto: the update just applied revealed addresses past the scripts the light
+        // client watched, so the scan is not complete; rebuild it from here (below).
+        let mut rescan: Option<bdk_kyoto::HashCheckpoint> = None;
+        // Kyoto: this pass applied an update (what completes a pending rescan).
+        let mut kyoto_delivered = false;
         let result = match conn {
             // Bitcoind, with its mempool pass in flight on a thread: collect the result if
             // it has landed, otherwise there is nothing to pull this pass (the emitter is
@@ -1618,11 +1742,27 @@ impl BtcActor {
                         let cp = self.wallet.latest_checkpoint();
                         (cp.height(), cp.hash())
                     };
+                    let last_active = update.last_active_indices.clone();
                     let applied = self
                         .wallet
                         .apply_update(update)
                         .map_err(|e| anyhow::anyhow!("apply kyoto update: {e}"))
                         .map(|()| 1usize);
+                    if applied.is_ok() {
+                        kyoto_delivered = true;
+                        // Did the update's reveals walk the wallet's attributable window
+                        // past the scripts this connection matched the blocks against?
+                        // Checked against the set as it stood for this update, then the
+                        // set is widened the way bdk_kyoto widens its own for the next.
+                        rescan = kyoto.rescan_from(&self.wallet);
+                        kyoto.extend_watch(&last_active, self.wallet.spk_index().lookahead());
+                        if rescan.is_some() {
+                            // Not at tip: the scan has a band to redo, and readiness says so
+                            // until a pass reveals nothing past its set.
+                            reached_tip = false;
+                            self.at_tip = false;
+                        }
+                    }
                     // A reorg: the block the wallet had at its old tip height is not the
                     // one it has there now. The light client may have followed a fork below
                     // the recorded birthday anchor by itself, with no redial ever failing
@@ -1825,6 +1965,35 @@ impl BtcActor {
                 return true;
             }
         };
+        if let Some(checkpoint) = rescan {
+            // Persist first, restart second (the anchor's rule): a restart mid-loop must
+            // resume the rescan, not sync on from the tip over an unscanned band. A
+            // deliberate restart, not an outage: no backoff, the next pass redials at once
+            // and `scan_plan` picks the checkpoint up.
+            if let Err(e) = self
+                .persister
+                .save_rescan(checkpoint.height, &checkpoint.hash.to_string())
+            {
+                warn!("failed to record the pending rescan: {e:#}");
+            }
+            self.rescan_from = Some(checkpoint);
+            info!(
+                from = checkpoint.height,
+                wallet_tip = self.wallet.latest_checkpoint().height(),
+                "the scan revealed addresses past the scripts the light client watched; \
+                 restarting it from an older checkpoint with a wider set"
+            );
+            self.conn = None;
+            return true;
+        }
+        if kyoto_delivered && self.rescan_from.take().is_some() {
+            // The connection built from the pending rescan delivered, and no further one
+            // is needed: the discovery loop is complete.
+            if let Err(e) = self.persister.clear_rescan() {
+                warn!("failed to clear the completed rescan: {e:#}");
+            }
+            info!("rescan complete: the light client watched every script the index now asks for");
+        }
         if !evicted_now.is_empty() {
             // The node dropped them from its mempool: BDK records the eviction, and the
             // tombstone plus reload retires any that had reorged out of a block (which the
@@ -2373,14 +2542,15 @@ impl BtcActor {
                     block_time: self.birthday_block_time,
                 };
                 let resync = crate::btc::kyoto::resync_depth(self.header_sync_failures);
-                e.connect(&self.wallet, &birthday, resync).map(|kyoto| {
-                    info!(
-                        upstream = %endpoint.describe(),
-                        wallet_height = self.wallet.latest_checkpoint().height(),
-                        "started the light client (peer discovery runs in the background)"
-                    );
-                    Conn::Kyoto(kyoto)
-                })
+                e.connect(&self.wallet, &birthday, resync, self.rescan_from)
+                    .map(|kyoto| {
+                        info!(
+                            upstream = %endpoint.describe(),
+                            wallet_height = self.wallet.latest_checkpoint().height(),
+                            "started the light client (peer discovery runs in the background)"
+                        );
+                        Conn::Kyoto(kyoto)
+                    })
             }
         };
         match dial {
@@ -2612,6 +2782,24 @@ impl BtcActor {
         self.wallet.latest_checkpoint().height()
     }
 
+    /// See [`BtcRecovery`].
+    fn recovery(&self) -> BtcRecovery {
+        let index = self.wallet.spk_index();
+        let issued_through = index.last_revealed_index(KeychainKind::External);
+        let horizon = recovery_horizon_for(
+            self.initial_scan,
+            index.last_used_index(KeychainKind::External),
+            self.lookahead,
+        );
+        BtcRecovery {
+            initial_scan: self.initial_scan,
+            lookahead: self.lookahead,
+            horizon,
+            issued_through,
+            restorable: issued_through.is_none_or(|issued| issued <= horizon),
+        }
+    }
+
     fn is_coinbase(&self, txid: Txid) -> bool {
         self.wallet
             .get_tx(txid)
@@ -2709,13 +2897,37 @@ impl BtcActor {
     async fn handle(&mut self, cmd: BtcCommand) {
         match cmd {
             BtcCommand::NewAddress { reply } => {
+                // The horizon before the reveal: the reveal itself does not move it (only
+                // `initial_scan` and funding do), so an index past it is one a from-seed
+                // restore under today's configuration does not re-derive. The funds are
+                // not lost - the seed controls them, and a restore with `initial_scan`
+                // raised past the index finds them - but the configuration has to say so
+                // before a restore relies on it, which is what the warning is for.
+                let horizon = self.recovery().horizon;
                 let address = self.wallet.reveal_next_address(KeychainKind::External);
+                if address.index > horizon {
+                    warn!(
+                        target: "zecd::audit",
+                        index = address.index,
+                        horizon,
+                        "issued an address past the recovery horizon: a restore from seed \
+                         under the current configuration does not look there, so funds \
+                         received at it would be missed by such a restore until \
+                         [wallets.<name>] initial_scan is raised past this index. Raise it \
+                         now, in the configuration a restore will run with (preferred over a \
+                         wide lookahead: a floor is derived once, the lookahead costs every \
+                         block)"
+                    );
+                }
                 let result = self
                     .wallet
                     .persist(&mut self.persister)
                     .map(|_| address.to_string())
                     .map_err(|e| RpcError::misc(format!("persist revealed address: {e:#}")));
                 let _ = reply.send(result);
+            }
+            BtcCommand::Recovery { reply } => {
+                let _ = reply.send(Ok(self.recovery()));
             }
             BtcCommand::Balance { reply } => {
                 // Every bucket on Core's rules, from the same unspent set `listunspent`
@@ -4568,6 +4780,7 @@ mod tests {
             birthday: 0,
             birthday_time: None,
             lookahead: DEFAULT_LOOKAHEAD,
+            initial_scan: 0,
             sync_interval: Duration::from_secs(20),
             reconnect_base: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
@@ -4618,6 +4831,55 @@ mod tests {
 
     /// A second spawn over the same directory verifies the stored descriptors against the
     /// seed (the binding check): the right seed loads, a different seed fails the spawn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initial_scan_reveals_the_floor_once_and_the_horizon_follows_it() {
+        assert_eq!(recovery_horizon_for(0, None, 25), 24);
+        assert_eq!(recovery_horizon_for(30, None, 25), 54);
+        assert_eq!(recovery_horizon_for(30, Some(29), 25), 54);
+        assert_eq!(recovery_horizon_for(30, Some(60), 25), 85);
+        assert_eq!(recovery_horizon_for(0, Some(0), 25), 25);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = offline_config(dir.path(), Some(bip84_seed()));
+        config.initial_scan = 30;
+        let (handle, _task) = spawn(config).unwrap();
+        // The floor is revealed at spawn, and the cursor continues past it.
+        let fresh = handle.recovery().await.unwrap();
+        assert_eq!(
+            fresh,
+            BtcRecovery {
+                initial_scan: 30,
+                lookahead: 25,
+                horizon: 54,
+                issued_through: Some(29),
+                restorable: true,
+            }
+        );
+        for _ in 30..=54 {
+            handle.new_address().await.unwrap();
+        }
+        assert!(handle.recovery().await.unwrap().restorable);
+        // Index 55 is the first a restore would not re-derive without funding.
+        handle.new_address().await.unwrap();
+        let past = handle.recovery().await.unwrap();
+        assert_eq!(past.issued_through, Some(55));
+        assert!(!past.restorable);
+        drop(handle);
+
+        // A respawn at the same depth reveals nothing more; a deeper one reveals the rest.
+        let mut config = offline_config(dir.path(), Some(bip84_seed()));
+        config.initial_scan = 30;
+        let (handle, _task) = spawn(config).unwrap();
+        assert_eq!(handle.recovery().await.unwrap().issued_through, Some(55));
+        drop(handle);
+        let mut config = offline_config(dir.path(), Some(bip84_seed()));
+        config.initial_scan = 100;
+        let (handle, _task) = spawn(config).unwrap();
+        let deeper = handle.recovery().await.unwrap();
+        assert_eq!((deeper.issued_through, deeper.horizon), (Some(99), 124));
+        assert!(deeper.restorable);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn respawn_verifies_descriptors_against_the_seed() {
         let dir = tempfile::tempdir().unwrap();

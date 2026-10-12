@@ -68,6 +68,7 @@
 //! birthday anchor or the shipped floor) - never genesis. A delivered update resets the count.
 //! While it lasts the outage is honest: the wallet reports `Down`/`Syncing`, not `Ready`.
 
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -77,9 +78,9 @@ use anyhow::{anyhow, bail, Context as _};
 use bdk_kyoto::bip157::{AddrV2, ServiceFlags};
 use bdk_kyoto::builder::{Builder, BuilderExt as _};
 use bdk_kyoto::{HashCheckpoint, Requester, ScanType, TrustedPeer, Update, Warning};
-use bdk_wallet::bitcoin::{BlockHash, FeeRate, Transaction};
+use bdk_wallet::bitcoin::{BlockHash, FeeRate, Transaction, Txid};
 use bdk_wallet::chain::CheckPoint;
-use bdk_wallet::Wallet;
+use bdk_wallet::{KeychainKind, Wallet};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -230,18 +231,160 @@ pub(crate) fn scan_floor(network: BitcoinNetwork) -> Option<&'static ScanFloor> 
     }
 }
 
-/// The gap-limit hint given to a recovery scan: how many scripts of each keychain kyoto
-/// should watch for, at least. The engine reveals addresses on demand, so this only has to
-/// cover the unused lookahead beyond what the wallet has already revealed - and a wallet
-/// whose `[wallets.<name>] lookahead` is wider than this watches that many instead
-/// ([`recovery_script_lookahead`]): the node fetching a block is worth nothing unless the
+/// The scripts one light client connection matches filters against, as the highest
+/// derivation index watched per keychain, and where its scan started.
+///
+/// bdk_kyoto hands bip157 a fixed set when the client is built: from index 0 through
+/// `last_revealed + lookahead - 1` of each keychain - the wallet's `[wallets.<name>]
+/// lookahead` either way, since zecd passes it as a [`ScanType::Recovery`]'s
+/// `used_script_index` and a [`ScanType::Sync`] uses it by itself; there is no separate
+/// light-client number, because the node fetching a block is worth nothing unless the
 /// wallet's own index attributes the output, and it attributes only within its lookahead.
-const RECOVERY_SCRIPT_LOOKAHEAD: u32 = 100;
+/// It extends the set after each delivered update, to its own index's
+/// `last_revealed + lookahead - 1`, but never rescans the blocks already passed. So as a
+/// scan reveals addresses the wallet's window walks past the watched set, and from then on
+/// a payment to an index beyond it matches no filter and is never fetched: with the fixed
+/// 100-script recovery set zecd used to pass, a restore recovered about 120 used addresses
+/// per keychain, then reported synced with the rest of the funds missing. The
+/// block-by-block backend has no such ceiling, since every output of every block meets the
+/// index.
+///
+/// [`ScriptWatch::rescan_from`] is the check the actor runs after every applied update:
+/// when the set bdk_kyoto would build for the index as it now stands reaches past the set
+/// this connection has, it answers the checkpoint to rebuild the client from with the set
+/// that index now gives, and the actor keeps the wallet at `Syncing` and restarts until a
+/// pass reveals nothing past what it watched - a restore that discovers until the gap, as
+/// Core's does, in as many passes as the history is lookaheads long (a wider `lookahead`,
+/// or an `initial_scan` floor, means fewer). Measured by bdk_kyoto's own formula, deliberately: its set ends one
+/// index short of the window the wallet attributes within (`last_revealed + lookahead`),
+/// so held to the wallet's window every fresh `Sync` connection would rebuild once for
+/// nothing. That last index is upstream's to watch (`TODO(upstream)`); until it does, the
+/// gap a kyoto wallet bridges is one address narrower than its lookahead.
+#[derive(Debug, Clone)]
+pub struct ScriptWatch {
+    /// Where this connection's scan started: the lowest a rescan from it ever goes.
+    start: HashCheckpoint,
+    /// The highest index in the set, per keychain.
+    watched: BTreeMap<KeychainKind, u32>,
+}
 
-/// The scripts per keychain a recovery scan watches for `wallet`: the fixed floor, or the
-/// wallet's configured lookahead when that is wider.
-fn recovery_script_lookahead(wallet: &Wallet) -> u32 {
-    RECOVERY_SCRIPT_LOOKAHEAD.max(wallet.spk_index().lookahead())
+impl ScriptWatch {
+    /// The set bdk_kyoto builds for `wallet` under `scan`, starting at `start`.
+    fn new(wallet: &Wallet, scan: ScanType, start: HashCheckpoint) -> Self {
+        let scripts = match scan {
+            ScanType::Sync => wallet.spk_index().lookahead(),
+            ScanType::Recovery {
+                used_script_index, ..
+            } => used_script_index,
+        };
+        let watched = [KeychainKind::External, KeychainKind::Internal]
+            .into_iter()
+            .map(|keychain| {
+                let revealed = wallet.spk_index().last_revealed_index(keychain);
+                (keychain, watched_through(revealed, scripts))
+            })
+            .collect();
+        Self { start, watched }
+    }
+
+    /// Mirror the extension bdk_kyoto applies after delivering an update whose highest
+    /// used indices were `last_active`: its own index revealed through each of them, and
+    /// the next update's filters are matched through that plus the wallet's `lookahead`.
+    /// Only ever widens: a keychain the update did not touch keeps its set.
+    fn extend(&mut self, last_active: &BTreeMap<KeychainKind, u32>, lookahead: u32) {
+        for (keychain, used) in last_active {
+            let through = watched_through(Some(*used), lookahead);
+            self.watched
+                .entry(*keychain)
+                .and_modify(|w| *w = (*w).max(through))
+                .or_insert(through);
+        }
+    }
+
+    /// After the actor applied this connection's update: `None` when the set bdk_kyoto
+    /// would build for the index as it now stands is within this connection's, so the
+    /// scan is complete; else the checkpoint to rebuild the client from. That is the
+    /// wallet's own checkpoint just below the earliest block that may hold a payment the
+    /// set missed - the first block that paid an index whose reveal put an unwatched one
+    /// in the window ([`first_reveal_past`]) - or, when no block did (the addresses were
+    /// revealed by `getnewaddress`), the scan's own start, since such a payment could sit
+    /// anywhere in the band. Clamped at the start either way, like a resync.
+    pub fn rescan_from(&self, wallet: &Wallet) -> Option<HashCheckpoint> {
+        let index = wallet.spk_index();
+        let lookahead = index.lookahead();
+        // Read once, and only if a keychain needs it: the canonical transaction list is a
+        // pass over the whole graph.
+        let mut heights: Option<HashMap<Txid, u32>> = None;
+        let mut needed = false;
+        let mut earliest: Option<u32> = None;
+        for (keychain, watched) in &self.watched {
+            let revealed = index.last_revealed_index(*keychain);
+            if watched_through(revealed, lookahead) <= *watched {
+                continue;
+            }
+            needed = true;
+            let heights = heights.get_or_insert_with(|| confirmed_heights(wallet));
+            let first = first_reveal_past(*watched, lookahead);
+            let from = index
+                .keychain_outpoints(*keychain)
+                .rev()
+                .take_while(|(i, _)| *i >= first)
+                .filter_map(|(_, outpoint)| heights.get(&outpoint.txid).copied())
+                .min();
+            info!(
+                keychain = ?keychain,
+                watched,
+                revealed,
+                lookahead,
+                from,
+                "the scan revealed addresses past the scripts the light client watched"
+            );
+            earliest = match (earliest, from) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        if !needed {
+            return None;
+        }
+        let tip = wallet.latest_checkpoint();
+        let depth = match earliest {
+            Some(height) => tip.height().saturating_sub(height.saturating_sub(1)),
+            None => u32::MAX,
+        };
+        Some(resync_checkpoint(&tip, depth, self.start))
+    }
+}
+
+/// The highest index among `scripts` scripts peeked from index 0 past `last_revealed`:
+/// bdk_kyoto's `peek_scripts`, which takes `last_revealed.unwrap_or(0) + scripts` of the
+/// keychain's unbounded iterator.
+fn watched_through(last_revealed: Option<u32>, scripts: u32) -> u32 {
+    last_revealed
+        .unwrap_or(0)
+        .saturating_add(scripts)
+        .saturating_sub(1)
+}
+
+/// The lowest index whose reveal puts an index past `watched` in the window
+/// ([`watched_through`] of it exceeds `watched`): the first payment at or above it is the
+/// earliest block a set this wide could have missed anything after.
+fn first_reveal_past(watched: u32, lookahead: u32) -> u32 {
+    watched.saturating_add(2).saturating_sub(lookahead)
+}
+
+/// The confirmation height of every confirmed wallet transaction.
+fn confirmed_heights(wallet: &Wallet) -> HashMap<Txid, u32> {
+    use bdk_wallet::chain::ChainPosition;
+    wallet
+        .transactions()
+        .filter_map(|wtx| match wtx.chain_position {
+            ChainPosition::Confirmed { anchor, .. } => {
+                Some((wtx.tx_node.txid, anchor.block_id.height))
+            }
+            ChainPosition::Unconfirmed { .. } => None,
+        })
+        .collect()
 }
 
 /// How far back the *second* consecutive header-sync failure restarts the light client, in
@@ -573,17 +716,22 @@ impl KyotoEndpoint {
     /// first `Update` is available.
     ///
     /// `resync` is the escalating restart depth from [`resync_depth`] - `None` on a healthy
-    /// (re)dial, `Some` after repeated header-sync failures (see the module doc).
+    /// (re)dial, `Some` after repeated header-sync failures (see the module doc). `rescan`
+    /// is a pending rescan checkpoint from [`ScriptWatch::rescan_from`]: the previous
+    /// connection's scan revealed addresses past the scripts it watched.
     pub fn connect(
         &self,
         wallet: &Wallet,
         birthday: &KyotoBirthday,
         resync: Option<u32>,
+        rescan: Option<HashCheckpoint>,
     ) -> anyhow::Result<KyotoConn> {
         self.preflight()?;
         let network = crate::btc::keys::network(self.network);
-        let (scan_type, tree_start, target) = self.scan_plan(wallet, birthday, resync);
+        let (scan_type, start, target) = self.scan_plan(wallet, birthday, resync, rescan);
+        let tree_start = start.height;
         let resolution = target.map(|target| (tree_start, target));
+        let watch = ScriptWatch::new(wallet, scan_type, start);
 
         // Created so the path exists the moment the crate starts honoring it; today it stays
         // empty (see `data_dir`). Cheap, and it keeps the failure mode "empty directory"
@@ -797,6 +945,7 @@ impl KyotoEndpoint {
             upstream = %self.describe(),
             scan = ?scan_type,
             from = tree_start,
+            watched = ?watch.watched,
             "kyoto light client started"
         );
         Ok(KyotoConn {
@@ -809,14 +958,15 @@ impl KyotoEndpoint {
             runtime: Some(runtime),
             birthday_time,
             tree_start,
+            watch,
             fee_sampler: None,
             started: Some(Instant::now()),
         })
     }
 
-    /// Where a fresh scan starts, the height the light client's header tree is anchored
-    /// at for it (no header at or below that height is ever in the tree), and whether a
-    /// birthday-anchor resolution should run beside it.
+    /// Where a fresh scan starts - the checkpoint the light client's header tree is
+    /// anchored at for it (no header at or below that height is ever in the tree) - and
+    /// whether a birthday-anchor resolution should run beside it.
     ///
     /// A wallet that has synced before resumes from its own checkpoint
     /// ([`ScanType::Sync`], which kyoto walks back by a reorg margin itself); everything
@@ -831,33 +981,45 @@ impl KyotoEndpoint {
     /// A synced wallet redialing after repeated header-sync failures (`resync`) restarts
     /// that many blocks below its own tip instead, as a recovery scan over the same script
     /// lookahead a first scan uses - a superset of what `Sync` would watch, so the rescanned
-    /// band cannot miss a script the wallet has revealed since.
+    /// band cannot miss a script the wallet has revealed since. A pending `rescan` (the
+    /// previous connection's scan revealed addresses past the scripts it watched,
+    /// [`ScriptWatch::rescan_from`]) restarts the same way from its checkpoint; both
+    /// pending, the lower wins, since each is a floor the other's band must not skip.
     fn scan_plan(
         &self,
         wallet: &Wallet,
         birthday: &KyotoBirthday,
         resync: Option<u32>,
-    ) -> (ScanType, u32, Option<AnchorTarget>) {
+        rescan: Option<HashCheckpoint>,
+    ) -> (ScanType, HashCheckpoint, Option<AnchorTarget>) {
         let tip = wallet.latest_checkpoint();
         if tip.height() > 0 {
-            let (scan, tree_start) = match resync {
-                None => (ScanType::Sync, sync_tree_start(&tip)),
-                Some(depth) => {
-                    let checkpoint =
-                        resync_checkpoint(&tip, depth, self.first_scan_start(birthday));
-                    info!(
-                        depth,
-                        from = checkpoint.height,
-                        wallet_tip = tip.height(),
-                        "kyoto resync after repeated header-sync failures: rebuilding the \
-                         light client from an older checkpoint"
-                    );
-                    let start = checkpoint.height;
+            let resync_at = resync.map(|depth| {
+                let checkpoint = resync_checkpoint(&tip, depth, self.first_scan_start(birthday));
+                info!(
+                    depth,
+                    from = checkpoint.height,
+                    wallet_tip = tip.height(),
+                    "kyoto resync after repeated header-sync failures: rebuilding the \
+                     light client from an older checkpoint"
+                );
+                checkpoint
+            });
+            let restart = match (resync_at, rescan) {
+                (Some(a), Some(b)) => Some(if b.height < a.height { b } else { a }),
+                (a, b) => a.or(b),
+            };
+            let (scan, start) = match restart {
+                None => {
+                    let cp = sync_tree_start(&tip);
+                    (ScanType::Sync, HashCheckpoint::new(cp.height(), cp.hash()))
+                }
+                Some(checkpoint) => {
                     let scan = ScanType::Recovery {
-                        used_script_index: recovery_script_lookahead(wallet),
+                        used_script_index: wallet.spk_index().lookahead(),
                         checkpoint,
                     };
-                    (scan, start)
+                    (scan, checkpoint)
                 }
             };
             // A synced wallet without an anchor - one from before the per-wallet anchor
@@ -869,11 +1031,11 @@ impl KyotoEndpoint {
             // connection (the resolver used to poll for it every 5 s for the connection's
             // life), and a resync tree starts at its own checkpoint.
             let target = if birthday.anchor.is_none() {
-                resolution_target(tree_start, birthday)
+                resolution_target(start.height, birthday)
             } else {
                 None
             };
-            return (scan, tree_start, target);
+            return (scan, start, target);
         }
         if let Some((height, hash)) = birthday.anchor {
             debug!(
@@ -881,11 +1043,12 @@ impl KyotoEndpoint {
                 anchor = height,
                 "kyoto recovery scan start (recorded birthday anchor)"
             );
+            let checkpoint = HashCheckpoint::new(height, hash);
             let scan = ScanType::Recovery {
-                used_script_index: recovery_script_lookahead(wallet),
-                checkpoint: HashCheckpoint::new(height, hash),
+                used_script_index: wallet.spk_index().lookahead(),
+                checkpoint,
             };
-            return (scan, height, None);
+            return (scan, checkpoint, None);
         }
         let floor = recovery_floor(self.network, birthday.height);
         let target = resolution_target(floor.height, birthday);
@@ -895,12 +1058,11 @@ impl KyotoEndpoint {
             resolving = target.is_some(),
             "kyoto recovery scan start"
         );
-        let start = floor.height;
         let scan = ScanType::Recovery {
-            used_script_index: recovery_script_lookahead(wallet),
+            used_script_index: wallet.spk_index().lookahead(),
             checkpoint: floor,
         };
-        (scan, start, target)
+        (scan, floor, target)
     }
 }
 
@@ -909,15 +1071,14 @@ impl KyotoEndpoint {
 /// [`sync_tree_start`] replicates it). Below that height the tree holds no header.
 const SYNC_WALK_BACK_CHECKPOINTS: usize = 7;
 
-/// The height a `Sync` scan's header tree is anchored at: the checkpoint
+/// The checkpoint a `Sync` scan's header tree is anchored at: the one
 /// [`SYNC_WALK_BACK_CHECKPOINTS`] steps below the tip along the wallet's own (sparse)
 /// checkpoint chain, or the lowest one when the chain is shorter.
-fn sync_tree_start(tip: &CheckPoint) -> u32 {
+fn sync_tree_start(tip: &CheckPoint) -> CheckPoint {
     tip.iter()
         .take(SYNC_WALK_BACK_CHECKPOINTS + 1)
         .last()
-        .map(|cp| cp.height())
-        .unwrap_or_else(|| tip.height())
+        .unwrap_or_else(|| tip.clone())
 }
 
 impl KyotoEndpoint {
@@ -1145,6 +1306,8 @@ pub struct KyotoConn {
     /// The height the header tree is anchored at (see [`KyotoEndpoint::scan_plan`]): what
     /// a later resolution on this connection can and cannot reach.
     tree_start: u32,
+    /// The scripts this connection matches filters against (see [`ScriptWatch`]).
+    watch: ScriptWatch,
     /// The background fee sampler, once an estimate armed it ([`Self::arm_fee_sampler`]).
     fee_sampler: Option<JoinHandle<()>>,
     /// When the node started, until the first update is delivered: what the "caught up"
@@ -1197,6 +1360,20 @@ impl KyotoConn {
                 "the kyoto node stopped running".to_string(),
             )),
         }
+    }
+
+    /// After the actor applied an update from this connection: the checkpoint to rebuild
+    /// the client from with a wider script set, or `None` when the scan is complete - see
+    /// [`ScriptWatch::rescan_from`]. Run before [`Self::extend_watch`] for the same update:
+    /// the update's blocks were matched against the set as it stood.
+    pub fn rescan_from(&self, wallet: &Wallet) -> Option<HashCheckpoint> {
+        self.watch.rescan_from(wallet)
+    }
+
+    /// Widen the watched set the way bdk_kyoto does after delivering an update whose
+    /// `last_active_indices` these were (see [`ScriptWatch::extend`]).
+    pub fn extend_watch(&mut self, last_active: &BTreeMap<KeychainKind, u32>, lookahead: u32) {
+        self.watch.extend(last_active, lookahead);
     }
 
     /// A handle for the async requests (broadcast, fee signals) the free functions below
@@ -2035,7 +2212,7 @@ mod tests {
                 .unwrap();
         }
         // Tip 100, then 90, 80, ... : seven steps back lands on 30.
-        assert_eq!(sync_tree_start(&chain.tip()), 30);
+        assert_eq!(sync_tree_start(&chain.tip()).height(), 30);
         let (mut short, _) = LocalChain::from_genesis_hash(genesis.hash);
         short
             .insert_block(BlockId {
@@ -2043,7 +2220,7 @@ mod tests {
                 hash: hash(5),
             })
             .unwrap();
-        assert_eq!(sync_tree_start(&short.tip()), 0);
+        assert_eq!(sync_tree_start(&short.tip()).height(), 0);
     }
 
     #[test]
@@ -2071,7 +2248,6 @@ mod tests {
     #[test]
     fn a_recorded_anchor_beats_the_floor_and_needs_no_resolution() {
         use crate::btc::keys::{tests::bip84_seed, AccountKeys};
-        use bdk_wallet::KeychainKind;
         let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Testnet4).unwrap();
         let wallet = Wallet::create(
             keys.descriptor(KeychainKind::External),
@@ -2084,14 +2260,15 @@ mod tests {
 
         // Anchor-less: the first scan starts at the shipped floor and wants a resolution
         // for the above-floor birthday.
-        let (scan, tree_start, target) = endpoint.scan_plan(&wallet, &birthday(150_000), None);
+        let (scan, tree_start, target) =
+            endpoint.scan_plan(&wallet, &birthday(150_000), None, None);
         match scan {
             ScanType::Recovery { checkpoint, .. } => {
                 assert_eq!(checkpoint.height, BTC_KYOTO_SCAN_FLOOR_TESTNET4.height)
             }
             other => panic!("expected a recovery scan, got {other:?}"),
         }
-        assert_eq!(tree_start, BTC_KYOTO_SCAN_FLOOR_TESTNET4.height);
+        assert_eq!(tree_start.height, BTC_KYOTO_SCAN_FLOOR_TESTNET4.height);
         // The anchor names the block BEFORE the birthday: the scan resumes at anchor + 1,
         // which must be the birthday block itself.
         assert_eq!(target, Some(AnchorTarget::Height(149_999)));
@@ -2102,12 +2279,12 @@ mod tests {
             anchor: Some((150_000, hash)),
             ..birthday(150_000)
         };
-        let (scan, tree_start, target) = endpoint.scan_plan(&wallet, &anchored, None);
+        let (scan, tree_start, target) = endpoint.scan_plan(&wallet, &anchored, None, None);
         match scan {
             ScanType::Recovery { checkpoint, .. } => assert_eq!(checkpoint.height, 150_000),
             other => panic!("expected a recovery scan, got {other:?}"),
         }
-        assert_eq!(tree_start, 150_000);
+        assert_eq!(tree_start.height, 150_000);
         assert_eq!(target, None);
     }
 
@@ -2302,7 +2479,6 @@ mod tests {
     fn a_synced_wallet_resyncs_from_its_own_chain_only_when_asked() {
         use crate::btc::keys::{tests::bip84_seed, AccountKeys};
         use bdk_wallet::chain::BlockId;
-        use bdk_wallet::KeychainKind;
         let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Testnet4).unwrap();
         let mut wallet = Wallet::create(
             keys.descriptor(KeychainKind::External),
@@ -2331,30 +2507,175 @@ mod tests {
             ..birthday(150_000)
         };
 
-        let (scan, _, target) = endpoint.scan_plan(&wallet, &anchored, None);
+        let (scan, _, target) = endpoint.scan_plan(&wallet, &anchored, None, None);
         assert!(matches!(scan, ScanType::Sync), "{scan:?}");
         assert_eq!(target, None);
 
-        let (scan, tree_start, target) = endpoint.scan_plan(&wallet, &anchored, Some(15));
+        let (scan, tree_start, target) = endpoint.scan_plan(&wallet, &anchored, Some(15), None);
         match scan {
             ScanType::Recovery {
                 used_script_index,
                 checkpoint,
             } => {
                 assert_eq!((checkpoint.height, checkpoint.hash), (160_000, hash(1)));
-                assert_eq!(used_script_index, RECOVERY_SCRIPT_LOOKAHEAD);
+                // The wallet's own lookahead, the one knob: BDK's default here.
+                assert_eq!(used_script_index, wallet.spk_index().lookahead());
+                assert_eq!(used_script_index, 25);
             }
             other => panic!("expected a recovery scan, got {other:?}"),
         }
-        assert_eq!(tree_start, 160_000);
+        assert_eq!(tree_start.height, 160_000);
         assert_eq!(target, None);
 
-        let (scan, _, _) = endpoint.scan_plan(&wallet, &anchored, Some(u32::MAX));
+        let (scan, _, _) = endpoint.scan_plan(&wallet, &anchored, Some(u32::MAX), None);
         match scan {
             ScanType::Recovery { checkpoint, .. } => {
                 assert_eq!((checkpoint.height, checkpoint.hash), (150_000, hash(7)))
             }
             other => panic!("expected a recovery scan, got {other:?}"),
         }
+    }
+
+    /// bdk_kyoto's set is `last_revealed + N` scripts from index 0 (a fresh wallet and one
+    /// with index 0 revealed watch the same N), `N` the `used_script_index` of a recovery
+    /// scan or the lookahead of a `Sync` - and zecd passes the lookahead as both. The same
+    /// formula measures the window the wallet has walked to, so a fresh `Sync` connection
+    /// over a quiet wallet is complete as is.
+    #[test]
+    fn the_watched_window_follows_bdk_kyoto() {
+        assert_eq!(watched_through(None, 100), 99);
+        assert_eq!(watched_through(Some(0), 100), 99);
+        assert_eq!(watched_through(Some(119), 100), 218);
+        assert_eq!(watched_through(None, 25), 24);
+        assert_eq!(watched_through(Some(5), 25), 29);
+        // The reveal that first puts an index past the set in the window: `watched + 2 -
+        // lookahead` (its window ends at `index + lookahead - 1`), and index 0 when the
+        // whole set is within one lookahead of it.
+        assert_eq!(first_reveal_past(99, 25), 76);
+        assert_eq!(watched_through(Some(76), 25), 100);
+        assert_eq!(watched_through(Some(75), 25), 99);
+        assert_eq!(first_reveal_past(24, 25), 1);
+        assert_eq!(first_reveal_past(10, 25), 0);
+    }
+
+    /// The failing restore's shape, with the 100-script recovery set zecd passed at the time (the
+    /// arithmetic is bdk_kyoto's and holds for any N; today N is the lookahead): the scan
+    /// watches indexes 0..=99 per keychain; once the blocks it fetched reveal through 119,
+    /// the window runs to 143, so the scan is not complete, and the rescan starts below
+    /// the first block that paid index 76 or above. A scan that reveals nothing past its
+    /// set is.
+    #[test]
+    fn a_recovery_scan_that_reveals_past_its_set_rescans_from_the_first_unwatched_reveal() {
+        use crate::btc::keys::{tests::bip84_seed, AccountKeys};
+        use bdk_wallet::chain::BlockId;
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let mut wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .lookahead(25)
+        .create_wallet_no_persist()
+        .unwrap();
+        let start = HashCheckpoint::new(0, wallet.latest_checkpoint().hash());
+        let recovery = ScanType::Recovery {
+            used_script_index: 100,
+            checkpoint: start,
+        };
+        let watch = ScriptWatch::new(&wallet, recovery, start);
+        assert_eq!(
+            watch.watched,
+            BTreeMap::from([(KeychainKind::External, 99), (KeychainKind::Internal, 99)])
+        );
+        let sync = ScriptWatch::new(&wallet, ScanType::Sync, start);
+        assert_eq!(
+            sync.watched,
+            BTreeMap::from([(KeychainKind::External, 24), (KeychainKind::Internal, 24)])
+        );
+        // Nothing revealed: complete.
+        assert_eq!(watch.rescan_from(&wallet), None);
+
+        // Three blocks pay the external keychain: 0..=59 at height 10, 60..=119 at 20 (the
+        // set had 60..=99, so the block was fetched and the cascade revealed through 119),
+        // and the one at 30 the scan never fetched.
+        let mut chain = wallet.latest_checkpoint();
+        let mut tx_update = bdk_wallet::chain::TxUpdate::default();
+        for (height, indexes) in [(10u32, 0u32..60), (20, 60..120)] {
+            let block = BlockId {
+                height,
+                hash: hash(height as u8),
+            };
+            chain = chain.insert(block);
+            let tx = Transaction {
+                version: bdk_wallet::bitcoin::transaction::Version::TWO,
+                lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+                input: vec![],
+                output: indexes
+                    .map(|i| bdk_wallet::bitcoin::TxOut {
+                        value: bdk_wallet::bitcoin::Amount::from_sat(1_000),
+                        script_pubkey: wallet
+                            .peek_address(KeychainKind::External, i)
+                            .script_pubkey(),
+                    })
+                    .collect(),
+            };
+            let txid = tx.compute_txid();
+            tx_update.txs.push(Arc::new(tx));
+            tx_update.anchors.insert((
+                bdk_wallet::chain::ConfirmationBlockTime {
+                    block_id: block,
+                    confirmation_time: 0,
+                },
+                txid,
+            ));
+        }
+        chain = chain.insert(BlockId {
+            height: 30,
+            hash: hash(30),
+        });
+        wallet
+            .apply_update(Update {
+                chain: Some(chain),
+                tx_update,
+                last_active_indices: BTreeMap::from([(KeychainKind::External, 119)]),
+            })
+            .unwrap();
+        assert_eq!(
+            wallet
+                .spk_index()
+                .last_revealed_index(KeychainKind::External),
+            Some(119)
+        );
+        let rescan = watch
+            .rescan_from(&wallet)
+            .expect("a window to 143 reaches past 99");
+        // Below height 20, on the wallet's own chain: its checkpoint at 10.
+        assert_eq!((rescan.height, rescan.hash), (10, hash(10)));
+
+        // The next connection watches through 119 + 100 - 1 and finds nothing more: done.
+        let wider = ScriptWatch::new(&wallet, recovery, rescan);
+        assert_eq!(wider.watched[&KeychainKind::External], 218);
+        assert_eq!(wider.rescan_from(&wallet), None);
+
+        // A `Sync` connection built at 119 watches through 143 - complete as it stands -
+        // and, extended by an update that used index 130, through 154. Reveals from
+        // `getnewaddress` alone walk the window to 155: a rescan with no block to start
+        // below, so from the connection's own start.
+        let mut live = ScriptWatch::new(&wallet, ScanType::Sync, rescan);
+        assert_eq!(live.watched[&KeychainKind::External], 143);
+        assert_eq!(live.rescan_from(&wallet), None);
+        live.extend(&BTreeMap::from([(KeychainKind::External, 130)]), 25);
+        assert_eq!(live.watched[&KeychainKind::External], 154);
+        live.extend(&BTreeMap::from([(KeychainKind::External, 100)]), 25);
+        assert_eq!(live.watched[&KeychainKind::External], 154, "never narrows");
+        for _ in 120..=130 {
+            wallet.reveal_next_address(KeychainKind::External);
+        }
+        assert_eq!(live.rescan_from(&wallet), None, "130 + 24 is within 154");
+        wallet.reveal_next_address(KeychainKind::External);
+        let from_start = live
+            .rescan_from(&wallet)
+            .expect("131 + 24 reaches past 154");
+        assert_eq!((from_start.height, from_start.hash), (10, hash(10)));
     }
 }

@@ -597,6 +597,12 @@ pub struct WalletEntry {
     /// BDK's own 25 ([`crate::btc::actor::DEFAULT_LOOKAHEAD`]); carried at that default on
     /// a Zcash wallet, whose gap limit is `transparent_gap_limit`.
     pub lookahead: u32,
+    /// The Bitcoin engine's initial scan depth (`[wallets.<name>] initial_scan`, Bitcoin
+    /// wallets only): external indexes `0..N` are revealed once, at spawn, so a restore
+    /// watches all of them from its first pass while `lookahead` stays small - the
+    /// Bitcoin counterpart of `transparent_initial_scan`. `0` (the default) reveals
+    /// nothing; carried at `0` on a Zcash wallet.
+    pub initial_scan: u32,
 }
 
 impl WalletEntry {
@@ -1866,6 +1872,9 @@ struct WalletFile {
     /// The Bitcoin engine's address lookahead (BDK's; the restore gap limit). Bitcoin
     /// wallets only - a Zcash wallet's gap limit is `transparent_gap_limit`.
     lookahead: Option<u32>,
+    /// The Bitcoin engine's initial scan depth (external indexes revealed at spawn).
+    /// Bitcoin wallets only - a Zcash wallet's is `transparent_initial_scan`.
+    initial_scan: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2762,6 +2771,13 @@ impl AppConfig {
                      past the last revealed one and recover nothing on a restore)"
                 );
             }
+            if is_zcash && w.initial_scan.is_some() {
+                anyhow::bail!(
+                    "[wallets.{name}] initial_scan does not apply to a zcash wallet (it \
+                     configures the Bitcoin engine's initial scan depth; a Zcash wallet's is \
+                     transparent_initial_scan)"
+                );
+            }
             let dir = w.dir.clone().unwrap_or_else(|| wallet_dir(&datadir, name));
             let backend_override = resolve_wallet_backend(name, w)?;
             #[cfg(feature = "zcash")]
@@ -2819,6 +2835,7 @@ impl AppConfig {
                         .or(global_birthday_margin)
                         .unwrap_or_else(|| crate::init::default_fresh_wallet_birthday_margin(coin)),
                     lookahead: w.lookahead.unwrap_or(DEFAULT_LOOKAHEAD),
+                    initial_scan: w.initial_scan.unwrap_or(0),
                 },
             );
         }
@@ -2850,6 +2867,7 @@ impl AppConfig {
                 fresh_wallet_birthday_margin: global_birthday_margin
                     .unwrap_or(crate::init::FRESH_WALLET_BIRTHDAY_MARGIN),
                 lookahead: DEFAULT_LOOKAHEAD,
+                initial_scan: 0,
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {
@@ -5276,6 +5294,41 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("transparent_gap_limit"), "{err}");
+    }
+
+    /// The Bitcoin engine's `initial_scan`: off by default, taken as given on a Bitcoin
+    /// wallet, and refused on a Zcash wallet naming `transparent_initial_scan`.
+    #[cfg(feature = "zcash")]
+    #[test]
+    #[cfg(all(feature = "cli", feature = "bitcoin"))]
+    fn initial_scan_is_a_bitcoin_wallet_knob() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("zecd.toml");
+        let resolve = |body: &str| {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            AppConfig::resolve(&cli)
+        };
+        let cfg =
+            resolve("network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n")
+                .unwrap();
+        assert_eq!(cfg.wallets["btc"].initial_scan, 0);
+        let cfg = resolve(
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n\
+             initial_scan = 10000\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.wallets["btc"].initial_scan, 10000);
+        let err =
+            resolve("network = \"test\"\ndatadir = \"/d\"\n[wallets.zec]\ninitial_scan = 100\n")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("[wallets.zec] initial_scan does not apply to a zcash wallet"),
+            "{err}"
+        );
+        assert!(err.contains("transparent_initial_scan"), "{err}");
     }
 
     #[cfg(feature = "zcash")]

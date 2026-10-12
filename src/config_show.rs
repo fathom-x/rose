@@ -463,6 +463,8 @@ pub fn render(config: &AppConfig) -> String {
             // output that silently fell back to BDK's 25 would miss funds a deployment
             // relying on a wider window (the mainnet view sample runs 200) had recovered.
             kv(&mut s, "lookahead", w.lookahead);
+            // Likewise the initial scan depth: the other half of what a restore covers.
+            kv(&mut s, "initial_scan", w.initial_scan);
             if let Some(server) = &w.backend.server {
                 match crate::btc::chain::resolve_for_wallet(config, w) {
                     Ok(resolved) => {
@@ -765,6 +767,7 @@ mod tests {
         // The lookahead renders at its effective value, default included: it is the restore
         // gap limit, so a rebuilt config must not silently fall back to it.
         assert!(btc_section.contains("lookahead = 25"), "{first}");
+        assert!(btc_section.contains("initial_scan = 0"), "{first}");
         for absent in ["pools", "transparent", "default_receivers", "server"] {
             assert!(
                 !btc_section.contains(absent),
@@ -801,12 +804,13 @@ mod tests {
         let wide = render(&resolve_from(
             &format!(
                 "network = \"test\"\ndatadir = {:?}\n[wallets.btc]\ncoin = \"bitcoin\"\n\
-                 lookahead = 200\n",
+                 lookahead = 200\ninitial_scan = 10000\n",
                 dir.path()
             ),
             dir.path(),
         ));
         assert!(wide.contains("lookahead = 200"), "{wide}");
+        assert!(wide.contains("initial_scan = 10000"), "{wide}");
         assert_eq!(wide, render(&resolve_from(&wide, dir.path())));
     }
 

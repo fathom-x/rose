@@ -701,6 +701,11 @@ impl ZecdBtc {
         }
     }
 
+    /// The running daemon's pid (what a benchmark reads `/proc/<pid>/status` for).
+    pub fn pid(&self) -> Option<u32> {
+        self.proc.as_ref().map(|p| p.0.id())
+    }
+
     /// Kill the daemon (the guard's drop releases the datadir lock).
     pub fn stop(&mut self) {
         self.proc = None;

@@ -439,9 +439,74 @@ type FetchedTransaction = Option<(Transaction, Option<BlockHeight>)>;
 /// and false for a `GetStatus` (record its chain status only). The original request rides
 /// along so a serviced one can be marked satisfied.
 struct TxidRequest<'a> {
-    req: &'a TransactionDataRequest,
+    req: &'a EnhanceRequest,
     txid: TxId,
     enhance: bool,
+}
+
+/// One unit of outstanding transaction work, in the shape the drain services it.
+///
+/// The wallet layer used to hand all three kinds back from one read
+/// (`WalletRead::transaction_data_requests`). Since `zakura-client-backend` 0.1.0-rc7 they come
+/// from three: status observation from `TransactionStatusRead::transaction_status_work`, payload
+/// retrieval from `EnhancePirRead::transaction_enhancement_work`, and transparent history from
+/// `transaction_data_requests`, which now returns only that. zecd services all three the same
+/// way it always did, so [`enhance_requests`] merges them back into this one list and the drain,
+/// the backlog count and the `fetch_memos` cut keep a single type to reason about.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum EnhanceRequest {
+    /// Observe a transaction's chain status (mined, unmined, unknown) without storing it.
+    GetStatus(TxId),
+    /// Fetch the full transaction and decrypt-and-store it (memos, outgoing records, fee).
+    Enhancement(TxId),
+    /// Search a transparent address's history for spends of the wallet's UTXOs or for
+    /// ephemeral (ZIP-320) activity.
+    TransactionsInvolvingAddress(TransactionsInvolvingAddress),
+}
+
+impl From<TransactionDataRequest> for EnhanceRequest {
+    fn from(req: TransactionDataRequest) -> Self {
+        // Deliberately exhaustive: `transaction_data_requests` grows a variant only under a
+        // feature zecd does not enable (`spend-index`), and if that ever changes this must stop
+        // compiling rather than drop the new work silently.
+        match req {
+            TransactionDataRequest::TransactionsInvolvingAddress(r) => {
+                EnhanceRequest::TransactionsInvolvingAddress(r)
+            }
+        }
+    }
+}
+
+/// Every unit of outstanding transaction work, merged from the wallet layer's three sources
+/// (see [`EnhanceRequest`]).
+///
+/// Only the public route is mapped. The writer handle is configured for public status and
+/// standard enhancement (`open::configure_request_routing`), under which the wallet layer
+/// never routes work privately; a private item would be a transaction whose id must not reach
+/// a server, so if one appeared it is left alone rather than fetched by id.
+fn enhance_requests(
+    db: &crate::wallet::open::WriteDb,
+) -> Result<Vec<EnhanceRequest>, zcash_client_sqlite::error::SqliteClientError> {
+    use zcash_client_backend::data_api::enhance_pir::{EnhancePirRead, TransactionEnhancementWork};
+    use zcash_client_backend::data_api::status::{TransactionStatusRead, TransactionStatusWork};
+
+    let mut out = Vec::new();
+    for work in db.transaction_status_work()? {
+        if let TransactionStatusWork::Public(r) = work {
+            out.push(EnhanceRequest::GetStatus(r.txid()));
+        }
+    }
+    for work in db.transaction_enhancement_work()? {
+        if let TransactionEnhancementWork::Public(r) = work {
+            out.push(EnhanceRequest::Enhancement(r.txid()));
+        }
+    }
+    out.extend(
+        db.transaction_data_requests()?
+            .into_iter()
+            .map(EnhanceRequest::from),
+    );
+    Ok(out)
 }
 
 /// How often to emit an enhancement-drain progress heartbeat (throttled by wall time, like the
@@ -489,21 +554,21 @@ fn enhanced_through(fully_scanned: u32, lowest_pending: Option<u32>) -> u32 {
     }
 }
 
-/// Whether a [`TransactionDataRequest`] is one zecd can actually service (and therefore one that
+/// Whether an [`EnhanceRequest`] is one zecd can actually service (and therefore one that
 /// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
 /// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
 /// (`fetch_transparent_tx_evidence` + `notify_address_checked`), which converges once the address is
 /// recorded as checked, so it doesn't pin the backlog above zero.
-fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
+fn is_serviceable_request(req: &EnhanceRequest) -> bool {
     matches!(
         req,
-        TransactionDataRequest::GetStatus(_)
-            | TransactionDataRequest::Enhancement(_)
-            | TransactionDataRequest::TransactionsInvolvingAddress(_)
+        EnhanceRequest::GetStatus(_)
+            | EnhanceRequest::Enhancement(_)
+            | EnhanceRequest::TransactionsInvolvingAddress(_)
     )
 }
 
-/// Whether a [`TransactionDataRequest`] is in scope for this wallet's enhancement drain:
+/// Whether an [`EnhanceRequest`] is in scope for this wallet's enhancement drain:
 /// serviceable ([`is_serviceable_request`]) and not excluded by policy.
 ///
 /// The one policy exclusion is an `Enhancement` request under `[sync] fetch_memos = false`, and
@@ -535,13 +600,13 @@ fn is_serviceable_request(req: &TransactionDataRequest) -> bool {
 /// the knob reversible - flipping `fetch_memos` back on picks the backlog up and backfills the
 /// memos, no rescan needed.
 fn request_in_scope(
-    req: &TransactionDataRequest,
+    req: &EnhanceRequest,
     fetch_memos: bool,
     spending: &std::collections::BTreeSet<TxId>,
 ) -> bool {
     is_serviceable_request(req)
         && match req {
-            TransactionDataRequest::Enhancement(txid) => fetch_memos || spending.contains(txid),
+            EnhanceRequest::Enhancement(txid) => fetch_memos || spending.contains(txid),
             _ => true,
         }
 }
@@ -565,11 +630,11 @@ fn request_in_scope(
 /// redundant upstream query. TODO(upstream): add the missing
 /// `tro.output_index = ssq.output_index` join predicate in librustzcash.
 fn outstanding_requests(
-    requests: Vec<TransactionDataRequest>,
-    satisfied: &std::collections::BTreeSet<TransactionDataRequest>,
+    requests: Vec<EnhanceRequest>,
+    satisfied: &std::collections::BTreeSet<EnhanceRequest>,
     fetch_memos: bool,
     spending: &std::collections::BTreeSet<TxId>,
-) -> Vec<TransactionDataRequest> {
+) -> Vec<EnhanceRequest> {
     let mut seen = std::collections::BTreeSet::new();
     requests
         .into_iter()
@@ -807,6 +872,10 @@ pub struct ActorConfig {
     /// trust_own_transactions`, default on) - see [`mark_own_tx_trusted`]. Off = persist no
     /// trust marker, so a restore classifies identically to the authoring instance.
     pub trust_own_transactions: bool,
+    /// The most blocks a send may scan to catch up before it is built (`[spend]
+    /// max_send_catchup_blocks`, default 100; `0` = unbounded). See
+    /// [`WalletActor::sync_to_tip_for_send`].
+    pub max_send_catchup_blocks: u32,
     /// Shielded pools this wallet receives into and spends from (change pool selection).
     pub enabled_pools: ReceiverSet,
     /// Receivers included by default in this wallet's Unified Addresses.
@@ -986,6 +1055,9 @@ struct WalletActor {
     /// `[spend] trust_own_transactions`: mark wallet-authored transactions trusted at store
     /// time (see [`mark_own_tx_trusted`]). Off = the full-statelessness posture.
     trust_own_transactions: bool,
+    /// `[spend] max_send_catchup_blocks`: past this much lag a send fails fast with `-10`
+    /// rather than scanning the gap on the actor. See [`Self::sync_to_tip_for_send`].
+    max_send_catchup_blocks: u32,
     /// `[spend] shutdown_drain_secs`: how long to finish already-accepted sends once shutdown is
     /// signalled. See [`Self::finish_accepted_sends`].
     shutdown_drain: Duration,
@@ -1077,7 +1149,7 @@ struct WalletActor {
     /// re-fetched at most once per drain instead of spinning the batch loop. Cleared whenever a
     /// sync batch does work (new blocks may add or re-satisfy requests). Entries removed from the
     /// DB by librustzcash on success simply never reappear.
-    enhance_satisfied: std::collections::BTreeSet<TransactionDataRequest>,
+    enhance_satisfied: std::collections::BTreeSet<EnhanceRequest>,
     /// Heartbeat throttle for the current enhancement drain (see [`ENHANCE_LOG_INTERVAL`]).
     /// `None` when no drain is in progress; transient and per-drain, reset whenever the drain
     /// completes or a sync batch does work (which clears `enhance_satisfied`, the
@@ -1556,6 +1628,7 @@ async fn spawn_inner(
         pipeline_proving: cfg.pipeline_proving,
         shutdown_drain: cfg.shutdown_drain,
         trust_own_transactions: cfg.trust_own_transactions,
+        max_send_catchup_blocks: cfg.max_send_catchup_blocks,
         send_in_flight: false,
         send_queue: VecDeque::new(),
         send_done_tx,
@@ -2880,7 +2953,7 @@ impl WalletActor {
     /// update - a consumer waits for the backlog to come down instead, which is the same thing
     /// it would do anyway. The count itself is always exact; only the watermark degrades.
     fn enhancement_backlog(&self) -> (u64, Option<u32>) {
-        let reqs = match self.db_data.transaction_data_requests() {
+        let reqs = match enhance_requests(&self.db_data) {
             Ok(reqs) => reqs,
             Err(e) => {
                 // Best-effort for the count (observability), but the watermark must fail
@@ -2906,7 +2979,7 @@ impl WalletActor {
     /// pass already read rather than reading the table a second time.
     fn summarize_backlog<'a>(
         &self,
-        pending: impl ExactSizeIterator<Item = &'a TransactionDataRequest>,
+        pending: impl ExactSizeIterator<Item = &'a EnhanceRequest>,
     ) -> (u64, Option<u32>) {
         let count = pending.len() as u64;
         if count == 0 {
@@ -2925,21 +2998,20 @@ impl WalletActor {
         (count, lowest)
     }
 
-    /// The block height a pending [`TransactionDataRequest`] refers to, or `None` when it refers
+    /// The block height a pending [`EnhanceRequest`] refers to, or `None` when it refers
     /// to no mined height (an unmined transaction, which no height watermark can be below).
     ///
     /// `Enhancement`/`GetStatus` name a transaction, so the height is that transaction's;
     /// `TransactionsInvolvingAddress` names a range, so it is the range's start.
-    fn enhancement_request_height(&self, req: &TransactionDataRequest) -> Option<u32> {
+    fn enhancement_request_height(&self, req: &EnhanceRequest) -> Option<u32> {
         match req {
-            TransactionDataRequest::GetStatus(txid) | TransactionDataRequest::Enhancement(txid) => {
-                self.db_data
-                    .get_tx_height(*txid)
-                    .ok()
-                    .flatten()
-                    .map(u32::from)
-            }
-            TransactionDataRequest::TransactionsInvolvingAddress(addr_req) => {
+            EnhanceRequest::GetStatus(txid) | EnhanceRequest::Enhancement(txid) => self
+                .db_data
+                .get_tx_height(*txid)
+                .ok()
+                .flatten()
+                .map(u32::from),
+            EnhanceRequest::TransactionsInvolvingAddress(addr_req) => {
                 Some(u32::from(addr_req.block_range_start()))
             } // Deliberately no catch-all arm: a new upstream request variant must stop this
               // compiling, so its height contribution is decided here rather than defaulting to
@@ -3052,7 +3124,7 @@ impl WalletActor {
         }
         let chain_tip = BlockHeight::from_u32(tip);
         let t_requests = Instant::now();
-        let requests = match self.db_data.transaction_data_requests() {
+        let requests = match enhance_requests(&self.db_data) {
             Ok(r) => r,
             Err(e) => {
                 warn!("reading transaction data requests: {e}");
@@ -3084,21 +3156,20 @@ impl WalletActor {
         // with the others; an address search keeps the sequential path.
         let pass = &pending[..pending.len().min(self.enhance_concurrency.max(1))];
         let mut txid_reqs: Vec<TxidRequest<'_>> = Vec::new();
-        let mut address_reqs: Vec<(&TransactionDataRequest, &TransactionsInvolvingAddress)> =
-            Vec::new();
+        let mut address_reqs: Vec<(&EnhanceRequest, &TransactionsInvolvingAddress)> = Vec::new();
         for req in pass {
             match req {
-                TransactionDataRequest::GetStatus(txid) => txid_reqs.push(TxidRequest {
+                EnhanceRequest::GetStatus(txid) => txid_reqs.push(TxidRequest {
                     req,
                     txid: *txid,
                     enhance: false,
                 }),
-                TransactionDataRequest::Enhancement(txid) => txid_reqs.push(TxidRequest {
+                EnhanceRequest::Enhancement(txid) => txid_reqs.push(TxidRequest {
                     req,
                     txid: *txid,
                     enhance: true,
                 }),
-                TransactionDataRequest::TransactionsInvolvingAddress(addr) => {
+                EnhanceRequest::TransactionsInvolvingAddress(addr) => {
                     address_reqs.push((req, addr))
                 }
             }
@@ -3223,7 +3294,7 @@ impl WalletActor {
         // only a fresh read can see; publishing zero over them would flip readiness to synced
         // and `waitforsync` to done with work still queued, for a whole idle interval, since the
         // loop stops driving the drain on a `false` return. So that case reads the table again.
-        let remaining: Vec<&TransactionDataRequest> = pending
+        let remaining: Vec<&EnhanceRequest> = pending
             .iter()
             .filter(|r| !self.enhance_satisfied.contains(*r))
             .collect();
@@ -3302,10 +3373,11 @@ impl WalletActor {
                         (true, Some((tx, mined))) => {
                             decrypt_and_store_transaction(&network, wdb, tx, *mined)?;
                         }
-                        (true, None) => wdb.set_transaction_status(
-                            req.txid,
-                            TransactionStatus::TxidNotRecognized,
-                        )?,
+                        // The upstream answered and does not know the transaction: retire
+                        // the payload request. Status is a separate obligation now, so this
+                        // no longer goes through `set_transaction_status`, which since rc7
+                        // updates status only and would leave the fetch queued forever.
+                        (true, None) => wdb.notify_transaction_enhancement_not_found(req.txid)?,
                         (false, found) => {
                             let status = match found {
                                 None => TransactionStatus::TxidNotRecognized,
@@ -3454,7 +3526,7 @@ impl WalletActor {
         // `block_range_end - 1`, so rebuild the request over the range actually checked
         // (`notify_address_checked` reads only the address and the heights, and the
         // extended claim is truthful - the query above covered the whole range).
-        let TransactionDataRequest::TransactionsInvolvingAddress(checked) =
+        let EnhanceRequest::TransactionsInvolvingAddress(checked) =
             TransactionDataRequest::transactions_involving_address(
                 addr_req.address(),
                 addr_req.block_range_start(),
@@ -3463,6 +3535,7 @@ impl WalletActor {
                 addr_req.tx_status_filter().clone(),
                 addr_req.output_status_filter().clone(),
             )
+            .into()
         else {
             unreachable!("transactions_involving_address builds that variant");
         };
@@ -5377,18 +5450,32 @@ impl WalletActor {
     /// the tip captured by `refresh_tip` (it isn't re-bumped mid-loop), so newly-mined blocks
     /// can't make it spin; it terminates once that tip is scanned.
     ///
-    /// Best-effort throughout: an unreachable upstream or a sync error logs and falls back to
+    /// Best-effort on transport: an unreachable upstream or a sync error logs and falls back to
     /// the last-scanned tip (the send then rides the usual commit/rebroadcast path, and would
-    /// fail at broadcast anyway if the upstream is truly gone), so this must never hard-fail the
-    /// spend.
-    async fn sync_to_tip_for_send(&mut self) {
+    /// fail at broadcast anyway if the upstream is truly gone).
+    ///
+    /// **Bounded on lag.** The catch-up is cheap only because the sync loop normally leaves a
+    /// block or two to do. On a wallet still restoring it is the whole remaining scan - minutes
+    /// to hours on the single-writer actor, with the caller waiting and every other send queued
+    /// behind it. So once the tip is known, a lag beyond `[spend] max_send_catchup_blocks`
+    /// refuses the send with `-10` (Core's "still downloading" code) naming the gap, and the
+    /// caller retries after `waitforsync`. A halted wallet (see `sync_halted`) refuses too: its
+    /// scan cannot advance, so a send would be built against a chain view the wallet already
+    /// knows is wrong.
+    async fn sync_to_tip_for_send(&mut self) -> Result<(), RpcError> {
+        if self.sync_halted {
+            return Err(RpcError::wallet(
+                "sync is halted for this wallet, so a send cannot be built against the current \
+                 chain; run `zecd rescan` to rebuild it",
+            ));
+        }
         if self.client.is_none() {
             if let Err(e) = self.connect().await {
                 warn!(
                     "could not reach upstream to sync before sending ({e}); building \
                      against the last-scanned height"
                 );
-                return;
+                return Ok(());
             }
         }
         // Record zebra's real tip (and extend the scan queue up to it).
@@ -5396,7 +5483,29 @@ impl WalletActor {
             // A failed refresh means the client is likely stale; drop it so the broadcast
             // path reconnects cleanly, and build against the last-scanned tip.
             self.mark_disconnected(format!("tip refresh before send failed ({e})"));
-            return;
+            return Ok(());
+        }
+        if let Some(tip) = self.tip_height {
+            let scanned = tokio::task::block_in_place(|| {
+                self.db_data
+                    .block_fully_scanned()
+                    .ok()
+                    .flatten()
+                    .map(|meta| u32::from(meta.block_height()))
+            });
+            if let Some(lag) = send_catchup_exceeded(tip, scanned, self.max_send_catchup_blocks) {
+                return Err(RpcError::new(
+                    codes::RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                    format!(
+                        "Wallet is still syncing: it has scanned to height {} of {tip} ({lag} \
+                         blocks behind), more than [spend] max_send_catchup_blocks = {} allows \
+                         a send to catch up. Retry once `waitforsync` reports the wallet \
+                         caught up.",
+                        scanned.map_or_else(|| "none".to_string(), |h| h.to_string()),
+                        self.max_send_catchup_blocks,
+                    ),
+                ));
+            }
         }
         // Scan up to that tip so the spend anchor lands in a fully-scanned range. Bounded: the
         // target is the tip just captured, so the loop ends when the wallet reaches it.
@@ -5410,6 +5519,7 @@ impl WalletActor {
                 }
             }
         }
+        Ok(())
     }
 
     /// Whether sends on this wallet *may* use the cached-Orchard PCZT path (so prove and store are
@@ -5514,6 +5624,7 @@ impl WalletActor {
             .map_err(|e| {
                 enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
             })?;
+            enforce_single_step(&proposal)?;
             if privacy == SendPrivacy::FullPrivacy {
                 enforce_full_privacy(&proposal)?;
             }
@@ -5634,7 +5745,7 @@ impl WalletActor {
         // load and produce an already-expired tx that zebra rejects with -25. This scans up to
         // the tip (not just bumps the pointer) so the spend anchor also lands in a fully-scanned
         // range; normally a no-op because the sync loop keeps the wallet caught up.
-        self.sync_to_tip_for_send().await;
+        self.sync_to_tip_for_send().await?;
 
         let account_id = self.require_account(None)?;
         let account_index = self.account_index.ok_or_else(private_keys_disabled)?;
@@ -5800,6 +5911,7 @@ impl WalletActor {
                 .map_err(|e| {
                     enrich_insufficient_funds(db, &engine_dir, scope, policy, classify_err(e))
                 })?;
+                enforce_single_step(&proposal)?;
                 if privacy == SendPrivacy::FullPrivacy {
                     enforce_full_privacy(&proposal)?;
                 }
@@ -5932,7 +6044,10 @@ impl WalletActor {
         // no-op when the sync loop already has the wallet caught up. Runs here (not in
         // `begin_or_queue_send`) so a send queued behind an in-flight proof re-syncs when it
         // actually starts, keeping its tip fresh.
-        self.sync_to_tip_for_send().await;
+        if let Err(e) = self.sync_to_tip_for_send().await {
+            let _ = reply.send(Err(e));
+            return;
+        }
 
         let account_index = match self.account_index.ok_or_else(private_keys_disabled) {
             Ok(i) => i,
@@ -6380,7 +6495,7 @@ impl WalletActor {
 
         // Same tip catch-up as a send: the proposal's target height (and thus the eventual tx's
         // expiry) must come from the real chain tip, not a lagging scanned height.
-        self.sync_to_tip_for_send().await;
+        self.sync_to_tip_for_send().await?;
 
         let account_id = self.require_account(None)?;
         let net = self.network;
@@ -6535,6 +6650,7 @@ impl WalletActor {
             tokio::task::block_in_place(move || -> Result<_, RpcError> {
                 // The `Infallible` turbofish parameters pin the phantom input-selection and
                 // change-strategy error types (this proposal was built without either).
+                enforce_single_step(&proposal)?;
                 let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
                     db,
                     &net,
@@ -6613,7 +6729,7 @@ impl WalletActor {
 
         // Same tip catch-up as a send: the plan's target height (and thus the eventual tx's
         // expiry) must come from the real chain tip, not a lagging scanned height.
-        self.sync_to_tip_for_send().await;
+        self.sync_to_tip_for_send().await?;
 
         let account_id = self.require_account(None)?;
         let net = self.network;
@@ -7192,6 +7308,7 @@ impl WalletActor {
                 let prover: &LocalTxProver = &prover;
                 let db = &mut self.db_data;
                 tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                    enforce_single_step(&proposal)?;
                     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
                         db,
                         &net,
@@ -7219,6 +7336,7 @@ impl WalletActor {
                 let prover: &LocalTxProver = &prover;
                 let db = &mut self.db_data;
                 tokio::task::block_in_place(move || -> Result<_, RpcError> {
+                    enforce_single_step(&proposal)?;
                     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
                         db,
                         &net,
@@ -8352,6 +8470,39 @@ fn enforce_max_tx_bytes<FeeRuleT, NoteRef>(
     Ok(())
 }
 
+/// Refuse a proposal of more than one step before anything is built from it. zecd broadcasts
+/// exactly one transaction per send, but a multi-step proposal (ZIP 320: paying a TEX address
+/// goes through an ephemeral transparent hop) builds one transaction per step, and
+/// `create_proposed_transactions` **stores every step it builds** - inputs marked spent, raw
+/// bytes queued - before returning. Checking the returned txid count afterwards therefore came
+/// too late: the send reported an error while the rebroadcast loop picked both stored
+/// transactions up and sent them anyway, so a caller who retried paid twice. This runs on the
+/// proposal, where refusing still costs nothing.
+fn enforce_single_step<FeeRuleT, NoteRef>(
+    proposal: &Proposal<FeeRuleT, NoteRef>,
+) -> Result<(), RpcError> {
+    let steps = proposal.steps().len();
+    if steps > 1 {
+        return Err(RpcError::wallet(format!(
+            "multi-transaction proposals are not supported (this send would need {steps} \
+             transactions)"
+        )));
+    }
+    Ok(())
+}
+
+/// How far a send's pre-build catch-up would have to scan, if that is more than `limit`
+/// (`[spend] max_send_catchup_blocks`; `0` = unbounded). `scanned` is the wallet's fully
+/// scanned height, `None` before it has scanned anything - which counts as the whole chain
+/// behind, since such a wallet holds nothing a send could spend yet.
+fn send_catchup_exceeded(tip: u32, scanned: Option<u32>, limit: u32) -> Option<u32> {
+    if limit == 0 {
+        return None;
+    }
+    let lag = tip.saturating_sub(scanned.unwrap_or(0));
+    (lag > limit).then_some(lag)
+}
+
 /// Classify a librustzcash spend/proposal error into a Bitcoin-Core RPC code. Insufficient
 /// funds maps to -6; everything else to the generic wallet error -4. Client-facing messages
 /// use `Display` (not `Debug`) so internal note/proposal structure isn't leaked.
@@ -8691,6 +8842,23 @@ mod tests {
     /// whose default address lands at an index >= gap_limit reported a *fresh restore* as beyond
     /// its own horizon (`restorable: false`) - the intermittent `regtest_transparent_gap` CI
     /// failure (frontiers 5/6/10 with gap 3, one per fresh per-run mnemonic).
+    #[test]
+    fn send_catchup_bound_refuses_only_past_the_limit() {
+        use super::send_catchup_exceeded;
+        // A live wallet a block or two behind catches up inline.
+        assert_eq!(send_catchup_exceeded(1_000, Some(998), 100), None);
+        // Exactly at the limit is still allowed; one past it is refused, naming the lag.
+        assert_eq!(send_catchup_exceeded(1_100, Some(1_000), 100), None);
+        assert_eq!(send_catchup_exceeded(1_101, Some(1_000), 100), Some(101));
+        // A wallet that has scanned nothing counts the whole chain as behind.
+        assert_eq!(send_catchup_exceeded(5_000, None, 100), Some(5_000));
+        assert_eq!(send_catchup_exceeded(50, None, 100), None);
+        // A scanned height above the recorded tip (a tip that went backwards) is no lag.
+        assert_eq!(send_catchup_exceeded(1_000, Some(1_005), 100), None);
+        // 0 removes the bound.
+        assert_eq!(send_catchup_exceeded(3_000_000, None, 0), None);
+    }
+
     #[test]
     fn recovery_horizon_is_anchored_at_the_restore_floor() {
         use super::recovery_horizon_for;
@@ -9394,7 +9562,7 @@ mod tests {
     /// never report ready.
     #[test]
     fn serviceable_request_classification() {
-        use super::is_serviceable_request;
+        use super::{is_serviceable_request, EnhanceRequest};
         use zcash_client_backend::data_api::{
             OutputStatusFilter, TransactionDataRequest, TransactionStatusFilter,
         };
@@ -9403,21 +9571,20 @@ mod tests {
         use zcash_transparent::address::TransparentAddress;
 
         let txid = TxId::from_bytes([7u8; 32]);
-        assert!(is_serviceable_request(
-            &TransactionDataRequest::Enhancement(txid)
-        ));
-        assert!(is_serviceable_request(&TransactionDataRequest::GetStatus(
-            txid
-        )));
+        assert!(is_serviceable_request(&EnhanceRequest::Enhancement(txid)));
+        assert!(is_serviceable_request(&EnhanceRequest::GetStatus(txid)));
         assert!(
-            is_serviceable_request(&TransactionDataRequest::transactions_involving_address(
-                TransparentAddress::PublicKeyHash([9u8; 20]),
-                BlockHeight::from_u32(1),
-                Some(BlockHeight::from_u32(100)),
-                None,
-                TransactionStatusFilter::All,
-                OutputStatusFilter::All,
-            )),
+            is_serviceable_request(
+                &TransactionDataRequest::transactions_involving_address(
+                    TransparentAddress::PublicKeyHash([9u8; 20]),
+                    BlockHeight::from_u32(1),
+                    Some(BlockHeight::from_u32(100)),
+                    None,
+                    TransactionStatusFilter::All,
+                    OutputStatusFilter::All,
+                )
+                .into()
+            ),
             "the transparent address-index query drains, so it counts toward the backlog"
         );
     }
@@ -9437,7 +9604,7 @@ mod tests {
     /// default wallet's behaviour cannot depend on it.
     #[test]
     fn fetch_memos_off_skips_only_receive_side_enhancement_requests() {
-        use super::request_in_scope;
+        use super::{request_in_scope, EnhanceRequest};
         use zcash_client_backend::data_api::{
             OutputStatusFilter, TransactionDataRequest, TransactionStatusFilter,
         };
@@ -9449,17 +9616,18 @@ mod tests {
         let spending = std::collections::BTreeSet::from([spent]);
         let none: std::collections::BTreeSet<TxId> = std::collections::BTreeSet::new();
 
-        let recv_enhancement = TransactionDataRequest::Enhancement(received);
-        let spend_enhancement = TransactionDataRequest::Enhancement(spent);
-        let status = TransactionDataRequest::GetStatus(received);
-        let tia = TransactionDataRequest::transactions_involving_address(
+        let recv_enhancement = EnhanceRequest::Enhancement(received);
+        let spend_enhancement = EnhanceRequest::Enhancement(spent);
+        let status = EnhanceRequest::GetStatus(received);
+        let tia: EnhanceRequest = TransactionDataRequest::transactions_involving_address(
             TransparentAddress::PublicKeyHash([0u8; 20]),
             zcash_protocol::consensus::BlockHeight::from_u32(100),
             None,
             None,
             TransactionStatusFilter::All,
             OutputStatusFilter::All,
-        );
+        )
+        .into();
 
         // fetch_memos on: everything serviceable is in scope, and the spend set is not even
         // consulted (pass the empty one, which would exclude both enhancements if it were).
@@ -9500,13 +9668,12 @@ mod tests {
     /// repeatedly within one batch.
     #[test]
     fn outstanding_requests_dedup_and_satisfied_filter() {
-        use super::outstanding_requests;
-        use zcash_client_backend::data_api::TransactionDataRequest;
+        use super::{outstanding_requests, EnhanceRequest};
         use zcash_protocol::TxId;
 
-        let a = TransactionDataRequest::Enhancement(TxId::from_bytes([1u8; 32]));
-        let b = TransactionDataRequest::GetStatus(TxId::from_bytes([2u8; 32]));
-        let c = TransactionDataRequest::Enhancement(TxId::from_bytes([3u8; 32]));
+        let a = EnhanceRequest::Enhancement(TxId::from_bytes([1u8; 32]));
+        let b = EnhanceRequest::GetStatus(TxId::from_bytes([2u8; 32]));
+        let c = EnhanceRequest::Enhancement(TxId::from_bytes([3u8; 32]));
 
         // The upstream shape: the same request repeated many times, interleaved with others.
         let raw = vec![
@@ -9548,14 +9715,12 @@ mod tests {
     /// correct and cheap either way).
     #[test]
     fn upstream_spend_search_duplication_is_collapsed_by_outstanding_requests() {
-        use super::outstanding_requests;
+        use super::{outstanding_requests, EnhanceRequest};
         use bip0039::{English, Mnemonic};
         use secrecy::SecretVec;
         use zcash_client_backend::data_api::chain::ChainState;
         use zcash_client_backend::data_api::wallet::decrypt_and_store_transaction;
-        use zcash_client_backend::data_api::{
-            AccountBirthday, TransactionDataRequest, WalletRead, WalletWrite,
-        };
+        use zcash_client_backend::data_api::{AccountBirthday, WalletRead, WalletWrite};
         use zcash_primitives::block::BlockHash;
         use zcash_primitives::transaction::{TransactionData, TxVersion};
         use zcash_protocol::consensus::{BlockHeight, BranchId};
@@ -9634,10 +9799,15 @@ mod tests {
         // Count only the spend-search requests for the K paid addresses: the read also holds
         // TransactionsInvolvingAddress rows for the ZIP-320 *ephemeral* address checks (one per
         // ephemeral gap address), which are a different, non-duplicated population.
-        let reqs = db.transaction_data_requests().expect("read requests");
+        let reqs: Vec<EnhanceRequest> = db
+            .transaction_data_requests()
+            .expect("read requests")
+            .into_iter()
+            .map(EnhanceRequest::from)
+            .collect();
         let ours: std::collections::BTreeSet<_> = addrs.iter().copied().collect();
-        let is_our_spend_search = |r: &TransactionDataRequest| match r {
-            TransactionDataRequest::TransactionsInvolvingAddress(a) => ours.contains(&a.address()),
+        let is_our_spend_search = |r: &EnhanceRequest| match r {
+            EnhanceRequest::TransactionsInvolvingAddress(a) => ours.contains(&a.address()),
             _ => false,
         };
         let raw = reqs.iter().filter(|r| is_our_spend_search(r)).count();

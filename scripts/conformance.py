@@ -111,6 +111,38 @@ def read_together(first, second, key=lambda v: v, attempts=6, delay=0.5):
 # ever moves later (or disappears) fails on insufficient funds instead of paying.
 UNAFFORDABLE = "20999999"
 
+def bech32m_encode(hrp, data):
+    """BIP 350 bech32m over 8-bit `data` (the reference algorithm, stdlib only).
+
+    Used to build a TEX (ZIP 320) address for a refusal check without pulling in a library.
+    """
+    charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+    acc, bits, five = 0, 0, []
+    for b in data:
+        acc = (acc << 8) | b
+        bits += 8
+        while bits >= 5:
+            bits -= 5
+            five.append((acc >> bits) & 31)
+    if bits:
+        five.append((acc << (5 - bits)) & 31)
+
+    def polymod(values):
+        gen = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
+        chk = 1
+        for v in values:
+            top = chk >> 25
+            chk = (chk & 0x1FFFFFF) << 5 ^ v
+            for i in range(5):
+                chk ^= gen[i] if ((top >> i) & 1) else 0
+        return chk
+
+    expanded = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+    pm = polymod(expanded + five + [0] * 6) ^ 0x2BC830A3
+    checksum = [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(charset[d] for d in five + checksum)
+
+
 # The sections, in run order. Each is `(title, coins, fn)`; `main` runs the ones tagged
 # with the selected coin, in this order, so the Zcash run is the same sequence of checks
 # it always was.
@@ -1316,6 +1348,13 @@ def s_history(ctx):
             ck("verbose txid echoes", v.get("txid") == t["txid"])
             ck("verbose hex matches", v.get("hex") == raw)
             ck("verbose vin/vout are lists", isinstance(v.get("vin"), list) and isinstance(v.get("vout"), list))
+            # Shielded bundles render by version, as zcashd's TxToJSON: `orchard` from v5, and
+            # `ironwood` (Orchard-shaped) from v6 - every wallet tx on a NU6.3-active chain.
+            if v.get("version", 0) >= 5:
+                ck("v5+ verbose has orchard", isinstance(v.get("orchard"), dict))
+            if v.get("version", 0) >= 6:
+                ck("v6 verbose has ironwood",
+                   isinstance(v.get("ironwood"), dict) and isinstance(v["ironwood"].get("actions"), list))
 
 
 @section("z_listtransactions (extension)", ZCASH)
@@ -1451,6 +1490,16 @@ def s_errors(ctx):
         ck("subtractfeefromamount raises", False)
     except JSONRPCException as e:
         ck("subtractfeefromamount -> code -8", e.code == -8, e.code)
+    try:
+        # A TEX (ZIP 320) recipient needs a two-transaction proposal; zecd sends one
+        # transaction per call, so it refuses the address up front rather than building
+        # (and storing) a send it cannot complete.
+        tex_hrp = {"main": "tex", "test": "textest", "regtest": "texregtest"}[
+            rpc.call("getblockchaininfo")["chain"]]
+        rpc.call("sendtoaddress", bech32m_encode(tex_hrp, bytes([7] * 20)), "0.1")
+        ck("TEX recipient raises", False)
+    except JSONRPCException as e:
+        ck("TEX recipient -> code -8", e.code == -8, e.code)
     try:
         # Zero amounts are rejected before any send logic, like Bitcoin Core.
         rpc.call("sendtoaddress", addr, 0)

@@ -227,8 +227,8 @@ pub(crate) async fn createwallet(state: &AppState, params: &[Value]) -> Result<V
 /// re-scan every other wallet in it, which is a far larger action than "stop answering for this
 /// name". That is the whole operation: the name leaves the RPC surface and nothing else changes,
 /// which is why the response says so in its `warning` rather than leaving a caller to infer that
-/// unloading freed some scanning work. Retiring a wallet for good is a different job: remove its
-/// manifest, then rebuild the shard to stop scanning its account.
+/// unloading freed some scanning work. Retiring a wallet for good is a different job (remove its
+/// manifest, and rebuild the shard to stop scanning its account); see the README.
 ///
 /// The arguments are validated **before** the wallet is resolved, so a malformed call answers the
 /// same way whichever wallet it names - the rule `getnewaddress` already follows for its

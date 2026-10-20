@@ -68,6 +68,22 @@ watches that last index, the gap a kyoto wallet bridges is one address narrower 
 lookahead. The second test in `regtest_btc_lookahead.rs` restores a 140-address history
 over kyoto at the default.
 
+What moved the window decides how soon the client is rebuilt. A discovery - a payment the
+pass found at an index the wallet had not revealed before the update, the way a restore
+finds its history - whose window reaches past the set rebuilds it at once, since the
+blocks already passed may hold more payments the set could not match: that is what makes
+a restore discover until the gap. A reveal by `getnewaddress`, or a change address a send
+takes, and a payment to an address so handed out, get half a lookahead of slack: held exactly to the
+window, a wallet handing out an address per deposit rebuilt the client, and its whole
+script set, on nearly every block (5 s per block at a lookahead of 50,000 for the
+rebuild alone), so the client is rebuilt only once reveals alone have carried the window
+more than `lookahead / 2` past the set. Every address the wallet handed out stays within
+the set meanwhile, since the set reaches `lookahead - 1` past the index revealed when the
+connection was built, and a handed-out address past the set rebuilds at once regardless;
+what waits for the rebuild is a payment to an index nobody has handed out yet (derived
+elsewhere from the xpub), which the rebuild's recovery scan from the connection's start
+then finds.
+
 **The floor: `[wallets.<name>] initial_scan`** (default 0), the counterpart of the Zcash
 side's `transparent_initial_scan`. External indexes `0..N` are revealed once at spawn
 (persisted, so the cursor continues past `N`), which makes a restore watch a pre-issued

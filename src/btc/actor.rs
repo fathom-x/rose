@@ -46,7 +46,7 @@
 //! signing wallet over the private BIP 84 descriptors - `keys::signing_wallet`), so no
 //! spending material ever lands on disk; the persisted wallet holds public descriptors only.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -1842,6 +1842,18 @@ impl BtcActor {
                         (cp.height(), cp.hash())
                     };
                     let last_active = update.last_active_indices.clone();
+                    // What the wallet had revealed before this update, per keychain: a
+                    // used index past it is a discovery (see `ScriptWatch::rescan_from`).
+                    let revealed_before: BTreeMap<KeychainKind, u32> =
+                        [KeychainKind::External, KeychainKind::Internal]
+                            .into_iter()
+                            .filter_map(|k| {
+                                self.wallet
+                                    .spk_index()
+                                    .last_revealed_index(k)
+                                    .map(|r| (k, r))
+                            })
+                            .collect();
                     let applied = self
                         .wallet
                         .apply_update(update)
@@ -1855,7 +1867,7 @@ impl BtcActor {
                         // past the scripts this connection matched the blocks against?
                         // Checked against the set as it stood for this update, then the
                         // set is widened the way bdk_kyoto widens its own for the next.
-                        rescan = kyoto.rescan_from(&self.wallet);
+                        rescan = kyoto.rescan_from(&self.wallet, &last_active, &revealed_before);
                         kyoto.extend_watch(&last_active, self.wallet.spk_index().lookahead());
                         if rescan.is_some() {
                             // Not at tip: the scan has a band to redo, and readiness says so

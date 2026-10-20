@@ -6,8 +6,9 @@
 //!
 //! # Using rose as a library
 //!
-//! Releases are published to crates.io as [`zecd`](https://crates.io/crates/zecd); depend on
-//! the released crate rather than on a git revision.
+//! Releases are published to crates.io as [`rosed`](https://crates.io/crates/rosed), 0.10.0
+//! onward (earlier releases were the [`zecd`](https://crates.io/crates/zecd) crate); depend on the
+//! released crate rather than on a git revision.
 //!
 //! The supported embedding surface:
 //!

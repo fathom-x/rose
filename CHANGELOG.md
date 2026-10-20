@@ -1,9 +1,620 @@
 # Changelog
 
-All notable changes to zecd are documented in this file.
+All notable changes to rose (`zecd` before 0.10.0) are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
+
+## [0.10.0] - 2026-10-20
+
+The first release under the new names. `zecd` is now **rose**, shipped as two crates over one
+library: **`rosed`**, the daemon and the library behind it, and **`rose-cli`**, whose binary
+`rose` is the command line. It is also the first release of the Bitcoin engine, which the
+`zecd` releases never carried. Everything below is relative to zecd 0.9.0-rc2; the Zcash engine
+is unchanged from it apart from the rename.
+
+**Read before upgrading.** Rename `zecd.toml` to `rose.toml` and every `ZECD_*` environment
+variable to `ROSE_*`; nothing inside a config file or a wallet datadir changed. `zecd run ...`
+is `rosed ...`, and every other subcommand is `rose <subcommand>`. A bare `cargo install` or
+`cargo build` is now Bitcoin-only; the Zcash engine is `--features zcash`, and the Docker images
+carry both.
+
+### Added
+
+- **The Bitcoin engine.** `[wallets.<name>] coin = "bitcoin"` selects a BDK-backed BIP 84
+  wallet over a local bitcoind (`bitcoind://host:port`) or the built-in kyoto BIP 157/158
+  light client (`kyoto://ip:port,...`), with no node of its own to run. The same `keys.toml`
+  seed serves it; watch-only wallets pin an account xpub (`rose init --xpub`,
+  `rose export-xpub`); `rose derive-address` derives receiving addresses offline; `rosed
+  --restore-if-empty` restores a wallet from `ROSE_MNEMONIC` (or creates a watch-only one from
+  `ROSE_XPUB`) when its datadir is empty and then serves, for storage-less deployments. Over
+  kyoto, `[fees]` is an ordered chain of estimators (`mempool_space`, `esplora`, `peer_median`
+  by default) and an opt-in `[mempool]` feed gives 0-conf receives to the light client. The
+  Bitcoin Core RPC surface a wallet needs is served in Core's shapes and error codes; a
+  restore scans from the wallet's birthday (`init --birthday`, a height or a date). Mainnet,
+  testnet4, testnet3 and regtest.
+- **Bitcoin: `bumpfee`.** An unconfirmed own send can be replaced with a higher-fee version
+  of itself (BIP 125), in Core's shape (`{txid, origfee, fee, errors}`) and with Core's
+  precondition codes. The default rate is Core's (the original's plus 5 sat/vB, or the
+  upstream's estimate when higher), `fee_rate` sets one explicitly, and `replaceable = false`
+  makes the replacement final.
+- **Bitcoin: ancestor-aware funding (the wallet's CPFP).** A send that spends an output of an
+  unconfirmed transaction pays what that transaction's unconfirmed ancestry lacks at the
+  send's own rate, as Bitcoin Core has since 26.0, so a send stuck at a low rate is unstuck by
+  the next send that spends its change. Coin selection sees each unconfirmed coin net of that
+  cost; `bumpfee` pays for the original's unconfirmed parents the same way. As in Core, a
+  foreign sender's unconfirmed payment is not spent until it confirms.
+- **Bitcoin: `fee_split = "output"`, fee sharing by block space.** An extension on
+  `sendtoaddress` (position 12) and `sendmany` (position 10). With `"output"`, each recipient
+  named to pay the fee pays only for its own output at the send's rate, and the sender pays
+  the rest - inputs, change and overhead - so what a recipient is charged no longer depends on
+  which coins the sender spent. `"equal"`, the default, stays Core's split.
+- **Bitcoin (kyoto): a better peer fee tier, and a check on the fee oracles.** The
+  `peer_median` tier reads an in-memory ring of up to 24 recent blocks that a background task
+  keeps warm, prices a recency-weighted quantile per confirmation target (so `estimatesmartfee
+  <n>` honors `n` on this tier) and stays at the 1 sat/vB relay floor while recent blocks are
+  not full. An HTTP oracle's answer above four times the highest recent block average (and
+  above 10 sat/vB) is disbelieved and the chain falls through to the next source.
+- **Bitcoin (kyoto): a restore discovers until the gap.** A kyoto recovery scan watches a
+  fixed script set, so a restore of a wallet paid at consecutive addresses used to stop at the
+  set's edge and report synced with the rest of the funds missing. The actor now tracks what
+  each connection watches and, while an update reveals addresses past that set, rebuilds the
+  client as a recovery scan from just below the first block that could hold a missed payment;
+  the pending rescan survives a restart and readiness stays syncing until it ends.
+  `[wallets.<name>] initial_scan` (default 0) reveals a one-time floor of addresses at spawn,
+  for a restore of a wallet that issued many; `[wallets.<name>] lookahead` is the one live
+  window, for the wallet and the light client alike. `getwalletinfo` gains a `recovery` block
+  (`initial_scan`, `lookahead`, `horizon`, `issued_through`, `restorable`), and
+  `getnewaddress` issuing past the recovery horizon warns on the audit target.
+- **Wallet GUI (`scripts/rose-gui`): every fee affordance of the RPC.** Several recipients in
+  one send, each with its own "pays fee"; a replaceable toggle; a confirmation target whose
+  estimate prefills the fee rate; `bumpfee` and `abandontransaction` on an unconfirmed send.
+  The fee estimate is the daemon's own `estimatesmartfee`, so it is exactly what a send would
+  use.
+
+### Changed
+
+- **`zecd` is now `rose`.** The binary, the crate, the config file (`rose.toml`), every
+  `ZECD_*` environment variable (`ROSE_RPC_PASSWORD`, `ROSE_MNEMONIC`, `ROSE_XPUB`,
+  `ROSE_DATADIR`, `ROSE_REGTEST_*`, ...), the `rose::audit` log target, the Docker image's
+  paths (`/var/lib/rose`, `/usr/share/doc/rose/`) and build argument (`ROSE_CARGO_FEATURES`),
+  the shipped sample configs (`rose.example.toml`, `deploy/rose.*.toml`), the GUI
+  (`scripts/rose-gui`) and the regtest harness crate. Nothing inside a config file or a wallet
+  datadir changed: upgrading is renaming `zecd.toml` to `rose.toml` and the environment
+  variables. A datadir that still holds only a `zecd.toml` is refused at startup with that
+  instruction rather than started on defaults. The crates on crates.io are `rosed` and
+  `rose-cli`; the images are `ghcr.io/fathom-x/rose` and `ghcr.io/fathom-x/rose-gui`.
+- **Two binaries: `rosed` and `rose`.** The daemon is `rosed`, bitcoind-style - no
+  subcommands, the same global flags, `rosed --restore-if-empty` where `zecd run
+  --restore-if-empty` was. Everything else moved to `rose`, the `rose-cli` crate's binary:
+  the admin subcommands (`init`, `rescan`, `config check|show`, `derive-address`,
+  `export-ufvk|xpub`, `rpcauth`, `example-config`, `licenses`, `chain-info`), spelled as before,
+  and a `bitcoin-cli`-style JSON-RPC client - any other first word is a method sent to the
+  running daemon (`rose getbalance`, `rose --rpcwallet btc listunspent 1`), each parameter
+  parsed as JSON else taken as a string, the daemon found through the same configuration
+  (`[rpc]` port, the cookie file or `--rpcuser`/`--rpcpassword`; `--rpcconnect`, `--rpcwallet`,
+  `--rpccookiefile`, `--rpcclienttimeout`), results printed and errors reported as `bitcoin-cli`
+  prints them. The library is the `rosed` crate. The Docker images, the release tarball and
+  the `.deb` ship both binaries; the image's `ENTRYPOINT` is `rosed` (`docker run --entrypoint
+  rose ... init` for the command line) and the `.deb`'s unit starts `rosed`.
+- **The default build is Bitcoin-only.** `cargo build`/`cargo install` now carry the BDK
+  engine alone; the Zcash engine is `--features zcash` (the release images carry both, built
+  with `--features mimalloc-secure,bitcoin,zcash`). A default binary refuses `coin = "zcash"`
+  at config resolve, as a bitcoin-less one refused `coin = "bitcoin"` before.
+- **Bitcoin: a send is committed to the wallet before it is relayed.** `sendtoaddress`,
+  `sendmany` and a wallet-relevant `sendrawtransaction` apply the signed transaction at 0-conf
+  and persist it *before* handing it to the upstream - Bitcoin Core's `CommitTransaction`
+  order - so a crash between the relay and the record cannot produce a wallet that
+  double-spends its own send. A node rejection withdraws the record and passes the node's
+  error through; a transport failure (no verdict) keeps it and returns the txid with a WARN,
+  since the bytes may have reached the network - the rebroadcast pass resubmits it and
+  `abandontransaction` releases the inputs if it never relays. `-4` remains the answer for a
+  send refused before anything is committed.
+- **Bitcoin: reads answer from a view built once per wallet change, not per call.** BDK
+  canonicalizes the whole transaction graph on every read, at a cost that grows with the
+  wallet's transactions times its checkpoints, so `getbalance` and `listunspent` grew with
+  the UTXO set on the actor, holding the sync loop and every send for the duration (157 s at
+  10,000 outputs on two hyperthreads). The actor now builds one read view on the first read
+  after a change and drops it at every site that changes the wallet; `getbalance`,
+  `listunspent`, `getwalletinfo.txcount` and a send's input pricing answer from it, so a
+  wallet polled often pays the pass once per block.
+- **Bitcoin (kyoto): the light client is rebuilt on a discovery, not on every
+  `getnewaddress`.** With the discovery loop above held exactly to the wallet's window, a
+  wallet handing out an address per deposit rebuilt the client, and re-derived its whole
+  script set, on nearly every block. A discovery (a used index past what the wallet had
+  revealed) still rebuilds at once; a reveal, and a payment to an address so handed out, gets
+  half a lookahead of slack first. Catch-up per block halved on the capacity benchmark.
+
+### Fixed
+
+- **Bitcoin (bitcoind backend): no more paying a broken estimator on a test network.**
+  testnet4's `estimatesmartfee` answered 361 sat/vB at every target while blocks cleared at
+  1 sat/vB, and a bitcoind-backed wallet paid it on every send. Off mainnet, a flat estimate
+  curve above 1 sat/vB (the 1008-block estimate at least 90% of the 2-block one) now counts
+  as no estimate, so sends take the 1 sat/vB test-network fallback and `estimatesmartfee`
+  reports no estimate. Mainnet is unchanged.
+
+### Security
+
+- **rustls 0.23.46** (RUSTSEC-2026-0346, 2026-10-14): derived `Debug` impls on rustls's client
+  session values could print a TLS master secret or resumption PSK if a custom
+  `ClientSessionStore` logged them. rose has no such store, so nothing was exposed; the
+  dependency moves past the advisory.
+
+## [0.9.0-rc2] - 2026-10-12
+
+Six fixes over rc1, and one new configuration key. Five of the fixes also shipped in 0.8.2.
+
+**Read before deploying.** A node whose RPC password is empty, or that has an `[rpc] auth` line
+minted for the empty password, now refuses to start; set a password first. And a send made while
+the wallet is more than 100 blocks behind the tip now fails at once with `-10` instead of waiting
+for the scan.
+
+### Added
+- **`[spend] max_send_catchup_blocks`** (default 100, `0` = unbounded). Every send first scans
+  the wallet up to the chain tip, and on a wallet still restoring that was the whole remaining
+  scan, run while the caller waited and every other send queued behind it. Past this lag a send,
+  `z_shieldcoinbase` or `z_mergetoaddress` fails at once with `-10`, naming the scanned height and
+  the tip; retry once `waitforsync` reports the wallet caught up. Balance and history reads are
+  not gated. A wallet whose sync has halted now refuses sends.
+
+### Security
+- **An empty RPC password was a working login.** An empty `[rpc]` password, typically a
+  `password_file` that exists but was never filled in, made `user:` a valid login with spend
+  authority, and because a password counted as set, no cookie was written either. An
+  `[rpc] auth` line minted for the empty password admitted the same login. The daemon and
+  `zecd config check` now refuse both, and `zecd rpcauth <user> ""` refuses to mint such a line.
+- **An explicit shielded `fromaddress` could spend from pools it cannot hold.** `z_sendmany`
+  treated any wallet-owned shielded or unified `fromaddress` as the whole account, so a send
+  from a Sapling address could spend Orchard and Ironwood notes. An explicit source now funds
+  only the pools its receivers can hold: a Sapling address or Sapling-only UA spends Sapling, an
+  Orchard-only UA spends Orchard and Ironwood, and a UA with both keeps every shielded pool. A
+  shortfall returns `-6` rather than drawing on another pool. `z_mergetoaddress` follows the
+  same rule.
+
+### Fixed
+- **Retrying a send to a TEX address paid twice.** A TEX recipient produces a two-step
+  proposal. Some sends built and stored both transactions before failing with
+  "multi-transaction proposals are not supported", and the rebroadcast loop then broadcast
+  them anyway. Every send RPC now rejects a TEX recipient with `-8` before building, and any
+  proposal of more than one step is refused before anything is stored.
+- **Verbose `getrawtransaction` showed no shielded outputs for post-NU6.3 sends.** Only the
+  `orchard` section was rendered, while payment and change ride the Ironwood bundle. v6
+  transactions now carry an `ironwood` section in the same shape as `orchard`.
+- **Light mode recorded coinbase outputs as ordinary receives.** With transparent enabled, a
+  light-mode wallet that mined to itself could spend immature coinbase, and
+  `z_shieldcoinbase` could not see it. The lightwalletd backend now marks coinbase outputs
+  and stores the coinbase transaction, as the zebra backend does.
+- **`zecd example-config` omitted several keys.** `[backend] rfc1918_is_local` and
+  `allow_remote_cleartext`, `[rpc] work_queue` and the `[log]` section are now documented in it.
+
+## [0.9.0-rc1] - 2026-10-02
+
+NU7 support, which needed the Zakura Common 2.x crates. No configuration key, RPC or response
+shape changed.
+
+Take it if you run zecd on testnet: NU7 activates there at block 4,465,026, and from that block
+0.8.1 builds transactions that upgraded nodes reject. Mainnet has no NU7 height yet.
+
+**Read before deploying.** The wallet database gains two migrations on first start, which 0.8.1
+does not know. Copy the data directory first if you might need to go back.
+
+### Added
+- **NU7.** From testnet block 4,465,026, transactions commit to the NU7 consensus branch id
+  (`0x77190AD9`) and stay on the V6 format NU6.3 introduced. NU7 is compiled in and activated by
+  height, as NU6.3 was. On regtest it is opt-in through `ZECD_REGTEST_NU7_HEIGHT`, which must be
+  above `ZECD_REGTEST_NU63_HEIGHT`.
+
+### Changed
+- **Zakura Common 2.2.** The cryptography and protocol crates move from 1.0.0 to 2.2, and
+  `zcash_protocol`, `zcash_address`, `zcash_transparent` and `zip321` are now `zakura-*` forks
+  as well. The wallet layer moves to `zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc7
+  and `zakura-pczt` 0.1.0-rc4. The minimum Rust version stays 1.91.
+- **The enhancement drain reads the wallet layer's split work queues.** rc7 hands out status
+  lookups, payload fetches and transparent-history searches separately. zecd merges them and
+  services them as before, so the backlog count, `/readyz` and `[sync] fetch_memos` behave as
+  they did.
+
+## [0.8.1] - 2026-09-27
+
+One fix, no new features, no configuration key or response shape moved. A drop-in upgrade from
+0.8.0.
+
+Take it if any wallet you run holds Orchard-pool notes: on 0.8.0 it cannot spend them. That
+covers notes received before NU6.3 activated (mainnet block 3,428,143) and change that older
+software still creates in the Orchard pool after it.
+
+### Fixed
+- **Spending an Orchard-pool note after NU6.3 failed.** Any send that spent a legacy Orchard
+  note, however recently the note was received, failed with `Orchard proof generation failed:
+  Prover(ProofFailed(InvalidInstances))` and broadcast nothing. From NU6.3 the Orchard pool is on
+  protocol V3, whose bundles must disable cross-address transfers, and only the post-NU6.3
+  circuit constrains that flag; the PCZT send path proved the Orchard bundle with the NU6.2 key
+  regardless. It now proves, and verifies, under the circuit the transaction's consensus branch
+  names, as the fused builder already did, so sends that go through it (Sapling spends,
+  transparent sources, `z_shieldcoinbase`, `z_mergetoaddress`) were never affected. A new regtest
+  funds a wallet before activation and spends after it; nothing in the tier held an Orchard-pool
+  note across activation before.
+
+## [0.8.0] - 2026-09-21
+
+The 0.8.0 line, released as `0.8.0-rc1` through `0.8.0-rc3`. Everything below is relative to
+0.7.0; the release-candidate sections that follow are kept for history. Nothing lands here that
+was in no candidate.
+
+A feature release with three independent headlines. One daemon can now monitor a large number
+of watch-only wallets without paying for a full wallet stack per key. The Zcash cryptography
+crates are the Zakura Common forks, which prove an Orchard send about four times faster. And a
+full node is no longer the slowest way to sync: on a 238,000-block testnet restore against a
+node on loopback, a from-seed scan went from 803 s to 152 s, where a lightwalletd across the
+internet had served the same wallet in 214 s.
+
+**Read before deploying.** Building from source now requires **Rust 1.91**, where 0.7.0 needed
+1.88; binary and package users are unaffected. The block cache moved into memory, so an existing
+data directory migrates on first start and `zecd rescan` removes the old `blocks/` and
+`blockmeta.sqlite`. And a send that draws pre-NU6.3 Orchard notes into Ironwood outputs is now
+counted against `[spend] orchard_action_limit` as the prover actually counts it, so a send 0.7.0
+accepted can be refused; raise the cap on SIGHUP or consolidate first.
+
+The fleet is experimental, off unless `[fleet] enabled = true`, and its manifest format, its
+`[fleet]` keys and its wallet-management RPCs may change in a patch release. Upgrading from an
+0.8.0 candidate rather than from 0.7.0, read the rc2 section: its fleet directories moved with
+no migration performed.
+
+Every other configuration key and response shape from 0.7.0 still resolves as it did, and every
+new option defaults to the previous behaviour. If you run 0.7.1 through 0.7.3, all of their
+fixes are here.
+
+### Added
+- **A fleet of watch-only wallets in one daemon**, sharing a shard - one database, one actor,
+  one scan pass, one tree set - so a block is fetched once and trial-decrypted once against
+  every key in it, with `createwallet`, `loadwallet`, `unloadwallet` and `listwalletdir` to grow
+  one without a restart. Off by default. See the rc1 and rc2 sections.
+- **`[backend] proxy`**, routing every connection zecd makes through a SOCKS5 proxy, most
+  usefully Tor. The proxy resolves the destination, so no DNS leaves the machine and a `.onion`
+  upstream works.
+- **Sync tuning and observability:** `[sync] writer_cache_mib`, `[sync] enhance_concurrency`,
+  `[sync] fetch_memos`, and a per-phase split of where sync time goes on `/status`.
+- **Send bounds:** `[spend] max_tx_bytes`, refusing at plan time a transaction too large for
+  nodes to relay, and `[spend] shutdown_drain_secs`. Both `max_tx_bytes` and
+  `orchard_action_limit` reload on SIGHUP.
+- **`z_listunifiedreceivers`** and **`z_validateaddress`**, `ANY_SAPLING` / `ANY_ORCHARD` as
+  `z_sendmany` funding sources, **`diversifier_index` on received history entries and on
+  `getaddressinfo`**, `[spend] trust_own_transactions`, and `import_error` / `imported` on the
+  fleet's readiness surfaces. Each is described in the candidate section that introduced it.
+
+### Changed
+- **The Zcash stack is the Zakura Common forks of librustzcash**, published on crates.io. They
+  keep librustzcash's API, so this is a dependency rename and no code in zecd moved to meet it.
+  Proving falls from about 840 ms per Orchard action to about 200, a one-input `sendtoaddress`
+  from about 3.5 s to about 0.66 s, and startup key generation from 3.45 s to 0.38 s. The wallet
+  layer is on release-candidate version numbers, which is the cost to weigh.
+  `docs/ZAKURA_COMMON_BENCHMARK.md` carries the measurements and the method.
+- **Sync is between three and five times faster against a full node.** A node's block stream
+  keeps 32 blocks in flight where it issued them one at a time, the next range downloads while
+  the current one scans, the block cache is in memory rather than one file per block, and the
+  memo drain fetches concurrently and commits once per pass. Calls to a full node are capped at
+  64 in flight, since concurrency helps a light backend and hurts a node.
+- **One upstream connection serves every wallet**, collapsing the dial, the mempool
+  subscription, the subtree roots and the chain tip to one each where each wallet actor used to
+  own its own.
+- **Incoming history names the receiver an output actually paid**, so a payer and a payee print
+  the same string for one output. Byte-identical under the default Orchard-only configuration.
+- **A watch-only wallet builds no Sapling prover**, and the Orchard proving keys are not warmed
+  when no wallet can spend.
+- **`unloadwallet` refuses what it cannot honor and reports what it did not do**, and
+  **configured passwords are redacted in debug output** and kept out of the upstream connection
+  key. Nothing shipped printed either, so nothing leaked.
+- Every read that reports a wallet's own money, history or addresses now names the account it
+  means. At one account per database, which is every wallet outside a fleet, this is a
+  behavioural no-op.
+
+### Security
+- **rustls updated past RUSTSEC-2026-0285.** A patch release under the same license terms. Also
+  released as 0.7.3.
+
+### Fixed
+- **Per-address reads returned zero after a from-seed restore or `zecd rescan`.**
+  `getreceivedbyaddress` answered `0.00000000` for the wallet's own `getnewaddress` address, and
+  `listreceivedbyaddress` and `z_listtransactions` reported those funds under an address zecd
+  will not derive. Balances stayed correct throughout, so only per-address reconciliation could
+  see it. Matching is now by diversifier index rather than by the recorded string. Also released
+  as 0.7.3.
+- **A newly created fleet wallet could report its shard-mates' money, history and addresses as
+  its own** during the window before its import ran. A member without an account now matches no
+  row.
+- **`[spend] orchard_action_limit` under-counted a two-bundle send by up to half**, so a send
+  the cap exists to bound could prove twice the memory and time it allowed. The cap now counts
+  per bundle and sums, as the builder does.
+- **A wallet's payment to its own address was reported unconfirmed for ten blocks rather than
+  three.**
+- **`gettransaction` and `listtransactions` cost O(history)**, and **a busy read RPC could make
+  `/status` and `/readyz` time out for minutes** while `/healthz` kept answering. Both also
+  released as 0.7.2.
+- **Two HTTP/2 failures on long block downloads**: a client-shed connection that stalled a
+  restore where retrying would have finished it, and a server-sent `ENHANCE_YOUR_CALM` read as
+  the client library's own load shed. Also fixed: the reorg rewind margin now doubles while
+  reorgs keep coming, one unreadable fleet manifest no longer aborts startup, and
+  `Node::wallet_location` reports a fleet member's engine directory, account and scope.
+
+### Removed
+- Nothing a deployment can see. Regtest guards whose premise or twin was gone are retired, which
+  leaves the `[spend] cache_proving_key` knob without dedicated coverage.
+
+## [0.8.0-rc3] - 2026-09-17
+
+Mostly a performance candidate, plus one correctness fix worth reading if you reconcile
+payments per address. No configuration key or default from rc2 moved, and the new `[sync]`
+keys all default to the behaviour you already have; the response shapes gain fields and one
+method, all additive.
+
+The headline is that **a full node is no longer the slowest way to sync zecd**. On a
+238,000-block testnet restore against a node on loopback, a from-seed scan went from 803 s
+to 152 s, where a lightwalletd across the internet had served the same wallet in 214 s. The
+memo drain that follows the scan improved on the same order: a 7,546-request backlog went
+from 1303 s to 194 s at the shipped default, and a case that previously did not converge at
+all now does.
+
+Every number below is the same wallet on the same host, and each change was measured on its
+own. A deployment that syncs from a light backend gains less, though not nothing.
+
+### Added
+- **`[sync] writer_cache_mib`** (default 256), the SQLite page cache for the wallet's writer
+  connection. It was on SQLite's 2 MiB default while the read connections were already at 32,
+  and the writer is the one doing the work: 178 s to 152 s. It is a ceiling rather than an
+  allocation and durability does not depend on it, but SQLite keeps a cache once it has grown
+  for the life of the connection, and there is one writer per configured wallet and per fleet
+  shard. `config check` warns when the value times the writer connections passes 2 GiB.
+- **`[sync] enhance_concurrency`** (default 16), how many memo fetches the drain has in flight
+  at once. Also the number of stores between two points where the wallet actor services queued
+  commands, since the stores still run one at a time on the single writer.
+- **`z_listunifiedreceivers`**, taking a unified address apart into per-receiver strings in
+  zcashd's shape and vocabulary. By construction these are the strings history reports for
+  outputs paid to that address. Pure and key-free, so it works on an address you are about to
+  pay as well as one you own.
+- **`diversifier_index` on received history entries and on `getaddressinfo`** for any of the
+  wallet's own addresses. It is the stateless identity every encoding of an address shares, and
+  it survives a restore because the scanner recovers it from the note. Read from the row the
+  note already links to, so it costs no cryptography per entry. Sends never carry it; the
+  recipient's index is theirs. Together with the method above, this is the read-back half of
+  `z_getaddressforaccount`: issue with it, store the integer, and every later receipt resolves
+  to it regardless of which encoding of the address is in play.
+- **`/status` reports where sync time goes.** Each batch logs a `batch complete` line with its
+  phase split, accumulated as `sync_totals`; the memo drain publishes its own totals, split
+  between reading the request table, waiting on the upstream, and applying transactions.
+
+### Changed
+- **A full node's block stream keeps 32 blocks in flight.** A node serves a compact block in
+  two dependent round trips and has no range request to batch them into, and the stream issued
+  them one block at a time: 476,000 sequential round trips for that restore. The pairs for
+  different blocks are independent, so they now overlap, with delivery still in height order
+  for the scanner and an error still ending the range at the block that hit it. 803 s to 249 s.
+- **The block cache is in memory.** A batch lived entirely inside one scan call, so writing one
+  file per block plus a metadata index bought nothing and cost about 30,000 syscalls per
+  10,000-block batch; cleanup alone was 10 s of a 220 s scan. It also carried a class of
+  file-versus-metadata inconsistency on the reorg path that no longer has anywhere to occur.
+  An existing data directory migrates and `zecd rescan` removes the old `blocks/` and
+  `blockmeta.sqlite`.
+- **The next range downloads while the current one scans**, where the loop used to alternate
+  between the network and this host's CPU with each idle for the other's turn. 249 s to 184 s
+  on a full node, about 8% on lightwalletd. Shielded-only wallets only: the transparent matcher
+  checks blocks against address and outpoint sets that a receive in the current batch can
+  extend.
+- **The memo drain fetches concurrently, reads its request table once per pass, and commits
+  once per pass.** Fetching one transaction at a time capped throughput at 1/latency, about
+  five requests a second against a remote server. Choosing what to service and publishing
+  status each read and de-duplicated every queued request, charged once per pass however few it
+  serviced, which is what made a large backlog quadratic: 394 s deciding what to fetch against
+  189 s fetching. And each stored transaction was its own commit. A pass now either records
+  everything it fetched or records none of it and is retried whole.
+- **Calls to a full node are capped at 64 in flight.** Concurrency helps a light backend and
+  hurts a node, where every fetch is its own HTTP/1.1 call, the client opens a connection per
+  concurrent request, and the server refuses a burst rather than queueing it. `config check`
+  warns above 64 either way.
+- **Incoming history names the receiver an output actually paid**, in both directions, so a
+  payer and a payee print the same string for one output and history no longer depends on
+  `[pools] default_receivers`. Byte-identical under the default Orchard-only configuration;
+  visible only on a wallet configured with several default receivers, which now also warns once
+  at startup and from `config check` that the address it hands out is not the string history
+  will report.
+- **`[sync] batch_size` still defaults to 10,000.** 2k/10k/25k/50k measured 294/226/198/207 s,
+  but two batches are now resident at once and mainnet's densest ranges make that hundreds of
+  megabytes at 25k. `config check` warns above 50,000.
+
+### Security
+- **rustls updated past RUSTSEC-2026-0285.** A patch release under the same license terms.
+
+### Fixed
+- **Per-address reads returned zero after a from-seed restore or `zecd rescan`.**
+  `getreceivedbyaddress` answered `0.00000000` for the wallet's own `getnewaddress` address,
+  and `listreceivedbyaddress` and `z_listtransactions` reported those funds under an address
+  zecd will not derive - one carrying a transparent receiver a shielded-only wallet does not
+  watch. Balances stayed correct throughout, so only per-address reconciliation could see it.
+  The cause is that which encoding of a diversifier index a payer used never reaches the chain,
+  so the wallet picks one, and the pick depended on whether `getnewaddress` or the block scanner
+  wrote the row first; a restore rebuilds that table from the scan alone and so switched every
+  index to the scanner's spelling. Matching is now by diversifier index rather than by the
+  recorded string, so any encoding of an index the wallet owns answers with that index's
+  receipts. A spliced address is still rejected, and a bare transparent address is still its own
+  key.
+- Regtest only, with no effect on a running daemon: a harness helper returned as soon as it saw
+  a transaction confirmed, which could be one block before the wallet had caught up, so a
+  following phase read `confirmations` twice a second apart and saw them differ. It now waits
+  for the wallet to reach the node's tip.
+
+## [0.8.0-rc2] - 2026-09-10
+
+The second 0.8.0 candidate. Its headline is a dependency change with no surface of its own: the
+Zcash cryptography and wallet crates are now the Zakura Common forks, which prove an Orchard
+send about four times faster and build their proving keys about eleven times faster. Nothing
+about the wallet, its database, addresses, keys or the RPC surface changes with them.
+
+**This candidate requires Rust 1.91** to build, where rc1 needed 1.88. Binary and package
+users are unaffected.
+
+**Three changes an rc1 deployment must read before upgrading.** The fleet is now off unless
+`[fleet] enabled = true`, and its two directories moved under `<datadir>/fleet/<coin>/`, with no
+migration performed. And a send that spends pre-NU6.3 Orchard notes into Ironwood outputs is
+now counted against `[spend] orchard_action_limit` as the prover actually counts it, so a send
+that rc1 accepted can be refused. All three are described below. Upgrading from 0.7.x rather
+than rc1, none of this applies: the fleet was never on, its directories were never written, and
+the action cap is the one correction to make.
+
+The serious fix is that a newly created fleet wallet could report its shard-mates' balances and
+history as its own during the window before its import ran.
+
+### Added
+- **`[spend] max_tx_bytes`** (default 250000, `0` disables), refusing at plan time a send whose
+  transaction would be too large for nodes to relay. Consensus only asks that a transaction fit
+  in a 2 MB block, but relay policy binds at a fifth of that, and a transaction past what nodes
+  forward is not so much rejected as never mined, after the wallet has paid to prove it. It
+  bounds bytes where `orchard_action_limit` bounds actions, neither implies the other, and
+  `config check` warns when the two disagree about which will bind first. Reloadable on SIGHUP.
+  `z_mergetoaddress` treats it as a limit to select under rather than a refusal, since a merge
+  exists to be repeated and already reports what it left behind.
+- **`[sync] fetch_memos`**, to opt out of memo recovery. Compact blocks carry no memos, so
+  recovering them costs one upstream full-transaction fetch and trial decrypt per received
+  transaction, which on a from-seed restore is the drain that holds `/readyz` at 503 long after
+  the block scan reaches the tip. Skipped rather than dismissed: the requests stay queued, so
+  turning it back on backfills the memos with no rescan. Status tracking, transparent spend
+  checks and the mempool path are unaffected, so 0-conf visibility is unchanged.
+  `enhanced_through` reports `null` while it is off, since it promises memos at or below it are
+  readable.
+- **`[spend] shutdown_drain_secs`**, bounding how long the wallet actor spends finishing sends
+  it has already accepted before it stops.
+- **`z_validateaddress`**, and `ANY_SAPLING` / `ANY_ORCHARD` as `z_sendmany` funding sources,
+  honoured on the cached-PCZT path as well as the fused one.
+- **`[spend] orchard_action_limit` reloads on SIGHUP**, beside `max_tx_bytes`. A wallet whose
+  notes have fragmented can fail every payout until the cap moves, and restarting a live payment
+  wallet to change a number is a poor answer.
+- **`import_error` on `waitforsync` and `getwalletinfo`**, and `imported` on `waitforsync`, so
+  the window between a fleet wallet being served and its account existing is observable rather
+  than inferred.
+
+### Changed
+- **The Zcash stack is the Zakura Common forks of librustzcash**, published on crates.io. They
+  keep librustzcash's API, so this is a dependency rename and no code in zecd moved to meet it.
+  Measured on one regtest chain: proving falls from about 840 ms per Orchard action to about
+  200, a one-input `sendtoaddress` from about 3.5 s to about 0.66 s, a 16-output fan-out from
+  about 15 s to about 3.2 s, and startup key generation from 3.45 s to 0.38 s. The forks build
+  keys from embedded parameters rather than regenerating the halo2 commitment parameters, which
+  also removes the per-send verifying-key rebuild that made the store phase cost about 1.5 s.
+  The wallet layer is on release-candidate version numbers, which is the cost to weigh.
+  `docs/ZAKURA_COMMON_BENCHMARK.md` carries the measurements and the method.
+- **The fleet is experimental and off by default.** `[fleet] enabled` defaults false, and with
+  it off the manifest directory is never read, no shard is opened, and the wallet-management RPCs
+  refuse. The manifest format, the `[fleet]` keys and those RPCs may change in a patch release.
+- **The fleet's manifest and shard directories are scoped to the coin**, defaulting to
+  `<datadir>/fleet/<coin>/`: manifests at `fleet/zec/wallets.d` where they were `wallets.d`, and
+  shards at `fleet/zec/shards` where they were `fleet`. A manifest holds a viewing key, which
+  serves one currency where the mnemonic in `keys.toml` serves every one, and which shard a
+  wallet lands in is decided by a birthday, a height on one chain. **No migration is performed**:
+  an rc1 fleet moves its two directories or names them explicitly, and either setting still
+  replaces the default outright. `fleet` is now a reserved wallet name, since a
+  `[wallets.fleet]` entry would resolve to `<datadir>/fleet`; zecd refuses to start on the
+  overlap, and `config check` warns about it whether or not the fleet is running.
+- **The Orchard proving keys are not warmed when no wallet can spend.** A daemon whose every
+  wallet is watch-only built and armed keys nothing in the process could reach. A send that
+  arrives anyway still proves, paying the warm-up inline.
+- **`unloadwallet` refuses what it cannot honor and reports what it did not do.**
+  `load_on_startup = false` asks zecd to stop loading a wallet at startup, but zecd's startup
+  list is the fleet manifest, which unloading deliberately keeps so `loadwallet` can restore the
+  wallet; the flag was accepted and dropped, and the wallet reappeared at the next restart. It is
+  now `-8`, naming the manifest to delete. A positional wallet name contradicting the
+  `/wallet/<name>` endpoint is `-8` rather than silently resolved in favour of the argument, and
+  a wrong-typed argument is `-3` rather than coerced. The response's `warning` now says the
+  account stays in its shard and is still scanned.
+- **Configured passwords are redacted in debug output and kept out of the upstream connection
+  key.** The `[rpc]` and `[zebra]` passwords were plain strings on types that derive `Debug`, and
+  the key that collapses wallets onto one connection formatted the whole auth struct. Nothing
+  shipped printed either, so nothing leaked; they now ride in a type whose `Debug` redacts, with
+  no `Display` and the buffer zeroized on drop, and the connection key carries a hash of the
+  credential instead. Which wallets share an upstream is unchanged.
+- **`[pools] enabled = ["ironwood"]` is still refused, but no longer calls Ironwood unknown.**
+  Ironwood is a pool zecd supports; what it lacks is a receiver, and a receiver is what the key
+  selects. The two RPC arguments taking a receiver render that explanation instead of "Unknown
+  address type". No config key, accepted value, default or error code changes.
+- **Sends log `tx_bytes` beside `est_tx_bytes`**, and warn when the estimate came in under what
+  was built. A slow successful RPC is logged at INFO rather than DEBUG, and a
+  method-not-found at DEBUG rather than INFO, so a client probing an absent method stops writing
+  one INFO line per poll.
+
+### Fixed
+- **A newly created fleet wallet could report its shard-mates' money, history and addresses as
+  its own.** A shard member is servable the moment it is placed, before its import runs, because
+  importing needs tree state below its birthday and waits for a connected pass. In that window
+  the wallet has no account of its own, and a wallet with no account scoped its reads to every
+  account in its database. For a conventional wallet that is harmless, since the database holds
+  none, but for a shard member those are its neighbours': `getbalance`, `listtransactions`,
+  `listunspent` and `getwalletinfo` answered with their balances and history under the new
+  wallet's name, and `is_mine`, which is what a send's `fromaddress` is checked against, claimed
+  their addresses. A member without an account now matches no row. A member the database refuses
+  outright is no longer indistinguishable from one still waiting its turn, and two paths that
+  left such a member unrecoverable without a restart are fixed with it.
+- **`[spend] orchard_action_limit` under-counted a two-bundle send by up to half.** The cap was
+  enforced against one family-wide `max(orchard spends, orchard outputs)`, but post-NU6.3 the
+  Orchard pool no longer lets a spend and an output share an action, so a send drawing legacy
+  Orchard V2 notes into Ironwood outputs builds two bundles and proves their sum. A 50-spend,
+  49-output send of that shape read as 50 actions, passed a cap of 50, and proved 99 - twice the
+  memory and proving time the cap exists to bound, on the path a wallet holding pre-NU6.3 funds
+  takes for every send. The cap now counts per bundle and sums, as the builder does, and the `-8`
+  explains the count where two bundles make it otherwise inexplicable. A send that was accepted
+  before can now be refused; raise the cap on SIGHUP or consolidate first.
+- **`gettransaction` and `listtransactions` cost O(history).** A single transaction was read
+  through the wallet's aggregate views, which SQLite cannot filter without aggregating the whole
+  history. They now read the base tables.
+- **A busy read RPC could make `/status` and `/readyz` time out for minutes while `/healthz`
+  kept answering.** Read methods are synchronous functions that query SQLite, and they were
+  called inline from the async dispatcher, so a monitoring poll with any concurrency could
+  occupy every runtime worker and starve the health server, whose handlers do no I/O. They now
+  release their worker for the duration; request admission is unchanged. Also released as 0.7.2.
+- **One unreadable fleet manifest aborted startup and hid every other wallet.** It is skipped
+  with a warning and reported in `listwalletdir`. Manifests are written atomically, so an
+  interrupted `createwallet` cannot leave a torn viewing key.
+- **A server-sent `ENHANCE_YOUR_CALM` was read as the HTTP/2 client library's own load shed**,
+  so a failed compact-block range was resumed into an upstream that was deliberately shedding
+  load or rate-limiting, for as long as the retry bound allowed. The GOAWAY must now also name
+  the client library as the initiator, which is the only case where resuming is the right answer;
+  a server's refusal surfaces to the caller instead.
+- **The reorg rewind margin doubles while reorgs keep coming** (10 blocks up to 1280) rather
+  than retrying the same shallow depth, so a deep rollback is walked back in eight rounds instead
+  of dozens. It snaps back on the first clean batch, so a wallet that is keeping up never carries
+  a widened margin.
+- **`Node::wallet_location`** reports a loaded wallet's engine directory, account and scope,
+  which were unreachable for a fleet member whose account lives in a shard database. The scope is
+  reported rather than derived, since a `None` account scopes two different ways.
+
+### Removed
+- Nothing a deployment can see. Four regtest guards whose premise or twin was gone are retired,
+  which leaves the `[spend] cache_proving_key` knob without dedicated coverage.
+
+## [0.8.0-rc1] - 2026-09-02
+
+A release candidate built around one capability: monitoring a large number of watch-only
+wallets from a single daemon. Everything else here is smaller, and everything defaults to
+0.7.0's behaviour, so a deployment that does not want a fleet can upgrade for the fixes alone.
+
+Two of those fixes matter outside the fleet. A wallet that paid itself reported the payment as
+unconfirmed for ten blocks instead of three, and a long block download over a light backend
+could fail part-way through for a reason that a retry resolves. Both are described below.
+
+Every configuration key and response shape from 0.7.0 still resolves as it did.
+
+### Added
+- **A fleet of watch-only wallets in one daemon.** A view wallet used to cost a full stack of its own: a database, an actor, a scan, note-commitment trees and an enhancement backlog, all of it multiplied by the wallet count against a single upstream. Several view wallets now share a shard - one database, one actor, one scan pass, one tree set - so a block is fetched once and trial-decrypted once against every key in the shard, which is what librustzcash's scanner already does when a database holds more than one account. Each fleet wallet is a small manifest file naming a viewing key and a birthday, so onboarding is not a configuration edit, and placement is read back from the shard databases themselves rather than a side file that could disagree with them. Shards are bounded because importing an account rewinds its database to that account's birthday: a deep-birthday arrival gets a shard of its own instead of dragging a caught-up group through a rescan. Fleet members are watch-only and shielded-only, and a transparent one is refused rather than half-supported. Spending is untouched - one conventional wallet, its own database, its own actor, every existing invariant - and with no manifests present none of this does anything.
+- **`createwallet`, `loadwallet`, `unloadwallet` and `listwalletdir`**, so a fleet can grow without a restart that would cost every other wallet in the daemon a re-sync. `createwallet` places a view wallet into a shard, opening a new one when none has room, writes its manifest, and serves the wallet immediately, before its account exists; its scan begins on the shard's next pass, exactly as a wallet loaded at boot behaves before it catches up. The methods follow Bitcoin Core's dialect where a Zcash wallet allows it and diverge where it does not: a monitored wallet is defined by the viewing key it is given, so a key and a birthday are required and every flag asking for a wallet that generates its own spending keys is refused rather than ignored. `unloadwallet` deletes nothing - the manifest and the account stay, and the shard keeps scanning - so a reload or a restart serves the wallet again with its history intact; a wallet from the configuration file is refused rather than unloaded, since nothing but a restart could bring it back.
+- **`[backend] proxy`**, routing every connection zecd makes through a SOCKS5 proxy, most usefully Tor. It covers both upstream kinds, so nothing zecd dials bypasses it. The proxy resolves the destination rather than this host, so no DNS leaves the machine and a `.onion` upstream works; TLS is layered over the proxied connection unchanged, with certificate verification still pinned to the destination hostname, so the proxy carries ciphertext it cannot read. Proxy authentication is not supported - restrict access by source address instead, which for a local Tor daemon is the usual arrangement. Off by default, and `config check` warns when a loopback upstream is combined with a proxy, since the address then names the proxy's loopback rather than this machine's.
+- **`[spend] trust_own_transactions`**, on by default, governing the fix below. Setting it false keeps zecd from persisting the trust marker at all, so classification derives only from data a from-seed restore re-derives and an authoring instance and a restore of the same seed report identical balances at every confirmation depth, at the cost of the wallet's own payments to itself waiting the untrusted depth.
+
+### Changed
+- **One upstream connection serves every wallet.** Each wallet actor used to dial the node itself, poll its own chain tip and run its own mempool poller, so a daemon holding N wallets opened N connections and issued N mempool polls every two seconds against one zebrad or lightwalletd. A shared chain layer now owns the connection and collapses the dial, the mempool subscription, the subtree roots, the chain tip and transaction fetches to one each, with a late subscriber still seeing the current mempool. Compact block ranges deliberately still pass through uncached, because caching them by height is not safe across a reorg. A failure invalidates only the connection generation that saw it, so one outage produces one re-dial rather than a thundering herd. For a single-wallet deployment this is invisible.
+- **A watch-only wallet no longer builds a Sapling prover.** The bundled proving parameters are tens of megabytes that only a wallet which can spend ever touches, and they were built per actor.
+- Every read that reports a wallet's own money, history or addresses now names the account it means, since one database can hold several. At one account per database, which is every wallet outside a fleet, this is a behavioural no-op.
+- Regtest coverage only, with no effect on a running daemon: a new end-to-end binary runs a fleet against a live chain and asserts that each wallet sees its own balance, history and addresses and none of its neighbours', including one funder transaction paying many fleet wallets and a restart that adopts every account from its shard database rather than re-importing it. The test funder is pinned to 0.7.0.
+
+### Fixed
+- **A wallet's payment to its own address was reported unconfirmed for ten blocks rather than three.** Change is recognized as the wallet's own by its key scope, but the payment half of a self-send is an ordinary external output, and nothing marked the transaction as one this wallet authored, so the confirmations policy applied the untrusted depth to funds the wallet had paid itself. A transaction is now marked trusted immediately after it is stored and before it is broadcast, so its outputs wait `trusted_confirmations`, which is Bitcoin Core's own-transaction trust model. Marking is best-effort: a failure warns and leaves the output on the conservative depth rather than failing the send. The marker is a cache of derivable data, so a from-seed restore does not re-derive it and is briefly more conservative than the wallet that authored the transaction, never less safe.
+- **A long compact-block download could fail part-way through when the HTTP/2 client shed its own connection.** A range of blocks carried as many small frames could momentarily leave more of them unpolled than the client library tolerates, at which point it tore down a healthy connection. Nothing written was lost, but the error surfaced as a failed sync, so a restore over a light backend could stall where retrying would have finished it. The download now recognizes that specific shutdown, drains the stream eagerly enough to make it rare, and resumes one block past the last one written, carrying its scan state across the reconnect so a receive and its spend in the same batch are still matched. Only a range that makes no progress at all across several reconnects gives up, and every other failure surfaces to the caller unchanged.
 
 ## [0.7.0] - 2026-08-23
 
@@ -593,6 +1204,14 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.10.0]: https://github.com/fathom-x/rose/releases/tag/v0.10.0
+[0.9.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.9.0-rc1...v0.9.0-rc2
+[0.9.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.8.1...v0.9.0-rc1
+[0.8.1]: https://github.com/zecrocks/zecd/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.8.0
+[0.8.0-rc3]: https://github.com/zecrocks/zecd/compare/v0.8.0-rc2...v0.8.0-rc3
+[0.8.0-rc2]: https://github.com/zecrocks/zecd/compare/v0.8.0-rc1...v0.8.0-rc2
+[0.8.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.7.0...v0.8.0-rc1
 [0.7.0]: https://github.com/zecrocks/zecd/compare/v0.6.3...v0.7.0
 [0.7.0-rc5]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc4...v0.7.0-rc5
 [0.7.0-rc4]: https://github.com/zecrocks/zecd/compare/v0.7.0-rc3...v0.7.0-rc4

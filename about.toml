@@ -18,7 +18,10 @@ targets = [
     "aarch64-unknown-linux-gnu",
 ]
 
-# Workspace-internal crates carry no third-party text.
+# Workspace-internal crates carry no third-party text. This only skips *unpublished*
+# members, and both crates publish, so about.hbs also leaves `rosed` and `rose-cli` out of
+# the "Used by" lists (the file is the third-party notices; rose's own license is
+# LICENSE-MIT / LICENSE-APACHE).
 private = { ignore = true }
 
 # cargo-about's defaults cover build- and dev-dependencies as well as the ones linked into

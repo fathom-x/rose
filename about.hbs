@@ -16,7 +16,9 @@ scripts/generate-licenses.sh.
 
 Used by:
 {{#each used_by}}
+{{#unless (or (eq crate.name "rosed") (eq crate.name "rose-cli"))}}
   - {{{crate.name}}} {{{crate.version}}}
+{{/unless}}
 {{/each}}
 
 {{{text}}}

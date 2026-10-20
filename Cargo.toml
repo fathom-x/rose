@@ -1,10 +1,28 @@
 [package]
 name = "rosed"
-version = "0.7.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 description = "A Bitcoin-Core-style JSON-RPC wallet server: the rose daemon and the library behind it, with a BDK Bitcoin engine and an opt-in Zakura Common (librustzcash) Zcash engine"
+repository = "https://github.com/fathom-x/rose"
+readme = "README.md"
+keywords = ["bitcoin", "zcash", "wallet", "json-rpc", "bip157"]
+categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
+# What the crate ships: the source, the licenses, and the two files the build embeds with
+# `include_str!` (`rose.example.toml` for `rose example-config`, THIRD-PARTY-LICENSES.txt for
+# `rose licenses`). Everything else in this tree - deploy samples, scripts, docs, the harness,
+# the workflows - is the repository's, not the crate's. The patterns are anchored: an
+# unanchored `README.md` is gitignore syntax and matches every README in the tree.
+include = [
+    "/src/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/THIRD-PARTY-LICENSES.txt",
+    "/rose.example.toml",
+]
 
 # Two crates over one library: this one is the library plus the `rosed` daemon, and
 # `rose-cli/` is the operator's `rose` binary (the admin subcommands and a bitcoin-cli-style

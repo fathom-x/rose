@@ -1,10 +1,17 @@
 [package]
 name = "rose-cli"
-version = "0.7.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 description = "rose: the operator's command line for the rosed wallet daemon - wallet setup and configuration subcommands, plus a bitcoin-cli-style JSON-RPC client"
+repository = "https://github.com/fathom-x/rose"
+readme = "README.md"
+keywords = ["bitcoin", "zcash", "wallet", "json-rpc", "cli"]
+categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
+# The black-box tests read sample configs from the repository root, so they stay out of the
+# crate; `src/` is the whole of it.
+include = ["/src/**", "/README.md"]
 
 [[bin]]
 name = "rose"
@@ -14,7 +21,9 @@ path = "src/main.rs"
 # The library behind rosed: the CLI cores (`init`, `config check`, ...) and the config
 # resolution the RPC client borrows for the daemon's port and cookie. No `server` feature: the
 # CLI never serves HTTP, so axum stays out of this binary.
-rosed = { path = "..", default-features = false, features = ["cli"] }
+# `version` beside `path`: crates.io strips the path and resolves the published `rosed`, so
+# the two crates release in lockstep (publish `rosed` first).
+rosed = { path = "..", version = "0.10.0", default-features = false, features = ["cli"] }
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "string", "env"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }

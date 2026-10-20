@@ -4,12 +4,13 @@ This containerizes the lightweight Python dev server that proxies RPC requests t
 
 ## Read this first: rose itself does not run in a container here
 
-The published `ghcr.io/zecrocks/zecd:latest` image is built **without** the `bitcoin` cargo
-feature (both Dockerfiles pass only `--features mimalloc-secure`), so it refuses
-`coin = "bitcoin"` at config resolution and rejects `[bitcoind]` as an unknown field. A
-containerised rose for a Bitcoin wallet needs an image built from source with
-`--features bitcoin`; none is shipped. So in every recipe below, **rose runs on the host**
-from your own `cargo build --release --features bitcoin` and only the UI is containerised.
+The `zecd` release images published up to 0.7.0 (`ghcr.io/zecrocks/zecd`) were built
+**without** the `bitcoin` cargo feature, so they refuse `coin = "bitcoin"` at config
+resolution and reject `[bitcoind]` as an unknown field. The images built from this tree and
+from the public `fathom-x/rose` tree carry both engines (`ROSE_CARGO_FEATURES` defaults to
+`--features mimalloc-secure,bitcoin`). The recipes below predate that and still run **rose on
+the host** from your own `cargo build --release --features bitcoin`, with only the UI
+containerised; a containerised daemon works the same way once pointed at a current image.
 
 ## Config file, or pure environment
 
@@ -124,13 +125,12 @@ a `gui-v*` tag (e.g. `git tag gui-v0.0.0-test <sha> && git push origin gui-v0.0.
 publishes just the GUI and works from any branch; a real `v*` release tag ships it alongside a
 release; and once the workflow is on the default branch, Actions -> Docker GUI -> Run workflow
 (give it a version) does it on demand. The name is the main image's name with a `-gui` suffix, derived from the repository
-the workflow runs in: `ghcr.io/fathom-x/rose-gui` from this development tree, and
-`ghcr.io/zecrocks/zecd-gui` from the public `zecrocks/zecd` tree it is released from. Use a
+the workflow runs in: `ghcr.io/fathom-x/rose-gui` from this tree. Use a
 version tag, not a moving `latest` (none is published). Point `$GUI_IMAGE` at whichever applies
 and the commands below run unchanged:
 
 ```bash
-GUI_IMAGE=ghcr.io/zecrocks/zecd-gui:<version>    # or ...rose-gui:<version> from this tree
+GUI_IMAGE=ghcr.io/fathom-x/rose-gui:<version>
 docker pull "$GUI_IMAGE"
 ```
 

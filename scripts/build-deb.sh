@@ -45,7 +45,7 @@ install -D -m 0644 "$REPO_ROOT/THIRD-PARTY-LICENSES.txt" "$STAGE/usr/share/doc/r
 install -D -m 0644 /dev/stdin "$STAGE/lib/systemd/system/rose.service" <<'UNIT'
 [Unit]
 Description=rose - Bitcoin-Core-style JSON-RPC server for shielded-first Zcash
-Documentation=https://github.com/zecrocks/zecd
+Documentation=https://github.com/fathom-x/rose
 After=network-online.target
 Wants=network-online.target
 
@@ -73,13 +73,13 @@ UNIT
 install -D -m 0644 /dev/stdin "$STAGE/usr/share/doc/rose/copyright" <<'COPYRIGHT'
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: rose
-Source: https://github.com/zecrocks/zecd
+Source: https://github.com/fathom-x/rose
 
 Files: *
 Copyright: The rose authors
 License: MIT or Apache-2.0
  rose is dual-licensed under the MIT and Apache-2.0 licenses. The full texts are
- distributed with the source at https://github.com/zecrocks/zecd
+ distributed with the source at https://github.com/fathom-x/rose
  (LICENSE-MIT and LICENSE-APACHE). The licenses of the third-party crates compiled
  into the statically linked binary are reproduced in
  /usr/share/doc/rose/THIRD-PARTY-LICENSES.txt.
@@ -90,7 +90,7 @@ CHANGELOG_TMP="$(mktemp)"
 cat > "$CHANGELOG_TMP" <<CHANGELOG
 rose (${VERSION}) unstable; urgency=medium
 
-  * Release ${VERSION}. See https://github.com/zecrocks/zecd/releases for notes.
+  * Release ${VERSION}. See https://github.com/fathom-x/rose/releases for notes.
 
  -- rose <noreply@users.noreply.github.com>  Thu, 01 Jan 1970 00:00:00 +0000
 CHANGELOG
@@ -108,7 +108,7 @@ Maintainer: rose <noreply@users.noreply.github.com>
 Installed-Size: ${INSTALLED_SIZE}
 Section: net
 Priority: optional
-Homepage: https://github.com/zecrocks/zecd
+Homepage: https://github.com/fathom-x/rose
 Description: Bitcoin-Core-style JSON-RPC server for shielded and transparent Zcash
  rose speaks bitcoind's JSON-RPC dialect (method names, response shapes, error
  codes, HTTP auth) and maps it onto shielded Zcash operations (Ironwood, Orchard

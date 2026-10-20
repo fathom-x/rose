@@ -115,7 +115,10 @@ env:
   # migrates an existing flat wallet directory into it on first start, so a funder datadir this
   # pin builds is in the new layout; the chain-snapshot cache key below already includes this
   # image, so bumping the pin rebuilds the archive rather than restoring one the funder would
-  # have to migrate. Resolve a new digest with:
+  # have to migrate. The current pin is a pre-rename `zecd` release under the retired
+  # `zecrocks/zecd` registry path; releases of the public tree land at `ghcr.io/fathom-x/rose`,
+  # so substitute that path (and drop the harness's pre-rename funder shims, see
+  # regtest-harness/src/lib.rs `funder_command`) when moving the pin. Resolve a new digest with:
   #   TOKEN=$(curl -sL "https://ghcr.io/token?scope=repository:zecrocks/zecd:pull&service=ghcr.io" | jq -r .token)
   #   curl -sI -H "Authorization: Bearer $TOKEN" \
   #     -H "Accept: application/vnd.oci.image.index.v1+json" \

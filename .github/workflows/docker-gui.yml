@@ -22,9 +22,8 @@ name: Docker GUI
 #
 # The image name is `${{ github.repository }}-gui` - the main rose image's name
 # (ghcr.io/${{ github.repository }}) plus a `-gui` suffix - so it lands under whichever repo the
-# workflow runs in: ghcr.io/fathom-x/rose-gui here, ghcr.io/zecrocks/zecd-gui on the
-# public release tree. One buildx job produces a multi-arch (amd64+arm64) image; emulation costs
-# nothing but a file copy since there is nothing to compile.
+# workflow runs in: ghcr.io/fathom-x/rose-gui here. One buildx job produces a multi-arch
+# (amd64+arm64) image; emulation costs nothing but a file copy since there is nothing to compile.
 
 on:
   push:

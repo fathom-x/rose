@@ -4,11 +4,16 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-# No advisory exceptions are currently needed. The last one, RUSTSEC-2026-0173
-# (proc-macro-error2 unmaintained), went away when `age` 0.12 moved to
-# i18n-embed-fl 0.10 - which depends on the maintained proc-macro-error3 fork -
-# and getset 0.1.7 (orchard's build-time dependency) dropped it too.
-ignore = []
+# RUSTSEC-2026-0374: `basic-toml` is unmaintained (its repository was archived in
+# 2025-03; informational, no vulnerability). It reaches the tree only through `age` ->
+# `i18n-embed-fl` -> `i18n-config`, where it parses the i18n configuration of age's own
+# localized messages at compile time (the `fl!` proc macro), so no untrusted input ever
+# meets it. Every crate on that chain is at its newest release and i18n-config 0.4.8 still
+# requires it, so there is nothing to upgrade to; drop the exception when i18n-config moves
+# to `toml`. (The previous exception, RUSTSEC-2026-0173 - proc-macro-error2 unmaintained -
+# went away when `age` 0.12 moved to i18n-embed-fl 0.10, which depends on the maintained
+# proc-macro-error3 fork, and getset 0.1.7, orchard's build-time dependency, dropped it too.)
+ignore = [{ id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained: compile-time i18n config parser behind age, no upgrade exists yet" }]
 
 [licenses]
 version = 2

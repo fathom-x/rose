@@ -1013,6 +1013,8 @@ pub fn spawn(
         lookahead,
         initial_scan,
         unconfirmed_since: HashMap::new(),
+        read_view: std::cell::OnceCell::new(),
+        descriptors: std::cell::RefCell::new(HashMap::new()),
         fee_samples: Default::default(),
         sync_interval,
         status_tx,
@@ -1164,6 +1166,14 @@ struct BtcActor {
     /// Kyoto only: the wallet tip at which each once-confirmed received transaction was
     /// first seen unconfirmed again - a reorg unwound it - for [`BtcActor::expire_reorged_receives`].
     unconfirmed_since: HashMap<Txid, u32>,
+    /// The read path's cache, see [`ReadView`]: built on the first read after a change,
+    /// emptied by [`BtcActor::wallet_changed`].
+    read_view: std::cell::OnceCell<ReadView>,
+    /// `listunspent.desc` per key, memoized for the actor's life: a descriptor at an index
+    /// never changes, and deriving one is a secp derivation plus a miniscript parse -
+    /// the per-output cost that remained on `listunspent` once the view existed (150 us
+    /// an output, 1.5 s per call at 10,000). Bounded by the indexes ever listed.
+    descriptors: std::cell::RefCell<HashMap<(KeychainKind, u32), Option<String>>>,
     /// Kyoto only: the peer fee tier's block samples (`crate::btc::fee_samples`), kept
     /// across reconnects; each connection's sampler and estimate refresh them against its
     /// own header chain.
@@ -1206,6 +1216,90 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// What the read path answers from between two changes to the wallet: everything that
+/// takes a canonicalization of the transaction graph, taken once.
+///
+/// BDK's canonicalization (`list_canonical_txs`, behind `Wallet::transactions`,
+/// `list_unspent` and `get_tx`) asks the local chain whether each anchored transaction's
+/// block is in it, and `CheckPoint::get` walks the checkpoint chain from the tip, so one
+/// pass costs transactions times checkpoints: 70 ms at 2,000 receives in 2,000 blocks,
+/// seconds at 10,000, and the wallet's chain is dense (every applied block is a
+/// checkpoint). `getbalance` took two or three such passes per call and `listunspent` one
+/// per output on top (`get_tx` for the coinbase flag) - 157 s at 10,000 outputs on the
+/// enclave's two hyperthreads, on the actor, holding the sync loop and every send. This
+/// view is built lazily on the first read after a change
+/// ([`BtcActor::read_view`]) and dropped at every site that changes the wallet
+/// ([`BtcActor::wallet_changed`]), so a wallet that receives a block every ten minutes
+/// pays the pass once per block however often it is polled, and a send prices its inputs
+/// from the same view.
+struct ReadView {
+    /// The canonical, relevant transactions, counted (`getwalletinfo.txcount`).
+    tx_count: usize,
+    /// The transactions the wallet funded - Core's trust rule for an unconfirmed output
+    /// (trusted iff created by the wallet's own transaction: change, a self-payment),
+    /// never by a foreign sender's unconfirmed payment. Behind both `getbalance`'s
+    /// `trusted_pending` and `listunspent`'s `safe`, so the two cannot disagree.
+    funded: HashSet<Txid>,
+    /// The unspent outputs, exactly as `Wallet::list_unspent` lists them (the differential
+    /// test `read_view_matches_bdk` pins that): a recorded wallet output of a canonical
+    /// transaction that no canonical transaction spends, in the index's order.
+    unspent: Vec<bdk_wallet::LocalOutput>,
+}
+
+/// One pass over the canonical transactions, see [`ReadView`].
+///
+/// The unspent set is computed the way `TxGraph::filter_chain_unspents` computes it: over
+/// the index's *recorded* outpoints (`KeychainTxOutIndex::outpoints`, what was indexed when
+/// each transaction was inserted), kept when their transaction is canonical and no
+/// canonical transaction spends them. Not over the canonical transactions' outputs matched
+/// against the index as it now stands: an output whose address was revealed only after its
+/// transaction was inserted is in the second set and not the first, and BDK's coin
+/// selection works from the first, so a balance that counted it would be one a send could
+/// not spend.
+fn build_read_view(wallet: &Wallet) -> ReadView {
+    let mut tx_count = 0;
+    let mut funded = HashSet::new();
+    let mut spent = HashSet::new();
+    let mut canonical = HashMap::new();
+    for wtx in wallet.transactions() {
+        tx_count += 1;
+        let txid = wtx.tx_node.txid;
+        let tx = &wtx.tx_node.tx;
+        if wallet.sent_and_received(tx).0 > Amount::ZERO {
+            funded.insert(txid);
+        }
+        // A spend of a wallet output is relevant, so the relevant set holds every
+        // canonical spend (BDK's filter walks all canonical transactions for the same).
+        if !tx.is_coinbase() {
+            spent.extend(tx.input.iter().map(|input| input.previous_output));
+        }
+        canonical.insert(txid, (Arc::clone(tx), wtx.chain_position));
+    }
+    let unspent = wallet
+        .spk_index()
+        .outpoints()
+        .iter()
+        .filter(|(_, outpoint)| !spent.contains(outpoint))
+        .filter_map(|((keychain, derivation_index), outpoint)| {
+            let (tx, chain_position) = canonical.get(&outpoint.txid)?;
+            let txout = tx.output.get(outpoint.vout as usize)?.clone();
+            Some(bdk_wallet::LocalOutput {
+                outpoint: *outpoint,
+                txout,
+                keychain: *keychain,
+                is_spent: false,
+                derivation_index: *derivation_index,
+                chain_position: *chain_position,
+            })
+        })
+        .collect();
+    ReadView {
+        tx_count,
+        funded,
+        unspent,
+    }
 }
 
 /// Confirmations of a transaction anchored at `height` against the wallet's own tip
@@ -1621,6 +1715,8 @@ impl BtcActor {
                             );
                             let sightings = self.drop_superseded_sightings(event.update);
                             self.wallet.apply_unconfirmed_txs(sightings);
+                            // `wallet_changed` by field: the connection is borrowed.
+                            self.read_view.take();
                             // The emitter diffs the node's whole mempool, so nearly every
                             // departure it reports is a foreign transaction the wallet never
                             // held. Retiring those wrote one tombstone row apiece (244
@@ -1673,11 +1769,14 @@ impl BtcActor {
                         match pull.next_block() {
                             Ok(Some(event)) => {
                                 let height = event.block_height();
-                                if let Err(e) = self.wallet.apply_block_connected_to(
+                                let applied_block = self.wallet.apply_block_connected_to(
                                     &event.block,
                                     height,
                                     event.connected_to(),
-                                ) {
+                                );
+                                // `wallet_changed` by field: the connection is borrowed.
+                                self.read_view.take();
+                                if let Err(e) = applied_block {
                                     return BlockPull::Failed(anyhow::anyhow!(
                                         "apply block {height}: {e}"
                                     ));
@@ -1748,6 +1847,8 @@ impl BtcActor {
                         .apply_update(update)
                         .map_err(|e| anyhow::anyhow!("apply kyoto update: {e}"))
                         .map(|()| 1usize);
+                    // `wallet_changed` by field: the connection is borrowed.
+                    self.read_view.take();
                     if applied.is_ok() {
                         kyoto_delivered = true;
                         // Did the update's reveals walk the wallet's attributable window
@@ -2225,6 +2326,7 @@ impl BtcActor {
             status.matched += matched.len() as u64;
         }
         self.wallet.apply_unconfirmed_txs(matched);
+        self.wallet_changed();
         self.persist("mempool feed");
         self.feed_held.retain(|txid| {
             self.wallet
@@ -2352,6 +2454,7 @@ impl BtcActor {
             self.feed_pending_evictions.remove(txid);
         }
         self.wallet.apply_evicted_txs(evicted.iter().copied());
+        self.wallet_changed();
         // The tombstones and the eviction they accompany land in ONE SQLite transaction. Written
         // separately, a tombstone that outlived a failed eviction write reloaded the transaction
         // with its anchors stripped but no `last_evicted` - canonical and unconfirmed, wrong on
@@ -2428,6 +2531,7 @@ impl BtcActor {
         match PersistedWallet::load(&mut self.persister, load) {
             Ok(Some(wallet)) => {
                 self.wallet = wallet;
+                self.wallet_changed();
                 info!(
                     height = self.wallet.latest_checkpoint().height(),
                     "reloaded the wallet ({why}); the retired transactions are gone"
@@ -2800,22 +2904,41 @@ impl BtcActor {
         }
     }
 
+    /// Whether `txid` is a coinbase transaction: a graph lookup, not `Wallet::get_tx`,
+    /// which canonicalizes the whole graph to find one transaction (every caller here
+    /// already holds a canonical output of it).
     fn is_coinbase(&self, txid: Txid) -> bool {
         self.wallet
+            .tx_graph()
             .get_tx(txid)
-            .is_some_and(|wtx| wtx.tx_node.tx.is_coinbase())
+            .is_some_and(|tx| tx.is_coinbase())
     }
 
-    /// The transactions the wallet funded - Core's trust rule for an unconfirmed output
-    /// (trusted iff created by the wallet's own transaction: change, a self-payment),
-    /// never by a foreign sender's unconfirmed payment. Behind both `getbalance`'s
-    /// `trusted_pending` and `listunspent`'s `safe`, so the two cannot disagree.
-    fn funded_txids(&self) -> HashSet<Txid> {
-        self.wallet
-            .transactions()
-            .filter(|wtx| self.wallet.sent_and_received(&wtx.tx_node.tx).0 > Amount::ZERO)
-            .map(|wtx| wtx.tx_node.txid)
-            .collect()
+    /// The read path's view of the wallet (see [`ReadView`]), built on first use since
+    /// the last change.
+    fn read_view(&self) -> &ReadView {
+        self.read_view.get_or_init(|| build_read_view(&self.wallet))
+    }
+
+    /// Forget the read view: the wallet changed. Called at every site that applies a
+    /// block, an update, a sighting or an eviction, or swaps the wallet; a reveal alone
+    /// changes nothing the view holds.
+    fn wallet_changed(&mut self) {
+        self.read_view.take();
+    }
+
+    /// See [`ReadView::funded`].
+    fn funded_txids(&self) -> &HashSet<Txid> {
+        &self.read_view().funded
+    }
+
+    /// [`inferred_descriptor`], memoized (see [`BtcActor::descriptors`]).
+    fn cached_descriptor(&self, keychain: KeychainKind, index: u32) -> Option<String> {
+        self.descriptors
+            .borrow_mut()
+            .entry((keychain, index))
+            .or_insert_with(|| inferred_descriptor(&self.wallet, keychain, index))
+            .clone()
     }
 
     /// Drop mempool sightings of transactions the wallet holds as *replaced by one of its own
@@ -2849,8 +2972,9 @@ impl BtcActor {
     /// coin selection: BDK's own rule would admit a reward one block before Core does, and
     /// `listunspent` already hides it for that block.
     fn immature_coinbase_outpoints(&self) -> Vec<OutPoint> {
-        self.wallet
-            .list_unspent()
+        self.read_view()
+            .unspent
+            .iter()
             .filter(|output| self.coinbase_immature(output))
             .map(|output| output.outpoint)
             .collect()
@@ -2859,14 +2983,15 @@ impl BtcActor {
     /// The wallet's unconfirmed transactions for ancestor-aware funding: fees, sizes,
     /// parents and Core's trust rule (see `crate::btc::ancestors`).
     fn ancestry(&self) -> Ancestry {
-        wallet_ancestry(&self.wallet, &self.funded_txids())
+        wallet_ancestry(&self.wallet, self.funded_txids())
     }
 
     /// Unconfirmed outputs a send may not select: those whose ancestry the wallet cannot
     /// price - a foreign sender's unconfirmed payment, first of all (Core's untrusted).
     fn unpriceable_unconfirmed(&self, ancestry: &Ancestry) -> Vec<OutPoint> {
-        self.wallet
-            .list_unspent()
+        self.read_view()
+            .unspent
+            .iter()
             .filter(|output| !output.chain_position.is_confirmed())
             .filter(|output| !ancestry.is_spendable(&output.outpoint.txid))
             .map(|output| output.outpoint)
@@ -2938,20 +3063,20 @@ impl BtcActor {
                 // `listunspent.safe` says. BDK's own `balance()` trusts the internal
                 // keychain instead, so an unconfirmed self-payment to an external address
                 // read `safe: true` in one and `untrusted_pending` in the other.
-                let own = self.funded_txids();
+                let view = self.read_view();
                 let mut balance = BtcBalance::default();
-                for output in self.wallet.list_unspent() {
+                for output in &view.unspent {
                     let value = output.txout.value.to_sat();
                     let bucket = match &output.chain_position {
                         bdk_wallet::chain::ChainPosition::Confirmed { .. } => {
-                            if self.coinbase_immature(&output) {
+                            if self.coinbase_immature(output) {
                                 &mut balance.immature
                             } else {
                                 &mut balance.confirmed
                             }
                         }
                         bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => {
-                            if own.contains(&output.outpoint.txid) {
+                            if view.funded.contains(&output.outpoint.txid) {
                                 &mut balance.trusted_pending
                             } else {
                                 &mut balance.untrusted_pending
@@ -2965,10 +3090,10 @@ impl BtcActor {
             BtcCommand::ListUnspent { reply } => {
                 let network = self.wallet.network();
                 let tip = self.tip_height();
-                let own_txids = self.funded_txids();
-                let utxos = self
-                    .wallet
-                    .list_unspent()
+                let view = self.read_view();
+                let utxos = view
+                    .unspent
+                    .iter()
                     .map(|output| {
                         let confirmations = match &output.chain_position {
                             bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => {
@@ -2976,13 +3101,9 @@ impl BtcActor {
                             }
                             bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => 0,
                         };
-                        let immature = self.coinbase_immature(&output);
+                        let immature = self.coinbase_immature(output);
                         let coinbase = self.is_coinbase(output.outpoint.txid);
-                        let desc = inferred_descriptor(
-                            &self.wallet,
-                            output.keychain,
-                            output.derivation_index,
-                        );
+                        let desc = self.cached_descriptor(output.keychain, output.derivation_index);
                         BtcUtxo {
                             txid: output.outpoint.txid.to_string(),
                             vout: output.outpoint.vout,
@@ -2995,7 +3116,8 @@ impl BtcActor {
                             .map(|a| a.to_string()),
                             change: output.keychain == KeychainKind::Internal,
                             confirmations,
-                            trusted: confirmations > 0 || own_txids.contains(&output.outpoint.txid),
+                            trusted: confirmations > 0
+                                || view.funded.contains(&output.outpoint.txid),
                             coinbase,
                             immature,
                             script_pubkey: output.txout.script_pubkey.to_hex_string(),
@@ -3078,7 +3200,7 @@ impl BtcActor {
                 let _ = reply.send(result);
             }
             BtcCommand::TxCount { reply } => {
-                let _ = reply.send(Ok(self.wallet.transactions().count()));
+                let _ = reply.send(Ok(self.read_view().tx_count));
             }
             BtcCommand::GetTransaction { txid, reply } => {
                 let result = match Txid::from_str(&txid) {
@@ -3441,11 +3563,13 @@ impl BtcActor {
         .max(not_before);
         self.wallet
             .apply_unconfirmed_txs(vec![(Arc::clone(tx), seen_at)]);
+        self.wallet_changed();
         if self.wallet.get_tx(txid).is_none() {
             return Ok(Commit::NotOurs);
         }
         if let Err(e) = self.wallet.persist(&mut self.persister) {
             self.wallet.apply_evicted_txs([(txid, seen_at)]);
+            self.wallet_changed();
             error!(
                 %txid,
                 "failed to persist the wallet before relaying the {what}; nothing was \
@@ -4785,6 +4909,255 @@ mod tests {
             reconnect_base: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
             shutdown: tokio::sync::watch::channel(false).1,
+        }
+    }
+
+    /// The read view is BDK's own answer, taken once: the unspent set equals
+    /// `Wallet::list_unspent` (same outputs, same order) over confirmed and unconfirmed
+    /// receives, a confirmed and an unconfirmed spend with change, and a coinbase; the
+    /// funded set is the trust rule computed the long way; the count is `transactions()`.
+    #[test]
+    fn read_view_matches_bdk() {
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        use bdk_wallet::bitcoin::{absolute, transaction, BlockHash, TxIn, TxOut};
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime, TxUpdate};
+        let keys = AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Regtest).unwrap();
+        let mut wallet = Wallet::create(
+            keys.descriptor(KeychainKind::External),
+            keys.descriptor(KeychainKind::Internal),
+        )
+        .network(keys.network)
+        .lookahead(DEFAULT_LOOKAHEAD)
+        .create_wallet_no_persist()
+        .unwrap();
+        let hash = |i: u32| {
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&i.to_le_bytes());
+            b[31] = 2;
+            BlockHash::from_byte_array(b)
+        };
+        let foreign =
+            |i: u32| OutPoint::new(Txid::from_byte_array(hash(1000 + i).to_byte_array()), 0);
+        let pay = |inputs: Vec<OutPoint>, outputs: Vec<TxOut>| Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: inputs
+                .into_iter()
+                .map(|previous_output| TxIn {
+                    previous_output,
+                    ..Default::default()
+                })
+                .collect(),
+            output: outputs,
+        };
+        let out = |value: u64, spk: bdk_wallet::bitcoin::ScriptBuf| TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: spk,
+        };
+        let ext = |w: &Wallet, i: u32| w.peek_address(KeychainKind::External, i).script_pubkey();
+        let int = |w: &Wallet, i: u32| w.peek_address(KeychainKind::Internal, i).script_pubkey();
+        let foreign_spk = bdk_wallet::bitcoin::ScriptBuf::new_op_return([7u8; 4]);
+
+        // Blocks 1..=3: a coinbase to index 0, receives at 1 and 2 (two outputs, one tx),
+        // then a spend of index 1's output with change to internal 0.
+        let coinbase = Transaction {
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                ..Default::default()
+            }],
+            ..pay(vec![], vec![out(50_000, ext(&wallet, 0))])
+        };
+        let receive = pay(
+            vec![foreign(1)],
+            vec![out(10_000, ext(&wallet, 1)), out(20_000, ext(&wallet, 2))],
+        );
+        let receive_txid = receive.compute_txid();
+        let spend = pay(
+            vec![OutPoint::new(receive_txid, 0)],
+            vec![out(4_000, foreign_spk.clone()), out(5_000, int(&wallet, 0))],
+        );
+        let mut chain = wallet.latest_checkpoint();
+        let mut tx_update = TxUpdate::default();
+        for (height, tx) in [(1u32, &coinbase), (2, &receive), (3, &spend)] {
+            let block = BlockId {
+                height,
+                hash: hash(height),
+            };
+            chain = chain.insert(block);
+            tx_update.txs.push(Arc::new(tx.clone()));
+            tx_update.anchors.insert((
+                ConfirmationBlockTime {
+                    block_id: block,
+                    confirmation_time: 0,
+                },
+                tx.compute_txid(),
+            ));
+        }
+        wallet
+            .apply_update(bdk_wallet::Update {
+                chain: Some(chain),
+                tx_update,
+                last_active_indices: Default::default(),
+            })
+            .unwrap();
+        // Unconfirmed: a foreign receive at index 3, and the wallet's own spend of index
+        // 2's output with change to internal 1 (funded, so trusted).
+        let pending_receive = pay(vec![foreign(2)], vec![out(30_000, ext(&wallet, 3))]);
+        let pending_spend = pay(
+            vec![OutPoint::new(receive_txid, 1)],
+            vec![out(1_000, foreign_spk), out(18_000, int(&wallet, 1))],
+        );
+        let pending_spend_txid = pending_spend.compute_txid();
+        wallet.apply_unconfirmed_txs([
+            (Arc::new(pending_receive), 100u64),
+            (Arc::new(pending_spend), 101u64),
+        ]);
+
+        let view = build_read_view(&wallet);
+        let bdk: Vec<bdk_wallet::LocalOutput> = wallet.list_unspent().collect();
+        assert_eq!(view.unspent, bdk);
+        // Coinbase (ext 0), ext 3 pending, int 0 confirmed change, int 1 pending change.
+        assert_eq!(bdk.len(), 4, "{bdk:#?}");
+        let funded_the_long_way: HashSet<Txid> = wallet
+            .transactions()
+            .filter(|wtx| wallet.sent_and_received(&wtx.tx_node.tx).0 > Amount::ZERO)
+            .map(|wtx| wtx.tx_node.txid)
+            .collect();
+        assert_eq!(view.funded, funded_the_long_way);
+        assert_eq!(
+            view.funded,
+            HashSet::from([spend.compute_txid(), pending_spend_txid])
+        );
+        assert_eq!(view.tx_count, wallet.transactions().count());
+        assert_eq!(view.tx_count, 5);
+        // The graph lookup agrees with the canonical transaction's own flag.
+        assert!(wallet
+            .tx_graph()
+            .get_tx(coinbase.compute_txid())
+            .unwrap()
+            .is_coinbase());
+        assert!(!wallet
+            .tx_graph()
+            .get_tx(receive_txid)
+            .unwrap()
+            .is_coinbase());
+    }
+
+    /// Micro-benchmark for the read path's growth with the UTXO set, on the
+    /// real handlers through the handle: a wallet paid once per block at `N` consecutive
+    /// addresses (`ZECD_MICRO_UTXOS`, default 2000), the deposit shape the capacity
+    /// benchmark builds, without a node. Ignored: it prints timings and asserts nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "timing only; run with --include-ignored --nocapture"]
+    async fn read_path_timings_at_scale() {
+        use bdk_wallet::bitcoin::hashes::Hash as _;
+        use bdk_wallet::bitcoin::{absolute, transaction, Amount, BlockHash, TxIn, TxOut};
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime, TxUpdate};
+        use std::time::Instant;
+        let n: u32 = std::env::var("ZECD_MICRO_UTXOS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+        let dir = tempfile::tempdir().unwrap();
+        let config = offline_config(dir.path(), Some(bip84_seed()));
+        let keys = AccountKeys::from_seed(&bip84_seed(), config.network).unwrap();
+        let mut persister = Persister::open(&config.engine_dir).unwrap();
+        let mut wallet = PersistedWallet::create(
+            &mut persister,
+            Wallet::create(
+                keys.descriptor(KeychainKind::External),
+                keys.descriptor(KeychainKind::Internal),
+            )
+            .network(keys.network)
+            .lookahead(DEFAULT_LOOKAHEAD),
+        )
+        .unwrap();
+        let hash = |i: u32| {
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&i.to_le_bytes());
+            b[31] = 1;
+            BlockHash::from_byte_array(b)
+        };
+        let mut chain = wallet.latest_checkpoint();
+        let mut tx_update = TxUpdate::default();
+        let built = Instant::now();
+        for i in 0..n {
+            let height = i + 1;
+            let block = BlockId {
+                height,
+                hash: hash(height),
+            };
+            chain = chain.insert(block);
+            let tx = Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(
+                        bdk_wallet::bitcoin::Txid::from_byte_array(hash(i).to_byte_array()),
+                        0,
+                    ),
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: wallet
+                        .peek_address(KeychainKind::External, i)
+                        .script_pubkey(),
+                }],
+            };
+            let txid = tx.compute_txid();
+            tx_update.txs.push(Arc::new(tx));
+            tx_update.anchors.insert((
+                ConfirmationBlockTime {
+                    block_id: block,
+                    confirmation_time: 0,
+                },
+                txid,
+            ));
+        }
+        wallet
+            .apply_update(bdk_wallet::Update {
+                chain: Some(chain),
+                tx_update,
+                last_active_indices: std::collections::BTreeMap::from([(
+                    KeychainKind::External,
+                    n - 1,
+                )]),
+            })
+            .unwrap();
+        wallet.persist(&mut persister).unwrap();
+        eprintln!("built {n} receives in {n} blocks: {:?}", built.elapsed());
+
+        let t = Instant::now();
+        let canonical = wallet.transactions().count();
+        eprintln!("transactions(): {canonical} in {:?}", t.elapsed());
+        let t = Instant::now();
+        let unspent = wallet.list_unspent().count();
+        eprintln!("list_unspent(): {unspent} in {:?}", t.elapsed());
+        let some = wallet.list_unspent().next().unwrap().outpoint.txid;
+        let t = Instant::now();
+        let _ = wallet.get_tx(some);
+        eprintln!("get_tx(one): {:?}", t.elapsed());
+        drop(wallet);
+        drop(persister);
+
+        let (handle, _task) = spawn(config).unwrap();
+        for (what, calls) in [("getbalance", 3), ("listunspent", 3)] {
+            let mut times = Vec::new();
+            for _ in 0..calls {
+                let t = Instant::now();
+                match what {
+                    "getbalance" => {
+                        handle.balance().await.unwrap();
+                    }
+                    _ => {
+                        assert_eq!(handle.list_unspent().await.unwrap().len(), n as usize);
+                    }
+                }
+                times.push(t.elapsed());
+            }
+            times.sort();
+            eprintln!("{what} x{calls}: median {:?}", times[calls / 2]);
         }
     }
 

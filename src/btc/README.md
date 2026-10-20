@@ -300,6 +300,37 @@ transaction it names (`Wallet::get_tx`) and is the only reader that serializes h
 `getwalletinfo.txcount` counts without building. `received_by_address` still walks every
 transaction once per call, bounded by the revealed address set.
 
+## The read path: one canonicalization per change
+
+Every BDK read that needs to know which transactions are canonical (`Wallet::transactions`,
+`list_unspent`, `get_tx`) canonicalizes the whole graph, and that pass asks the local chain
+whether each anchored transaction's block is in it through `CheckPoint::get`, a walk of the
+checkpoint chain from the tip. The wallet's chain is dense (every applied block is a
+checkpoint), so one pass costs transactions times checkpoints: 70 ms at 2,000 receives in
+2,000 blocks, 1.9 s at 10,000, on a fast core. `getbalance` used to take two or three such
+passes per call and `listunspent` one per output on top (`Wallet::get_tx` for the coinbase
+flag): 6.7 s and 157 s at 10,000 outputs on the enclave's two hyperthreads, on the actor,
+holding the sync loop and every send for the duration. No upstream relief:
+`bdk_core` 0.6.4 still walks.
+
+So the actor keeps a `ReadView` - the canonical relevant transactions counted, the funded
+set (Core's trust rule), and the unspent outputs exactly as `list_unspent` lists them
+(`read_view_matches_bdk` pins that against BDK over confirmed and unconfirmed receives,
+spends with change and a coinbase) - built on the first read after a change by one pass
+over `transactions()` and dropped at every site that applies a block, an update, a sighting
+or an eviction, or swaps the wallet (`wallet_changed`; a reveal changes nothing the view
+holds). `getbalance`, `listunspent`, `getwalletinfo.txcount` and a send's input pricing
+(`immature_coinbase_outpoints`, `ancestry`, `unpriceable_unconfirmed`) read it, so a wallet
+that receives a block every ten minutes pays the pass once per block however often it is
+polled. The coinbase flag is a graph lookup (`is_coinbase`), never `get_tx`. What remained
+per output on `listunspent` was Core's inferred `desc`, a secp derivation plus a miniscript
+parse (150 us each); a descriptor at an index never changes, so it is memoized for the
+actor's life. Measured on the ignored `read_path_timings_at_scale` at 10,000 outputs:
+`getbalance` 0.4 ms once the view exists (one pass after each change), `listunspent` 1.5 s
+the first time and formatting cost after. **Any new code that changes the wallet must call
+`wallet_changed()`**, or the next read answers from before the change; the regtest tier's
+balance assertions after every block and send are the net under that rule.
+
 ## Chain and fee reads, and the rest of Core's shapes
 
 A Bitcoin wallet answers the chain and fee reads a Core client polls, from the wallet's own

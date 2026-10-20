@@ -43,9 +43,9 @@ pub fn default_server(_network: ZNetwork) -> &'static str {
 
 /// The default directory for wallet `name`: `<datadir>/<name>`.
 ///
-/// A wallet directory holds `keys.toml` - the one file in it that is zecd's own, and the only
+/// A wallet directory holds `keys.toml` - the one file in it that is rose's own, and the only
 /// one a from-seed restore cannot rebuild - plus one subdirectory per coin ([`coin_dir`]).
-/// The data directory itself holds only daemon-level files (`zecd.toml`, `.lock`, `.cookie`,
+/// The data directory itself holds only daemon-level files (`rose.toml`, `.lock`, `.cookie`,
 /// `identity.txt`).
 ///
 /// A `[wallets.<name>] dir` override replaces this outright; everything below is still laid
@@ -71,7 +71,7 @@ pub fn coin_dir(parent: &Path, coin: Coin) -> PathBuf {
 /// The fleet is the outer unit and the coin sits inside it, mirroring
 /// `<datadir>/<wallet>/<coin>/` - so a datadir's top level is a list of *units* (wallets, plus
 /// the fleet) rather than a mix of units and currencies. That ordering also keeps the reserved
-/// names down to one: `wallet_dir` is `datadir.join(name)`, so anything zecd puts at the datadir
+/// names down to one: `wallet_dir` is `datadir.join(name)`, so anything rose puts at the datadir
 /// root is a name a `[wallets.<name>]` entry could claim. One reserved `fleet` is checkable
 /// ([`fleet_path_conflict`]); a reserved name per coin token would mean a wallet called `zec`
 /// silently sharing a directory with the fleet.
@@ -95,7 +95,7 @@ pub fn fleet_coin_dir(datadir: &Path, coin: Coin) -> PathBuf {
 /// therefore gets a sibling manifest directory with its own wallets, not a share of this one.
 ///
 /// It is named under the fleet rather than beside it because `<datadir>/<wallet>/` directories
-/// are wallets too: at the datadir root, `wallets.d` would read as zecd's wallets in general
+/// are wallets too: at the datadir root, `wallets.d` would read as rose's wallets in general
 /// rather than the fleet's.
 ///
 /// A `[fleet] manifest_dir` override replaces this outright, exactly as `[wallets.<name>] dir`
@@ -123,7 +123,7 @@ pub fn fleet_dir(datadir: &Path, coin: Coin) -> PathBuf {
 ///
 /// The coin level is already above the shards directory ([`fleet_dir`]), so a shard directory
 /// takes only the engine level - which it takes for the same reason a wallet does: what
-/// librustzcash owns stays separable from zecd's own shard-index namespace, so replacing the
+/// librustzcash owns stays separable from rose's own shard-index namespace, so replacing the
 /// storage library is a sibling directory and a rescan.
 pub fn shard_engine_dir(shard_dir: &Path, coin: Coin) -> PathBuf {
     shard_dir.join(coin.engine_dir())
@@ -131,10 +131,10 @@ pub fn shard_engine_dir(shard_dir: &Path, coin: Coin) -> PathBuf {
 
 /// The first wallet whose directory overlaps one of the fleet's, with the two paths.
 ///
-/// `wallet_dir` is `datadir.join(name)`, so a wallet named after anything zecd puts at the
+/// `wallet_dir` is `datadir.join(name)`, so a wallet named after anything rose puts at the
 /// datadir root claims that path - a wallet called `fleet` resolves to [`fleet_root`] itself.
 /// Nothing would be *overwritten* (the fleet's files sit deeper), but one directory would hold
-/// two owners' state, `zecd rescan` on that wallet would delete through it, and a backup scoped
+/// two owners' state, `rose rescan` on that wallet would delete through it, and a backup scoped
 /// to the wallet would silently carry viewing keys. An explicit `[wallets.<name>] dir` or a
 /// `[fleet]` override can produce the same overlap from either side, so the test is containment
 /// in both directions rather than a reserved-name list.
@@ -155,7 +155,7 @@ pub fn fleet_path_conflict(
 
 /// Where the wallet-storage engine's own files live: `<wallet dir>/zec/lrz` for Zcash, holding
 /// everything librustzcash owns - `data.sqlite`, plus the `blockmeta.sqlite` and `blocks/` an
-/// older zecd's on-disk block cache left behind ([`Coin::engine_dir`]).
+/// older rose's on-disk block cache left behind ([`Coin::engine_dir`]).
 ///
 /// Nothing outside these functions and [`crate::migrate`] should join a coin or engine
 /// directory name onto a path: callers take a wallet directory from [`WalletEntry::dir`] and an
@@ -178,7 +178,7 @@ pub fn btc_kyoto_dir(wallet_dir: &Path) -> PathBuf {
 
 /// Binary configuration defaults (config file, datadir, ports).
 pub struct BinaryDefaults {
-    /// Config file name looked up inside the datadir (`zecd.toml`).
+    /// Config file name looked up inside the datadir (`rose.toml`).
     pub conf_file: &'static str,
     /// Default datadir when neither CLI nor env supplies one.
     pub datadir: &'static str,
@@ -191,10 +191,15 @@ pub struct BinaryDefaults {
     pub health_port: u16,
 }
 
-pub const ZECD_DEFAULTS: BinaryDefaults = BinaryDefaults {
-    conf_file: "zecd.toml",
-    datadir: "./zecd-data",
-    datadir_env: "ZECD_DATADIR",
+/// The config file name from before the `zecd` -> `rose` rename. A datadir that holds one and
+/// no [`BinaryDefaults::conf_file`] is refused rather than silently started on defaults: the
+/// operator renames the file (nothing inside it changed).
+pub const LEGACY_CONF_FILE: &str = "zecd.toml";
+
+pub const ROSE_DEFAULTS: BinaryDefaults = BinaryDefaults {
+    conf_file: "rose.toml",
+    datadir: "./rose-data",
+    datadir_env: "ROSE_DATADIR",
     rpc_port_main: 8232,
     rpc_port_test: 18232,
     health_port: 9233,
@@ -321,7 +326,7 @@ pub struct FleetConfig {
     pub dir: PathBuf,
     /// The coin this fleet's wallets are watched on.
     ///
-    /// Not a config key (nothing in `zecd.toml` selects it and `config show` renders nothing for
+    /// Not a config key (nothing in `rose.toml` selects it and `config show` renders nothing for
     /// it), exactly like [`WalletEntry::coin`]: it is carried so the shard directories can be
     /// laid out without the fleet code naming a currency itself.
     pub coin: Coin,
@@ -351,7 +356,7 @@ impl Default for FleetConfig {
 /// `[wallets.<name>]` entries can override either field; this is the global default.
 ///
 /// Both fields name receivers rather than value pools, so this list is shorter than the set of
-/// pools zecd reports funds in: ironwood has no receiver of its own (see `crate::pools`).
+/// pools rose reports funds in: ironwood has no receiver of its own (see `crate::pools`).
 #[cfg(feature = "zcash")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolsConfig {
@@ -366,7 +371,7 @@ pub struct PoolsConfig {
     pub default_receivers: ReceiverSet,
     /// Whether the wallet may hand out bare transparent (`t1...`/`tm...`) receiving addresses - via
     /// `getnewaddress "" "transparent"`, and (when `transparent_default`) as the no-argument
-    /// default. Off preserves zecd's shielded-only behaviour: `address_type = "transparent"` is
+    /// default. Off preserves rose's shielded-only behaviour: `address_type = "transparent"` is
     /// rejected `-8`. Received transparent UTXOs are spendable only by auto-shielding them into a
     /// shielded send.
     #[cfg(feature = "zcash")]
@@ -396,7 +401,7 @@ pub struct PoolsConfig {
     /// Whether `getnewaddress "" "transparent"` may keep issuing receiving addresses **past** the
     /// recovery window (`transparent_gap_limit` consecutive unfunded addresses, plus the
     /// `transparent_initial_scan` floor). librustzcash fails closed at the gap limit; with this set
-    /// (the default) zecd issues beyond it anyway, logging a loud warning that funds received at
+    /// (the default) rose issues beyond it anyway, logging a loud warning that funds received at
     /// such an address may be unrecoverable from seed. Set `false` to instead fail the call with an
     /// actionable error. Only meaningful when `transparent_enabled`.
     #[cfg(feature = "zcash")]
@@ -427,7 +432,7 @@ pub const DEFAULT_TRANSPARENT_GAP_LIMIT: u32 = 20;
 /// 71000-wide window costs about a minute per received UTXO (quadratically more for multi-output
 /// transactions), all on the single-writer actor inside the sync batch - in the field this
 /// presented as a restore "stalled" >100x, one core pegged, with the block scan frozen for hours
-/// (zecd 0.5.1-rc2 report, 2026-07-30). Deep restore coverage belongs to
+/// (rose 0.5.1-rc2 report, 2026-07-30). Deep restore coverage belongs to
 /// `transparent_initial_scan` (a one-time pre-exposure, not a per-receive cost); the gap limit
 /// only needs to cover outstanding unfunded handed-out addresses. Above 10 000 the worst-case
 /// per-receive cost passes ~10s, far beyond any sane outstanding-handout count - but the value
@@ -451,7 +456,7 @@ pub const DEFAULT_TRANSPARENT_GAP_WARN_THRESHOLD: u32 = 5;
 #[cfg(feature = "zcash")]
 impl Default for PoolsConfig {
     fn default() -> Self {
-        // Preserves zecd's historical behaviour: Orchard-only receiving, no transparent.
+        // Preserves rose's historical behaviour: Orchard-only receiving, no transparent.
         Self {
             enabled: ReceiverSet::single(Receiver::Orchard),
             default_receivers: ReceiverSet::single(Receiver::Orchard),
@@ -488,7 +493,7 @@ pub enum ReadinessMode {
     Scanned,
     /// Ready as soon as the backend is connected and its chain tip is past the wallet's birthday
     /// (a cheap sanity check that we're talking to the right, live network). Does NOT wait for
-    /// the wallet to finish scanning, so RPC clients can reach zecd while it catches up - at the
+    /// the wallet to finish scanning, so RPC clients can reach rose while it catches up - at the
     /// cost of reads possibly lagging the tip. Avoids readiness flapping during long scans. Opt in
     /// (`readiness = "connected"`) only when reachability matters more than balance freshness.
     Connected,
@@ -547,7 +552,7 @@ pub struct WalletEntry {
     pub dir: PathBuf,
     /// Where this wallet's `keys.toml` lives. `None` means the default location,
     /// `<dir>/keys.toml`; an explicit path (per-wallet `keys_file`, or the global
-    /// `[keys] keys_file` / `ZECD_KEYS_FILE` for the default wallet) lets the encrypted seed
+    /// `[keys] keys_file` / `ROSE_KEYS_FILE` for the default wallet) lets the encrypted seed
     /// be mounted as a Kubernetes Secret separately from the (disposable) data directory.
     pub keys_file: Option<PathBuf>,
     /// The coin this wallet serves.
@@ -760,7 +765,7 @@ pub struct BackendConfig {
     /// Treat private / non-globally-routable ranges (RFC1918, link-local, CGNAT, IPv6 unique-local
     /// and link-local) as "local" for the cleartext-credential gate, so a credentialed connect to
     /// a container/LAN zebra is allowed without an override. Default `true` (the self-hosted
-    /// `zebra -> zecd` Docker/LAN norm); set `false` for a strict loopback-only posture.
+    /// `zebra -> rose` Docker/LAN norm); set `false` for a strict loopback-only posture.
     pub rfc1918_is_local: bool,
     /// Escape hatch for the cleartext-credential gate: allow the (plaintext) zebra connection to
     /// carry RPC credentials to *any* host, including globally-routable ones. Off by default; the
@@ -787,7 +792,7 @@ pub struct BackendConfig {
     /// normally - hostname and expiry included.
     pub tls_ca_pem: Option<Vec<u8>>,
     /// Where [`tls_ca_pem`](Self::tls_ca_pem) was read from. Kept alongside the bytes purely so
-    /// the setting can be *reported* by its key (`zecd config show` renders the effective
+    /// the setting can be *reported* by its key (`rose config show` renders the effective
     /// configuration in its own TOML syntax, and a PEM blob is not a value that can be written
     /// back as `tls_ca_file`). Nothing on the connect path reads it.
     pub tls_ca_file: Option<PathBuf>,
@@ -812,7 +817,7 @@ pub struct BackendConfig {
     ///
     /// Daemon policy, not a per-endpoint setting: it covers both upstream kinds - the zebrad
     /// JSON-RPC client and the lightwalletd gRPC channel - so a configured proxy carries *all*
-    /// of zecd's network traffic. The destination is resolved by the proxy rather than locally
+    /// of rose's network traffic. The destination is resolved by the proxy rather than locally
     /// (so `.onion` upstreams work and no DNS leaks), and lightwalletd TLS is layered over the
     /// proxied stream unchanged, keeping certificate verification pinned to the destination
     /// hostname. SOCKS username/password authentication is not supported.
@@ -966,7 +971,7 @@ impl Default for FeesConfig {
 pub enum MempoolSource {
     /// mempool.space's `/api/v1/ws` websocket, subscribed with `track-mempool`.
     MempoolSpace,
-    /// zecd's own relay connection to one node over the Bitcoin P2P protocol - by default
+    /// rose's own relay connection to one node over the Bitcoin P2P protocol - by default
     /// the wallet's `kyoto://` trusted peer, else `p2p_peer` (`crate::btc::p2p_feed`).
     P2p,
 }
@@ -1105,7 +1110,7 @@ pub struct RpcConfig {
     pub user: Option<String>,
     pub password: Option<Password>,
     /// Bitcoin-Core-style `rpcauth` entries (`<user>:<salt>$<hmac-sha256 hex>`), each an
-    /// additional accepted credential; generate them with `zecd rpcauth <user> [password]`.
+    /// additional accepted credential; generate them with `rose rpcauth <user> [password]`.
     pub auth: Vec<String>,
     /// Path to a bitcoind-style cookie file; generated at startup when no user/password set.
     pub cookiefile: Option<PathBuf>,
@@ -1118,7 +1123,7 @@ pub struct RpcConfig {
     pub allowed_methods: Vec<String>,
     /// Accept a repeated *shielded* recipient in one `z_sendmany` call (default false).
     ///
-    /// zcashd rejects any duplicate recipient address, and zecd matches that by default: this
+    /// zcashd rejects any duplicate recipient address, and rose matches that by default: this
     /// is a zcashd-dialect method, and quietly accepting input a client was written against a
     /// refusal for is how bugs get baked in. But nothing in consensus or the wallet forbids two
     /// shielded outputs paying one address - it is how a batch of memo-carrying payments to a
@@ -1154,7 +1159,7 @@ pub struct KeysConfig {
     /// for tuning. Restores and an explicit `--birthday` are unaffected.
     pub fresh_wallet_birthday_margin: Option<u32>,
     /// Permit more than one loaded wallet to hold spending keys - **honored only by an embedded
-    /// node, and refused outright by the `zecd` daemon** (see
+    /// node, and refused outright by the `rose` daemon** (see
     /// [`reject_multiple_spenders_in_daemon`]).
     ///
     /// The single-spender rule is a custody line, not a technical limit: over RPC, a credential
@@ -1284,7 +1289,7 @@ pub struct SpendConfig {
     /// (`actor::mark_own_tx_trusted`), so their outputs - including the payment half of a
     /// self-send - are spendable at `trusted_confirmations` instead of
     /// `untrusted_confirmations` (Bitcoin Core's own-transaction trust model). **On by
-    /// default.** Set `trust_own_transactions = false` to keep zecd from persisting the marker
+    /// default.** Set `trust_own_transactions = false` to keep rose from persisting the marker
     /// at all: every output is then classified purely from data a from-seed restore re-derives
     /// (key scope + chain), so an authoring instance and a restore of the same seed report
     /// byte-identical classifications at every confirmation depth - the strictest reading of
@@ -1404,7 +1409,7 @@ impl SpendConfig {
     /// Reject change-splitting settings the send path could not use.
     ///
     /// Both values reach librustzcash through constructors that reject out-of-range input, so
-    /// without this a typo in `zecd.toml` would surface as a panic on the first send rather than
+    /// without this a typo in `rose.toml` would surface as a panic on the first send rather than
     /// as a refusal to start.
     pub fn validate_change_splitting(&self) -> anyhow::Result<()> {
         if self.target_note_count == 0 {
@@ -1647,13 +1652,13 @@ pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 60;
 pub const DEFAULT_MAX_SEND_CATCHUP_BLOCKS: u32 = 100;
 
 /// `[spend] privacy_policy` - Zallet/zcashd's privacy-policy idea (zcash/zcash#6240) reduced to
-/// the leaks a zecd send can actually cause: whether a send may cross between shielded pools
+/// the leaks a rose send can actually cause: whether a send may cross between shielded pools
 /// (Sapling↔Orchard, revealing the transferred amount on-chain via `valueBalance`), whether it
 /// may include a transparent recipient (additionally revealing the recipient), whether it may be
 /// *funded* from the wallet's transparent UTXOs (revealing the sender's addresses and input
 /// amounts - `z_sendmany`'s transparent `fromaddress`/`ANY_TADDR` coin control), and whether the
 /// change of such a send may stay transparent (a fully transparent spend). zcashd/Zallet require
-/// an explicit `AllowRevealed*` opt-in for each, and this knob is zecd's equivalent: a five-rung
+/// an explicit `AllowRevealed*` opt-in for each, and this knob is rose's equivalent: a five-rung
 /// ladder - `FullPrivacy` < `AllowRevealedAmounts` < `AllowRevealedRecipients` <
 /// `AllowRevealedSenders` < `AllowFullyTransparent`. Unlike zcashd's policy lattice the ladder is
 /// linear, so each rung implies everything below it (`AllowRevealedSenders` here permits
@@ -1682,7 +1687,7 @@ pub enum SendPrivacy {
     /// (it goes to the wallet's shielded change pool), so a send from a t-address to a shielded
     /// recipient under this rung is the t->z *shielding* send. Kept-transparent change (a fully
     /// transparent spend) still requires `AllowFullyTransparent`. Mirrors zcashd's
-    /// `AllowRevealedSenders`, except zecd's linear ladder means this rung also permits
+    /// `AllowRevealedSenders`, except rose's linear ladder means this rung also permits
     /// transparent recipients (paid from shielded notes when the source is shielded).
     AllowRevealedSenders,
     /// Additionally permits a **fully transparent** spend: funding a send directly from the
@@ -1761,7 +1766,7 @@ impl SpendConfig {
         // The third argument exists because this crate enables `transparent-inputs` (so
         // transparent receivers surface in getrawtransaction/getaddressinfo): it allows
         // 0-conf spends of transparent UTXOs, matching the ZIP-315 default policy. It is
-        // inert for zecd, whose wallets never expose transparent receivers.
+        // inert for rose, whose wallets never expose transparent receivers.
         ConfirmationsPolicy::new(trusted, untrusted, true).map_err(|_| {
             anyhow::anyhow!(
                 "[spend] trusted_confirmations ({}) must not exceed untrusted_confirmations ({})",
@@ -1980,7 +1985,7 @@ struct RpcFile {
     /// Read the RPC password from this file (trailing newline trimmed) instead of inlining it.
     /// Lets the password - which is spend-equivalent for clients - live in a Kubernetes Secret
     /// rather than the ConfigMap the rest of the config lands in. Overrides `password`; the
-    /// `--rpcpassword` flag / `ZECD_RPC_PASSWORD` env still win over both.
+    /// `--rpcpassword` flag / `ROSE_RPC_PASSWORD` env still win over both.
     password_file: Option<PathBuf>,
     auth: Option<Vec<String>>,
     cookiefile: Option<PathBuf>,
@@ -1995,7 +2000,7 @@ struct KeysFile {
     age_identity: Option<PathBuf>,
     auto_unlock: Option<bool>,
     /// Path to the default wallet's `keys.toml`, independent of the datadir (mount as a Secret).
-    /// Equivalent to `[wallets.<default>] keys_file`; the `ZECD_KEYS_FILE` env / `--keys-file`
+    /// Equivalent to `[wallets.<default>] keys_file`; the `ROSE_KEYS_FILE` env / `--keys-file`
     /// flag override it.
     keys_file: Option<PathBuf>,
     /// Rebuild `data.sqlite` from `keys.toml` on an empty datadir (default true).
@@ -2068,9 +2073,9 @@ struct PoolsFile {
 /// flags one for one, and [`Cli`] converts into this, so the daemon and an embedder resolve
 /// configuration identically.
 ///
-/// NB the `ZECD_RPC_PASSWORD` / `ZECD_AGE_IDENTITY` / `ZECD_KEYS_FILE` env fallbacks are clap
+/// NB the `ROSE_RPC_PASSWORD` / `ROSE_AGE_IDENTITY` / `ROSE_KEYS_FILE` env fallbacks are clap
 /// behavior on the corresponding [`Cli`] flags and do NOT apply here - a library caller sets
-/// the fields explicitly. `ZECD_DATADIR` still applies (it is resolved during resolution, not
+/// the fields explicitly. `ROSE_DATADIR` still applies (it is resolved during resolution, not
 /// by clap).
 ///
 /// Deliberately **not** `#[non_exhaustive]`, unlike the option structs elsewhere on the
@@ -2083,7 +2088,7 @@ struct PoolsFile {
 /// [`AppConfig`], whose fields are public for that reason.
 #[derive(Debug, Default, Clone)]
 pub struct ConfigOverrides {
-    /// Path to the TOML config file (default: `<datadir>/zecd.toml`).
+    /// Path to the TOML config file (default: `<datadir>/rose.toml`).
     pub conf: Option<PathBuf>,
     /// Data directory holding per-wallet subdirectories and the cookie file.
     pub datadir: Option<PathBuf>,
@@ -2135,9 +2140,9 @@ impl From<&Cli> for ConfigOverrides {
     }
 }
 
-/// `zecd` - a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash.
+/// `rose` - a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash.
 // Every flag here is `global`, so it is accepted before *or* after a subcommand
-// (`zecd --conf f config check` and `zecd config check --conf f` are the same command). That
+// (`rose --conf f config check` and `rose config check --conf f` are the same command). That
 // matters most for `config check`, whose whole job is resolving a named config the way the daemon
 // would - having to remember that `--conf` only works in one position would be a trap on the one
 // command an operator reaches for when something is already wrong. (A normal comment, not a doc
@@ -2148,9 +2153,9 @@ impl From<&Cli> for ConfigOverrides {
 // which means holding on to the arguments rather than reconstructing them.
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, Parser)]
-#[command(name = "zecd", version)]
+#[command(name = "rose", version)]
 pub struct Cli {
-    /// Path to the TOML config file (default: <datadir>/zecd.toml, else ./zecd.toml).
+    /// Path to the TOML config file (default: <datadir>/rose.toml, else ./rose.toml).
     #[arg(long, global = true, value_name = "FILE")]
     pub conf: Option<PathBuf>,
 
@@ -2182,13 +2187,13 @@ pub struct Cli {
     #[arg(long = "rpcuser", global = true, value_name = "USER")]
     pub rpc_user: Option<String>,
 
-    /// RPC password (HTTP Basic auth). May also be supplied via `ZECD_RPC_PASSWORD` or
+    /// RPC password (HTTP Basic auth). May also be supplied via `ROSE_RPC_PASSWORD` or
     /// `[rpc] password_file` so it need not live in the (ConfigMap-bound) TOML.
     #[arg(
         long = "rpcpassword",
         global = true,
         value_name = "PASS",
-        env = "ZECD_RPC_PASSWORD"
+        env = "ROSE_RPC_PASSWORD"
     )]
     pub rpc_password: Option<Password>,
 
@@ -2206,12 +2211,12 @@ pub struct Cli {
     pub proxy: Option<String>,
 
     /// age identity file used to decrypt the wallet seed for sending.
-    #[arg(long, global = true, value_name = "FILE", env = "ZECD_AGE_IDENTITY")]
+    #[arg(long, global = true, value_name = "FILE", env = "ROSE_AGE_IDENTITY")]
     pub age_identity: Option<PathBuf>,
 
     /// Path to the default wallet's `keys.toml`, independent of the datadir (so the encrypted
     /// seed can be a mounted Secret while the datadir stays a disposable cache).
-    #[arg(long, global = true, value_name = "FILE", env = "ZECD_KEYS_FILE")]
+    #[arg(long, global = true, value_name = "FILE", env = "ROSE_KEYS_FILE")]
     pub keys_file: Option<PathBuf>,
 
     /// Subcommand. When omitted, runs the daemon.
@@ -2238,12 +2243,12 @@ pub enum Command {
     /// `rpcauth.py` needed), then exit.
     Rpcauth(RpcauthArgs),
     /// Print the annotated example configuration file to stdout (or `--output-file`), then
-    /// exit. Redirect it to `<datadir>/zecd.toml` and edit to taste.
+    /// exit. Redirect it to `<datadir>/rose.toml` and edit to taste.
     ExampleConfig(ExampleConfigArgs),
     /// Print the license texts of the third-party crates compiled into this binary to
     /// stdout, then exit. The same text the packaging ships as `THIRD-PARTY-LICENSES.txt`.
     Licenses,
-    /// Inspect the configuration (`zecd config check`), then exit.
+    /// Inspect the configuration (`rose config check`), then exit.
     #[command(subcommand)]
     Config(ConfigCommand),
     /// Rebuild a wallet whose database is broken: delete the wallet database (keys.toml and
@@ -2253,7 +2258,7 @@ pub enum Command {
     Rescan(RescanArgs),
     /// Dial the configured upstream and report its chain tip, then exit. Needs no wallet, so
     /// it answers "can this deployment reach its backend?" and "what birthday should a wallet
-    /// created now get?" before `zecd init` has run.
+    /// created now get?" before `rose init` has run.
     ChainInfo(ChainInfoArgs),
     /// Run the JSON-RPC daemon (default). Takes the boot-time options a shell-less
     /// deployment needs (`--restore-if-empty`).
@@ -2283,18 +2288,18 @@ pub struct InitArgs {
     pub wallet: Option<String>,
 
     /// Restore from an existing mnemonic instead of generating a new one. The phrase is read
-    /// from `--mnemonic-file`, else the `ZECD_MNEMONIC` env var, else stdin.
+    /// from `--mnemonic-file`, else the `ROSE_MNEMONIC` env var, else stdin.
     #[arg(long)]
     pub restore: bool,
 
     /// For `--restore`: read the mnemonic phrase from this file (trailing newline trimmed)
-    /// instead of stdin, for non-interactive init. `ZECD_MNEMONIC` takes precedence.
+    /// instead of stdin, for non-interactive init. `ROSE_MNEMONIC` takes precedence.
     #[arg(long, value_name = "FILE")]
     pub mnemonic_file: Option<PathBuf>,
 
     /// Passphrase-encrypt the wallet (Bitcoin-Core style): the mnemonic is wrapped with a
     /// passphrase instead of the age identity, and the wallet starts locked - sending requires
-    /// `walletpassphrase`. The passphrase is read from `ZECD_WALLET_PASSPHRASE` or stdin.
+    /// `walletpassphrase`. The passphrase is read from `ROSE_WALLET_PASSPHRASE` or stdin.
     #[arg(long)]
     pub encrypt: bool,
 
@@ -2324,7 +2329,7 @@ pub struct InitArgs {
     pub birthday: Option<crate::init::Birthday>,
 }
 
-/// `zecd run`'s own flags: what the daemon does before it serves. Every one of them exists
+/// `rose run`'s own flags: what the daemon does before it serves. Every one of them exists
 /// for a deployment with no shell to script `init` first - an enclave, or the `FROM scratch`
 /// container images - where the whole "restore into an empty data directory, then serve"
 /// sequence has to be one command.
@@ -2332,8 +2337,8 @@ pub struct InitArgs {
 #[derive(Debug, Clone, Default, clap::Args)]
 pub struct RunArgs {
     /// Before serving, create `--wallet` if it is not yet initialized (its `keys.toml` is
-    /// absent): `init --restore` from the phrase in `ZECD_MNEMONIC` or `--mnemonic-file`
-    /// (a spending wallet), or `init --xpub` from the account xpub in `ZECD_XPUB` (a
+    /// absent): `init --restore` from the phrase in `ROSE_MNEMONIC` or `--mnemonic-file`
+    /// (a spending wallet), or `init --xpub` from the account xpub in `ROSE_XPUB` (a
     /// watch-only Bitcoin wallet) - non-interactively, never stdin, and both set is refused.
     /// An initialized wallet is left exactly as it is and no secret is read at all. A
     /// restore that fails is fatal for the daemon - it exists to serve that wallet.
@@ -2347,7 +2352,7 @@ pub struct RunArgs {
     pub wallet: Option<String>,
 
     /// For `--restore-if-empty`: read the mnemonic phrase from this file (trailing newline
-    /// trimmed) when `ZECD_MNEMONIC` is unset. `ZECD_MNEMONIC` takes precedence, as for
+    /// trimmed) when `ROSE_MNEMONIC` is unset. `ROSE_MNEMONIC` takes precedence, as for
     /// `init --restore`.
     #[arg(long, value_name = "FILE", requires = "restore_if_empty")]
     pub mnemonic_file: Option<PathBuf>,
@@ -2391,7 +2396,7 @@ pub struct ExampleConfigArgs {
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum ConfigCommand {
-    /// Validate a configuration file against this zecd build without starting the daemon, and
+    /// Validate a configuration file against this rose build without starting the daemon, and
     /// print the settings it resolves to. Exits non-zero if the daemon would refuse to start.
     Check(ConfigCheckArgs),
     /// Print the effective configuration - the file, CLI flags and environment resolved
@@ -2413,7 +2418,7 @@ pub struct ConfigCheckArgs {
     pub quiet: bool,
 }
 
-/// `zecd config show` takes no options of its own - the configuration it renders is selected by
+/// `rose config show` takes no options of its own - the configuration it renders is selected by
 /// the global flags (`--conf`, `--datadir`, `--network`, ...), exactly as the daemon selects it.
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, clap::Args)]
@@ -2447,12 +2452,12 @@ pub struct DeriveAddressArgs {
     pub wallet: Option<String>,
 
     /// Derive from a BIP-39 mnemonic instead of the wallet's `keys.toml`. The phrase is read
-    /// from `ZECD_MNEMONIC`, else `--mnemonic-file`, else stdin.
+    /// from `ROSE_MNEMONIC`, else `--mnemonic-file`, else stdin.
     #[arg(long)]
     pub mnemonic: bool,
 
     /// Read the mnemonic phrase from this file (trailing newline trimmed) instead of stdin,
-    /// for non-interactive derivation. Implies `--mnemonic`; `ZECD_MNEMONIC` takes precedence.
+    /// for non-interactive derivation. Implies `--mnemonic`; `ROSE_MNEMONIC` takes precedence.
     #[arg(long, value_name = "FILE")]
     pub mnemonic_file: Option<PathBuf>,
 
@@ -2513,15 +2518,15 @@ pub struct RescanArgs {
 }
 
 impl AppConfig {
-    /// Resolve the effective configuration from CLI flags and the TOML file, using zecd's
+    /// Resolve the effective configuration from CLI flags and the TOML file, using rose's
     /// file/port defaults.
     #[cfg(feature = "cli")]
     pub fn resolve(cli: &Cli) -> anyhow::Result<AppConfig> {
-        Self::resolve_with(cli, &ZECD_DEFAULTS)
+        Self::resolve_with(cli, &ROSE_DEFAULTS)
     }
 
     /// Resolve the effective configuration from clap-free overrides and the TOML file, using
-    /// zecd's file/port defaults - the library consumer's entry point ([`Cli`] converts into
+    /// rose's file/port defaults - the library consumer's entry point ([`Cli`] converts into
     /// The wallet a `--wallet` flag names, or the config's [`implied_wallet`](Self::implied_wallet)
     /// when it was omitted - the one rule for every subcommand's `--wallet` (init,
     /// export-ufvk, export-xpub, rescan, `run --restore-if-empty`). A config that declares
@@ -2545,13 +2550,13 @@ impl AppConfig {
 
     /// [`ConfigOverrides`], so this and [`resolve`](Self::resolve) cannot disagree).
     pub fn resolve_overrides(overrides: &ConfigOverrides) -> anyhow::Result<AppConfig> {
-        Self::resolve_overrides_with(overrides, &ZECD_DEFAULTS)
+        Self::resolve_overrides_with(overrides, &ROSE_DEFAULTS)
     }
 
     /// The datadir named in the overrides (the command line) or in the environment, before the
     /// config file is read. The file is located *before* its own `datadir` can apply (like
     /// bitcoind: `-conf` resolution never depends on a datadir set inside the file), so the
-    /// lookup uses only overrides/env. Datadir precedence overall: CLI > env (`ZECD_DATADIR`) >
+    /// lookup uses only overrides/env. Datadir precedence overall: CLI > env (`ROSE_DATADIR`) >
     /// config file > default.
     fn cli_datadir(overrides: &ConfigOverrides, defaults: &BinaryDefaults) -> Option<PathBuf> {
         overrides
@@ -2561,11 +2566,11 @@ impl AppConfig {
     }
 
     /// The config file [`resolve`](Self::resolve) would read for this invocation, whether or not
-    /// it exists. Exposed so `zecd config check` can name the file it is checking - and can only
+    /// it exists. Exposed so `rose config check` can name the file it is checking - and can only
     /// ever check the same one the daemon would load.
     #[cfg(feature = "cli")]
     pub fn conf_path(cli: &Cli) -> PathBuf {
-        Self::conf_path_with(cli, &ZECD_DEFAULTS)
+        Self::conf_path_with(cli, &ROSE_DEFAULTS)
     }
 
     /// [`conf_path`](Self::conf_path) with the binary's defaults.
@@ -2586,7 +2591,7 @@ impl AppConfig {
         })
     }
 
-    /// Resolve the effective configuration with the binary's defaults (`zecd`).
+    /// Resolve the effective configuration with the binary's defaults (`rose`).
     #[cfg(feature = "cli")]
     pub fn resolve_with(cli: &Cli, defaults: &BinaryDefaults) -> anyhow::Result<AppConfig> {
         Self::resolve_overrides_with(&ConfigOverrides::from(cli), defaults)
@@ -2602,6 +2607,21 @@ impl AppConfig {
         let cli = overrides;
         let cli_datadir = Self::cli_datadir(cli, defaults);
         let conf_path = Self::conf_path_overrides_with(cli, defaults);
+
+        // Only the implied location is checked: an explicit `--conf` names exactly one file,
+        // and a daemon with its own defaults (an embedder's) has no history to trip over.
+        if cli.conf.is_none() && defaults.conf_file != LEGACY_CONF_FILE && !conf_path.exists() {
+            let legacy = conf_path.with_file_name(LEGACY_CONF_FILE);
+            if legacy.exists() {
+                anyhow::bail!(
+                    "found {} but no {}: the config file was renamed with the daemon. Rename it \
+                     (its contents are unchanged), or pass --conf {}",
+                    legacy.display(),
+                    conf_path.display(),
+                    legacy.display()
+                );
+            }
+        }
 
         let file: ConfigFile = if conf_path.exists() {
             let text = std::fs::read_to_string(&conf_path)
@@ -2637,7 +2657,7 @@ impl AppConfig {
         #[cfg(not(feature = "bitcoin"))]
         if let Some(token) = &file.btc_testnet {
             anyhow::bail!(
-                "btc_testnet = {token:?} requires a zecd build with the `bitcoin` feature \
+                "btc_testnet = {token:?} requires a rose build with the `bitcoin` feature \
                  (this build supports: {})",
                 Coin::supported_names()
             );
@@ -2681,7 +2701,7 @@ impl AppConfig {
             .then(|| default_wallet.clone());
 
         // keys.toml location override (so the encrypted seed can be a mounted Secret, separate
-        // from the disposable datadir). The global `[keys] keys_file` / `ZECD_KEYS_FILE` /
+        // from the disposable datadir). The global `[keys] keys_file` / `ROSE_KEYS_FILE` /
         // `--keys-file` applies to the default wallet; a per-wallet `[wallets.<name>] keys_file`
         // overrides it for that wallet.
         let keys_file_global = cli
@@ -3158,7 +3178,7 @@ impl AppConfig {
             allowed_methods: None,
             allow_duplicate_shielded_recipients: None,
         });
-        // RPC password precedence: `--rpcpassword` / `ZECD_RPC_PASSWORD` (clap) > `[rpc]
+        // RPC password precedence: `--rpcpassword` / `ROSE_RPC_PASSWORD` (clap) > `[rpc]
         // password_file` > inline `[rpc] password`. A configured `password_file` that can't be
         // read is fatal (fail fast rather than silently fall through to a weaker source).
         let password_from_file = rpc_file
@@ -3226,7 +3246,7 @@ impl AppConfig {
             fresh_wallet_birthday_margin: None,
         });
         let keys = KeysConfig {
-            // Default to <datadir>/identity.txt, matching where `zecd init` writes the
+            // Default to <datadir>/identity.txt, matching where `rose init` writes the
             // identity, so auto-unlock works out of the box.
             age_identity: cli
                 .age_identity
@@ -3327,7 +3347,7 @@ impl AppConfig {
             // Default to "synced": `/readyz` reports ready only once the wallet has actually
             // scanned to (near) the tip, so a client routed by readiness never sees an empty or
             // stale balance/history as authoritative during initial sync or a `--restore` (audit
-            // 3.15). Deployments that prefer reachability-over-freshness - reaching zecd while it
+            // 3.15). Deployments that prefer reachability-over-freshness - reaching rose while it
             // catches up, at the cost of possibly-lagging reads - can set `readiness = "connected"`.
             readiness: health_file
                 .readiness
@@ -3376,7 +3396,7 @@ impl AppConfig {
         // A wallet directory that overlaps one of the fleet's would put two owners' state in one
         // tree - see `fleet_path_conflict`. Refused only when the fleet actually runs: with
         // `[fleet] enabled` false nothing reads or writes those paths, so a deployment that has
-        // long had a wallet called `fleet` keeps starting, and `zecd config check` reports the
+        // long had a wallet called `fleet` keeps starting, and `rose config check` reports the
         // latent overlap as a warning instead.
         #[cfg(feature = "zcash")]
         if fleet.enabled {
@@ -3444,7 +3464,7 @@ impl AppConfig {
     }
 }
 
-/// Refuse a configuration that opts into multiple spending wallets **when it is the `zecd`
+/// Refuse a configuration that opts into multiple spending wallets **when it is the `rose`
 /// daemon that would run it**.
 ///
 /// [`KeysConfig::allow_multiple_spending_wallets`] is honored only by an embedded node, whose
@@ -3454,19 +3474,19 @@ impl AppConfig {
 /// and "which key can this credential spend?" has no single answer. Rather than let that be
 /// configured by accident, the binary refuses to start.
 ///
-/// Called by `daemon::run` and by `zecd config check` (which reports what the daemon would do),
+/// Called by `daemon::run` and by `rose config check` (which reports what the daemon would do),
 /// and deliberately *not* by [`crate::node::NodeBuilder`] - that asymmetry is the whole
 /// mechanism by which the option stays library-only.
 pub fn reject_multiple_spenders_in_daemon(config: &AppConfig) -> anyhow::Result<()> {
     if config.keys.allow_multiple_spending_wallets {
         anyhow::bail!(
-            "[keys] allow_multiple_spending_wallets is set, which the zecd daemon does not \
+            "[keys] allow_multiple_spending_wallets is set, which the rose daemon does not \
              support: over RPC a credential is spend authority for whichever wallet a request \
              routes to, so more than one loaded spending wallet leaves no single answer to \
              \"which key can this credential spend?\". The option exists for applications \
-             embedding zecd as a library, where the host application is the authorization \
+             embedding rose as a library, where the host application is the authorization \
              boundary and names the wallet on every call. To run several writable wallets under \
-             the daemon, run one zecd per wallet (separate datadirs and ports); otherwise unset \
+             the daemon, run one rose per wallet (separate datadirs and ports); otherwise unset \
              the option and keep one spending wallet plus any number of watch-only replicas."
         );
     }
@@ -3482,7 +3502,7 @@ pub fn reject_multiple_spenders_in_daemon(config: &AppConfig) -> anyhow::Result<
 ///
 /// Deliberately *not* part of [`AppConfig::resolve`]: it is a startup policy, not a parse rule,
 /// and `resolve` is used by tooling (`config check`, `config show`) that must be able to
-/// describe such a config rather than fail to build it. Both the daemon and `zecd config check`
+/// describe such a config rather than fail to build it. Both the daemon and `rose config check`
 /// call this, so the two always agree on the verdict.
 pub fn reject_placeholder_password(config: &AppConfig) -> anyhow::Result<()> {
     if config
@@ -3493,7 +3513,7 @@ pub fn reject_placeholder_password(config: &AppConfig) -> anyhow::Result<()> {
     {
         anyhow::bail!(
             "[rpc] password is still the example placeholder \"CHANGE-ME\"; set a real password \
-             (in the file, via [rpc] password_file, or as ZECD_RPC_PASSWORD in the environment) \
+             (in the file, via [rpc] password_file, or as ROSE_RPC_PASSWORD in the environment) \
              before starting - on any network"
         );
     }
@@ -3856,7 +3876,7 @@ mod tests {
     #[cfg(feature = "zcash")]
     #[test]
     fn transparent_flags_and_gap_limit() {
-        // Default: transparent off, gap limit at the zecd default.
+        // Default: transparent off, gap limit at the rose default.
         let p = resolve_global_pools(None).unwrap();
         assert!(!p.transparent_enabled);
         assert!(!p.transparent_default);
@@ -4187,7 +4207,7 @@ mod tests {
             DEFAULT_MAX_SEND_CATCHUP_BLOCKS
         );
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("zecd.toml");
+        let path = dir.path().join("rose.toml");
         for (value, expected) in [("0", 0), ("2500", 2500)] {
             std::fs::write(
                 &path,
@@ -4204,9 +4224,41 @@ mod tests {
         }
     }
 
+    /// A datadir whose only config is the pre-rename `zecd.toml` is refused with the rename
+    /// spelled out, instead of being started on defaults. Only the implied location counts:
+    /// `--conf` names a file, and a renamed file (or both present) resolves as usual.
+    #[test]
+    fn a_legacy_config_file_is_refused_until_renamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = dir.path().join(LEGACY_CONF_FILE);
+        std::fs::write(&legacy, "network = \"regtest\"\n").expect("write legacy config");
+        let overrides = ConfigOverrides {
+            datadir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let err = AppConfig::resolve_overrides(&overrides).expect_err("legacy file refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("zecd.toml") && msg.contains("rose.toml"),
+            "{msg}"
+        );
+
+        let explicit = AppConfig::resolve_overrides(&ConfigOverrides {
+            conf: Some(legacy.clone()),
+            ..overrides.clone()
+        })
+        .expect("--conf names the file explicitly");
+        assert!(explicit.network.is_regtest());
+
+        std::fs::rename(&legacy, dir.path().join(ROSE_DEFAULTS.conf_file)).expect("rename");
+        let renamed = AppConfig::resolve_overrides(&overrides).expect("renamed file resolves");
+        assert!(renamed.network.is_regtest());
+    }
+
     /// `[spend] shutdown_drain_secs` bounds how long a stopping wallet finishes sends it already
     /// accepted. It is configuration rather than a constant because the value that binds is the
-    /// supervisor's own grace period, not any property of zecd - so the parse, the default, and
+    /// supervisor's own grace period, not any property of rose - so the parse, the default, and
     /// the disabling `0` all have to hold.
     #[cfg(feature = "zcash")]
     #[test]
@@ -4223,7 +4275,7 @@ mod tests {
             "the default is the documented 60s"
         );
 
-        let path = dir.path().join("zecd.toml");
+        let path = dir.path().join("rose.toml");
         std::fs::write(&path, "[spend]\nshutdown_drain_secs = 0\n").expect("write config");
         let disabled = AppConfig::resolve_overrides(&ConfigOverrides {
             regtest: true,
@@ -4308,7 +4360,7 @@ mod tests {
     fn trust_own_transactions_defaults_on_and_parses() {
         // Absent -> on: wallet-authored transactions are marked trusted at store time.
         assert!(SpendConfig::default().trust_own_transactions);
-        // The full-statelessness opt-out round-trips: with it off, zecd persists no trust
+        // The full-statelessness opt-out round-trips: with it off, rose persists no trust
         // marker, so an authoring instance and a from-seed restore classify identically.
         let f: SpendFile = toml::from_str("trust_own_transactions = false").unwrap();
         assert_eq!(f.trust_own_transactions, Some(false));
@@ -4455,7 +4507,7 @@ mod tests {
     #[test]
     fn the_implied_wallet_follows_default_wallet_then_the_sole_declared_wallet() {
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         let resolve = |body: &str| {
             std::fs::write(
                 &conf,
@@ -4504,7 +4556,7 @@ mod tests {
     #[test]
     fn a_library_consumers_override_reaches_the_resolved_server() {
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             format!(
@@ -4580,10 +4632,10 @@ mod tests {
         let f: BackendFile = toml::from_str("tls_insecure_skip_verify = true").unwrap();
         assert_eq!(f.tls_insecure_skip_verify, Some(true));
         let f: BackendFile = toml::from_str(
-            "tls_ca_file = \"/etc/zecd/ca.pem\"\ntls_pinned_sha256 = [\"AB:CD\", \"ef01\"]",
+            "tls_ca_file = \"/etc/rose/ca.pem\"\ntls_pinned_sha256 = [\"AB:CD\", \"ef01\"]",
         )
         .unwrap();
-        assert_eq!(f.tls_ca_file, Some(PathBuf::from("/etc/zecd/ca.pem")));
+        assert_eq!(f.tls_ca_file, Some(PathBuf::from("/etc/rose/ca.pem")));
         assert_eq!(
             f.tls_pinned_sha256,
             Some(vec!["AB:CD".to_string(), "ef01".to_string()])
@@ -4710,24 +4762,24 @@ mod tests {
     fn file_datadir_is_honored_and_cli_wins() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
-        std::fs::write(&conf, "datadir = \"/tmp/zecd-from-file\"\n").unwrap();
+        let conf = dir.path().join("rose.toml");
+        std::fs::write(&conf, "datadir = \"/tmp/rose-from-file\"\n").unwrap();
 
         // A `datadir` set in the config file governs data placement...
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.datadir, PathBuf::from("/tmp/zecd-from-file"));
+        assert_eq!(cfg.datadir, PathBuf::from("/tmp/rose-from-file"));
 
         // ...but --datadir on the CLI still wins over the file.
         let cli = Cli::parse_from([
-            "zecd",
+            "rose",
             "--conf",
             conf.to_str().unwrap(),
             "--datadir",
-            "/tmp/zecd-from-cli",
+            "/tmp/rose-from-cli",
         ]);
         let cfg = AppConfig::resolve(&cli).unwrap();
-        assert_eq!(cfg.datadir, PathBuf::from("/tmp/zecd-from-cli"));
+        assert_eq!(cfg.datadir, PathBuf::from("/tmp/rose-from-cli"));
     }
 
     #[cfg(feature = "cli")]
@@ -4736,20 +4788,20 @@ mod tests {
         use clap::Parser as _;
         // Security-critical defaults: an absent [backend] resolves to rfc1918_is_local = true
         // (private/LAN self-hosting works) and allow_remote_cleartext = false (no public leak).
-        let cli = Cli::parse_from(["zecd"]);
+        let cli = Cli::parse_from(["rose"]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert!(cfg.backend.rfc1918_is_local);
         assert!(!cfg.backend.allow_remote_cleartext);
 
         // Both knobs are honored from the file.
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             "[backend]\nrfc1918_is_local = false\nallow_remote_cleartext = true\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert!(!cfg.backend.rfc1918_is_local);
         assert!(cfg.backend.allow_remote_cleartext);
@@ -4761,33 +4813,33 @@ mod tests {
         use clap::Parser as _;
         // Absent [health] readiness resolves to Synced: `/readyz` waits for the scan so a client
         // routed by readiness never trusts an empty/stale balance mid-sync.
-        let cli = Cli::parse_from(["zecd"]);
+        let cli = Cli::parse_from(["rose"]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.health.readiness, ReadinessMode::Synced);
 
         // A [health] block that omits `readiness` still defaults to Synced...
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(&conf, "[health]\nport = 9999\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.health.readiness, ReadinessMode::Synced);
 
         // ...and the lenient modes are still opt-in from the file.
         std::fs::write(&conf, "[health]\nreadiness = \"connected\"\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.health.readiness, ReadinessMode::Connected);
 
         // The middle mode: scanned to tip without waiting on the enhancement backlog.
         std::fs::write(&conf, "[health]\nreadiness = \"scanned\"\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.health.readiness, ReadinessMode::Scanned);
 
         // An unknown mode is a config error naming the accepted values.
         std::fs::write(&conf, "[health]\nreadiness = \"caught-up\"\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let err = AppConfig::resolve(&cli).unwrap_err().to_string();
         assert!(
             err.contains("scanned"),
@@ -4800,25 +4852,25 @@ mod tests {
     fn sync_interval_secs_is_clamped_to_at_least_one() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
 
         // A misconfigured `interval_secs = 0` must not make the actor busy-poll with no idle
         // delay; it clamps up to 1s (mirroring `rebroadcast_secs`).
         std::fs::write(&conf, "[sync]\ninterval_secs = 0\nrebroadcast_secs = 0\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.sync.interval_secs, 1);
         assert_eq!(cfg.sync.rebroadcast_secs, 1);
 
         // An explicit larger value is preserved unchanged.
         std::fs::write(&conf, "[sync]\ninterval_secs = 45\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.sync.interval_secs, 45);
 
         // Absent section -> the 20s default.
-        std::fs::write(&conf, "datadir = \"/tmp/zecd-x\"\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        std::fs::write(&conf, "datadir = \"/tmp/rose-x\"\n").unwrap();
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.sync.interval_secs, 20);
     }
@@ -4830,14 +4882,14 @@ mod tests {
     fn writer_cache_mib_defaults_parses_and_clamps() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         for (body, expected) in [
             ("[sync]\ninterval_secs = 20\n", DEFAULT_WRITER_CACHE_MIB),
             ("[sync]\nwriter_cache_mib = 64\n", 64),
             ("[sync]\nwriter_cache_mib = 0\n", 1),
         ] {
             std::fs::write(&conf, body).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             let cfg = AppConfig::resolve(&cli).unwrap();
             assert_eq!(cfg.sync.writer_cache_mib, expected, "config body: {body:?}");
         }
@@ -4851,16 +4903,16 @@ mod tests {
     fn fetch_memos_defaults_on_and_parses_off() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
 
         for (body, want) in [
-            ("datadir = \"/tmp/zecd-x\"\n", true),
+            ("datadir = \"/tmp/rose-x\"\n", true),
             ("[sync]\ninterval_secs = 20\n", true),
             ("[sync]\nfetch_memos = true\n", true),
             ("[sync]\nfetch_memos = false\n", false),
         ] {
             std::fs::write(&conf, body).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             let cfg = AppConfig::resolve(&cli).unwrap();
             assert_eq!(cfg.sync.fetch_memos, want, "config body: {body:?}");
         }
@@ -4871,14 +4923,14 @@ mod tests {
     /// The test above goes through `resolve`, which is clap's path; an embedder calls
     /// `resolve_overrides`, and `ConfigOverrides` carries no `fetch_memos` field at all (it
     /// mirrors the CLI's global flags, and there is no such flag). So a library consumer that
-    /// ships no `zecd.toml` - which is the common case, and what `examples/embedded.rs` does -
+    /// ships no `rose.toml` - which is the common case, and what `examples/embedded.rs` does -
     /// reaches the default through a seam the clap test never exercises. Pinning it here is what
     /// makes "memos are on unless you asked otherwise" true of the library and not just the
     /// binary: the two share one `unwrap_or(true)`, and this is the assertion that fails if a
     /// future refactor gives the embedded path a resolver of its own.
     #[test]
     fn embedded_resolution_defaults_fetch_memos_on() {
-        // A datadir of our own, so a `zecd.toml` sitting in the default location cannot answer
+        // A datadir of our own, so a `rose.toml` sitting in the default location cannot answer
         // for the default we are trying to observe.
         let dir = tempfile::tempdir().unwrap();
         let cfg = AppConfig::resolve_overrides(&ConfigOverrides {
@@ -4902,7 +4954,7 @@ mod tests {
     fn allow_multiple_spending_wallets_is_off_by_default_and_daemon_only_refused() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
 
         for (body, want) in [
             ("network = \"test\"\n", false),
@@ -4910,7 +4962,7 @@ mod tests {
             ("[keys]\nallow_multiple_spending_wallets = true\n", true),
         ] {
             std::fs::write(&conf, body).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             let cfg = AppConfig::resolve(&cli).unwrap();
             assert_eq!(
                 cfg.keys.allow_multiple_spending_wallets, want,
@@ -4933,7 +4985,7 @@ mod tests {
     fn allow_duplicate_shielded_recipients_defaults_off_and_parses() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
 
         for (body, want) in [
             ("network = \"test\"\n", false),
@@ -4944,7 +4996,7 @@ mod tests {
             ("[rpc]\nallow_duplicate_shielded_recipients = true\n", true),
         ] {
             std::fs::write(&conf, body).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             let cfg = AppConfig::resolve(&cli).unwrap();
             assert_eq!(
                 cfg.rpc.allow_duplicate_shielded_recipients, want,
@@ -4958,11 +5010,11 @@ mod tests {
     fn rpc_allowed_methods_parses_and_validates() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
 
         // Absent -> empty list (no restriction; every method served).
         std::fs::write(&conf, "network = \"test\"\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert!(cfg.rpc.allowed_methods.is_empty());
 
@@ -4972,7 +5024,7 @@ mod tests {
             "[rpc]\nallowed_methods = [\"getbalance\", \"getnewaddress\", \"sendtoaddress\"]\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(
             cfg.rpc.allowed_methods,
@@ -4985,7 +5037,7 @@ mod tests {
 
         // An explicit empty array is "no restriction", never "deny everything".
         std::fs::write(&conf, "[rpc]\nallowed_methods = []\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert!(cfg.rpc.allowed_methods.is_empty());
 
@@ -4995,7 +5047,7 @@ mod tests {
             "[rpc]\nallowed_methods = [\"getbalance\", \"getblance\"]\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let err = AppConfig::resolve(&cli).unwrap_err().to_string();
         assert!(err.contains("getblance"), "got: {err}");
     }
@@ -5019,7 +5071,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pw = dir.path().join("rpc.pw");
         std::fs::write(&pw, "from-file\n").unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             format!(
@@ -5030,7 +5082,7 @@ mod tests {
         .unwrap();
 
         // password_file overrides the inline [rpc] password...
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(
             cfg.rpc.password.as_ref().map(Password::expose),
@@ -5039,7 +5091,7 @@ mod tests {
 
         // ...but an explicit --rpcpassword still wins over the file.
         let cli = Cli::parse_from([
-            "zecd",
+            "rose",
             "--conf",
             conf.to_str().unwrap(),
             "--rpcpassword",
@@ -5057,7 +5109,7 @@ mod tests {
             "network = \"test\"\n[rpc]\npassword_file = \"/no/such/rpc.pw\"\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         assert!(AppConfig::resolve(&cli).is_err());
     }
 
@@ -5066,12 +5118,12 @@ mod tests {
     fn keys_file_override_resolves_per_wallet() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
 
         // Default: keys.toml lives at the root of the wallet's dir, above the per-coin
         // subdirectories (see `Coin::data_dir`) - the seed it wraps serves every coin.
         std::fs::write(&conf, "network = \"test\"\ndatadir = \"/d\"\n").unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(
             cfg.wallets["default"].keys_path(),
@@ -5088,7 +5140,7 @@ mod tests {
              [wallets.other]\nkeys_file = \"/secrets/other.toml\"\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(
             cfg.wallets["default"].keys_path(),
@@ -5101,7 +5153,7 @@ mod tests {
 
         // --keys-file overrides the file's global keys_file for the default wallet.
         let cli = Cli::parse_from([
-            "zecd",
+            "rose",
             "--conf",
             conf.to_str().unwrap(),
             "--keys-file",
@@ -5123,13 +5175,13 @@ mod tests {
         // reads it from the entry rather than assuming it.
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             "network = \"test\"\ndatadir = \"/d\"\n[wallets.default]\n[wallets.other]\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.wallets["default"].coin, Coin::Zcash);
         assert_eq!(cfg.wallets["other"].coin, Coin::Zcash);
@@ -5145,13 +5197,13 @@ mod tests {
     fn the_coin_key_is_validated_in_resolve() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             "network = \"test\"\ndatadir = \"/d\"\n[wallets.w]\ncoin = \"zcash\"\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.wallets["w"].coin, Coin::Zcash);
 
@@ -5160,7 +5212,7 @@ mod tests {
             "network = \"test\"\ndatadir = \"/d\"\n[wallets.w]\ncoin = \"dogecoin\"\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let err = AppConfig::resolve(&cli).unwrap_err().to_string();
         assert!(err.contains("unsupported coin \"dogecoin\""), "{err}");
         assert!(err.contains("\"w\""), "{err}");
@@ -5174,7 +5226,7 @@ mod tests {
             "network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         #[cfg(not(feature = "bitcoin"))]
         {
             let err = AppConfig::resolve(&cli).unwrap_err().to_string();
@@ -5208,10 +5260,10 @@ mod tests {
     fn the_btc_testnet_key_is_validated_in_resolve() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         let resolve = |text: &str| {
             std::fs::write(&conf, text).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             AppConfig::resolve(&cli)
         };
 
@@ -5220,7 +5272,7 @@ mod tests {
             let err = resolve("network = \"test\"\ndatadir = \"/d\"\nbtc_testnet = \"testnet4\"\n")
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("requires a zecd build"), "{err}");
+            assert!(err.contains("requires a rose build"), "{err}");
         }
         #[cfg(feature = "bitcoin")]
         {
@@ -5279,7 +5331,7 @@ mod tests {
     fn zcash_engine_keys_are_refused_on_a_bitcoin_wallet() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         for (key, line) in [
             ("transparent", "transparent = true"),
             ("pools", "pools = [\"orchard\"]"),
@@ -5292,7 +5344,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             let err = AppConfig::resolve(&cli).unwrap_err().to_string();
             assert!(
                 err.contains(&format!("[wallets.btc] {key}")),
@@ -5310,10 +5362,10 @@ mod tests {
     fn lookahead_is_a_bitcoin_wallet_knob() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         let resolve = |body: &str| {
             std::fs::write(&conf, body).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             AppConfig::resolve(&cli)
         };
         let cfg =
@@ -5353,10 +5405,10 @@ mod tests {
     fn initial_scan_is_a_bitcoin_wallet_knob() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         let resolve = |body: &str| {
             std::fs::write(&conf, body).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             AppConfig::resolve(&cli)
         };
         let cfg =
@@ -5389,7 +5441,7 @@ mod tests {
         // daemon.
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             "datadir = \"/d\"\n[wallets.default]\n[wallets.other]\n",
@@ -5398,7 +5450,7 @@ mod tests {
 
         for (flag, env) in [("test", ZNetwork::Test), ("main", ZNetwork::Main)] {
             let cli = Cli::parse_from([
-                "zecd",
+                "rose",
                 "--conf",
                 conf.to_str().unwrap(),
                 "--network",
@@ -5424,7 +5476,7 @@ mod tests {
         // A wallet that overrides nothing must resolve exactly as it did before the keys existed.
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             "network = \"test\"\ndatadir = \"/d\"\n\
@@ -5433,7 +5485,7 @@ mod tests {
              [wallets.replica]\nserver = \"https://lwd.example:9067\"\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
 
         // No overrides: the global endpoint, unchanged.
@@ -5461,7 +5513,7 @@ mod tests {
     fn per_wallet_backend_keys_are_parsed_and_validated_by_their_own_key() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
 
         // A bad value names the wallet's own key, not `[backend]`.
         std::fs::write(
@@ -5469,7 +5521,7 @@ mod tests {
             "network = \"test\"\ndatadir = \"/d\"\n[wallets.a]\ntls_roots = \"bogus\"\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let err = format!("{:#}", AppConfig::resolve(&cli).unwrap_err());
         assert!(err.contains("[wallets.a] tls_roots"), "{err}");
 
@@ -5481,7 +5533,7 @@ mod tests {
              tls_pinned_sha256 = [\"AA:BB\"]\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         assert!(AppConfig::resolve(&cli).is_err());
     }
 
@@ -5491,14 +5543,14 @@ mod tests {
         use clap::Parser as _;
         // No `[fees]` at all is the built-in chain: a forward estimate first, a second
         // independent oracle behind it, the no-third-party signals last.
-        let cli = Cli::parse_from(["zecd"]);
+        let cli = Cli::parse_from(["rose"]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.fees.sources, DEFAULT_FEE_SOURCES.to_vec());
         assert!(cfg.fees.mempool_space_url.is_none());
         assert!(cfg.fees.esplora_url.is_none());
 
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         // Reordered, shortened, and both endpoints redirected at instances the operator runs -
         // the shape that turns the fee lookup from a third-party disclosure into a private one.
         std::fs::write(
@@ -5508,7 +5560,7 @@ mod tests {
              esplora_url = \"http://esplora.internal:3002/api/fee-estimates\"\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(
             cfg.fees.sources,
@@ -5527,17 +5579,17 @@ mod tests {
     #[test]
     fn the_absolute_fee_cap_defaults_to_cores_and_refuses_zero() {
         use clap::Parser as _;
-        let cli = Cli::parse_from(["zecd"]);
+        let cli = Cli::parse_from(["rose"]);
         assert_eq!(
             AppConfig::resolve(&cli).unwrap().fees.max_tx_fee_sat,
             DEFAULT_MAX_TX_FEE_SAT
         );
 
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         let resolve = |body: &str| {
             std::fs::write(&conf, body).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             AppConfig::resolve(&cli)
         };
         assert_eq!(
@@ -5559,17 +5611,17 @@ mod tests {
         use clap::Parser as _;
         // No `[mempool]` at all: the relay peer, which contacts nobody the wallet is not
         // already peered with. The websocket tier is never reached by default.
-        let cli = Cli::parse_from(["zecd"]);
+        let cli = Cli::parse_from(["rose"]);
         let cfg = AppConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.mempool, MempoolConfig::default());
         assert_eq!(cfg.mempool.sources, DEFAULT_MEMPOOL_SOURCES.to_vec());
         assert!(!cfg.mempool.sources_explicit);
 
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         let resolve = |body: &str| {
             std::fs::write(&conf, body).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             AppConfig::resolve(&cli)
         };
         // Named, at a self-hosted instance - plaintext allowed, like the fee overrides.
@@ -5656,10 +5708,10 @@ mod tests {
     fn a_fee_chain_that_could_not_work_is_refused_at_resolve() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         let resolve = |body: &str| {
             std::fs::write(&conf, body).unwrap();
-            let cli = Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
             AppConfig::resolve(&cli)
         };
 
@@ -5690,22 +5742,22 @@ mod tests {
     /// The example and docker configs must deserialize (`deny_unknown_fields` catches typos and
     /// drift as the schema evolves).
     ///
-    /// These three select the Zcash engine - `zecd.example.toml` documents `[pools]` and
+    /// These three select the Zcash engine - `rose.example.toml` documents `[pools]` and
     /// `[spend]`, the deploy pair set `[zebra]` - so they parse in a build that carries it and
     /// are refused as unknown sections in one that does not, which is the doctrine and is
     /// asserted from the other side in `tests/cli.rs`.
     #[cfg(feature = "zcash")]
     #[test]
     fn shipped_configs_parse() {
-        toml::from_str::<ConfigFile>(include_str!("../zecd.example.toml"))
-            .expect("zecd.example.toml");
-        // What `zecd example-config` emits must be loadable by the same binary that emitted it.
+        toml::from_str::<ConfigFile>(include_str!("../rose.example.toml"))
+            .expect("rose.example.toml");
+        // What `rose example-config` emits must be loadable by the same binary that emitted it.
         toml::from_str::<ConfigFile>(crate::example_config::EXAMPLE_CONFIG)
             .expect("example-config output");
-        toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.toml"))
-            .expect("deploy/zecd.toml");
-        toml::from_str::<ConfigFile>(include_str!("../deploy/zecd.mainnet.toml"))
-            .expect("deploy/zecd.mainnet.toml");
+        toml::from_str::<ConfigFile>(include_str!("../deploy/rose.toml"))
+            .expect("deploy/rose.toml");
+        toml::from_str::<ConfigFile>(include_str!("../deploy/rose.mainnet.toml"))
+            .expect("deploy/rose.mainnet.toml");
     }
 
     /// The Bitcoin deploy samples are the mirror image: they parse wherever the BDK engine is
@@ -5715,28 +5767,28 @@ mod tests {
     fn shipped_bitcoin_configs_parse() {
         for (name, body) in [
             (
-                "deploy/zecd.btc-mainnet.toml",
-                include_str!("../deploy/zecd.btc-mainnet.toml"),
+                "deploy/rose.btc-mainnet.toml",
+                include_str!("../deploy/rose.btc-mainnet.toml"),
             ),
             (
-                "deploy/zecd.btc-mainnet-view.toml",
-                include_str!("../deploy/zecd.btc-mainnet-view.toml"),
+                "deploy/rose.btc-mainnet-view.toml",
+                include_str!("../deploy/rose.btc-mainnet-view.toml"),
             ),
             (
-                "deploy/zecd.btc-testnet3.toml",
-                include_str!("../deploy/zecd.btc-testnet3.toml"),
+                "deploy/rose.btc-testnet3.toml",
+                include_str!("../deploy/rose.btc-testnet3.toml"),
             ),
             (
-                "deploy/zecd.btc-testnet4.toml",
-                include_str!("../deploy/zecd.btc-testnet4.toml"),
+                "deploy/rose.btc-testnet4.toml",
+                include_str!("../deploy/rose.btc-testnet4.toml"),
             ),
             (
-                "deploy/zecd.btc-testnet4-kyoto.toml",
-                include_str!("../deploy/zecd.btc-testnet4-kyoto.toml"),
+                "deploy/rose.btc-testnet4-kyoto.toml",
+                include_str!("../deploy/rose.btc-testnet4-kyoto.toml"),
             ),
             (
-                "deploy/zecd.btc-testnet4-view.toml",
-                include_str!("../deploy/zecd.btc-testnet4-view.toml"),
+                "deploy/rose.btc-testnet4-view.toml",
+                include_str!("../deploy/rose.btc-testnet4-view.toml"),
             ),
         ] {
             toml::from_str::<ConfigFile>(body).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -5745,13 +5797,13 @@ mod tests {
 
     /// `wallet_dir` is `datadir.join(name)`, so a wallet named after the fleet root claims it.
     /// Nothing is overwritten - the fleet's own files sit deeper - which is exactly why this
-    /// needs catching: two owners would share a tree, `zecd rescan` on the wallet would delete
+    /// needs catching: two owners would share a tree, `rose rescan` on the wallet would delete
     /// through it, and a backup scoped to the wallet would quietly carry viewing keys.
     #[cfg(feature = "zcash")]
     #[test]
     fn a_wallet_named_after_the_fleet_root_is_refused_when_the_fleet_runs() {
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             format!(
@@ -5778,7 +5830,7 @@ mod tests {
     #[test]
     fn a_wallet_named_after_the_fleet_root_is_allowed_while_the_fleet_is_off() {
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             format!(
@@ -5802,7 +5854,7 @@ mod tests {
     #[test]
     fn an_ordinary_wallet_does_not_overlap_the_fleet() {
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             format!(

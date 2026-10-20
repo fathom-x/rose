@@ -20,11 +20,11 @@
 //!
 //! The wallet stamps a replacement's sighting after its original's (the actor's
 //! `commit_before_relay` floor), so step 2 immediately after the send - the same second,
-//! usually - is the case that floor exists for. Skips cleanly without a bitcoind or a zecd
+//! usually - is the case that floor exists for. Skips cleanly without a bitcoind or a rose
 //! built without the `bitcoin` feature.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::{json, Value};
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn btc_bumpfee_replaces_a_send_over_bitcoind() {
@@ -41,7 +41,7 @@ fn send_params(to: &str, amount: f64, fee_rate: u32) -> Value {
     json!([to, amount, null, null, false, null, null, null, null, fee_rate])
 }
 
-/// A BTC amount as satoshis, from the 8-decimal JSON numbers zecd answers with.
+/// A BTC amount as satoshis, from the 8-decimal JSON numbers rose answers with.
 fn sats(v: &Value) -> u64 {
     (v.as_f64().expect("an amount") * 1e8).round() as u64
 }
@@ -53,12 +53,12 @@ async fn bumpfee_flow(backend: BtcBackend) {
     };
     let node = BitcoinD::start(&bitcoind, &dir.path().join("btcdata")).await;
     node.mine(101).await;
-    let mut zecd = ZecdBtc::prepare(dir.path().join("zecddata"), backend, &node, &["btc"]);
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(101).await;
+    let mut rose = RoseBtc::prepare(dir.path().join("rosedata"), backend, &node, &["btc"]);
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(101).await;
 
-    let addr = zecd
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -67,11 +67,11 @@ async fn bumpfee_flow(backend: BtcBackend) {
         .await
         .expect("fund");
     node.mine(1).await;
-    zecd.wait_height(102).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
+    rose.wait_height(102).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
     let miner = node.new_address().await;
 
-    let original = zecd
+    let original = rose
         .call("sendtoaddress", send_params(&miner, 0.1, 1))
         .await
         .expect("a 1 sat/vB send");
@@ -79,7 +79,7 @@ async fn bumpfee_flow(backend: BtcBackend) {
     node.wait_mempool_contains(&original).await;
 
     // 1. No higher than the original's rate: refused, nothing replaced.
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("bumpfee", json!([original, {"fee_rate": 1}]))
         .await
         .expect_err("a bump at the original's rate");
@@ -87,7 +87,7 @@ async fn bumpfee_flow(backend: BtcBackend) {
     assert!(msg.contains("Insufficient fee rate"), "{msg}");
 
     // 2. The default bump.
-    let bumped = zecd
+    let bumped = rose
         .call("bumpfee", json!([original]))
         .await
         .expect("bumpfee");
@@ -102,12 +102,12 @@ async fn bumpfee_flow(backend: BtcBackend) {
         !mempool.contains(&original),
         "the node replaced the original: {mempool:?}"
     );
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("gettransaction", json!([original]))
         .await
         .expect_err("the replaced original left the wallet's view");
     assert_eq!(code, -5, "{msg}");
-    let tx = zecd
+    let tx = rose
         .call("gettransaction", json!([replacement]))
         .await
         .expect("gettransaction replacement");
@@ -116,7 +116,7 @@ async fn bumpfee_flow(backend: BtcBackend) {
     assert_eq!(tx["bip125-replaceable"], json!("yes"), "{tx}");
     // Charged once, at the replacement's fee: the original's input is spent by the
     // replacement alone, and its change is the one change output.
-    let balance = zecd
+    let balance = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances");
@@ -128,7 +128,7 @@ async fn bumpfee_flow(backend: BtcBackend) {
     );
 
     // 3. The original is already replaced.
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("bumpfee", json!([original]))
         .await
         .expect_err("bumping the replaced original");
@@ -137,7 +137,7 @@ async fn bumpfee_flow(backend: BtcBackend) {
     assert!(msg.contains(&replacement), "{msg}");
 
     // 4. Bump the replacement, opting out of BIP 125: the result cannot be bumped again.
-    let final_bump = zecd
+    let final_bump = rose
         .call("bumpfee", json!([replacement, {"replaceable": false}]))
         .await
         .expect("bumpfee replaceable=false");
@@ -146,12 +146,12 @@ async fn bumpfee_flow(backend: BtcBackend) {
     assert_eq!(sats(&final_bump["origfee"]), fee, "{final_bump}");
     assert!(final_fee > fee, "{final_bump}");
     node.wait_mempool_contains(&final_txid).await;
-    let tx = zecd
+    let tx = rose
         .call("gettransaction", json!([final_txid]))
         .await
         .expect("gettransaction final");
     assert_eq!(tx["bip125-replaceable"], json!("no"), "{tx}");
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("bumpfee", json!([final_txid]))
         .await
         .expect_err("bumping a non-replaceable transaction");
@@ -166,9 +166,9 @@ async fn bumpfee_flow(backend: BtcBackend) {
         "only the final replacement"
     );
     node.mine(1).await;
-    zecd.wait_height(103).await;
+    rose.wait_height(103).await;
     let expected = 100_000_000 - 10_000_000 - final_fee;
-    zecd.wait_wallet(
+    rose.wait_wallet(
         "btc",
         "getbalance",
         json!([]),
@@ -176,7 +176,7 @@ async fn bumpfee_flow(backend: BtcBackend) {
         |v| sats(v) == expected,
     )
     .await;
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("bumpfee", json!([final_txid]))
         .await
         .expect_err("bumping a mined transaction");
@@ -185,18 +185,18 @@ async fn bumpfee_flow(backend: BtcBackend) {
 
     // 6. A wallet descendant blocks the bump: the second send can only spend the first's
     //    unconfirmed change (the wallet's one output), so replacing the first would evict it.
-    let parent = zecd
+    let parent = rose
         .call("sendtoaddress", send_params(&miner, 0.1, 2))
         .await
         .expect("parent send");
     let parent = parent.as_str().unwrap().to_string();
     node.wait_mempool_contains(&parent).await;
-    let child = zecd
+    let child = rose
         .call("sendtoaddress", send_params(&miner, 0.1, 2))
         .await
         .expect("child send, spending the parent's change");
     let child = child.as_str().unwrap().to_string();
-    let child_tx = zecd
+    let child_tx = rose
         .call("gettransaction", json!([child]))
         .await
         .expect("gettransaction child");
@@ -204,7 +204,7 @@ async fn bumpfee_flow(backend: BtcBackend) {
         child_tx["hex"].as_str().is_some(),
         "the child is the wallet's: {child_tx}"
     );
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("bumpfee", json!([parent]))
         .await
         .expect_err("bumping a transaction with a wallet descendant");
@@ -212,5 +212,5 @@ async fn bumpfee_flow(backend: BtcBackend) {
     assert!(msg.contains("descendants in the wallet"), "{msg}");
     node.wait_mempool_contains(&child).await;
     node.mine(1).await;
-    zecd.wait_height(104).await;
+    rose.wait_height(104).await;
 }

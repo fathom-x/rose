@@ -1,4 +1,4 @@
-//! `zecd chain info`: dial the configured upstream and report its chain tip, without a wallet.
+//! `rose chain info`: dial the configured upstream and report its chain tip, without a wallet.
 //!
 //! This exists because there was no way to answer two questions before a wallet existed.
 //! [`crate::config_check`] is deliberately offline - it reports what the daemon *would* refuse,
@@ -111,7 +111,7 @@ pub async fn tip_status(source: &mut impl ChainSource) -> anyhow::Result<TipStat
 /// and rejects it, and there is no pre-genesis tree state. A short chain (a fresh regtest
 /// network) is exactly where that clamp matters.
 ///
-/// `zecd init` builds its birthday through this same function, so what an embedder pins here and
+/// `rose init` builds its birthday through this same function, so what an embedder pins here and
 /// what `init` would have recorded cannot diverge.
 pub async fn account_birthday(
     source: &mut impl ChainSource,
@@ -197,7 +197,7 @@ pub async fn probe(config: &AppConfig, server_override: Option<&str>) -> anyhow:
     })
 }
 
-/// `zecd chain-info`: the CLI shell around [`probe`].
+/// `rose chain-info`: the CLI shell around [`probe`].
 ///
 /// Streams follow `config check`: the report goes to stdout (so `--json` can be piped
 /// straight into a tool), and any verdict about it goes to stderr. Exits non-zero when the
@@ -242,7 +242,7 @@ pub async fn run(config: &AppConfig, args: &crate::config::ChainInfoArgs) -> any
     if !info.unsupported_upgrades.is_empty() {
         for u in &info.unsupported_upgrades {
             eprintln!(
-                "{}: upstream reports network upgrade {} (branch id {:08x}){} that this zecd \
+                "{}: upstream reports network upgrade {} (branch id {:08x}){} that this rose \
                  build does not know",
                 if u.active { "error" } else { "warning" },
                 u.name,
@@ -255,8 +255,8 @@ pub async fn run(config: &AppConfig, args: &crate::config::ChainInfoArgs) -> any
         }
         if info.unsupported_upgrades.iter().any(|u| u.active) {
             anyhow::bail!(
-                "this zecd build cannot follow the upstream's current consensus rules; update \
-                 zecd before syncing a wallet against it"
+                "this rose build cannot follow the upstream's current consensus rules; update \
+                 rose before syncing a wallet against it"
             );
         }
     }

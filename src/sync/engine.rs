@@ -69,7 +69,7 @@ const TRANSPARENT_RECORD_LOG_INTERVAL: std::time::Duration = std::time::Duration
 /// so the actor can tell this class apart from transport failures: reconnecting can fix a
 /// transport error, but a *persistent* apply failure at the same range means the local
 /// database cannot accept valid chain data, and the actor escalates its log guidance
-/// accordingly (unsupported upgrade → update zecd; otherwise → `zecd rescan`).
+/// accordingly (unsupported upgrade → update rose; otherwise → `rose rescan`).
 #[derive(Debug)]
 pub struct WalletApplyError(pub String);
 
@@ -83,7 +83,7 @@ impl std::error::Error for WalletApplyError {}
 
 /// A reorg the wallet cannot rewind past: every truncation target at or below the conflict was
 /// refused, so the conflicting block cannot be removed and no retry will ever apply the range.
-/// Only an operator-driven `zecd rescan` clears it.
+/// Only an operator-driven `rose rescan` clears it.
 ///
 /// Typed (recoverable via `anyhow`'s `downcast_ref`) because it is the one sync failure that is
 /// **terminal**: every other class - transport, a transient apply error - is worth retrying, and
@@ -267,7 +267,7 @@ pub struct MatchedTransparentSpend {
 /// Key for the wallet's unspent transparent outputs: `(funding txid, output index)`. The block
 /// scan tests every transparent input against this set, so a spend of a wallet UTXO is found in
 /// the block that mines it - no address queries, and no dependence on librustzcash emitting a
-/// spend-search request for an address zecd recorded itself.
+/// spend-search request for an address rose recorded itself.
 pub type UnspentOutpoints = HashSet<(TxId, u32)>;
 
 /// Build a [`WalletTransparentOutput`] for `utxo` iff its recipient address is one of the
@@ -1625,7 +1625,7 @@ mod tests {
         assert_eq!(m, REORG_MAX_MARGIN);
     }
 
-    /// Drive `scan_blocks`' continuity-error branch - the only code in zecd that handles
+    /// Drive `scan_blocks`' continuity-error branch - the only code in rose that handles
     /// reorgs - end to end and offline: scan a fabricated chain, present a block whose
     /// `prev_hash` contradicts the wallet's stored tip (what a post-reorg upstream serves),
     /// verify the rewind, then that the replacement chain - served as one batch, the way the

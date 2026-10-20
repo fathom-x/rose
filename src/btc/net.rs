@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 /// The receive-buffer size that keeps a peer to one segment in flight on a 1500-byte MTU
-/// path (one MSS); the `zecd.example.toml` recommendation.
+/// path (one MSS); the `rose.example.toml` recommendation.
 pub const ONE_SEGMENT_WINDOW_BYTES: u32 = 1448;
 
 /// Connect to `addr`, with the socket receive buffer set to `receive_window` bytes first

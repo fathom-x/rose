@@ -340,7 +340,7 @@ pub(crate) async fn waitforblockheight(
     wait_for_best_block(state, wallet, timeout, move |height, _| height >= target).await
 }
 
-/// `waitforsync ( timeout )` - zecd extension: start a sync pass immediately, then block until
+/// `waitforsync ( timeout )` - rose extension: start a sync pass immediately, then block until
 /// the wallet is fully caught up, meaning **both** the block scan has reached the chain tip and
 /// the transaction-enhancement backlog has drained.
 ///
@@ -410,7 +410,7 @@ pub(crate) async fn waitforsync(
                 "synced": synced,
                 "pending_enhancements": st.pending_enhancements,
                 "enhanced_through": st.enhanced_through,
-                // zecd extension: whether this wallet's own account exists in its database yet.
+                // rose extension: whether this wallet's own account exists in its database yet.
                 // Always true for a conventional wallet by the time it can be read; the case it
                 // exists for is a fleet member that has been onboarded but not yet imported,
                 // where every read is legitimately empty and `synced` alone would not say why.

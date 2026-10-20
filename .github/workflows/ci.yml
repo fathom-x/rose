@@ -1,6 +1,6 @@
 name: CI
 
-# Offline tier: builds zecd and runs the full `cargo test` suite (unit + HTTP integration +
+# Offline tier: builds rose and runs the full `cargo test` suite (unit + HTTP integration +
 # the regtest network/lifecycle tests) plus clippy. No network or Docker required, so this is
 # the gating check that runs on every push/PR - including from automated runs.
 
@@ -13,8 +13,8 @@ on:
     # docs, the release/docker/regtest workflows, the Dockerfiles, and the release packaging
     # script. (Editing ci.yml itself still runs - it's not ignored.)
     #
-    # `zecd.example.toml` and `deploy/**` are deliberately NOT ignored: tests/cli.rs runs
-    # `zecd config check` over the sample configs this repo ships, so editing one of them can
+    # `rose.example.toml` and `deploy/**` are deliberately NOT ignored: tests/cli.rs runs
+    # `rose config check` over the sample configs this repo ships, so editing one of them can
     # fail this tier and must therefore run it.
     paths-ignore:
       - "**.md"
@@ -130,7 +130,7 @@ jobs:
       - name: Test the bitcoin-only build
         run: cargo test --no-default-features --features bitcoin,server,cli
 
-      # A bitcoin-only zecd must carry no Zcash crate at all - the whole point of making them
+      # A bitcoin-only rose must carry no Zcash crate at all - the whole point of making them
       # optional. Compiling proves nothing here: an unused dependency still builds, ships in
       # the binary, and lands in the licence bundle. `-e normal` excludes dev-dependencies,
       # which are irrelevant to what a consumer links.
@@ -168,7 +168,7 @@ jobs:
       - name: Check advisories, licenses, bans, sources
         run: cargo deny check
 
-  # Verify THIRD-PARTY-LICENSES.txt still covers the current dependency tree. zecd ships
+  # Verify THIRD-PARTY-LICENSES.txt still covers the current dependency tree. rose ships
   # statically linked, so that bundle of every dependency's license text travels with the
   # binary (.deb / tarball / Docker image); it is committed rather than generated at build
   # time so the reproducible StageX/Alpine Docker builds stay tooling-free. Regenerate it
@@ -240,9 +240,9 @@ jobs:
 
   # Windows *target* check, cross-compiled from Ubuntu - runs on every PR.
   #
-  # Windows is not a supported deployment target: zecd ships as a static-musl Linux binary, its
+  # Windows is not a supported deployment target: rose ships as a static-musl Linux binary, its
   # hardening and file-permission paths are Unix-specific, and the regtest tier drives Unix node
-  # binaries. What this protects is the *library* consumer, since zecd is embeddable
+  # binaries. What this protects is the *library* consumer, since rose is embeddable
   # (`default-features = false`): a host application that happens to build for Windows should
   # fail on a feature it cannot use, not on a stray ungated `libc` call in code it never runs.
   # That is the exact regression it was added for - `lock::hostname` called `libc::gethostname`,

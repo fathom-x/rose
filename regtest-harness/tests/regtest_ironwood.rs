@@ -16,19 +16,19 @@
 //!
 //! Requires a node that accepts the `"NU6.3"` regtest activation-height key (zebrad >= 6.2.2), a
 //! V6-parsing lightwalletd on the light-mode leg, and
-//! `ZECD_REGTEST_NU63_HEIGHT=8` in zecd's environment - the same stack every other funded binary in
+//! `ROSE_REGTEST_NU63_HEIGHT=8` in rose's environment - the same stack every other funded binary in
 //! this tier now uses.
 //!
 //! Flow (no `migrate` needed): mine a transparent coinbase to the funder, mature it, `shield` into
-//! Orchard, then `wallet send` to zecd's unified address. Post-NU6.3 the proposal builder auto-routes
-//! the Orchard payment to an **ironwood** output (the `orchard_outputs_to_ironwood` path), so zecd
+//! Orchard, then `wallet send` to rose's unified address. Post-NU6.3 the proposal builder auto-routes
+//! the Orchard payment to an **ironwood** output (the `orchard_outputs_to_ironwood` path), so rose
 //! scans an ironwood (V3) note at its Orchard receiver - ironwood has no distinct UA receiver.
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Rose, RoseConfig,
 };
+use serde_json::json;
 
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
@@ -39,7 +39,7 @@ const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 async fn regtest_ironwood_receive_and_orchard_send() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP: set {} (plus ZECD_REGTEST_NU63_HEIGHT=8) to run the ironwood pool-structure \
+            "SKIP: set {} (plus ROSE_REGTEST_NU63_HEIGHT=8) to run the ironwood pool-structure \
              e2e. The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
@@ -54,19 +54,19 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         .await
         .expect("bring up a funded regtest chain");
 
-    // 5. zecd (ironwood compiled unconditionally) against zebra; get its unified address.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
-    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    // 5. rose (ironwood compiled unconditionally) against zebra; get its unified address.
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
+    let _rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
-        .expect("attach zecd backend");
-    let zecd = Zecd::start(&cfg)
+        .expect("attach rose backend");
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd against ironwood regtest zebra");
-    let zecd_ua = zecd
+        .expect("start rose against ironwood regtest zebra");
+    let rose_ua = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
-    let zecd_ua = zecd_ua.as_str().expect("address string").to_string();
+    let rose_ua = rose_ua.as_str().expect("address string").to_string();
     // `getnewaddress` must NEVER return an empty response, and must stay a valid unified address
     // even with NU6.3/ironwood active on this chain and an Orchard-only receiver config: ironwood
     // has no distinct UA receiver (it reuses the Orchard receiver - a post-NU6.3 Orchard-address
@@ -75,18 +75,18 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     // empty success string. Assert it here so a regression fails at the call with a clear message
     // rather than later as a downstream funding timeout. (`u`/`utest`/`uregtest` all start with `u`.)
     assert!(
-        !zecd_ua.is_empty(),
+        !rose_ua.is_empty(),
         "getnewaddress returned an empty address on an NU6.3-active chain (Orchard-only config)"
     );
     assert!(
-        zecd_ua.starts_with('u'),
-        "getnewaddress returned a non-unified address on an NU6.3-active chain: {zecd_ua:?}"
+        rose_ua.starts_with('u'),
+        "getnewaddress returned a non-unified address on an NU6.3-active chain: {rose_ua:?}"
     );
 
-    // 6. Wait until zecd is fully caught up.
+    // 6. Wait until rose is fully caught up.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -99,30 +99,30 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached conn_state ready before funding: {peers}"
+            "rose never reached conn_state ready before funding: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // 7. Fund zecd. Post-NU6.3 the funder's `wallet send` auto-routes the Orchard payment to an
-    //    ironwood output (no `migrate` needed), so zecd should receive an ironwood note at its
+    // 7. Fund rose. Post-NU6.3 the funder's `wallet send` auto-routes the Orchard payment to an
+    //    ironwood output (no `migrate` needed), so rose should receive an ironwood note at its
     //    Orchard receiver.
     funder
-        .send(&zecd_ua, FUND_ZATOSHIS)
+        .send(&rose_ua, FUND_ZATOSHIS)
         .await
-        .expect("send funds to zecd (auto-routed to ironwood post-NU6.3)");
+        .expect("send funds to rose (auto-routed to ironwood post-NU6.3)");
     zebrad
         .generate_blocks(6)
         .await
         .expect("confirm funding send");
 
-    // 8. zecd scans the ironwood note: its value lands in `getbalance` and `listunspent` labels it
+    // 8. rose scans the ironwood note: its value lands in `getbalance` and `listunspent` labels it
     //    `pool == "ironwood"` (sourced from `v_tx_outputs.output_pool` = 4). We poll listunspent at
     //    minconf 0 and mine until the ironwood entry appears, then cross-check the balance.
     let expected = FUND_ZATOSHIS as f64 / 1e8;
     let deadline = Instant::now() + FUND_TIMEOUT;
     let ironwood_note = loop {
-        let unspent = zecd
+        let unspent = rose
             .call("listunspent", json!([0]))
             .await
             .expect("listunspent");
@@ -137,7 +137,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never recorded an ironwood note; listunspent = {unspent}"
+            "rose never recorded an ironwood note; listunspent = {unspent}"
         );
         // Advance the chain so the receive confirms (relabels from orchard to ironwood once mined)
         // and the actor re-syncs.
@@ -157,12 +157,12 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     // The balance eventually reflects the ironwood receive once the note clears the confirmation
     // policy. A foreign (received) note isn't spendable until `untrusted_confirmations` (ZIP-315:
     // 10), so `getbalance` reads 0 right after the note first appears at 0-conf in `listunspent`
-    // above - keep mining until it confirms into the balance. A zecd (ironwood always compiled) sums
+    // above - keep mining until it confirms into the balance. A rose (ironwood always compiled) sums
     // `ironwood_balance()`, and the note is a V3 output `orchard_balance()` excludes, so a non-zero
     // balance here is the ironwood value.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let balance = zecd
+        let balance = rose
             .call("getbalance", json!([]))
             .await
             .expect("getbalance")
@@ -182,15 +182,15 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // 9. Orchard→Ironwood SEND. zecd now holds an ironwood (Orchard-pool V3) note. Spending it on
+    // 9. Orchard→Ironwood SEND. rose now holds an ironwood (Orchard-pool V3) note. Spending it on
     //    this post-NU6.3 chain necessarily builds a V6 transaction whose Orchard payment + change
     //    land in the **ironwood** bundle (new Orchard V2 outputs are forbidden past NU6.3), so the
-    //    send can only prove and broadcast if zecd's ironwood proof step (`create_ironwood_proof`
+    //    send can only prove and broadcast if rose's ironwood proof step (`create_ironwood_proof`
     //    with the `PostNu6_3` circuit) ran. A fresh Orchard receiver is the payee (ironwood shares
     //    the Orchard receiver - there is no distinct ironwood address). The successful broadcast is
-    //    the proof the send path works end-to-end; we then confirm it and re-check zecd still holds
+    //    the proof the send path works end-to-end; we then confirm it and re-check rose still holds
     //    ironwood value (the change is an ironwood note too).
-    let payee = zecd
+    let payee = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress payee")
@@ -203,14 +203,14 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         .expect("getblockcount")
         .as_u64()
         .expect("tip height");
-    zecd.wait_until_synced(tip, FUND_TIMEOUT)
+    rose.wait_until_synced(tip, FUND_TIMEOUT)
         .await
-        .expect("zecd at tip before the ironwood send");
+        .expect("rose at tip before the ironwood send");
     // 8b. Pin the SEND INPUT pool. The wallet's entire spendable shielded set is the single ironwood
     //     note funded above - no Orchard V2 or Sapling notes exist - so the send below can only draw
     //     an ironwood input. Assert it explicitly, so this stays a genuine ironwood→ironwood send and
     //     would not silently degrade into an Orchard-V2 drain if the funding/routing ever regressed.
-    let pre_send = zecd
+    let pre_send = rose
         .call("listunspent", json!([0]))
         .await
         .expect("listunspent before send");
@@ -227,7 +227,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     // retry the send (a transient -6) while advancing the chain, exactly as the funded e2e does.
     let deadline = Instant::now() + FUND_TIMEOUT;
     let send_txid = loop {
-        match zecd.call("sendtoaddress", json!([payee, 0.3])).await {
+        match rose.call("sendtoaddress", json!([payee, 0.3])).await {
             Ok(txid) => break txid.as_str().expect("txid string").to_string(),
             Err(e) => {
                 assert!(
@@ -244,7 +244,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
                     .expect("getblockcount")
                     .as_u64()
                     .expect("tip height");
-                let _ = zecd.wait_until_synced(tip, FUND_TIMEOUT).await;
+                let _ = rose.wait_until_synced(tip, FUND_TIMEOUT).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -255,7 +255,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         "orchard->ironwood send returns a display-hex txid: {send_txid}"
     );
 
-    // Confirm the send and verify it landed: it shows as an outgoing tx, and zecd still holds an
+    // Confirm the send and verify it landed: it shows as an outgoing tx, and rose still holds an
     // ironwood note (the change - proof the V6/ironwood output side round-tripped through the scan).
     zebrad
         .generate_blocks(6)
@@ -269,8 +269,8 @@ async fn regtest_ironwood_receive_and_orchard_send() {
             .expect("getblockcount")
             .as_u64()
             .expect("tip height");
-        let _ = zecd.wait_until_synced(tip, FUND_TIMEOUT).await;
-        let txs = zecd
+        let _ = rose.wait_until_synced(tip, FUND_TIMEOUT).await;
+        let txs = rose
             .call("listtransactions", json!([]))
             .await
             .expect("listtransactions");
@@ -279,7 +279,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
             .expect("listtransactions array")
             .iter()
             .any(|t| t["category"] == "send");
-        let unspent = zecd
+        let unspent = rose
             .call("listunspent", json!([0]))
             .await
             .expect("listunspent");
@@ -308,11 +308,11 @@ async fn regtest_ironwood_receive_and_orchard_send() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // 9b. zecd's own decoder shows that send's Ironwood bundle. Its payment and change both ride
-    //     it, so a decoder that rendered only `orchard` (as zecd's did) showed a v6 send with no
+    // 9b. rose's own decoder shows that send's Ironwood bundle. Its payment and change both ride
+    //     it, so a decoder that rendered only `orchard` (as rose's did) showed a v6 send with no
     //     shielded outputs at all. Every wallet tx is stored with raw bytes, so this is answered
     //     from the wallet, not the node.
-    let decoded = zecd
+    let decoded = rose
         .call("getrawtransaction", json!([send_txid, 1]))
         .await
         .expect("verbose getrawtransaction of the ironwood send");
@@ -339,11 +339,11 @@ async fn regtest_ironwood_receive_and_orchard_send() {
     //     `ironwood_tree_retained_checkpoints` table. That table did not exist before #2554 (only the
     //     Sapling/Orchard counterparts did), so scanning across a 288-boundary failed the whole batch
     //     with `no such table: ironwood_tree_retained_checkpoints`. Every regtest chain here otherwise
-    //     tops out below 288, so this is the one place that drives zecd's scan across the boundary:
+    //     tops out below 288, so this is the one place that drives rose's scan across the boundary:
     //     sync exactly to height 288, then scan block 289 on its own - its batch `from_state` is height
     //     288 (a 288-multiple), so `update_tree` retains the ironwood anchor at 288 regardless of
     //     shielded activity in that block. Without #2554 the scan wedges and `wait_until_synced` times
-    //     out; with it, zecd scans cleanly across the interval.
+    //     out; with it, rose scans cleanly across the interval.
     const ANCHOR_RETENTION_INTERVAL: u64 = 288;
     let pre_tip = zebrad
         .rpc("getblockcount", json!([]))
@@ -357,33 +357,33 @@ async fn regtest_ironwood_receive_and_orchard_send() {
          (tip {pre_tip}); if the earlier flow now exceeds {ANCHOR_RETENTION_INTERVAL}, retarget this \
          to the next multiple"
     );
-    // Sync zecd to exactly the interval height, so the following block is scanned in its own batch.
+    // Sync rose to exactly the interval height, so the following block is scanned in its own batch.
     zebrad
         .generate_blocks((ANCHOR_RETENTION_INTERVAL - pre_tip) as u32)
         .await
         .expect("mine up to the anchor-retention interval");
-    zecd.wait_until_synced(ANCHOR_RETENTION_INTERVAL, FUND_TIMEOUT)
+    rose.wait_until_synced(ANCHOR_RETENTION_INTERVAL, FUND_TIMEOUT)
         .await
-        .expect("zecd syncs up to the anchor-retention interval");
-    // One more block: zecd scans it with `from_state` at height 288, retaining the ironwood anchor.
+        .expect("rose syncs up to the anchor-retention interval");
+    // One more block: rose scans it with `from_state` at height 288, retaining the ironwood anchor.
     zebrad
         .generate_blocks(1)
         .await
         .expect("mine one block past the anchor-retention interval");
-    zecd.wait_until_synced(ANCHOR_RETENTION_INTERVAL + 1, FUND_TIMEOUT)
+    rose.wait_until_synced(ANCHOR_RETENTION_INTERVAL + 1, FUND_TIMEOUT)
         .await
         .expect(
-            "zecd scans across the anchor-retention interval without hitting the missing \
+            "rose scans across the anchor-retention interval without hitting the missing \
              ironwood_tree_retained_checkpoints table (librustzcash#2554)",
         );
     // The boundary range committed: a read RPC still resolves against the scanned wallet.
-    zecd.call("getbalance", json!([]))
+    rose.call("getbalance", json!([]))
         .await
         .expect("getbalance after scanning past the anchor-retention interval");
 }
 
-/// Sapling→Ironwood send: prove zecd can spend a **Sapling** note and produce an **ironwood** output
-/// past NU6.3. The wallet is funded with ONLY a Sapling note (the funder pays zecd's Sapling
+/// Sapling→Ironwood send: prove rose can spend a **Sapling** note and produce an **ironwood** output
+/// past NU6.3. The wallet is funded with ONLY a Sapling note (the funder pays rose's Sapling
 /// receiver), so the send's single input pool is Sapling; paying a fresh Orchard receiver on a
 /// post-NU6.3 chain routes the output into the ironwood bundle (a Sapling→ironwood turnstile,
 /// permitted under the default privacy policy). Because the wallet held no Orchard/ironwood note
@@ -392,7 +392,7 @@ async fn regtest_ironwood_receive_and_orchard_send() {
 async fn regtest_ironwood_sapling_send() {
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
-            "SKIP: set {} (plus ZECD_REGTEST_NU63_HEIGHT=8) to run the ironwood pool-structure \
+            "SKIP: set {} (plus ROSE_REGTEST_NU63_HEIGHT=8) to run the ironwood pool-structure \
              e2e. The harness still compiled.",
             RegtestNode::from_env().bin_env()
         );
@@ -404,22 +404,22 @@ async fn regtest_ironwood_sapling_send() {
         .await
         .expect("bring up a funded regtest chain");
 
-    // zecd with BOTH shielded pools enabled, so it can hand out a Sapling receiver and route Orchard
+    // rose with BOTH shielded pools enabled, so it can hand out a Sapling receiver and route Orchard
     // outputs (which become ironwood past NU6.3).
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.pools = Some((
         vec!["sapling".into(), "orchard".into()],
         vec!["sapling".into(), "orchard".into()],
     ));
-    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    let _rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
-        .expect("attach zecd backend");
-    let zecd = Zecd::start(&cfg)
+        .expect("attach rose backend");
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd with sapling+orchard against ironwood zebra");
+        .expect("start rose with sapling+orchard against ironwood zebra");
 
-    // A Sapling-only receiver for zecd; the funder pays it, so zecd holds exactly one Sapling note.
-    let sapling_ua = zecd
+    // A Sapling-only receiver for rose; the funder pays it, so rose holds exactly one Sapling note.
+    let sapling_ua = rose
         .call("getnewaddress", json!(["", "sapling"]))
         .await
         .expect("getnewaddress sapling")
@@ -429,7 +429,7 @@ async fn regtest_ironwood_sapling_send() {
 
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -442,26 +442,26 @@ async fn regtest_ironwood_sapling_send() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached ready: {peers}"
+            "rose never reached ready: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // Fund zecd's Sapling receiver. The funder spends its (ironwood) notes to a Sapling recipient -
-    // a cross-pool payment that lands as a plain Sapling note in zecd.
+    // Fund rose's Sapling receiver. The funder spends its (ironwood) notes to a Sapling recipient -
+    // a cross-pool payment that lands as a plain Sapling note in rose.
     funder
         .send(&sapling_ua, FUND_ZATOSHIS)
         .await
-        .expect("fund zecd's Sapling receiver");
+        .expect("fund rose's Sapling receiver");
     zebrad
         .generate_blocks(6)
         .await
         .expect("confirm sapling funding");
 
-    // Wait until zecd sees a spendable Sapling note and NO ironwood note yet.
+    // Wait until rose sees a spendable Sapling note and NO ironwood note yet.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let unspent = zecd
+        let unspent = rose
             .call("listunspent", json!([0]))
             .await
             .expect("listunspent");
@@ -477,7 +477,7 @@ async fn regtest_ironwood_sapling_send() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never recorded the Sapling note: {unspent}"
+            "rose never recorded the Sapling note: {unspent}"
         );
         zebrad.generate_blocks(2).await.expect("advance chain");
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -485,7 +485,7 @@ async fn regtest_ironwood_sapling_send() {
 
     // Sapling→Ironwood send: pay a fresh Orchard receiver. The only fundable input is the Sapling
     // note, and the Orchard-pool output becomes an ironwood note past NU6.3.
-    let payee = zecd
+    let payee = rose
         .call("getnewaddress", json!(["", "orchard"]))
         .await
         .expect("getnewaddress orchard payee")
@@ -498,12 +498,12 @@ async fn regtest_ironwood_sapling_send() {
         .expect("getblockcount")
         .as_u64()
         .expect("tip height");
-    zecd.wait_until_synced(tip, FUND_TIMEOUT)
+    rose.wait_until_synced(tip, FUND_TIMEOUT)
         .await
-        .expect("zecd at tip before the sapling->ironwood send");
+        .expect("rose at tip before the sapling->ironwood send");
     let deadline = Instant::now() + FUND_TIMEOUT;
     let send_txid = loop {
-        match zecd.call("sendtoaddress", json!([payee, 0.3])).await {
+        match rose.call("sendtoaddress", json!([payee, 0.3])).await {
             Ok(txid) => break txid.as_str().expect("txid string").to_string(),
             Err(e) => {
                 assert!(
@@ -520,7 +520,7 @@ async fn regtest_ironwood_sapling_send() {
                     .expect("getblockcount")
                     .as_u64()
                     .expect("tip height");
-                let _ = zecd.wait_until_synced(tip, FUND_TIMEOUT).await;
+                let _ = rose.wait_until_synced(tip, FUND_TIMEOUT).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -545,8 +545,8 @@ async fn regtest_ironwood_sapling_send() {
             .expect("getblockcount")
             .as_u64()
             .expect("tip height");
-        let _ = zecd.wait_until_synced(tip, FUND_TIMEOUT).await;
-        let unspent = zecd
+        let _ = rose.wait_until_synced(tip, FUND_TIMEOUT).await;
+        let unspent = rose
             .call("listunspent", json!([0]))
             .await
             .expect("listunspent");

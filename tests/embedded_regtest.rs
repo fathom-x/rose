@@ -5,16 +5,16 @@
 //! walks shapes, not scenarios - the flows themselves stay covered by conformance + the
 //! harness tier.
 //!
-//! `#[ignore]`d and self-skipping: it runs only with `ZECD_EMBEDDED_REGTEST=1` and a zebrad
+//! `#[ignore]`d and self-skipping: it runs only with `ROSE_EMBEDDED_REGTEST=1` and a zebrad
 //! binary in `ZEBRAD_BIN` (the same variable the regtest workflow exports):
 //!
 //! ```sh
-//! ZECD_EMBEDDED_REGTEST=1 ZEBRAD_BIN=/path/to/zebrad \
+//! ROSE_EMBEDDED_REGTEST=1 ZEBRAD_BIN=/path/to/zebrad \
 //!     cargo test --release --test embedded_regtest -- --ignored --nocapture
 //! ```
 //!
 //! The chain deliberately does NOT activate NU6.3 and the test does not set
-//! `ZECD_REGTEST_NU63_HEIGHT`, so the two sides agree pre-NU6.3 (the harness's NU6.3-active
+//! `ROSE_REGTEST_NU63_HEIGHT`, so the two sides agree pre-NU6.3 (the harness's NU6.3-active
 //! chains cover ironwood; this test is about the embedding seam, not the pool).
 
 // The embedded path under test is the Zcash engine's (`init_wallet` over librustzcash, a
@@ -42,7 +42,7 @@ midnight culture idea mountain fame park social drip bid doctor scatter glance d
 /// `--test-threads=1` every caller would have to remember to pass.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The regtest chain shape zecd's `network::regtest()` expects (the harness's template minus
+/// The regtest chain shape rose's `network::regtest()` expects (the harness's template minus
 /// the NU6.3 activation): NU5/NU6 from genesis, NU6.1/NU6.2 at height 4 with the ZIP-271
 /// lockbox disbursement their activation block requires.
 /// `miner_address` is where coinbase goes, and may be a unified address (zebra >= 6.0.0 mines
@@ -225,8 +225,8 @@ fn mine(rpc_port: u16, count: u32) {
 
 /// The env gate both tests share. `None` means skip.
 fn zebrad_bin_or_skip(test: &str) -> Option<PathBuf> {
-    if std::env::var("ZECD_EMBEDDED_REGTEST").as_deref() != Ok("1") {
-        eprintln!("skipping {test}: set ZECD_EMBEDDED_REGTEST=1 (and ZEBRAD_BIN) to run");
+    if std::env::var("ROSE_EMBEDDED_REGTEST").as_deref() != Ok("1") {
+        eprintln!("skipping {test}: set ROSE_EMBEDDED_REGTEST=1 (and ZEBRAD_BIN) to run");
         return None;
     }
     let bin = std::env::var("ZEBRAD_BIN")
@@ -253,8 +253,8 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     mine(rpc_port, 10);
 
     // The embedded path proper: clap-free config, the init core, the node facade.
-    let datadir = tempfile::tempdir().expect("zecd datadir");
-    let config = zecd::config::AppConfig::resolve_overrides(&zecd::config::ConfigOverrides {
+    let datadir = tempfile::tempdir().expect("rose datadir");
+    let config = rose::config::AppConfig::resolve_overrides(&rose::config::ConfigOverrides {
         datadir: Some(datadir.path().to_path_buf()),
         regtest: true,
         server: Some(format!("zebra://127.0.0.1:{rpc_port}")),
@@ -262,12 +262,12 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     })
     .expect("config resolves");
 
-    let outcome = zecd::init::init_wallet(
+    let outcome = rose::init::init_wallet(
         &config,
-        zecd::init::InitOptions {
+        rose::init::InitOptions {
             wallet: "default".into(),
-            key: zecd::init::InitKey::Generate,
-            encryption: zecd::init::EncryptionInput::AgeIdentity,
+            key: rose::init::InitKey::Generate,
+            encryption: rose::init::EncryptionInput::AgeIdentity,
             birthday: None,
         },
     )
@@ -279,7 +279,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
         "a generated wallet returns its mnemonic"
     );
 
-    let node = zecd::node::NodeBuilder::new(config)
+    let node = rose::node::NodeBuilder::new(config)
         .start()
         .await
         .expect("node starts");
@@ -323,7 +323,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     let balances = c.get_balances().await.expect("getbalances");
     assert_eq!(balances.mine.trusted.zatoshis(), 0);
     assert!(c
-        .list_unspent(&zecd::typed::wallet::ListUnspentOptions::default())
+        .list_unspent(&rose::typed::wallet::ListUnspentOptions::default())
         .await
         .expect("listunspent")
         .is_empty());
@@ -340,9 +340,9 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     let opid = c
         .z_send_many(
             &address,
-            &[zecd::typed::wallet::ZRecipient {
+            &[rose::typed::wallet::ZRecipient {
                 address: address.clone(),
-                amount: zecd::amount::Amount::from_zatoshis(10_000_000),
+                amount: rose::amount::Amount::from_zatoshis(10_000_000),
                 memo: None,
             }],
             None,
@@ -364,7 +364,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
         waited.finished,
         "the unfunded send must finish (by failing)"
     );
-    assert_eq!(waited.status, zecd::typed::wallet::OperationState::Failed);
+    assert_eq!(waited.status, rose::typed::wallet::OperationState::Failed);
     assert_eq!(
         waited.error.as_ref().map(|e| e.code),
         Some(-6),
@@ -390,9 +390,9 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     let memo_payment = |i: u8| {
         let addr = zcash_address::ZcashAddress::try_from_encoded(&address).expect("own address");
         // Via the crate's own re-export, which is the point of having it: an embedder builds
-        // requests with the exact `zip321` zecd links, not a separately-pinned copy whose
+        // requests with the exact `zip321` rose links, not a separately-pinned copy whose
         // mismatch would surface as a type error naming two identical-looking paths.
-        zecd::zip321::Payment::new(
+        rose::zip321::Payment::new(
             addr,
             Some(zcash_protocol::value::Zatoshis::ZERO),
             Some(zcash_protocol::memo::MemoBytes::from_bytes(&[b'a' + i]).expect("memo")),
@@ -402,15 +402,15 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
         )
         .expect("a zero-valued memo payment to a shielded address")
     };
-    let duplicated = zecd::zip321::TransactionRequest::new(vec![memo_payment(0), memo_payment(1)])
+    let duplicated = rose::zip321::TransactionRequest::new(vec![memo_payment(0), memo_payment(1)])
         .expect("a request paying one address twice is representable");
     let err = node
-        .send(None, duplicated, zecd::node::SendOptions::default())
+        .send(None, duplicated, rose::node::SendOptions::default())
         .await
         .expect_err("an unfunded wallet cannot pay the fee");
     assert_eq!(
         err.code,
-        zecd::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS,
+        rose::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS,
         "duplicate shielded recipients must reach fund selection, not be rejected as \
          duplicates: {err:?}"
     );
@@ -419,7 +419,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     node.shutdown().await;
 }
 
-/// The funded happy path for [`zecd::node::Node::send`], which the shape-walk above cannot
+/// The funded happy path for [`rose::node::Node::send`], which the shape-walk above cannot
 /// reach: it deliberately keeps an empty wallet, so every send there fails for want of funds.
 /// This test completes a real send through the seam - proposal, proof, signature, broadcast -
 /// and is the only place in the tree that does so through the library rather than an RPC.
@@ -448,28 +448,28 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
         return;
     };
 
-    let datadir = tempfile::tempdir().expect("zecd datadir");
+    let datadir = tempfile::tempdir().expect("rose datadir");
     let phrase = || {
         <bip0039::Mnemonic<bip0039::English>>::from_phrase(FUNDED_MNEMONIC)
             .expect("the checked-in regtest phrase is valid BIP-39")
     };
 
     // 1. The wallet's unified address, derived offline - no chain, no wallet database, nothing
-    //    on disk. This is `zecd derive-address`'s reason to exist: `init_wallet` needs a live
+    //    on disk. This is `rose derive-address`'s reason to exist: `init_wallet` needs a live
     //    upstream (it anchors the birthday on a tree state), so without offline derivation
     //    there would be no address to point zebra at before the wallet exists.
     let derive_config =
-        zecd::config::AppConfig::resolve_overrides(&zecd::config::ConfigOverrides {
+        rose::config::AppConfig::resolve_overrides(&rose::config::ConfigOverrides {
             datadir: Some(datadir.path().to_path_buf()),
             regtest: true,
             ..Default::default()
         })
         .expect("config resolves for offline derivation");
-    let derived = zecd::derive_address::derive(
+    let derived = rose::derive_address::derive(
         &derive_config,
-        zecd::derive_address::DeriveOptions {
+        rose::derive_address::DeriveOptions {
             wallet: None,
-            key: zecd::derive_address::KeyInput::Mnemonic(phrase()),
+            key: rose::derive_address::KeyInput::Mnemonic(phrase()),
             address_type: Some("orchard"),
             index: 0,
             count: 1,
@@ -492,20 +492,20 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
 
     // 3. The wallet restored from the phrase its address came from, birthday at genesis so the
     //    coinbase blocks are all in range.
-    let config = zecd::config::AppConfig::resolve_overrides(&zecd::config::ConfigOverrides {
+    let config = rose::config::AppConfig::resolve_overrides(&rose::config::ConfigOverrides {
         datadir: Some(datadir.path().to_path_buf()),
         regtest: true,
         server: Some(format!("zebra://127.0.0.1:{rpc_port}")),
         ..Default::default()
     })
     .expect("config resolves");
-    zecd::init::init_wallet(
+    rose::init::init_wallet(
         &config,
-        zecd::init::InitOptions {
+        rose::init::InitOptions {
             wallet: "default".into(),
-            key: zecd::init::InitKey::Restore(zecd::init::MnemonicInput::Phrase(phrase())),
-            encryption: zecd::init::EncryptionInput::AgeIdentity,
-            birthday: Some(zecd::init::Birthday::Height(1)),
+            key: rose::init::InitKey::Restore(rose::init::MnemonicInput::Phrase(phrase())),
+            encryption: rose::init::EncryptionInput::AgeIdentity,
+            birthday: Some(rose::init::Birthday::Height(1)),
         },
     )
     .await
@@ -519,7 +519,7 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
         .expect("the default wallet is configured")
         .engine_dir();
 
-    let node = zecd::node::NodeBuilder::new(config)
+    let node = rose::node::NodeBuilder::new(config)
         .start()
         .await
         .expect("node starts");
@@ -548,7 +548,7 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
     let account = location.account.expect("a synced wallet has an account");
     assert_eq!(
         location.scope,
-        zecd::wallet::read::AccountScope::Only(account),
+        rose::wallet::read::AccountScope::Only(account),
         "an existing account scopes to itself: {location:?}"
     );
 
@@ -561,7 +561,7 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
     // 5. The send: two zero-valued memo outputs to one address, through `Node::send`.
     let memo_payment = |text: &str| {
         let addr = zcash_address::ZcashAddress::try_from_encoded(&own_ua).expect("own UA");
-        zecd::zip321::Payment::new(
+        rose::zip321::Payment::new(
             addr,
             Some(zcash_protocol::value::Zatoshis::ZERO),
             Some(zcash_protocol::memo::MemoBytes::from_bytes(text.as_bytes()).expect("memo")),
@@ -571,14 +571,14 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
         )
         .expect("a zero-valued memo payment to a shielded address")
     };
-    let request = zecd::zip321::TransactionRequest::new(vec![
+    let request = rose::zip321::TransactionRequest::new(vec![
         memo_payment("embedded-send-first"),
         memo_payment("embedded-send-second"),
     ])
     .expect("a request paying one address twice is representable");
 
     let txid = node
-        .send(None, request, zecd::node::SendOptions::default())
+        .send(None, request, rose::node::SendOptions::default())
         .await
         .expect("the funded batch send completes");
 

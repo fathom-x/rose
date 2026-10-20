@@ -27,13 +27,13 @@
 //! it resumed, so after the resume the transaction never reaches the node and the released
 //! input is spent by the post-recovery send.
 //!
-//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
+//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
 use std::time::{Duration, Instant};
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::json;
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 /// Worst-case time for the actor to notice the hang and free its loop: one hung request
 /// (two RPC deadlines of 15s - the transport retries a broken socket once) plus generous
@@ -58,12 +58,12 @@ async fn hang_flow(backend: BtcBackend) {
     let node = BitcoinD::start(&bitcoind, &dir.path().join("btcdata")).await;
     node.mine(101).await;
 
-    let mut zecd = ZecdBtc::prepare(dir.path().join("zecddata"), backend, &node, &["btc"]);
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(101).await;
+    let mut rose = RoseBtc::prepare(dir.path().join("rosedata"), backend, &node, &["btc"]);
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(101).await;
     // Funded, so the kyoto send probe below gets as far as the broadcast.
-    let addr = zecd
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -72,9 +72,9 @@ async fn hang_flow(backend: BtcBackend) {
         .await
         .expect("fund");
     node.mine(1).await;
-    zecd.wait_height(102).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
-    let wi = zecd
+    rose.wait_height(102).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
+    let wi = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -82,9 +82,9 @@ async fn hang_flow(backend: BtcBackend) {
     // The health server sees the Bitcoin wallet: healthy means running, ready means the
     // chain source reports the wallet at its tip. Before the fix a bitcoin-only
     // daemon's /readyz was 200 with nothing checked and /status listed no wallets.
-    let (code, body) = zecd.health_get("healthz").await;
+    let (code, body) = rose.health_get("healthz").await;
     assert_eq!(code, 200, "{body}");
-    let ready = zecd
+    let ready = rose
         .wait_readyz(200, "the synced wallet reports ready")
         .await;
     assert_eq!(ready["ready"], json!(true), "{ready}");
@@ -101,7 +101,7 @@ async fn hang_flow(backend: BtcBackend) {
             .is_some_and(|s| s.starts_with(backend.label())),
         "{ready}"
     );
-    let (_, status) = zecd.health_get("status").await;
+    let (_, status) = rose.health_get("status").await;
     assert_eq!(status["wallets"]["btc"]["ready"], json!(true), "{status}");
     let miner = node.new_address().await;
 
@@ -117,7 +117,7 @@ async fn hang_flow(backend: BtcBackend) {
     //    round-trips through the actor and touches no network, so it measures pure
     //    command-loop latency: at most one RPC deadline, never forever.
     let t0 = Instant::now();
-    let balance = tokio::time::timeout(DETECT_TIMEOUT, zecd.call("getbalance", json!([])))
+    let balance = tokio::time::timeout(DETECT_TIMEOUT, rose.call("getbalance", json!([])))
         .await
         .expect("the actor command loop must answer while the upstream hangs")
         .expect("getbalance");
@@ -139,7 +139,7 @@ async fn hang_flow(backend: BtcBackend) {
             //    never exited and its socket still accepts.
             let deadline = Instant::now() + DETECT_TIMEOUT;
             loop {
-                let wi = zecd
+                let wi = rose
                     .call("getwalletinfo", json!([]))
                     .await
                     .expect("getwalletinfo");
@@ -159,7 +159,7 @@ async fn hang_flow(backend: BtcBackend) {
             );
             // Readiness follows the detection: 503 naming the upstream, while liveness
             // stays 200 - the process is fine, its chain source is not.
-            let body = zecd
+            let body = rose
                 .wait_readyz(503, "the hung upstream fails readiness")
                 .await;
             assert_eq!(body["reason"], json!("upstream_down"), "{body}");
@@ -168,13 +168,13 @@ async fn hang_flow(backend: BtcBackend) {
                 json!("down"),
                 "{body}"
             );
-            let (code, _) = zecd.health_get("healthz").await;
+            let (code, _) = rose.health_get("healthz").await;
             assert_eq!(code, 200, "/healthz is liveness, not readiness");
             // A send while disconnected is refused up front (-4, no upstream), not parked
             // on the dead socket for fee estimation and broadcast.
             let (code, msg) = tokio::time::timeout(
                 Duration::from_secs(30),
-                zecd.call("sendtoaddress", json!([miner, 0.1])),
+                rose.call("sendtoaddress", json!([miner, 0.1])),
             )
             .await
             .expect("a send while the upstream hangs must answer promptly")
@@ -192,7 +192,7 @@ async fn hang_flow(backend: BtcBackend) {
             let t1 = Instant::now();
             let txid = tokio::time::timeout(
                 DETECT_TIMEOUT,
-                zecd.call(
+                rose.call(
                     "sendtoaddress",
                     json!([miner, 0.1, null, null, false, null, null, null, null, 2]),
                 ),
@@ -214,7 +214,7 @@ async fn hang_flow(backend: BtcBackend) {
             // when it relays after the resume.)
             // Recorded at 0-conf: the 1.0 input is spent and the change is the wallet's
             // own trusted unconfirmed output, so the trusted balance is 0.9 less the fee.
-            let balance = zecd
+            let balance = rose
                 .call("getbalance", json!([]))
                 .await
                 .expect("getbalance after the queued send")
@@ -224,7 +224,7 @@ async fn hang_flow(backend: BtcBackend) {
                 balance < 1.0 && balance > 0.89,
                 "{balance}: the queued send locks its input and returns its change"
             );
-            let tx = zecd
+            let tx = rose
                 .call("gettransaction", json!([txid]))
                 .await
                 .expect("the queued send is a wallet transaction");
@@ -233,7 +233,7 @@ async fn hang_flow(backend: BtcBackend) {
             // explicit fee rate, like the first send's: fee estimation would otherwise ask
             // the stopped peer for a block, and the light client drops a peer that does not
             // answer a request, which turns the relay after the resume into a reconnect.
-            let (code, msg) = zecd
+            let (code, msg) = rose
                 .call(
                     "sendtoaddress",
                     json!([miner, 0.95, null, null, false, null, null, null, null, 2]),
@@ -245,10 +245,10 @@ async fn hang_flow(backend: BtcBackend) {
             // wallet's canonical history, and restarts the light client so its broadcast
             // queue (which still holds the signed bytes, with the `inv` already sitting in
             // the stopped peer's socket) forgets it too.
-            zecd.call("abandontransaction", json!([txid]))
+            rose.call("abandontransaction", json!([txid]))
                 .await
                 .expect("abandontransaction on a queued, unrelayed send");
-            let balance = zecd
+            let balance = rose
                 .call("getbalance", json!([]))
                 .await
                 .expect("getbalance after the abandonment");
@@ -257,7 +257,7 @@ async fn hang_flow(backend: BtcBackend) {
                 Some(1.0),
                 "the abandoned send's input is spendable again"
             );
-            let (code, msg) = zecd
+            let (code, msg) = rose
                 .call("gettransaction", json!([txid]))
                 .await
                 .expect_err("an abandoned transaction leaves the canonical set");
@@ -277,7 +277,7 @@ async fn hang_flow(backend: BtcBackend) {
         // would have relayed has actually passed.
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let wi = zecd
+            let wi = rose
                 .call("getwalletinfo", json!([]))
                 .await
                 .expect("getwalletinfo after the abandonment");
@@ -303,22 +303,22 @@ async fn hang_flow(backend: BtcBackend) {
         );
     }
     node.mine(3).await;
-    zecd.wait_height(105).await;
-    zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+    rose.wait_height(105).await;
+    rose.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
     if let Some(queued) = &queued_txid {
-        let (code, msg) = zecd
+        let (code, msg) = rose
             .call("gettransaction", json!([queued]))
             .await
             .expect_err("the abandoned transaction stays abandoned");
         assert_eq!(code, -5, "{msg}");
     }
-    let wi = zecd
+    let wi = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo after recovery");
     assert_eq!(wi["upstream_connected"], json!(true), "{wi}");
-    let ready = zecd
+    let ready = rose
         .wait_readyz(200, "readiness returns once the wallet is back at the tip")
         .await;
     assert_eq!(
@@ -326,7 +326,7 @@ async fn hang_flow(backend: BtcBackend) {
         json!(105),
         "{ready}"
     );
-    let balance = zecd
+    let balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance after recovery")
@@ -337,7 +337,7 @@ async fn hang_flow(backend: BtcBackend) {
         "{balance} (expected {expected_balance} less at most a sat/vB-scale fee)"
     );
     // And it spends again over the recovered connection.
-    let txid = zecd
+    let txid = rose
         .call(
             "sendtoaddress",
             json!([miner, 0.1, null, null, false, null, null, null, null, 2]),

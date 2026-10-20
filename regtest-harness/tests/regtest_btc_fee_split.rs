@@ -1,4 +1,4 @@
-//! `fee_split = "output"` live (zecd's extension over `subtractfeefrom`): each recipient
+//! `fee_split = "output"` live (rose's extension over `subtractfeefrom`): each recipient
 //! named to pay the fee is charged its own output's block space at the send's rate, and the
 //! sender's change pays everything else.
 //!
@@ -9,10 +9,10 @@
 //!    fee between them and the sender is debited exactly the amounts.
 //!
 //! The engine path is the same over either chain source, so this runs over bitcoind only.
-//! Skips cleanly without a bitcoind or a zecd built without the `bitcoin` feature.
+//! Skips cleanly without a bitcoind or a rose built without the `bitcoin` feature.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::{json, Value};
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 /// A BTC amount as satoshis.
 fn sats(v: &Value) -> u64 {
@@ -30,8 +30,8 @@ fn paid_to(decoded: &Value, address: &str) -> u64 {
         .unwrap_or_else(|| panic!("no output to {address}: {decoded}"))
 }
 
-async fn wallet_balance(zecd: &ZecdBtc) -> u64 {
-    let b = zecd
+async fn wallet_balance(rose: &RoseBtc) -> u64 {
+    let b = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances");
@@ -46,16 +46,16 @@ async fn btc_fee_split_output_charges_each_recipient_its_own_output() {
     };
     let node = BitcoinD::start(&bitcoind, &dir.path().join("btcdata")).await;
     node.mine(101).await;
-    let mut zecd = ZecdBtc::prepare(
-        dir.path().join("zecddata"),
+    let mut rose = RoseBtc::prepare(
+        dir.path().join("rosedata"),
         BtcBackend::Bitcoind,
         &node,
         &["btc"],
     );
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(101).await;
-    let addr = zecd
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(101).await;
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -63,8 +63,8 @@ async fn btc_fee_split_output_charges_each_recipient_its_own_output() {
         .await
         .expect("fund");
     node.mine(1).await;
-    zecd.wait_height(102).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
+    rose.wait_height(102).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
 
     let wpkh = node
         .call("getnewaddress", json!(["", "bech32"]))
@@ -78,8 +78,8 @@ async fn btc_fee_split_output_charges_each_recipient_its_own_output() {
     let tr = tr.as_str().unwrap().to_string();
 
     // 1. By output.
-    let before = wallet_balance(&zecd).await;
-    let txid = zecd
+    let before = wallet_balance(&rose).await;
+    let txid = rose
         .call(
             "sendmany",
             json!(["", {&wpkh: 0.1, &tr: 0.2}, null, "", [&wpkh, &tr], null, null, null, 10, null, "output"]),
@@ -101,7 +101,7 @@ async fn btc_fee_split_output_charges_each_recipient_its_own_output() {
     let fee = sats(&entry["fees"]["base"]);
     assert!(fee > 740, "the sender paid the rest of the fee: {entry}");
     // The wallet paid out the recipients' net amounts plus the whole fee less their shares.
-    let after = wallet_balance(&zecd).await;
+    let after = wallet_balance(&rose).await;
     assert_eq!(
         before - after,
         (30_000_000 - 740) + fee,
@@ -110,7 +110,7 @@ async fn btc_fee_split_output_charges_each_recipient_its_own_output() {
 
     // 2. Core's equal split, for contrast: the recipients pay the whole fee.
     let before = after;
-    let txid = zecd
+    let txid = rose
         .call(
             "sendmany",
             json!(["", {&wpkh: 0.1, &tr: 0.2}, null, "", [&wpkh, &tr], null, null, null, 10]),
@@ -119,12 +119,12 @@ async fn btc_fee_split_output_charges_each_recipient_its_own_output() {
         .expect("sendmany equal split");
     let txid = txid.as_str().unwrap().to_string();
     node.wait_mempool_contains(&txid).await;
-    let after = wallet_balance(&zecd).await;
+    let after = wallet_balance(&rose).await;
     assert_eq!(
         before - after,
         30_000_000,
         "the sender is debited exactly the amounts"
     );
     node.mine(1).await;
-    zecd.wait_height(103).await;
+    rose.wait_height(103).await;
 }

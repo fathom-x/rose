@@ -1,12 +1,12 @@
-# zecd operations runbook
+# rose operations runbook
 
-How to run `zecd` in production (mainnet) without losing funds or sleep. Read the
-README first for the architecture (`zebra → zecd`) and configuration reference; this
+How to run `rose` in production (mainnet) without losing funds or sleep. Read the
+README first for the architecture (`zebra → rose`) and configuration reference; this
 document covers backup/restore, monitoring, upgrades, and the mainnet checklist.
 
 ## Assumed deployment posture (trust boundary)
 
-`zecd` is built for one shape of deployment, and its safe-by-default behavior assumes it.
+`rose` is built for one shape of deployment, and its safe-by-default behavior assumes it.
 Know the assumptions so you can see when you are widening the trust boundary.
 
 **The assumed posture:**
@@ -18,7 +18,7 @@ Know the assumptions so you can see when you are widening the trust boundary.
   HTTP (`server = "zebra"`). No secrets and no chain-affecting authority cross the wire, so
   the hop is unencrypted by design.
 - **The operator owns the datadir** - `keys.toml`, `identity.txt`, the wallet DB, and the
-  single-instance lock live on storage only the operator controls. zecd binds the DB to the
+  single-instance lock live on storage only the operator controls. rose binds the DB to the
   key material (`keys.toml` UFVK pin) and refuses to start on a mismatch, but it cannot defend
   a datadir an attacker can rewrite at will.
 - **Auto-unlock keeps spend authority resident** - an identity-file (unencrypted) wallet with
@@ -29,13 +29,13 @@ Know the assumptions so you can see when you are widening the trust boundary.
 **What widens the boundary (deliberate opt-ins, each a bigger blast radius):**
 
 - **Binding RPC off loopback** - exposes spend authority to whatever can reach the bind
-  address. zecd warns when a non-loopback bind is paired with a bare password; put TLS / a
+  address. rose warns when a non-loopback bind is paired with a bare password; put TLS / a
   reverse proxy / network policy in front.
 - **A remote zebra over plaintext** (`[backend] allow_remote_cleartext = true`) - sends the
   `[zebra]` RPC credentials in cleartext to a non-local host. Only do this when the hop is
-  secured out of band (VPN / private link); zecd refuses it otherwise (#111 loopback gate).
+  secured out of band (VPN / private link); rose refuses it otherwise (#111 loopback gate).
 - **Auto-unlocking an unencrypted wallet** - the resident-seed model above. Prefer
-  `zecd init --encrypt` (Bitcoin-Core-style passphrase, unlocked per session with an enforced
+  `rose init --encrypt` (Bitcoin-Core-style passphrase, unlocked per session with an enforced
   timeout) whenever unattended spend authority is not actually required.
 
 See the README **Security** section for the underlying rationale (RPC credentials as spend
@@ -47,20 +47,20 @@ Funds are recoverable from **the mnemonic alone**. Everything else is convenienc
 
 | Artifact | Where | What it protects |
 |---|---|---|
-| **24-word mnemonic** | shown once by `zecd init` | The funds. Record it offline (paper/HSM). Without it, loss of the server is loss of funds. |
+| **24-word mnemonic** | shown once by `rose init` | The funds. Record it offline (paper/HSM). Without it, loss of the server is loss of funds. |
 | `keys.toml` | `<wallet dir>/keys.toml`, or wherever `keys_file` points | The age-*encrypted* mnemonic plus network and birthday height. Useless without the identity, but pair it with the identity for a full server restore - and it's the file you ship as a Secret. |
 | `identity.txt` (age identity) | `[keys] age_identity`, default `<datadir>/identity.txt` | Decrypts `keys.toml`. **This is spend authority** - store the backup separately from `keys.toml` backups. |
 | Birthday height | inside `keys.toml`; also worth recording with the mnemonic | Makes a from-seed restore fast. Any height at/before the wallet's first transaction works. |
 
 The SQLite database (`data.sqlite`) is a cache derived from the chain; it does not
-need backup. zecd is **stateless** - it keeps no off-chain data the seed can't rebuild (there is
+need backup. rose is **stateless** - it keeps no off-chain data the seed can't rebuild (there is
 no label store), so the whole data directory is disposable: with the mnemonic (and birthday) you
-can recreate everything via `zecd init --restore`.
+can recreate everything via `rose init --restore`.
 
 > **One exception, and only with the experimental fleet enabled.** `[fleet] enabled = true` adds
 > a manifest directory (`<datadir>/fleet/zec/wallets.d/` by default) holding one file per
 > watched wallet, each
-> carrying a **viewing key that exists nowhere else in zecd**. It is operator-supplied key
+> carrying a **viewing key that exists nowhere else in rose**. It is operator-supplied key
 > material in the same class as `keys.toml`, not a cache - nothing on the chain can rebuild it -
 > and unlike `keys.toml` it is *written at runtime*, every time `createwallet` onboards a wallet.
 > So with a fleet, "the whole data directory is disposable" is no longer true: back up
@@ -69,21 +69,21 @@ can recreate everything via `zecd init --restore`.
 > Losing it means those wallets silently stop being watched, with nothing in the daemon to say
 > which ones went missing. The shard databases under `fleet/zec/shards/` *are* ordinary caches,
 > rebuilt from
-> the manifests plus the chain. If the viewing keys also live in a system upstream of zecd (the
+> the manifests plus the chain. If the viewing keys also live in a system upstream of rose (the
 > usual arrangement for a service that watches keys on someone's behalf), that system is your
-> real backup and the manifest directory can be regenerated from it - but nothing in zecd
+> real backup and the manifest directory can be regenerated from it - but nothing in rose
 > reconciles the two, so drift is yours to detect.
 
 ### Minimal runtime file set (what's a secret, what's a cache)
 
-A running wallet's data directory holds the daemon-level files (`zecd.toml`, `.lock`,
+A running wallet's data directory holds the daemon-level files (`rose.toml`, `.lock`,
 `.cookie`, `identity.txt`) plus one directory per wallet. `<dir>` below is
 `<datadir>/<wallet>` unless a `[wallets.<name>] dir` override says otherwise; inside it,
 `keys.toml` sits at the root and the databases one coin and one engine deeper:
 
 ```
 <datadir>/
-  zecd.toml  .lock  .cookie  identity.txt
+  rose.toml  .lock  .cookie  identity.txt
   default/
     keys.toml
     zec/lrz/    data.sqlite
@@ -99,41 +99,41 @@ wallet lands in is decided by its birthday, a height on one chain. The fleet is 
 and the coin sits inside it, the same shape as `<datadir>/<wallet>/<coin>/`.
 
 Because a wallet's directory is `<datadir>/<name>`, the name `fleet` is effectively reserved: a
-`[wallets.fleet]` entry would resolve to the fleet's own tree, and zecd refuses to start rather
-than let two owners share it (a warning from `zecd config check` while `[fleet] enabled` is
+`[wallets.fleet]` entry would resolve to the fleet's own tree, and rose refuses to start rather
+than let two owners share it (a warning from `rose config check` while `[fleet] enabled` is
 false, an error once it is true).
 
 | Path | Role | Ship it? |
 |---|---|---|
-| `<dir>/keys.toml` | **Secret** - encrypted seed + birthday/network. Shared by every coin the wallet serves, which is why it sits above the per-coin directories. | Yes - mount as a Secret (relocate with `keys_file` / `ZECD_KEYS_FILE`). |
-| `identity.txt` | **Secret** - decrypts the seed (spend authority). | Yes, if auto-unlocking - mount as a Secret (`ZECD_AGE_IDENTITY`). |
+| `<dir>/keys.toml` | **Secret** - encrypted seed + birthday/network. Shared by every coin the wallet serves, which is why it sits above the per-coin directories. | Yes - mount as a Secret (relocate with `keys_file` / `ROSE_KEYS_FILE`). |
+| `identity.txt` | **Secret** - decrypts the seed (spend authority). | Yes, if auto-unlocking - mount as a Secret (`ROSE_AGE_IDENTITY`). |
 | `<dir>/zec/lrz/data.sqlite` (+ `-wal`/`-shm`) | Wallet state: the account plus scan progress, balances, and tx history. A **cache** - rebuilt from `keys.toml` + a rescan when absent (see bootstrap below). | No (disposable). |
-| `<dir>/zec/lrz/blocks/`, `blockmeta.sqlite` | **Legacy cache** - the on-disk compact-block cache of a zecd before the batch being scanned lived in memory. Dead weight if present; `zecd rescan` removes it. | No. |
+| `<dir>/zec/lrz/blocks/`, `blockmeta.sqlite` | **Legacy cache** - the on-disk compact-block cache of a rose before the batch being scanned lived in memory. Dead weight if present; `rose rescan` removes it. | No. |
 | `<datadir>/.cookie` | Ephemeral RPC cookie, minted at startup and removed on clean shutdown. | No. |
 | `<datadir>/fleet/zec/wallets.d/` | **Secret**, and only with the experimental `[fleet] enabled = true` - one manifest per watched wallet, each holding a viewing key held nowhere else. Written at runtime by `createwallet`. See the note above. | Yes - back up continuously. |
 | `<datadir>/fleet/zec/shards/` | **Cache** - the shard databases (each under a `shard-NNNN/lrz/`), rebuilt from the sibling `wallets.d/` plus the chain. Experimental fleet only. | No (disposable). |
 
 For a cloud deployment: put `keys.toml` (and `identity.txt`, if used) in a read-only Secret
-and point `ZECD_KEYS_FILE` / `ZECD_AGE_IDENTITY` at the mount. The batch of compact blocks
+and point `ROSE_KEYS_FILE` / `ROSE_AGE_IDENTITY` at the mount. The batch of compact blocks
 being scanned lives in memory, so nothing under the engine directory but `data.sqlite` is ever
 worth a snapshot.
 
-> **Upgrading from a data directory without `zec/lrz/`.** Older zecd kept the databases at the
-> wallet root (`<datadir>/default/data.sqlite`). The first `zecd run` (or `zecd init` / `zecd
+> **Upgrading from a data directory without `zec/lrz/`.** Older rose kept the databases at the
+> wallet root (`<datadir>/default/data.sqlite`). The first `rose run` (or `rose init` / `rose
 > rescan`) of a version that ships this layout moves them into `<wallet>/zec/lrz/`, under the
 > datadir lock; `keys.toml` is already where it belongs and is not touched. Each file is renamed,
 > not copied: no extra disk space, nothing deleted, and an interrupted move finishes on the next
-> start. `zecd config check` reports a wallet still waiting for the move (and `--strict` fails on
+> start. `rose config check` reports a wallet still waiting for the move (and `--strict` fails on
 > it), so an upgrade pipeline can see it coming. The one case refused rather than guessed at is
 > the same file present in *both* places, and there both copies are left alone. A
 > `[wallets.<name>] dir` override is migrated like any other wallet: the move happens inside
 > whatever directory you named.
 
-> **The data directory must be host-local.** zecd's single-instance lock on `<datadir>/.lock` is
-> an OS advisory lock enforced by the *local* kernel, so it only prevents a second zecd on the
+> **The data directory must be host-local.** rose's single-instance lock on `<datadir>/.lock` is
+> an OS advisory lock enforced by the *local* kernel, so it only prevents a second rose on the
 > *same host*. It does **not** span hosts: a datadir on a network filesystem shared read-write by
 > two machines (NFS, SMB, a Kubernetes `ReadWriteMany` volume) can be locked independently by each
-> host's kernel, so two zecd on different hosts could both write the wallet DB and corrupt it. Keep
+> host's kernel, so two rose on different hosts could both write the wallet DB and corrupt it. Keep
 > the datadir on a local disk or a single-writer volume (Kubernetes `ReadWriteOnce`), and never
 > share it read-write across hosts - the `keys.toml`/`identity.txt` Secret can be mounted read-only
 > by many pods, but each pod needs its **own** writable datadir. The lockfile records the holder's
@@ -142,7 +142,7 @@ worth a snapshot.
 ### Bootstrapping a disposable data directory
 
 With `[keys] bootstrap_from_keys` (default on), an empty data directory next to a present
-`keys.toml` is **rebuilt automatically on boot**: zecd recreates the wallet account from the
+`keys.toml` is **rebuilt automatically on boot**: rose recreates the wallet account from the
 seed and rescans from the birthday. So "mount one Secret (`keys.toml`, plus `identity.txt` if
 auto-unlocking) and start with an empty PVC" just works. When the seed becomes available depends
 on the custody model:
@@ -153,26 +153,26 @@ on the custody model:
   `locked` signal on `/status` is `true`; address/spend RPCs return "account is not ready". The
   rebuild runs at the **first `walletpassphrase`**, after which the wallet syncs (and stays
   synced while locked). The `data.sqlite` write happens then, so the data directory must be
-  writable - zecd probes this at launch and refuses to start on a read-only datadir, rather than
+  writable - rose probes this at launch and refuses to start on a read-only datadir, rather than
   failing at unlock time.
 - **Watch-only (`--ufvk`)** - has no seed and is **not** covered by bootstrap; recreate it with
-  `zecd init --ufvk` against an empty datadir.
+  `rose init --ufvk` against an empty datadir.
 
 To opt out (fail fast on an empty datadir instead of rebuilding), set `bootstrap_from_keys =
 false`.
 
 **Nothing on disk at all - not even `keys.toml`.** That is the enclave shape (ephemeral
 storage, and a `FROM scratch` image with no shell to run `init` before the daemon), and
-`zecd run --restore-if-empty` covers it: when the named wallet (`--wallet`, else the
+`rose run --restore-if-empty` covers it: when the named wallet (`--wallet`, else the
 config's implied wallet - `default_wallet`, or its one declared wallet) has no `keys.toml`,
 the daemon runs the `init --restore` path first - the phrase
-from `ZECD_MNEMONIC`, else `--mnemonic-file`, never a prompt; the birthday from
+from `ROSE_MNEMONIC`, else `--mnemonic-file`, never a prompt; the birthday from
 `--birthday`, as for `init` - and then serves the wallet under age-identity custody
 (`auto_unlock`), rescanning from the birthday. An initialized wallet is left exactly as it
 is and the phrase is not read, so the same command is safe to run on every boot. A failed
 restore ends the daemon rather than leaving it up to serve nothing. A kyoto Bitcoin wallet
 restores offline; a Zcash wallet's restore dials the upstream to anchor its birthday, so
-that upstream must be reachable at boot. The restore is logged on the `zecd::audit` target
+that upstream must be reachable at boot. The restore is logged on the `rose::audit` target
 without the phrase. A Caution enclave deployment is built on it.
 
 ### Secret inputs without baking them into the config
@@ -181,16 +181,16 @@ The RPC password is spend-equivalent for clients, and the seed/identity are spen
 so none of them should land in a ConfigMap. Each can come from the environment or a mounted
 Secret file instead of the TOML:
 
-- **RPC password** - `ZECD_RPC_PASSWORD`, `--rpcpassword`, or `[rpc] password_file`
+- **RPC password** - `ROSE_RPC_PASSWORD`, `--rpcpassword`, or `[rpc] password_file`
   (precedence: flag/env > `password_file` > inline `[rpc] password`). Prefer
-  `ZECD_RPC_PASSWORD` or `password_file` over `--rpcpassword`: a password on the command line
-  is exposed to any local user via `ps` and `/proc/<pid>/cmdline`, so zecd warns at startup when
+  `ROSE_RPC_PASSWORD` or `password_file` over `--rpcpassword`: a password on the command line
+  is exposed to any local user via `ps` and `/proc/<pid>/cmdline`, so rose warns at startup when
   the password is passed that way.
-- **keys.toml location** - `ZECD_KEYS_FILE` / `--keys-file` / `[keys] keys_file` (default wallet)
+- **keys.toml location** - `ROSE_KEYS_FILE` / `--keys-file` / `[keys] keys_file` (default wallet)
   or per-wallet `[wallets.<name>] keys_file`.
-- **age identity** - `ZECD_AGE_IDENTITY` / `--age-identity` / `[keys] age_identity`.
-- **Non-interactive `init --restore`** - `ZECD_MNEMONIC` or `--mnemonic-file` (else stdin);
-  `ZECD_WALLET_PASSPHRASE` for `init --encrypt` (else prompted). `run --restore-if-empty`
+- **age identity** - `ROSE_AGE_IDENTITY` / `--age-identity` / `[keys] age_identity`.
+- **Non-interactive `init --restore`** - `ROSE_MNEMONIC` or `--mnemonic-file` (else stdin);
+  `ROSE_WALLET_PASSPHRASE` for `init --encrypt` (else prompted). `run --restore-if-empty`
   takes the same two mnemonic sources and refuses without one (a daemon never prompts).
 
 ## Restore procedures
@@ -204,7 +204,7 @@ account is recreated from `keys.toml` and the DB rebuilds by rescanning from the
 **From-seed restore (have only the mnemonic):**
 
 ```sh
-zecd init --datadir /var/lib/zecd --restore --birthday <height>
+rose init --datadir /var/lib/rose --restore --birthday <height>
 # paste the mnemonic when prompted
 ```
 
@@ -214,10 +214,10 @@ mainnet. The wallet's receive/send history reappears as the scan progresses; bal
 are not final until `/readyz` reports ready.
 
 **Watch-only instance (have a spending wallet somewhere else):** export the viewing key
-with `zecd export-ufvk` on the spending wallet's host, then on the watch-only host:
+with `rose export-ufvk` on the spending wallet's host, then on the watch-only host:
 
 ```sh
-zecd init --datadir /var/lib/zecd-watch --ufvk "uview1..." --birthday <height>
+rose init --datadir /var/lib/rose-watch --ufvk "uview1..." --birthday <height>
 ```
 
 A watch-only wallet has no mnemonic and nothing spendable to back up - it is fully
@@ -286,7 +286,7 @@ it reveals the wallet's entire transaction graph, though it cannot spend.
   `last_delta` (unix time of the last delta or snapshot - a healthy mainnet feed delivers
   one every couple of seconds; testnet4 can go minutes between them), and per-process
   `deltas` / `matched` / `dropped` counters. A `dropped` count that keeps growing on the
-  websocket source means the server's transaction shape has drifted from what zecd parses
+  websocket source means the server's transaction shape has drifted from what rose parses
   (run the `#[ignore]`d `the_public_feed_still_answers_in_the_shape_we_parse` test to
   confirm). Budget the **bandwidth** before turning a feed on: the `p2p` source carries
   every transaction entering the node's mempool at raw size, roughly 150-300 MB a day on
@@ -321,7 +321,7 @@ work-queue 503s; daemon restarts.
 
 ## Reorgs
 
-zecd follows chain reorgs automatically: the scanner detects the fork via a block-hash
+rose follows chain reorgs automatically: the scanner detects the fork via a block-hash
 continuity error, rewinds the wallet below it, and rescans the replacement chain. The first
 rewind goes 10 blocks below the break. That is all an ordinary reorg needs, but the wallet
 only learns of a fork one block at a time, at its own tip - it is never told how deep the
@@ -334,7 +334,7 @@ Transactions in reorged-away blocks revert to unconfirmed (`confirmations: 0`) u
 confirmation thresholds keep doing their job. Operator-visible consequences:
 
 - **A `listsinceblock` cursor pointing at a reorged-away block returns `-5 Block not
-  found`** (zecd keeps no stale-header history to walk back through, unlike bitcoind).
+  found`** (rose keeps no stale-header history to walk back through, unlike bitcoind).
   Treat `-5` as "cursor invalid": re-baseline with a parameterless `listsinceblock`,
   process the result idempotently (dedupe by txid), and store the fresh `lastblock`.
   Poller logic should assume any tx below your confirmation threshold can be re-reported.
@@ -351,14 +351,14 @@ pathological case is the **same** error repeating on every paced retry while the
 sync error: Wallet(PutBlocksCommitmentTree { pool: Sapling, block_range: ..., error: Insert(Conflict(...)) })
 ```
 
-zecd diagnoses the two known causes and says so in the log:
+rose diagnoses the two known causes and says so in the log:
 
-- **Unsupported network upgrade (outdated zecd).** At every connect zecd compares the upgrades
+- **Unsupported network upgrade (outdated rose).** At every connect rose compares the upgrades
   zebra reports (`getblockchaininfo.upgrades`/`consensus`) against the consensus branch IDs this
   build understands. A *pending* unknown upgrade logs a warning ahead of activation - update
-  zecd before that height; an *active* one logs an error naming the upgrade, its branch ID and
+  rose before that height; an *active* one logs an error naming the upgrade, its branch ID and
   activation height, and each sync failure under it is attributed to it. The fix is updating to
-  the latest zecd release; if you are already on the latest, report it at
+  the latest rose release; if you are already on the latest, report it at
   <https://forum.zcashcommunity.com>.
 - **Corrupt wallet database.** If the upstream serves blocks fine but the wallet database keeps
   failing to apply them - the same apply-side error on 3+ consecutive passes, with no upgrade in
@@ -366,19 +366,19 @@ zecd diagnoses the two known causes and says so in the log:
   log points at the rebuild:
 
   ```sh
-  zecd stop                                  # rescan refuses while the daemon holds the datadir
-  zecd --datadir /var/lib/zecd rescan --wallet default   # --yes to skip the prompt
+  rose stop                                  # rescan refuses while the daemon holds the datadir
+  rose --datadir /var/lib/rose rescan --wallet default   # --yes to skip the prompt
   # start the daemon again
   ```
 
   `rescan` deletes only the wallet database (and a legacy on-disk block cache, if one is
   present); `keys.toml` (seed, network,
   birthday, UFVK pin) is kept, so the next start rebuilds the account from the seed and rescans
-  from the wallet birthday - all funds and history are re-derived from the chain (zecd persists
+  from the wallet birthday - all funds and history are re-derived from the chain (rose persists
   nothing a from-seed restore couldn't rebuild). Budget the same sync time as a server restore;
   `/readyz` stays 503 until it catches up. For an encrypted wallet the rebuild starts at the
   first `walletpassphrase`; a watch-only wallet has no seed to rebuild from - recreate it with
-  `zecd init --ufvk` instead.
+  `rose init --ufvk` instead.
 
 ## Shutdown and the send drain
 
@@ -399,7 +399,7 @@ that is what actually bounds it:
 
 Killed mid-drain nothing is corrupted - a send that had not been stored is simply lost, as it
 was before the drain existed - but the guarantee is silently gone, so raise the supervisor's
-timeout to match or lower `shutdown_drain_secs`. `zecd config check` warns when the value
+timeout to match or lower `shutdown_drain_secs`. `rose config check` warns when the value
 exceeds every common default. `0` disables the drain.
 
 Operation status objects are in-memory and do not survive the restart either way; reconcile by
@@ -411,10 +411,10 @@ txid (`gettransaction`), not by opid.
    still serving (the check is read-only and takes no datadir lock):
 
    ```sh
-   ./zecd-new config check --conf /etc/zecd/zecd.toml
+   ./rose-new config check --conf /etc/rose/rose.toml
    ```
 
-   zecd rejects unknown config keys, so a key the new build has not learned - or, on a
+   rose rejects unknown config keys, so a key the new build has not learned - or, on a
    rollback, one it has dropped - fails startup. This catches that offline, exits non-zero if
    the build would refuse the file, and prints the **effective** settings so you can diff the
    old and new binaries' output and see which defaults moved. Add `--strict` to fail on the
@@ -424,15 +424,15 @@ txid (`gettransaction`), not by opid.
    stderr the verdict, so redirecting stderr leaves a clean comparison):
 
    ```sh
-   diff <(./zecd-old config show --conf /etc/zecd/zecd.toml 2>/dev/null) \
-        <(./zecd-new config show --conf /etc/zecd/zecd.toml 2>/dev/null)
+   diff <(./rose-old config show --conf /etc/rose/rose.toml 2>/dev/null) \
+        <(./rose-new config show --conf /etc/rose/rose.toml 2>/dev/null)
    ```
 
    Anything that changed is a default this upgrade moves under you. To keep the old behaviour,
-   pin it: `./zecd-old config show --conf /etc/zecd/zecd.toml > effective.toml` renders the
+   pin it: `./rose-old config show --conf /etc/rose/rose.toml > effective.toml` renders the
    current settings as TOML you can adopt as the config file, with the values now explicit
    rather than inherited. Re-add the credential lines by hand - they are redacted, deliberately.
-2. `zecd stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503, and the
+2. `rose stop` (or SIGINT) - graceful: in-flight requests finish, new ones get 503, and the
    wallet finishes any send it had already accepted (see **Shutdown and the send drain**).
 3. Replace the binary / pull the new image.
 4. Start. Wallet DB migrations run automatically at open; the first start after a big
@@ -444,7 +444,7 @@ older binary before rolling back to it.
 
 ## Mainnet checklist
 
-- [ ] `zecd config check --conf <file>` clean against the binary being deployed (it
+- [ ] `rose config check --conf <file>` clean against the binary being deployed (it
       resolves the file the way the daemon would and reports what it would refuse).
 - [ ] `network = "main"` and `[rpc] password` set to a real secret (the daemon refuses
       to start with the `CHANGE-ME` placeholder).
@@ -452,8 +452,8 @@ older binary before rolling back to it.
       must cross a network boundary. **RPC credentials are spend authority** (see
       README → Security).
 - [ ] Key custody chosen deliberately: for unattended sending, the age identity stored
-      outside the datadir (secrets manager / separate mount / `ZECD_AGE_IDENTITY`); for
-      human-operated wallets, `zecd init --encrypt` so spending requires a verified
+      outside the datadir (secrets manager / separate mount / `ROSE_AGE_IDENTITY`); for
+      human-operated wallets, `rose init --encrypt` so spending requires a verified
       `walletpassphrase` with an enforced timeout.
 - [ ] Mnemonic + birthday recorded offline; restore procedure tested on testnet.
 - [ ] Local zebra full node configured (`server = "zebra"` or `zebra://host:port`);

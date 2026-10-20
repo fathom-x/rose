@@ -22,17 +22,17 @@ to freshness).
 Stdlib only. Defaults target the deploy/docker-compose.btc-testnet4.yml node.
 
 By default it runs as a live "good testnet citizen" service (the deployed shape): it
-polls the local zecd for unconfirmed wallet transactions and mines ONE
+polls the local rose for unconfirmed wallet transactions and mines ONE
 mempool-inclusive block whenever one is actually waiting - so it confirms your sends
 (and everyone else's pending txs, at no extra cost) without grinding when there is
-nothing to do. It asks zecd rather than deriving addresses from an xpub because zecd
+nothing to do. It asks rose rather than deriving addresses from an xpub because rose
 already tracks its own txs and issues new addresses over time; a static xpub would
 drift.
 
-    ZECD_RPC_PASSWORD=... python3 scripts/btc-miner.py
+    ROSE_RPC_PASSWORD=... python3 scripts/btc-miner.py
 
 --no-watch-mempool is the one-shot mode: mine --blocks N blocks on the current tip
-and exit, no zecd needed when --address is given. That is what drives a regtest dev
+and exit, no rose needed when --address is given. That is what drives a regtest dev
 stack and doubles as the e2e test of the block construction.
 
     python3 scripts/btc-miner.py --no-watch-mempool --address tb1q... --watch <txid>
@@ -45,7 +45,7 @@ propagates better, so depth - each successive block pre-ground during the previo
 20-minute wait - is what makes a confirmation stick. Depth counts the node's active
 chain, so confirmations mined by anyone stand the miner down.
 
-Omit --address and it fetches a fresh payout address from zecd (getnewaddress) at
+Omit --address and it fetches a fresh payout address from rose (getnewaddress) at
 startup - so a service unit needs no address pinned in it; pass --address to pin one.
 
 When a competing block shows up at our height (a same-height tie the node resolves
@@ -693,20 +693,20 @@ def tail12_header(prefix, tail12, nonce):
     return prefix[:64] + tail12 + struct.pack("<I", nonce)
 
 
-def pending_wallet_txids(node, zecd, depth=1):
+def pending_wallet_txids(node, rose, depth=1):
     """Txids the wallet needs a block mined for: ones it considers unconfirmed AND
     that the node still holds in its mempool. The mempool intersection is what makes
     this correct across the sync lag: once we mine, the txid leaves the node's mempool
-    immediately, so we do not re-mine while zecd is still catching up and reporting it
+    immediately, so we do not re-mine while rose is still catching up and reporting it
     at 0 confirmations. With depth > 1, txids confirmed shallower than depth count as
     work too, so the caller keeps extending its own chain until a competing
     same-height block can no longer orphan the confirmation away (confirmations are
-    zecd's view of the node's active chain, so depth reached by anyone's blocks -
+    rose's view of the node's active chain, so depth reached by anyone's blocks -
     ours or a competitor's - stands the miner down)."""
     try:
-        txs = zecd("listtransactions", ["*", 100])
+        txs = rose("listtransactions", ["*", 100])
     except Exception as e:
-        log(f"  zecd unreachable ({e}); will retry")
+        log(f"  rose unreachable ({e}); will retry")
         return set()
     unconfirmed = {t["txid"] for t in txs if t.get("confirmations", 0) == 0}
     shallow = {t["txid"] for t in txs if 0 < t.get("confirmations", 0) < depth}
@@ -719,9 +719,9 @@ def pending_wallet_txids(node, zecd, depth=1):
     return unconfirmed | shallow
 
 
-def watch_mempool(node, zecd, args, chain):
+def watch_mempool(node, rose, args, chain):
     log(
-        f"watch-mempool: polling zecd ({args.zecd_url}) every {args.poll}s; mining "
+        f"watch-mempool: polling rose ({args.rose_url}) every {args.poll}s; mining "
         f"mempool-inclusive blocks when a wallet tx is waiting"
         + (f", to {args.blocks} confirmations" if args.blocks > 1 else "")
         + (f", at most one per {args.cadence}s" if args.cadence else "")
@@ -731,7 +731,7 @@ def watch_mempool(node, zecd, args, chain):
         # Surface a minority-fork state that developed since we mined (a competing
         # block arrived after our accept). Deduplicated, so a steady fork is quiet.
         check_fork_contention(node, adopt=args.adopt_fork_txs)
-        pending = pending_wallet_txids(node, zecd, args.blocks)
+        pending = pending_wallet_txids(node, rose, args.blocks)
         if not pending:
             time.sleep(args.poll)
             continue
@@ -753,7 +753,7 @@ def watch_mempool(node, zecd, args, chain):
                 node,
                 args,
                 chain,
-                work_check=lambda: bool(pending_wallet_txids(node, zecd, args.blocks)),
+                work_check=lambda: bool(pending_wallet_txids(node, rose, args.blocks)),
                 our_txids=pending,
             )
         except OSError as e:
@@ -764,7 +764,7 @@ def watch_mempool(node, zecd, args, chain):
             continue
         if r is True:
             last_mined = time.time()
-            time.sleep(1)  # let zecd see the new block before the next poll
+            time.sleep(1)  # let rose see the new block before the next poll
         elif r is False:
             # A reject means a build problem; back off instead of hot-spinning on it.
             log(f"  backing off {args.poll}s after a submitblock rejection")
@@ -780,7 +780,7 @@ def main():
     ap.add_argument("--password", default="btc")
     ap.add_argument(
         "--address",
-        help="payout address for the coinbase (default: fetch a fresh one from zecd via getnewaddress)",
+        help="payout address for the coinbase (default: fetch a fresh one from rose via getnewaddress)",
     )
     ap.add_argument(
         "--blocks",
@@ -823,16 +823,16 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="run continuously; mine mempool-inclusive blocks whenever an unconfirmed "
-        "wallet tx (per zecd) is in the node's mempool, until it reaches --blocks "
+        "wallet tx (per rose) is in the node's mempool, until it reaches --blocks "
         "confirmations. Default on; --no-watch-mempool mines --blocks blocks on the "
         "current tip and exits",
     )
-    ap.add_argument("--zecd-url", default="http://127.0.0.1:48232", help="zecd RPC to poll (watch-mempool)")
-    ap.add_argument("--zecd-user", default="btc")
+    ap.add_argument("--rose-url", default="http://127.0.0.1:48232", help="rose RPC to poll (watch-mempool)")
+    ap.add_argument("--rose-user", default="btc")
     ap.add_argument(
-        "--zecd-password",
-        default=os.environ.get("ZECD_RPC_PASSWORD", ""),
-        help="zecd RPC password (or set ZECD_RPC_PASSWORD)",
+        "--rose-password",
+        default=os.environ.get("ROSE_RPC_PASSWORD", ""),
+        help="rose RPC password (or set ROSE_RPC_PASSWORD)",
     )
     ap.add_argument("--poll", type=int, default=15, help="seconds between watch-mempool polls")
     ap.add_argument(
@@ -869,25 +869,25 @@ def main():
         log("--broadcast-peers is a public-network feature; ignoring it on regtest")
         args.broadcast_peers = 0
 
-    # zecd is needed to watch the mempool, and to fetch a payout address when --address
-    # is omitted - both talk to the same zecd, so build one handle for either.
-    zecd = None
+    # rose is needed to watch the mempool, and to fetch a payout address when --address
+    # is omitted - both talk to the same rose, so build one handle for either.
+    rose = None
     if args.watch_mempool or not args.address:
-        if not args.zecd_password:
+        if not args.rose_password:
             why = "--watch-mempool" if args.watch_mempool else "fetching a payout address (or pass --address)"
-            sys.exit(f"need the zecd RPC password (--zecd-password or ZECD_RPC_PASSWORD) for {why}")
-        zecd = Rpc(args.zecd_url, args.zecd_user, args.zecd_password)
+            sys.exit(f"need the rose RPC password (--rose-password or ROSE_RPC_PASSWORD) for {why}")
+        rose = Rpc(args.rose_url, args.rose_user, args.rose_password)
 
     if not args.address:
         try:
-            args.address = zecd("getnewaddress")
+            args.address = rose("getnewaddress")
         except Exception as e:
-            sys.exit(f"could not fetch a payout address from zecd ({args.zecd_url}): {e}")
-        log(f"payout address (fresh from zecd): {args.address}")
+            sys.exit(f"could not fetch a payout address from rose ({args.rose_url}): {e}")
+        log(f"payout address (fresh from rose): {args.address}")
 
     if args.watch_mempool:
         log(f"chain {chain}, tip {info['blocks']}, watch-mempool with {args.jobs} workers")
-        watch_mempool(node, zecd, args, chain)
+        watch_mempool(node, rose, args, chain)
         return
 
     log(f"chain {chain}, tip {info['blocks']}, mining {args.blocks} block(s) with {args.jobs} workers")

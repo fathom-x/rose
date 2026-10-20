@@ -1,6 +1,6 @@
 //! TEMPORARY benchmark: the librustzcash stack vs the Zakura Common stack, end to end.
 //!
-//! Runs the same wallet workload against two (or more) `zecd` binaries on ONE regtest chain
+//! Runs the same wallet workload against two (or more) `rose` binaries on ONE regtest chain
 //! funded by ONE pinned funder, alternating binaries across rounds so machine drift cannot favour
 //! whichever ran last. Every measurement is the wall clock a user or operator actually
 //! experiences on the daemon:
@@ -13,26 +13,26 @@
 //! * `restore` - a from-seed restore of the same wallet: time from RPC-up to fully scanned at
 //!   the tip (trial decryption + note commitment tree work over the whole regtest chain, plus
 //!   the wallet's background keygen competing for cores).
-//! * `keygen` - read from the daemon log (`ZECD_STDERR=1`): the background Orchard + Ironwood
+//! * `keygen` - read from the daemon log (`ROSE_STDERR=1`): the background Orchard + Ironwood
 //!   proving-key build.
 //!
-//! With `ZECD_STDERR=1 RUST_LOG=zecd=info` the daemon's `send complete` lines (with
+//! With `ROSE_STDERR=1 RUST_LOG=rose=info` the daemon's `send complete` lines (with
 //! `prove_ms`, `build_ms`, ...) land in the test output, tagged by RPC port; the test prints a
 //! `BENCH port=<port> label=<label>` line per daemon so a post-processor can attribute them.
 //!
 //! Configuration (all env):
-//!   ZECD_BENCH_BINS   = "label=/path/to/zecd,label2=/path/to/zecd2"  (required)
-//!   ZECD_BENCH_ROUNDS = rounds per binary (default 2)
-//!   ZECD_BENCH_SENDS  = sends per round (default 5)
-//!   ZECD_BENCH_FANOUT = outputs in the fan-out send (default 16; 0 disables)
-//!   ZEBRAD_BIN, ZECD_FUNDER_BIN as for every regtest.
+//!   ROSE_BENCH_BINS   = "label=/path/to/rose,label2=/path/to/rose2"  (required)
+//!   ROSE_BENCH_ROUNDS = rounds per binary (default 2)
+//!   ROSE_BENCH_SENDS  = sends per round (default 5)
+//!   ROSE_BENCH_FANOUT = outputs in the fan-out send (default 16; 0 disables)
+//!   ZEBRAD_BIN, ROSE_FUNDER_BIN as for every regtest.
 
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
-use zecd_regtest_harness::{
-    pick_port, resolve_node_bin, start_funded_chain, zec_str, Zebrad, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    pick_port, resolve_node_bin, start_funded_chain, zec_str, Rose, RoseConfig, Zebrad,
 };
+use serde_json::{json, Value};
 
 const NOTE_ZAT: u64 = 50_000_000; // 0.5 ZEC per funded note
 /// Enough notes that the growing-input sends (1+1+2+3+4 = 11 notes' worth) stay funded.
@@ -57,13 +57,13 @@ async fn tip(zebrad: &Zebrad) -> u64 {
         .expect("height")
 }
 
-/// Mine `n` blocks and wait for `zecd` to scan them; returns the scan latency (from the mine
+/// Mine `n` blocks and wait for `rose` to scan them; returns the scan latency (from the mine
 /// returning to the daemon reporting the new tip).
-async fn mine_and_sync(zebrad: &Zebrad, zecd: &Zecd, n: u32) -> Duration {
+async fn mine_and_sync(zebrad: &Zebrad, rose: &Rose, n: u32) -> Duration {
     let target = tip(zebrad).await + n as u64;
     zebrad.generate_blocks(n).await.expect("mine");
     let t = Instant::now();
-    zecd.wait_until_synced(target, SYNC_TIMEOUT)
+    rose.wait_until_synced(target, SYNC_TIMEOUT)
         .await
         .expect("sync");
     t.elapsed()
@@ -75,8 +75,8 @@ fn ms(d: Duration) -> u64 {
 
 #[tokio::test]
 async fn regtest_bench_stack() {
-    let Some(bins_spec) = std::env::var("ZECD_BENCH_BINS").ok() else {
-        eprintln!("SKIP regtest_bench_stack: set ZECD_BENCH_BINS=label=path,label=path");
+    let Some(bins_spec) = std::env::var("ROSE_BENCH_BINS").ok() else {
+        eprintln!("SKIP regtest_bench_stack: set ROSE_BENCH_BINS=label=path,label=path");
         return;
     };
     let Some(zebrad_bin) = resolve_node_bin() else {
@@ -90,9 +90,9 @@ async fn regtest_bench_stack() {
             (k.to_string(), v.to_string())
         })
         .collect();
-    let rounds = env_usize("ZECD_BENCH_ROUNDS", 2);
-    let sends = env_usize("ZECD_BENCH_SENDS", 5);
-    let fanout = env_usize("ZECD_BENCH_FANOUT", 16);
+    let rounds = env_usize("ROSE_BENCH_ROUNDS", 2);
+    let sends = env_usize("ROSE_BENCH_SENDS", 5);
+    let fanout = env_usize("ROSE_BENCH_FANOUT", 16);
 
     let (zebrad, funder) = start_funded_chain(&zebrad_bin).await.expect("funded chain");
     let funder_ua = funder.unified_address().to_string();
@@ -109,32 +109,32 @@ async fn regtest_bench_stack() {
             bins.iter().rev().collect()
         };
         for (label, bin) in order {
-            std::env::set_var("ZECD_BIN", bin);
+            std::env::set_var("ROSE_BIN", bin);
             let version = std::process::Command::new(bin)
                 .arg("--version")
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
 
-            let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("port"));
+            let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("port"));
             cfg.pipeline_proving = Some(false);
             cfg.orchard_action_limit = Some(0);
             let t0 = Instant::now();
-            let zecd = Zecd::start(&cfg).await.expect("start zecd");
+            let rose = Rose::start(&cfg).await.expect("start rose");
             let startup_ms = ms(t0.elapsed());
             eprintln!(
                 "BENCH port={} label={} round={} version={:?}",
                 cfg.rpc_port, label, round, version
             );
             let chain_tip = tip(&zebrad).await;
-            zecd.wait_until_synced(chain_tip, SYNC_TIMEOUT)
+            rose.wait_until_synced(chain_tip, SYNC_TIMEOUT)
                 .await
                 .expect("initial sync");
 
             // Fund with NOTES equal notes so input counts are predictable.
             let mut addrs = Vec::new();
             for _ in 0..NOTES {
-                let a = zecd
+                let a = rose
                     .call("getnewaddress", json!([]))
                     .await
                     .expect("getnewaddress");
@@ -142,7 +142,7 @@ async fn regtest_bench_stack() {
             }
             let outputs: Vec<(String, u64)> = addrs.iter().map(|a| (a.clone(), NOTE_ZAT)).collect();
             funder.send_many(&outputs).await.expect("fund");
-            let fund_scan_ms = ms(mine_and_sync(&zebrad, &zecd, FUND_CONFS).await);
+            let fund_scan_ms = ms(mine_and_sync(&zebrad, &rose, FUND_CONFS).await);
 
             // Sends with growing input counts: 0.4 (1 note), 0.4 (1), 0.9 (2), 1.4 (3), 1.9 (4), ...
             // Each is paid back to the funder; change returns as a fresh note.
@@ -151,7 +151,7 @@ async fn regtest_bench_stack() {
                 let inputs = if i < 2 { 1 } else { i };
                 let amount_zat = (inputs as u64) * NOTE_ZAT - 10_000_000; // leave fee room
                 let t = Instant::now();
-                let r = zecd
+                let r = rose
                     .call("sendtoaddress", json!([funder_ua, zec_str(amount_zat)]))
                     .await;
                 let elapsed = ms(t.elapsed());
@@ -167,7 +167,7 @@ async fn regtest_bench_stack() {
                         send_ms.push(json!({"i": i, "inputs": inputs, "error": e.to_string()}));
                     }
                 }
-                mine_and_sync(&zebrad, &zecd, 4).await;
+                mine_and_sync(&zebrad, &rose, 4).await;
             }
 
             // Fan-out: one z_sendmany paying `fanout` own addresses.
@@ -175,7 +175,7 @@ async fn regtest_bench_stack() {
             if fanout > 0 {
                 let mut outs = Vec::new();
                 for _ in 0..fanout {
-                    let a = zecd
+                    let a = rose
                         .call("getnewaddress", json!([]))
                         .await
                         .expect("getnewaddress");
@@ -185,11 +185,11 @@ async fn regtest_bench_stack() {
                 }
                 let from = addrs[0].clone();
                 let t = Instant::now();
-                let opid = zecd
+                let opid = rose
                     .call("z_sendmany", json!([from, outs]))
                     .await
                     .expect("z_sendmany");
-                let status = zecd
+                let status = rose
                     .call("z_waitforoperation", json!([opid, 600]))
                     .await
                     .expect("z_waitforoperation");
@@ -199,23 +199,23 @@ async fn regtest_bench_stack() {
                     "BENCH fanout label={label} round={round} outputs={fanout} ms={elapsed} ok={ok} status={status}"
                 );
                 fanout_ms = Some(json!({"outputs": fanout, "ms": elapsed, "ok": ok}));
-                mine_and_sync(&zebrad, &zecd, 4).await;
+                mine_and_sync(&zebrad, &rose, 4).await;
             }
 
-            let balance = zecd
+            let balance = rose
                 .call("getbalance", json!([]))
                 .await
                 .expect("getbalance");
-            let mnemonic = zecd.mnemonic.clone().expect("fresh wallet mnemonic");
-            zecd.shutdown().await.expect("stop");
+            let mnemonic = rose.mnemonic.clone().expect("fresh wallet mnemonic");
+            rose.shutdown().await.expect("stop");
 
             // Restore from seed and time the full-chain scan.
-            let mut rcfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("port"));
+            let mut rcfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("port"));
             rcfg.restore_mnemonic = Some(mnemonic);
             rcfg.birthday = Some(2);
             let chain_tip = tip(&zebrad).await;
             let t = Instant::now();
-            let restored = Zecd::start(&rcfg).await.expect("start restore");
+            let restored = Rose::start(&rcfg).await.expect("start restore");
             let restore_up_ms = ms(t.elapsed());
             eprintln!(
                 "BENCH port={} label={} round={} restore",

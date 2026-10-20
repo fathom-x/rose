@@ -1,4 +1,4 @@
-# zecd configuration for a Bitcoin **mainnet kyoto** wallet - the BIP-157/158
+# rose configuration for a Bitcoin **mainnet kyoto** wallet - the BIP-157/158
 # compact-block-filter light client, peering over P2P with the node that
 # deploy/docker-compose.btc-mainnet.yml runs. NO RPC credentials to the node: kyoto is
 # credential-free, and the node's RPC stays loopback-and-cookie for host admin only.
@@ -9,23 +9,23 @@
 #     can read that identity file can spend. Keep the datadir on this host only, root-owned,
 #     backed up with the mnemonic that `init` prints (record it offline; it is printed once).
 #   * The RPC password is the spend credential. This file ships the CHANGE-ME placeholder,
-#     which zecd refuses to start on: supply ZECD_RPC_PASSWORD in the daemon's environment
-#     (it wins over the file), the same value deploy/.env gives the zecd-gui container.
+#     which rose refuses to start on: supply ROSE_RPC_PASSWORD in the daemon's environment
+#     (it wins over the file), the same value deploy/.env gives the rose-gui container.
 #   * [rpc] binds 127.0.0.1 and must stay there. The UI container runs on the host network
 #     (docker-compose.btc-mainnet.yml) precisely so nothing has to be published past loopback.
-#   * Watch-only is an option for the UI: `zecd export-xpub --wallet btc` here, then
+#   * Watch-only is an option for the UI: `rose export-xpub --wallet btc` here, then
 #     `init --xpub <key>` on the box that runs the dashboard, and that box holds no seed at
 #     all. A bare BIP 84 account xpub from any other wallet works too (add `--birthday`
 #     for its history). The UI detects a watch-only wallet, says so, and disables its send
 #     form.
 #
-# Needs a zecd built with the `bitcoin` feature (a default build refuses this file). Probe:
-#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-mainnet.toml config check
+# Needs a rose built with the `bitcoin` feature (a default build refuses this file). Probe:
+#   cargo run --release --features bitcoin -- --conf deploy/rose.btc-mainnet.toml config check
 #
 # Bring-up (offline: kyoto init does not dial the node):
-#   export ZECD_RPC_PASSWORD=...                       # the value in deploy/.env
-#   ./target/release/zecd --conf deploy/zecd.btc-mainnet.toml init --wallet btc
-#   ./target/release/zecd --conf deploy/zecd.btc-mainnet.toml
+#   export ROSE_RPC_PASSWORD=...                       # the value in deploy/.env
+#   ./target/release/rose --conf deploy/rose.btc-mainnet.toml init --wallet btc
+#   ./target/release/rose --conf deploy/rose.btc-mainnet.toml
 #
 # `--wallet btc` is optional (it defaults to `default_wallet`, which names [wallets.btc]). A
 # freshly generated kyoto wallet's birthday defaults to today (funds cannot predate the
@@ -67,7 +67,7 @@ server = "kyoto://127.0.0.1:8333"
 # [fees] defaults apply: sources = ["mempool_space", "esplora", "peer_median"], both HTTP
 # oracles at their public mainnet endpoints. Point them at instances you run to remove the
 # "this IP is building a transaction" disclosure, or drop to ["peer_median"] for no server
-# contact at all (see deploy/zecd.btc-testnet4-kyoto.toml for the shapes).
+# contact at all (see deploy/rose.btc-testnet4-kyoto.toml for the shapes).
 
 # [mempool] - the 0-conf feed, so a payment is seen before its block. "p2p" RUNS BY
 # DEFAULT: a relay connection to the trusted node above (every transaction entering its
@@ -78,17 +78,17 @@ server = "kyoto://127.0.0.1:8333"
 # "mempool_space" is a websocket to a mempool.space instance instead
 # (wss://mempool.space/api/v1/ws) and stays opt-in: several GB a day of JSON and a third
 # party knowing a wallet is online at this IP; a self-hosted instance (mempool_space_url)
-# removes the third party. See deploy/zecd.btc-testnet4-kyoto.toml for the full note.
+# removes the third party. See deploy/rose.btc-testnet4-kyoto.toml for the full note.
 # [mempool]
 # sources = ["p2p"]      # the default; `sources = []` is the off switch
 # p2p_snapshot = true
 
 [rpc]
-# zecd's own Bitcoin-Core-dialect JSON-RPC: loopback only. This is the spend surface.
+# rose's own Bitcoin-Core-dialect JSON-RPC: loopback only. This is the spend surface.
 bind = "127.0.0.1"
 port = 8232
 user = "btc"
-# Refused as-is on every network; ZECD_RPC_PASSWORD in the environment wins over this line.
+# Refused as-is on every network; ROSE_RPC_PASSWORD in the environment wins over this line.
 password = "CHANGE-ME"
 
 [keys]

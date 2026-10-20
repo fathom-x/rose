@@ -1,7 +1,7 @@
-//! `zecd config check` - validate a configuration file against *this* zecd build, and print the
+//! `rose config check` - validate a configuration file against *this* rose build, and print the
 //! settings it resolves to, without starting the daemon.
 //!
-//! zecd rejects unknown config keys, which is what keeps a typo'd knob from being silently
+//! rose rejects unknown config keys, which is what keeps a typo'd knob from being silently
 //! ignored - but it means a config written for one build can be refused by another. That cuts
 //! both ways on an upgrade (a key this build has not learned yet) and on a rollback (a key it
 //! no longer has), and the only way to find out used to be to start the daemon on the target
@@ -138,7 +138,7 @@ fn check_fleet(config: &AppConfig, findings: &mut Vec<Finding>) {
             findings.push(Finding::warning(format!(
                 "wallet '{name}' has its data directory at {}, which overlaps the fleet's {}. \
                  Harmless while [fleet] enabled is false - those paths are never read - but \
-                 setting it true would make zecd refuse to start. Rename the wallet, or point \
+                 setting it true would make rose refuse to start. Rename the wallet, or point \
                  [wallets.{name}] dir (or the [fleet] manifest_dir/dir) somewhere else",
                 wallet_path.display(),
                 fleet_path.display(),
@@ -160,7 +160,7 @@ fn check_fleet(config: &AppConfig, findings: &mut Vec<Finding>) {
     findings.push(Finding::warning(format!(
         "[fleet] is enabled and is EXPERIMENTAL: the manifest format, the [fleet] keys and the \
          wallet-management RPCs may change in a patch release. {} holds viewing keys that exist \
-         nowhere else in zecd and is written at runtime - back it up like keys.toml. Known \
+         nowhere else in rose and is written at runtime - back it up like keys.toml. Known \
          limitations: placement groups wallets by arrival rather than birthday, so a recent \
          wallet can wait behind the oldest member of its shard; and a wallet cannot be removed \
          from a shard once imported",
@@ -211,12 +211,12 @@ fn check_spend(config: &AppConfig, findings: &mut Vec<Finding>) {
     }
 }
 
-/// The longest supervisor stop timeout zecd assumes is available by default (systemd's
+/// The longest supervisor stop timeout rose assumes is available by default (systemd's
 /// `DefaultTimeoutStopSec`). Past this, `[spend] shutdown_drain_secs` is warned about.
 #[cfg(feature = "zcash")]
 const SUPERVISOR_STOP_TIMEOUT_HINT_SECS: u64 = 90;
 
-/// The verdict `zecd config check` derives from a set of findings. The pass/fail and
+/// The verdict `rose config check` derives from a set of findings. The pass/fail and
 /// `--strict` semantics live here so a library caller and the CLI cannot disagree on them.
 #[derive(Debug, Clone)]
 pub struct CheckOutcome {
@@ -243,7 +243,7 @@ impl CheckOutcome {
     }
 }
 
-/// [`inspect`] with the verdict attached - the library core of `zecd config check`, which
+/// [`inspect`] with the verdict attached - the library core of `rose config check`, which
 /// adds only the file lookup, the stdout/stderr stream split, and the exit code on top.
 pub fn check(config: &AppConfig) -> CheckOutcome {
     CheckOutcome {
@@ -368,7 +368,7 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
             ));
         }
         // A proxy resolves and dials the destination itself, so a loopback destination names the
-        // *proxy's* own loopback - almost never what an operator pointing zecd at a local node
+        // *proxy's* own loopback - almost never what an operator pointing rose at a local node
         // meant. Warn rather than error: a proxy running on this same host is a legitimate setup.
         if config.backend.proxy.is_some() && crate::backend::host_is_loopback(server.host()) {
             findings.push(Finding::warning(format!(
@@ -591,7 +591,7 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
 const LIGHT_TRANSPARENT_ADDR_WARN: u32 = 1_000;
 
 /// The RPC surface: the credentials must be usable, and a bare password must not be about to
-/// cross a network in the clear (zecd serves plaintext HTTP).
+/// cross a network in the clear (rose serves plaintext HTTP).
 fn check_rpc(config: &AppConfig, findings: &mut Vec<Finding>) {
     if let Err(e) = crate::server::auth::check_config(&config.rpc) {
         findings.push(Finding::error(format!("{e:#}")));
@@ -600,8 +600,8 @@ fn check_rpc(config: &AppConfig, findings: &mut Vec<Finding>) {
     {
         findings.push(Finding::warning(format!(
             "[rpc] bind = {} is not loopback and a bare rpcuser/rpcpassword is set; credentials \
-             would cross the network in plaintext (zecd serves plaintext HTTP). Bind to \
-             localhost, or place zecd behind a TLS-terminating proxy",
+             would cross the network in plaintext (rose serves plaintext HTTP). Bind to \
+             localhost, or place rose behind a TLS-terminating proxy",
             config.rpc.bind
         )));
     }
@@ -621,7 +621,7 @@ fn check_layout(config: &AppConfig, findings: &mut Vec<Finding>) {
             for m in moves {
                 findings.push(Finding::warning(format!(
                     "wallet '{}' still keeps its databases in the older layout, at the root of \
-                     {}; the next `zecd run`, `zecd init` or `zecd rescan` moves {} into {}",
+                     {}; the next `rose run`, `rose init` or `rose rescan` moves {} into {}",
                     m.wallet,
                     m.from.display(),
                     m.artifacts.join(", "),
@@ -661,7 +661,7 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
         } else {
             findings.push(Finding::warning(format!(
                 "wallet '{name}' is not initialized ({} is missing); the daemon skips it (run \
-                 `zecd init --wallet {name}`)",
+                 `rose init --wallet {name}`)",
                 keys_path.display()
             )));
         }
@@ -692,7 +692,7 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
         }
 
         // A multi-receiver default means the address `getnewaddress` hands out is not the string
-        // history reports, since only the receiver an output paid reaches the chain and zecd
+        // history reports, since only the receiver an output paid reaches the chain and rose
         // keeps no recipient-side record. The actor warns at spawn; here it is worth catching
         // before a deployment builds reconciliation on the wrong assumption. Transparent cannot
         // trip this - see `ReceiverSet::is_multi_receiver`.
@@ -703,7 +703,7 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
                  Addresses, which transaction history does not report - listtransactions, \
                  gettransaction, listsinceblock and z_listtransactions name the single receiver \
                  each output actually paid, because only that receiver reaches the chain and \
-                 zecd is stateless. Match a payment by deconstructing the issued address into \
+                 rose is stateless. Match a payment by deconstructing the issued address into \
                  its receivers, or with getreceivedbyaddress, which accepts any encoding of an \
                  address the wallet owns",
                 wallet.default_receivers.display_names()
@@ -719,7 +719,7 @@ fn check_paths(config: &AppConfig, findings: &mut Vec<Finding>) {
     }
 }
 
-/// The effective settings, rendered by [`crate::config_show`] - the same text `zecd config
+/// The effective settings, rendered by [`crate::config_show`] - the same text `rose config
 /// show` prints. One renderer rather than two: a check that described the configuration in its
 /// own vocabulary would invent labels that map to no config key, and would drift from `show` the
 /// first time a knob was added. What `check` adds is the verdict, on stderr.
@@ -728,12 +728,12 @@ fn summary(config: &AppConfig) -> String {
     crate::config_show::render(config)
 }
 
-/// `zecd config check`.
+/// `rose config check`.
 ///
 /// **stdout carries the effective configuration; stderr carries the verdict.** That is `nginx`'s
 /// split (`nginx -t`'s "syntax is ok" goes to stderr precisely so `nginx -T` can put pure config
 /// on stdout), and it is what makes the two jobs this command does separable:
-/// `zecd config check --conf f > effective.txt` captures exactly the settings, so diffing two
+/// `rose config check --conf f > effective.txt` captures exactly the settings, so diffing two
 /// binaries' output is diffing configuration and nothing else, while the findings and the pass/
 /// fail line stay where diagnostics belong. With `-q` stdout is empty, so a CI gate is silent on
 /// success and still loud on stderr when it isn't.
@@ -741,7 +741,7 @@ fn summary(config: &AppConfig) -> String {
 pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
     let conf_path = AppConfig::conf_path(cli);
     emit_err(&format!(
-        "zecd {}\nconfig file: {}\n",
+        "rose {}\nconfig file: {}\n",
         env!("CARGO_PKG_VERSION"),
         conf_path.display()
     ));
@@ -764,7 +764,7 @@ pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
             // to report, so the capture is empty rather than half-written.
             emit_err(&format!("\n{}: {e:#}\n", Level::Error.label()));
             anyhow::bail!(
-                "{} is not valid for zecd {}",
+                "{} is not valid for rose {}",
                 conf_path.display(),
                 env!("CARGO_PKG_VERSION")
             );
@@ -787,7 +787,7 @@ pub fn run(cli: &Cli, args: &ConfigCheckArgs) -> anyhow::Result<()> {
     let warnings = outcome.warnings();
     if outcome.passes(args.strict) && !args.quiet {
         report.push_str(&format!(
-            "\nOK: {} is valid for zecd {}{}\n",
+            "\nOK: {} is valid for rose {}{}\n",
             conf_path.display(),
             env!("CARGO_PKG_VERSION"),
             plural_suffix(warnings, " ({} warning{})"),
@@ -824,7 +824,7 @@ fn plural_suffix(n: usize, template: &str) -> String {
 }
 
 /// Write the effective configuration to stdout, treating a closed pipe as a clean exit
-/// (`zecd config check | head` would otherwise *panic* through `print!`, since the macros panic
+/// (`rose config check | head` would otherwise *panic* through `print!`, since the macros panic
 /// on EPIPE).
 #[cfg(feature = "cli")]
 fn emit(text: &str) {
@@ -849,12 +849,12 @@ mod tests {
     /// Parse a CLI the way `main` does, so the tests exercise the real argument surface
     /// (including that the global flags are accepted *after* the subcommand).
     fn cli(args: &[&str]) -> Cli {
-        Cli::try_parse_from(std::iter::once("zecd").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("rose").chain(args.iter().copied()))
             .expect("parsing the test command line")
     }
 
     fn write_config(dir: &Path, text: &str) -> std::path::PathBuf {
-        let path = dir.join("zecd.toml");
+        let path = dir.join("rose.toml");
         std::fs::write(&path, text).unwrap();
         path
     }
@@ -1152,19 +1152,19 @@ mod tests {
         assert!(hit.contains("cannot be removed"), "{hit}");
     }
 
-    /// The global flags must be accepted on either side of the subcommand - `zecd config check
+    /// The global flags must be accepted on either side of the subcommand - `rose config check
     /// --conf FILE` is the spelling operators reach for, and it is the one that would silently
     /// not exist if `conf` were positional to the top-level command.
     #[test]
     fn conf_is_accepted_before_and_after_the_subcommand() {
         for args in [
-            vec!["--conf", "/etc/zecd/zecd.toml", "config", "check"],
-            vec!["config", "check", "--conf", "/etc/zecd/zecd.toml"],
+            vec!["--conf", "/etc/rose/rose.toml", "config", "check"],
+            vec!["config", "check", "--conf", "/etc/rose/rose.toml"],
         ] {
             let parsed = cli(&args);
             assert_eq!(
                 AppConfig::conf_path(&parsed),
-                Path::new("/etc/zecd/zecd.toml"),
+                Path::new("/etc/rose/rose.toml"),
                 "{args:?}"
             );
         }
@@ -1374,7 +1374,7 @@ mod tests {
         );
     }
 
-    /// A bare password on a non-loopback bind crosses the network in the clear (zecd is
+    /// A bare password on a non-loopback bind crosses the network in the clear (rose is
     /// plaintext HTTP) - the same call-out the daemon logs at startup.
     #[test]
     fn a_bare_password_on_a_public_bind_warns() {

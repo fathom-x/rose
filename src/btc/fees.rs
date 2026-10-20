@@ -149,7 +149,7 @@ fn esplora_endpoint(network: BitcoinNetwork) -> Option<&'static str> {
 /// **skipped**, not an error: "mempool.space has no regtest instance" and "Blockstream runs no
 /// testnet4 Esplora" are facts about the world, and a chain that named them should degrade to
 /// its next tier rather than refuse to start. What that costs is visibility, which is why
-/// `zecd config check` reports a named-but-inert tier as a warning.
+/// `rose config check` reports a named-but-inert tier as a warning.
 pub fn oracle_chain(fees: &FeesConfig, network: BitcoinNetwork) -> Vec<FeeTier> {
     fees.sources
         .iter()

@@ -34,7 +34,7 @@ pub fn data_db_path(engine_dir: &Path) -> PathBuf {
 /// **corruption-safe**: the append-only WAL means a power loss can only truncate the unsynced
 /// tail of the log (recovery replays up to the last intact frame), never corrupt the database
 /// file, and checkpoints still fsync before writing back to the main db. What it trades is
-/// durability of the last few committed writes - which for zecd is nearly free, because
+/// durability of the last few committed writes - which for rose is nearly free, because
 /// everything in this DB (scanned blocks, decrypted notes, the clock-derived diversifier
 /// cursor, even an authored-and-broadcast send recovered via the OVK enhancement) is
 /// re-derivable from the chain by resuming the scan. The win scales with fsync latency:
@@ -70,7 +70,7 @@ fn configure_writer_conn(conn: &rusqlite::Connection, cache_mib: u32) -> rusqlit
 }
 
 /// librustzcash's default transparent gap limits for the internal (change) and ephemeral (TEX)
-/// scopes. zecd only ever varies the *external* gap limit (the user-facing receiving chain), so
+/// scopes. rose only ever varies the *external* gap limit (the user-facing receiving chain), so
 /// these mirror `zcash_keys::keys::transparent::gap_limits::GapLimits::default()`.
 const DEFAULT_INTERNAL_GAP: u32 = 5;
 const DEFAULT_EPHEMERAL_GAP: u32 = 10;
@@ -163,11 +163,11 @@ pub fn open_write_with(
 ///
 /// The wallet layer (since `zakura-client-sqlite` 0.1.0-rc7) refuses to enumerate status or
 /// payload work until a handle has chosen these, and the choice is not persisted, so it is made
-/// on every writer handle as it opens. `Public` and `Standard` are what zecd has always done: it
+/// on every writer handle as it opens. `Public` and `Standard` are what rose has always done: it
 /// fetches by txid from its own zebrad or lightwalletd, the one chain source an operator has
 /// already decided to trust with the wallet's traffic. The private alternatives (`Private`
 /// status, `PrivateIronwood` enhancement) route pure-Ironwood transactions to an Enhance PIR
-/// server instead; zecd has no PIR client, so selecting them would only leave that work queued
+/// server instead; rose has no PIR client, so selecting them would only leave that work queued
 /// forever. Read handles (`open_read`) never enumerate work, so they are left unconfigured.
 fn configure_request_routing(db: &mut WriteDb) {
     db.set_status_mode(TransactionStatusMode::Public);
@@ -188,14 +188,14 @@ pub fn open_read(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<ReadDb>
 ///
 /// There is no block-cache database to initialize: the batch being scanned lives in memory
 /// (`sync::memcache`), so the engine directory holds `data.sqlite` and nothing else. An older
-/// zecd's `blockmeta.sqlite` and `blocks/` are left alone if present - they are dead weight, and
-/// `zecd rescan` removes them with the rest (`migrate::ENGINE_ARTIFACTS`).
+/// rose's `blockmeta.sqlite` and `blocks/` are left alone if present - they are dead weight, and
+/// `rose rescan` removes them with the rest (`migrate::ENGINE_ARTIFACTS`).
 pub fn init_dbs(network: ZNetwork, engine_dir: &Path) -> anyhow::Result<WriteDb> {
     init_dbs_with_gap_limit(network, engine_dir, None)
 }
 
 /// As [`init_dbs`], but with an explicit **external** transparent gap limit (`None` = crate
-/// default). The actor and `zecd init` pass the wallet's configured `transparent_gap_limit` when
+/// default). The actor and `rose init` pass the wallet's configured `transparent_gap_limit` when
 /// transparent receiving is enabled, so address generation and the restore scan use the same
 /// (wider) window.
 pub fn init_dbs_with_gap_limit(
@@ -374,7 +374,7 @@ mod tests {
     /// committed development phrase's default index is 0 - asserted below so a phrase swap can't
     /// silently void the precondition - which makes this the clean-baseline half of the pair.
     ///
-    /// Checked here directly and deterministically: create the account exactly as `zecd init`
+    /// Checked here directly and deterministically: create the account exactly as `rose init`
     /// does for a transparent wallet (`init_dbs_with_gap_limit` + `create_account`) and read back
     /// what the external chain actually holds.
     #[test]

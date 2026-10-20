@@ -2,7 +2,7 @@
 //!
 //! librustzcash's funded test harness (`zcash_client_sqlite`'s `TestDbFactory`) is crate-private,
 //! so an actual *funded* note cannot be materialised here; funded receive/spend lives in the
-//! regtest tier (`regtest-harness/`, whose funder is a released zecd that shields regtest
+//! regtest tier (`regtest-harness/`, whose funder is a released rose that shields regtest
 //! coinbase with `z_shieldcoinbase`) and, for the public network, in the manual testnet flow.
 //! What this file does is everything that needs a real database but no chain, in five groups:
 //!
@@ -227,7 +227,7 @@ fn regtest_wallet_lifecycle() {
     // but `prepare()` validates every referenced column against the real schema, so a
     // `zcash_client_sqlite` bump that renames a column we depend on fails loudly here (offline)
     // instead of silently at runtime. Together with the `list_unspent`/`list_transactions`/
-    // `get_transaction` calls above, this covers every internal column zecd reads.
+    // `get_transaction` calls above, this covers every internal column rose reads.
     assert_eq!(
         read::tx_count(engine_dir, read::AccountScope::Any).expect("tx_count"),
         0
@@ -283,7 +283,7 @@ fn regtest_wallet_lifecycle() {
         "a testnet address is not valid on regtest"
     );
 
-    // 5. zecd's send-path key derivation works on regtest (USK from the seed at account 0).
+    // 5. rose's send-path key derivation works on regtest (USK from the seed at account 0).
     let account_index = zip32::AccountId::try_from(0u32).unwrap();
     SeedKeeper::unlocked(test_seed())
         .derive_usk(net, account_index)
@@ -399,7 +399,7 @@ fn is_mine_attributes_unrecorded_addresses_via_viewing_key() {
 /// only supports the pool holding the *foreign* receiver pays the attacker regardless of order. So
 /// `is_mine` must reject any multi-receiver UA that is not wholly the wallet's at one index. The
 /// same splice also has a **transparent** form - the attacker staples their transparent receiver
-/// onto the victim's shielded receiver; since zecd never issues transparent receivers, any UA
+/// onto the victim's shielded receiver; since rose never issues transparent receivers, any UA
 /// carrying one can never be the wallet's, and a transparent-only sender pays the attacker. This
 /// test builds all three spliced orientations (two shielded, one transparent) and asserts they are
 /// NOT ismine, while a genuinely own shielded UA (and the wallet's own single-pool receivers) still
@@ -435,7 +435,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     drop(fdb);
 
     let far = DiversifierIndex::from(1_000_007u32);
-    // The victim's own *shielded* (Sapling + Orchard, no transparent) UA - the shape zecd actually
+    // The victim's own *shielded* (Sapling + Orchard, no transparent) UA - the shape rose actually
     // issues (`getnewaddress` builds shielded-only UAs). Its receivers are the raw material for the
     // splices below.
     use zcash_keys::keys::ReceiverRequirement::*;
@@ -502,7 +502,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
 
     // Splice C: the victim's *own* Orchard receiver + the attacker's *transparent* receiver. Only
     // one shielded receiver is present, so the shielded-consistency check (which counts shielded
-    // receivers) never engages - this is the transparent variant of the splice. zecd never issues
+    // receivers) never engages - this is the transparent variant of the splice. rose never issues
     // a transparent receiver, so a UA carrying one can never be an address it handed out, and a
     // transparent-only sender pays the attacker. It must NOT be ismine even though the Orchard
     // receiver alone is genuinely the wallet's.
@@ -533,7 +533,7 @@ fn is_mine_rejects_spliced_unified_address_with_foreign_receiver() {
     assert!(
         !read::is_mine(net, engine_dir, read::AccountScope::Any, &splice_c),
         "a UA stapling the wallet's Orchard receiver to a transparent receiver must NOT be ismine \
-         (zecd never issues transparent receivers; a transparent-only sender pays the attacker)"
+         (rose never issues transparent receivers; a transparent-only sender pays the attacker)"
     );
 
     // The classifier agrees: both splices are Inconsistent (a foreign receiver mixed in).
@@ -1042,7 +1042,7 @@ use crate::error::codes;
 use crate::wallet::actor::{self, ActorConfig};
 use crate::wallet::store::{Passphrase, WalletStore};
 
-/// The test seed's index-0 UFVK in its regtest encoding: the pin a real `zecd init` would
+/// The test seed's index-0 UFVK in its regtest encoding: the pin a real `rose init` would
 /// record for a wallet built from [`test_seed`], required by the actor's startup binding
 /// check (keys.toml pin vs the database account).
 fn test_pinned_ufvk(net: crate::network::ZNetwork) -> String {
@@ -1589,7 +1589,7 @@ fn load_outputs_sql_matches_the_view_it_replaces() {
     populate_two_transactions(&conn, account_id, address_id);
 
     // The view's own answer, restricted to the transaction under test and read through exactly
-    // the columns zecd reads.
+    // the columns rose reads.
     let via_view = "SELECT output_pool, output_index, from_account_uuid, to_account_uuid,
                            to_address, value, is_change, recipient_key_scope, memo
                     FROM v_tx_outputs
@@ -1945,9 +1945,9 @@ fn tx_count_matches_the_view_it_replaces() {
 /// would return the other one's rows.
 /// The reported per-address bug, reproduced end to end on a real, populated wallet database.
 ///
-/// After a from-seed restore or `zecd rescan`, `getreceivedbyaddress` on the wallet's own
+/// After a from-seed restore or `rose rescan`, `getreceivedbyaddress` on the wallet's own
 /// `getnewaddress` address answered `0.00000000`, and the same funds were listed under an address
-/// zecd will not derive - one carrying a transparent receiver a shielded-only wallet does not
+/// rose will not derive - one carrying a transparent receiver a shielded-only wallet does not
 /// watch. Balances stayed correct throughout, so only per-address reconciliation could see it.
 ///
 /// The cause is upstream and cannot be configured away. Where a diversifier index has no

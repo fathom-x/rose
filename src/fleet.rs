@@ -3,8 +3,8 @@
 //!
 //! # Why a manifest directory rather than `[wallets.<name>]`
 //!
-//! A configured wallet is a TOML table plus its own data directory, `keys.toml` and `zecd init`
-//! run. That is right for the handful of wallets zecd was built around and wrong for five
+//! A configured wallet is a TOML table plus its own data directory, `keys.toml` and `rose init`
+//! run. That is right for the handful of wallets rose was built around and wrong for five
 //! thousand: nobody edits a config file with five thousand tables in it, and a wallet arriving at
 //! runtime cannot be added to one without restarting the daemon.
 //!
@@ -167,7 +167,7 @@ pub fn write_manifest(manifest_dir: &Path, member: &ShardMember) -> anyhow::Resu
         ));
     }
     let body = format!(
-        "# Written by zecd createwallet.\nufvk = \"{}\"\nbirthday = {}\n",
+        "# Written by rose createwallet.\nufvk = \"{}\"\nbirthday = {}\n",
         member.ufvk,
         u32::from(member.birthday)
     );

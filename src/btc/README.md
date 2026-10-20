@@ -15,8 +15,8 @@ trusted/untrusted confirmation semantics, and sends (per-send seed-derived signe
 `estimatesmartfee`-driven fees, inputs locked at 0-conf against the next selection).
 Phase 3 adds the **kyoto** backend (`server = "kyoto"`): a BIP-157/158 compact-block-filter
 light client over P2P, with no server and no credentials to provision. **Watch-only
-wallets** pair with a spender through the account xpub: `zecd export-xpub` prints it with
-its key origin, `zecd init --xpub` builds a seedless wallet from it (any number beside the
+wallets** pair with a spender through the account xpub: `rose export-xpub` prints it with
+its key origin, `rose init --xpub` builds a seedless wallet from it (any number beside the
 one spender), `keys.toml` pins it, and the wallet syncs, reports and refuses to spend
 exactly as a UFVK watch-only Zcash wallet does. Import is BIP 84 first-account keys only,
 the one derivation the engine has; a bare xpub (no key origin, as most wallets show it) is
@@ -46,7 +46,7 @@ a history of any length restores. Over kyoto the light client matches filters ag
 script set fixed when it is built - `lookahead` per keychain past the last revealed index,
 from index 0, widened after each delivered update but never over the blocks already
 passed - so a restore used to stop at about index 100 of a wallet paid at consecutive
-addresses (the fixed 100-script recovery set zecd passed then), and report synced with the
+addresses (the fixed 100-script recovery set rose passed then), and report synced with the
 rest of the funds missing. The
 actor now keeps a `ScriptWatch` per connection: the highest index the client watches per
 keychain, tracked exactly as bdk_kyoto builds and widens its set. After every applied
@@ -78,7 +78,7 @@ the **live window** is BDK's, `lookahead` past the last revealed index, and foll
 issuance; the **recovery horizon** is what a from-seed restore under the same configuration
 re-derives without further funding, `max(initial_scan, highest paid index + 1) + lookahead
 - 1` (`actor::recovery_horizon_for`), and follows funding only, because issuance leaves no
-trace on chain. `getnewaddress` issuing past the horizon warns (`zecd::audit`) that a
+trace on chain. `getnewaddress` issuing past the horizon warns (`rose::audit`) that a
 restore under the current configuration would miss funds received there - not that they
 are lost: the seed controls them, and a restore with `initial_scan` raised past the index
 finds them - and `getwalletinfo.recovery` reports `initial_scan`, `lookahead`, `horizon`,
@@ -148,7 +148,7 @@ partially-synced header chain cannot cap an anchor low.
 
 The shipped floors (`scan_floor`, one per public network - mainnet, testnet3, testnet4)
 remain as the trusted base a resolution chains from and the start for anchor-less wallets:
-any hash at or below the birthday will do, and each shipped block predates zecd's **first
+any hash at or below the birthday will do, and each shipped block predates rose's **first
 release**, so it sits below the birthday of every generated wallet that will ever exist on
 its network. Testnet3 needs its floor *more* than mainnet, not less: its chain is over 5M
 blocks, so a first sync from genesis effectively never finishes. Correctness never depends
@@ -193,7 +193,7 @@ with no `--birthday` still faces the long scan - its history may genuinely preda
 anchor - but a restore given an explicit height or date gets the same anchor treatment as
 a generated wallet.
 
-### A rejected header batch parks the node, so zecd redials from an older checkpoint
+### A rejected header batch parks the node, so rose redials from an older checkpoint
 
 `bip157` keeps its header tree in memory and, on a batch it cannot accept, sends a
 `Warning::UnexpectedSyncError`, bans the peer, and carries on with the tree it has. When
@@ -207,7 +207,7 @@ lets CPU miners produce `1d00ffff` blocks between ASIC blocks at the real target
 fork whose second header is ASIC-mined, the usual shape of a testnet4 reorg, is rejected as
 `InvalidPow` and never reorged onto. Upstream master has the same code.
 
-zecd handles it at its seam rather than patching the crate (`kyoto.rs`, module doc):
+rose handles it at its seam rather than patching the crate (`kyoto.rs`, module doc):
 
 - The warning drain classifies the warning (`fatal_sync_warning`) and fails the update
   stream with `KyotoFailure::HeaderSync`. The actor treats that like a bitcoind transport
@@ -262,8 +262,8 @@ the node's.
 Regtest pins the mechanics; testnet4 supplies the real thing, daily: CPU miners contest
 min-difficulty tips, and `scripts/btc-miner.py` mines a lone block for every unconfirmed
 wallet transaction - exactly the block a competing miner orphans. Two daemons watch the
-same wallet over both backends: the bitcoind-backed one from `deploy/zecd.btc-testnet4.toml`
-and a watch-only kyoto sibling from `deploy/zecd.btc-testnet4-view.toml`, built from the
+same wallet over both backends: the bitcoind-backed one from `deploy/rose.btc-testnet4.toml`
+and a watch-only kyoto sibling from `deploy/rose.btc-testnet4-view.toml`, built from the
 spender's exported xpub and peered with the same compose node's filter-serving P2P port.
 `scripts/btc-reorg-watch.py` polls the node (`getbestblockhash`, `getchaintips`) and each
 wallet (`getwalletinfo`, its history) and logs one line per event: `REORG` when the node's
@@ -483,7 +483,7 @@ the same reason. The record then follows the relay's verdict:
   never-relayed send as "evicted", and the mempool pass **never retires a transaction the
   wallet funded** on that report (it used to, freeing the inputs for a double-spend of a
   transaction that may be on the network). Core keeps an own transaction that left the
-  mempool until a conflict confirms or the operator abandons it; so does zecd. The `-4` "retry" error is now reserved for a
+  mempool until a conflict confirms or the operator abandons it; so does rose. The `-4` "retry" error is now reserved for a
   send refused *before* anything is committed - no upstream connection, no seed, a persist
   failure - and for the relay of a foreign transaction via `sendrawtransaction`, which the
   wallet has nothing to commit for.
@@ -547,17 +547,17 @@ differ between the two methods, as in Core):
   subtract-fee send), then rate-priced rebuilds over those pinned inputs walk the fee to a
   fixed point, accepting a changeless build whose fee overshoots by at most a dust bound
   (the no-fixed-point shape where BDK folds a sub-dust surplus into the fee, as Core
-  does). zecd's **`fee_split`** extension (position 12 on `sendtoaddress`, after the Zcash
+  does). rose's **`fee_split`** extension (position 12 on `sendtoaddress`, after the Zcash
   memo at 11; 10 on `sendmany`) picks another share: `"output"` charges each paying
   recipient its own output's serialized size at the send's rate (`output_fee_share`: 310 sat
   for a P2WPKH output at 10 sat/vB, 430 for P2TR), and the sender's change pays the rest -
   header, inputs, change, unconfirmed parents - so a recipient's charge no longer depends on
   which coins the sender spent. `"equal"` (the default) is Core's split.
 - **`verbose`** (position 10 on `sendtoaddress`, 9 on `sendmany`) answers Core's
-  `{txid, fee_reason}`: Core's own strings where zecd prices the same way (`PayTxFee set`
+  `{txid, fee_reason}`: Core's own strings where rose prices the same way (`PayTxFee set`
   for an explicit `fee_rate`, `Fallback fee` for the test-network floor), else the source
   that answered (`estimatesmartfee`, or the `[fees]` tier name on kyoto) - Core's
-  estimator-horizon strings describe a computation zecd does not do.
+  estimator-horizon strings describe a computation rose does not do.
 - **`replaceable`** (position 5 on both) is honored, not ignored: omitted or `true` keeps
   BDK's BIP 125-signalling default (Core's `-walletrbf` default); `false` builds every input
   with `nSequence = 0xFFFFFFFE`, locktime still enforced for anti-fee-sniping, and
@@ -593,7 +593,7 @@ Core's default (`feebumper.cpp`'s `EstimateFeeRate`): the original's rate rounde
 1 sat/kvB, plus the wallet's 5 sat/vB incremental relay fee - or the upstream's estimate
 when that is higher. An unavailable estimate is not an error here, since the increment
 alone is a well-defined bump. Both BIP 125 fee rules hold: BDK enforces the rate (at least
-1 sat/vB above the original, `-8` otherwise), and zecd the total (the original's fee plus
+1 sat/vB above the original, `-8` otherwise), and rose the total (the original's fee plus
 1 sat/vB of the replacement's own signed size) - a replacement that sheds its change output
 can clear the first and fail the second, so a default bump is rebuilt once at the rate that
 clears it and an explicit rate is refused with Core's `-8` "Insufficient total fee". The
@@ -616,7 +616,7 @@ Core's `-3`. Live: `regtest_btc_bumpfee.rs`, both backends.
 
 Everything here is refused with a clear error rather than silently ignored or half-done:
 
-- **`walletpassphrase`** - there is no unlock for a bitcoin wallet, so `zecd init --encrypt`
+- **`walletpassphrase`** - there is no unlock for a bitcoin wallet, so `rose init --encrypt`
   refuses a seed-holding one (it could never send or be rebuilt by `rescan`); the seed is
   decrypted only by the identity-file custody model at startup. A wallet encrypted before
   that refusal existed still starts locked and cannot send, and says so: `encrypted` and
@@ -645,7 +645,7 @@ Everything here is refused with a clear error rather than silently ignored or ha
   BIP-158 filters cover blocks only, so
   without it an incoming payment is invisible until it confirms and `getbalances`'
   `untrusted_pending` stays empty; nothing in BIP-157 fixes that.
-  **`"p2p"` (2026-09-11)** is zecd's own relay connection to one node over the Bitcoin
+  **`"p2p"` (2026-09-11)** is rose's own relay connection to one node over the Bitcoin
   P2P protocol - by default the wallet's `kyoto://<ip>:<port>` trusted peer,
   `p2p_peer = "<ip>:<port>"` overriding it (a DNS-seeded wallet with no override runs no
   P2P feed): a minimal client of our own (version handshake announcing `relay = true` at
@@ -730,7 +730,7 @@ Everything here is refused with a clear error rather than silently ignored or ha
   built from the relay stream, Tor for the broadcast hop - is not built.
 - **`[rpc] bind` is one address.** A host that must serve both loopback clients and a
   container across the docker bridge has to choose `0.0.0.0` (every interface, wrong on a
-  public host) or the bridge gateway alone and repoint every local client (`--zecd-url`,
+  public host) or the bridge gateway alone and repoint every local client (`--rose-url`,
   `curl`). A list of bind addresses would remove the choice; daemon-wide, not engine-specific,
   noted here because the kyoto/UI deployments are where it bites.
 - **Health/readiness** - covered since 2026-09-10: `/readyz` counts every Bitcoin wallet
@@ -738,7 +738,7 @@ Everything here is refused with a clear error rather than silently ignored or ha
   the tip; `connected` mode accepts `syncing`), `/status` lists each with `coin`, `server`,
   `conn_state` and `synced_height`. The engine measures no lag against a tip it has not
   reached, so `max_scan_lag` does not apply and there is no `scan_lag` field. Per wallet,
-  `getwalletinfo` carries the same connection state as the zecd extension
+  `getwalletinfo` carries the same connection state as the rose extension
   `upstream_connected` (false once a hung or unreachable upstream is noticed - the bitcoind
   client's per-request deadline is `chain::RPC_DEADLINE`, 15s - true again after a
   reconnect), the wallet birthday and how it resolved (`birthday.height`, its `time` - the
@@ -786,7 +786,7 @@ while building a send and carry no wallet data. Both endpoints are overridable
 pointed at instances the operator runs, the fee lookup reaches infrastructure they control,
 the same posture `kyoto://<peer>` gives block data. It is also how a tier reaches a network
 the public instances do not serve: Blockstream runs **no testnet4 Esplora**, so on the
-network the dev stack targets that tier is skipped unless an override names one (`zecd
+network the dev stack targets that tier is skipped unless an override names one (`rose
 config check` reports it rather than leaving the chain quietly shorter than it reads).
 `sources = ["peer_median"]` is the no-server posture outright. **Every rate from every
 source** - the caller's `fee_rate`, `estimatesmartfee`, either HTTP oracle, the kyoto

@@ -11,10 +11,10 @@
 //!    and the trusted change to draw on, a send larger than the change is `-6`.
 //! 4. **Both confirm** in the next block.
 //!
-//! Skips cleanly without a bitcoind or a zecd built without the `bitcoin` feature.
+//! Skips cleanly without a bitcoind or a rose built without the `bitcoin` feature.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::{json, Value};
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn btc_a_send_pays_for_its_unconfirmed_parent_over_bitcoind() {
@@ -31,7 +31,7 @@ fn send_params(to: &str, amount: f64, fee_rate: u32) -> Value {
     json!([to, amount, null, null, false, null, null, null, null, fee_rate])
 }
 
-/// A BTC amount as satoshis, from the 8-decimal JSON numbers zecd and the node answer with.
+/// A BTC amount as satoshis, from the 8-decimal JSON numbers rose and the node answer with.
 fn sats(v: &Value) -> u64 {
     (v.as_f64().expect("an amount") * 1e8).round() as u64
 }
@@ -43,12 +43,12 @@ async fn ancestors_flow(backend: BtcBackend) {
     };
     let node = BitcoinD::start(&bitcoind, &dir.path().join("btcdata")).await;
     node.mine(101).await;
-    let mut zecd = ZecdBtc::prepare(dir.path().join("zecddata"), backend, &node, &["btc"]);
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(101).await;
+    let mut rose = RoseBtc::prepare(dir.path().join("rosedata"), backend, &node, &["btc"]);
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(101).await;
 
-    let addr = zecd
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -57,12 +57,12 @@ async fn ancestors_flow(backend: BtcBackend) {
         .await
         .expect("fund");
     node.mine(1).await;
-    zecd.wait_height(102).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
+    rose.wait_height(102).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
     let miner = node.new_address().await;
 
     // 1. The cheap parent.
-    let parent = zecd
+    let parent = rose
         .call("sendtoaddress", send_params(&miner, 0.1, 1))
         .await
         .expect("a 1 sat/vB send");
@@ -77,7 +77,7 @@ async fn ancestors_flow(backend: BtcBackend) {
     assert!(parent_fee < 2 * parent_vsize, "{parent_entry}");
 
     // 2. The child, spending the parent's change - the only coin.
-    let child = zecd
+    let child = rose
         .call("sendtoaddress", send_params(&miner, 0.1, 20))
         .await
         .expect("a 20 sat/vB send from unconfirmed change");
@@ -111,7 +111,7 @@ async fn ancestors_flow(backend: BtcBackend) {
         .await
         .expect("an unconfirmed payment to the wallet");
     if matches!(backend, BtcBackend::Bitcoind) {
-        zecd.wait_wallet(
+        rose.wait_wallet(
             "btc",
             "getunconfirmedbalance",
             json!([]),
@@ -120,7 +120,7 @@ async fn ancestors_flow(backend: BtcBackend) {
         )
         .await;
     }
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("sendtoaddress", send_params(&miner, 1.0, 2))
         .await
         .expect_err("a send the trusted balance cannot cover");
@@ -128,9 +128,9 @@ async fn ancestors_flow(backend: BtcBackend) {
 
     // 4. Mined together.
     node.mine(1).await;
-    zecd.wait_height(103).await;
+    rose.wait_height(103).await;
     for txid in [&parent, &child] {
-        let tx = zecd
+        let tx = rose
             .call("gettransaction", json!([txid]))
             .await
             .expect("gettransaction");

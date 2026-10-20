@@ -1,26 +1,26 @@
-# zecd configuration for a Bitcoin **testnet4 kyoto** wallet - the BIP-157/158
+# rose configuration for a Bitcoin **testnet4 kyoto** wallet - the BIP-157/158
 # compact-block-filter light client, peering over P2P with NO RPC node and NO
-# credentials. This is the light-mode twin of deploy/zecd.btc-testnet4.toml (the
+# credentials. This is the light-mode twin of deploy/rose.btc-testnet4.toml (the
 # bitcoind full-node backend) over the SAME wallet: both files name one datadir, and the
 # wallet DB records the wallet, not the backend, so the one testnet4 wallet is driven either
 # way by choosing a config. Only one daemon at a time - both take the datadir lock.
 #
-# Needs a zecd built with the `bitcoin` feature (a default build refuses this file:
+# Needs a rose built with the `bitcoin` feature (a default build refuses this file:
 # `[wallets.btc] coin`/`btc_testnet` are gated behind it). Probe with:
-#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4-kyoto.toml \
+#   cargo run --release --features bitcoin -- --conf deploy/rose.btc-testnet4-kyoto.toml \
 #       config check
 #
 # Bring-up (no bitcoind RPC needed for the wallet itself - see the server note):
-#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4-kyoto.toml \
+#   cargo run --release --features bitcoin -- --conf deploy/rose.btc-testnet4-kyoto.toml \
 #       init --wallet btc --birthday 2026-08-01
-#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4-kyoto.toml
+#   cargo run --release --features bitcoin -- --conf deploy/rose.btc-testnet4-kyoto.toml
 #
-# Add `--rpcbind 0.0.0.0` only if a container must reach it (the zecd-gui service in
+# Add `--rpcbind 0.0.0.0` only if a container must reach it (the rose-gui service in
 # docker-compose.btc-testnet4.yml does): that publishes the RPC to the LAN behind the RPC
 # password, acceptable for valueless testnet4 coins and nothing else.
 #
 # `--wallet btc` is optional (it defaults to `default_wallet`, which names [wallets.btc];
-# see the note in deploy/zecd.btc-testnet4.toml). Kyoto cannot dial a node to anchor a
+# see the note in deploy/rose.btc-testnet4.toml). Kyoto cannot dial a node to anchor a
 # birthday, so a freshly generated wallet defaults to **today** (funds cannot predate the
 # wallet); `--birthday` takes a height or a YYYY-MM-DD date, resolved offline against the
 # shipped scan floor. A restore with no birthday scans from the SegWit-activation floor.
@@ -38,7 +38,7 @@
 
 network = "test"
 btc_testnet = "testnet4"
-# Shared with deploy/zecd.btc-testnet4.toml on purpose (see the header). Kyoto adds its own
+# Shared with deploy/rose.btc-testnet4.toml on purpose (see the header). Kyoto adds its own
 # header/filter store under <wallet>/btc/kyoto and leaves the BDK database alone.
 datadir = "./data-btc-testnet4"
 default_wallet = "btc"
@@ -90,7 +90,7 @@ server = "kyoto://216.230.225.43:48333"
 # sources = ["peer_median"]
 #
 # NB Blockstream.info runs no **testnet4** Esplora, so on this network the `esplora` tier is
-# skipped unless `esplora_url` names an instance that does serve it - `zecd config check`
+# skipped unless `esplora_url` names an instance that does serve it - `rose config check`
 # reports that, rather than leaving the chain quietly one tier shorter than it reads.
 
 # [mempool] - the 0-conf feed. Filters cover blocks only, so a kyoto wallet without one
@@ -132,17 +132,17 @@ server = "kyoto://216.230.225.43:48333"
 # mempool_space_url = "ws://mempool.internal:8999/api/v1/ws"
 
 [rpc]
-# zecd's own Bitcoin-Core-dialect JSON-RPC. Distinct port from the bitcoind-backed config's
-# 48232 so a client (the zecd-gui compose service, say) can tell the two apart, and so nothing
+# rose's own Bitcoin-Core-dialect JSON-RPC. Distinct port from the bitcoind-backed config's
+# 48232 so a client (the rose-gui compose service, say) can tell the two apart, and so nothing
 # collides if the two are ever given separate datadirs and run at once.
 bind = "127.0.0.1"
 port = 48242
 user = "btc"
-# The one value in this file you MUST change: zecd refuses to start while it is the `CHANGE-ME`
+# The one value in this file you MUST change: rose refuses to start while it is the `CHANGE-ME`
 # placeholder, on every network, testnet included. Either edit this line or leave it and supply
-# ZECD_RPC_PASSWORD in the daemon's environment (it wins over the file) - the latter is what
-# the zecd-gui compose service expects, since the UI proxy reads the same variable. Same rule
-# and same variable for deploy/zecd.btc-testnet4.toml, so one value serves either config.
+# ROSE_RPC_PASSWORD in the daemon's environment (it wins over the file) - the latter is what
+# the rose-gui compose service expects, since the UI proxy reads the same variable. Same rule
+# and same variable for deploy/rose.btc-testnet4.toml, so one value serves either config.
 password = "CHANGE-ME"
 
 [keys]

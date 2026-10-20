@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zecd btc monitor</title>
+<title>rose btc monitor</title>
 <style>
   :root {
     --bg: #12151a; --panel: #1b2027; --line: #2b323c; --text: #dbe2ea;
@@ -99,7 +99,7 @@
 <body>
 <header>
   <div>
-    <h1>&#9679; zecd &middot; bitcoin wallet</h1>
+    <h1>&#9679; rose &middot; bitcoin wallet</h1>
     <div id="cfgbadge" class="sub" style="margin-top:.2rem">&ndash;</div>
   </div>
 </header>
@@ -130,7 +130,7 @@
   <!-- Where the wallet stands on the chain: its own synced height (what getblockcount
        answers for this wallet), and the birthday its history starts from - the recorded
        height, the anchor a kyoto first scan actually started at when it differs, and the
-       birthday's calendar date (zecd's getwalletinfo `birthday` extension). -->
+       birthday's calendar date (rose's getwalletinfo `birthday` extension). -->
   <div class="card" id="statuscard">
     <div class="head">
       <h2>Status</h2>
@@ -155,7 +155,7 @@
               title="one recipient: the whole spendable balance, fee taken from it">send all</button>
     </div>
     <div class="feerow">
-      <label>fee rate (sat/vB &mdash; prefilled with zecd's estimate for the target, or its test-network fallback; edit to override, clear to let zecd price the send itself)
+      <label>fee rate (sat/vB &mdash; prefilled with rose's estimate for the target, or its test-network fallback; edit to override, clear to let rose price the send itself)
         <input type="text" id="feerate" placeholder="" inputmode="decimal"></label>
       <label>confirm within
         <select id="feetarget">
@@ -206,7 +206,7 @@
     <div id="txaction" hidden>
       <div class="sub" id="txa-title"></div>
       <div id="txa-bump">
-        <label>new fee rate (sat/vB; blank = zecd's default, the original's rate + 5 sat/vB or the estimate if higher)
+        <label>new fee rate (sat/vB; blank = rose's default, the original's rate + 5 sat/vB or the estimate if higher)
           <input type="text" id="txa-rate" inputmode="decimal"></label>
         <label style="margin-top:.4rem"><input type="checkbox" id="txa-replaceable" checked>
           keep the replacement replaceable (uncheck to make it final)</label>
@@ -220,7 +220,7 @@
   </div>
   <div id="pane-addrs" class="pane" hidden>
     <!-- The account xpub, from listdescriptors: the receiving descriptor's key with its
-         origin. Public material only; zecd refuses the private form. -->
+         origin. Public material only; rose refuses the private form. -->
     <div id="xpub-block">
       <div>
         <label style="margin-top:0">account xpub</label>
@@ -250,7 +250,7 @@ let unit = "tBTC";  // "BTC" on mainnet, from /info
 let watchOnly = null;  // getwalletinfo.private_keys_enabled === false; null until known
 
 // A watch-only wallet (init --xpub) serves the whole read surface but has nothing to sign
-// with: zecd answers every send with -4. Rather than let the user fill in a form that can
+// with: rose answers every send with -4. Rather than let the user fill in a form that can
 // only fail, say so at the top of the page and disable the send controls. Re-evaluated on
 // every refresh, so a wallet swapped behind the proxy is reflected without a reload.
 const sendControls = () => document.querySelectorAll("#sendcard input, #sendcard button, #sendcard select");
@@ -267,8 +267,8 @@ function setWatchOnly(flag) {
 
 // One JSON-RPC call through the same-origin proxy. `raw` maps a placeholder
 // string in params to raw JSON text spliced into the body after stringify -
-// used for amounts, so what zecd parses is exactly the decimal the user typed
-// (zecd is strict about 8-dp amounts; no float round-trip on the send path).
+// used for amounts, so what rose parses is exactly the decimal the user typed
+// (rose is strict about 8-dp amounts; no float round-trip on the send path).
 async function rpc(method, params = [], raw = {}) {
   let body = JSON.stringify({ jsonrpc: "1.0", id: ++rpcId, method, params });
   for (const [ph, text] of Object.entries(raw)) body = body.replace(`"${ph}"`, text);
@@ -277,7 +277,7 @@ async function rpc(method, params = [], raw = {}) {
   });
   let parsed;
   try { parsed = JSON.parse(await resp.text()); }
-  catch { throw new Error(`HTTP ${resp.status} from zecd`); }
+  catch { throw new Error(`HTTP ${resp.status} from rose`); }
   if (parsed.error) throw new Error(`${parsed.error.message} (code ${parsed.error.code})`);
   return parsed.result;
 }
@@ -312,7 +312,7 @@ function renderAddresses(received, descriptors, unspent) {
     // Origin is "<fingerprint>/<path>": the master key fingerprint (identifies the seed the
     // key came from) and the hardened BIP 84 path down to this account.
     const [fp, ...path] = (m ? m[1] : "").split("/");
-    // All zeros is not a fingerprint: it is what zecd records for a bare xpub import
+    // All zeros is not a fingerprint: it is what rose records for a bare xpub import
     // (init --xpub without the [fingerprint/path] origin), since the master key's
     // fingerprint cannot be recovered from an account key. Say so rather than show a
     // value that looks real.
@@ -385,7 +385,7 @@ async function refresh() {
     $("pending").textContent = fmt(balances.mine.untrusted_pending);
     $("immature").textContent = fmt(balances.mine.immature);
     $("conn").className = "dot ok";
-    // upstream_connected is zecd's per-wallet signal for the chain source; false means a
+    // upstream_connected is rose's per-wallet signal for the chain source; false means a
     // hung or unreachable node has been noticed and the heights shown are the last known.
     $("chaintext").textContent =
       info.upstream_connected === false ? "disconnected" : "connected";
@@ -398,10 +398,10 @@ async function refresh() {
     $("st-hash").innerHTML = /^[0-9a-f]{64}$/.test(hash || "")
       ? `<span title="${hash}">...${hash.slice(-12)}</span>${copyBtn(hash)}`
       : "";
-    // The wallet birthday (zecd's getwalletinfo extension): the recorded height, and - on
+    // The wallet birthday (rose's getwalletinfo extension): the recorded height, and - on
     // kyoto - the anchor the first scan actually started from once resolved, which is the
     // block that decides how much history this wallet can have seen. The date is the
-    // birthday's UTC day when zecd knows it (the operator's, or the shipped table's).
+    // birthday's UTC day when rose knows it (the operator's, or the shipped table's).
     const b = info.birthday || {};
     if (Number.isInteger(b.height)) {
       const a = b.anchor;
@@ -443,7 +443,7 @@ async function refresh() {
     const rows = entries.slice(-25).reverse().map(({ tx, debit, credit, net, synthetic }) => {
       const when = tx.time ? new Date(tx.time * 1000).toLocaleString() : "";
       // The fee row stands for its whole transaction, so an unconfirmed send's actions sit
-      // there, beside its "transaction fee" label: bump (BIP 125, only while it signals replaceability) and abandon (zecd refuses
+      // there, beside its "transaction fee" label: bump (BIP 125, only while it signals replaceability) and abandon (rose refuses
       // one still in the mempool, and says so). Hidden on a watch-only wallet, which cannot sign.
       const pending = synthetic && !watchOnly && (tx.confirmations ?? 0) === 0
         && /^[0-9a-f]{64}$/.test(tx.txid || "");
@@ -501,12 +501,12 @@ async function loadInfo() {
     $("cfgbadge").textContent =
       `${i.network} · ${i.backend} · ${i.wallet}${mode}  (on ${i.machine || "unknown host"})`;
     $("cfgbadge").title = `config: ${i.conf}`;
-    document.title = `zecd btc – ${i.network}/${i.backend}${mode}${i.machine ? " @ " + i.machine : ""}`;
+    document.title = `rose btc – ${i.network}/${i.backend}${mode}${i.machine ? " @ " + i.machine : ""}`;
     refreshFee();
   } catch (e) { $("cfgbadge").textContent = ""; }
 }
 
-// The fee estimate is zecd's own estimatesmartfee at the chosen target - the same answer a
+// The fee estimate is rose's own estimatesmartfee at the chosen target - the same answer a
 // send without a fee rate would use: bitcoind's estimator on that backend (a test network's
 // flat, data-less curve reported as no estimate), the [fees] chain on kyoto (the peer tier
 // honors the target; the HTTP oracles answer one horizon). `source` names which answered.
@@ -514,11 +514,11 @@ async function loadInfo() {
 // it sampling.
 //
 // The estimate is PREFILLED into the fee-rate field and sent as the explicit fee_rate, so
-// the send pays exactly the number the page showed rather than whatever zecd re-estimates
+// the send pays exactly the number the page showed rather than whatever rose re-estimates
 // seconds later. It is carried at sat/kvB precision (3 decimals of sat/vB), which is what
 // the estimate is and what fee_rate accepts. Refreshes keep overwriting the field only while
 // it still holds a prefilled value (data-auto); a value the user typed is left alone. With
-// no estimate the field shows what a send would pay anyway: zecd's 1 sat/vB test-network
+// no estimate the field shows what a send would pay anyway: rose's 1 sat/vB test-network
 // fallback. On mainnet there is no fallback (a send without a rate is refused), so the
 // field is cleared and the user has to name a rate.
 const TESTNET_FALLBACK_SAT_PER_VB = "1";
@@ -547,13 +547,13 @@ async function refreshFee() {
       const why = (r.errors || []).join("; ") || "no estimate";
       $("feeest").textContent = `fee estimate: none (${why}); ` + (unit === "BTC"
         ? "a send without a fee rate is refused on mainnet"
-        : `prefilled with zecd's ${TESTNET_FALLBACK_SAT_PER_VB} sat/vB test-network fallback`);
+        : `prefilled with rose's ${TESTNET_FALLBACK_SAT_PER_VB} sat/vB test-network fallback`);
       setFeePrefill(noEstimatePrefill());
     }
   } catch (e) {
     $("feeest").textContent = "fee estimate: unavailable (" + e.message + "); " + (unit === "BTC"
       ? "a send without a fee rate is refused on mainnet"
-      : `prefilled with zecd's ${TESTNET_FALLBACK_SAT_PER_VB} sat/vB test-network fallback`);
+      : `prefilled with rose's ${TESTNET_FALLBACK_SAT_PER_VB} sat/vB test-network fallback`);
     setFeePrefill(noEstimatePrefill());
   }
 }
@@ -627,10 +627,10 @@ $("send").onclick = async () => {
   const feerate = $("feerate").value.trim();
   if (feerate && !/^\d+(\.\d{1,3})?$/.test(feerate)) return fail("fee rate must be sat/vB with at most 3 decimals");
   const replaceable = $("replaceable").checked;
-  // zecd's fee_split extension, sent only when it changes something: "output" with at least
-  // one paying recipient (zecd refuses "output" with none).
+  // rose's fee_split extension, sent only when it changes something: "output" with at least
+  // one paying recipient (rose refuses "output" with none).
   const byOutput = $("feesplit").value === "output" && recips.some(r => r.subfee);
-  // Amounts and the fee rate ride as raw JSON placeholders, so zecd parses exactly the
+  // Amounts and the fee rate ride as raw JSON placeholders, so rose parses exactly the
   // decimals typed (no float round trip on the send path).
   const raw = {};
   const feeParam = feerate ? "__FEE__" : null;
@@ -657,7 +657,7 @@ $("send").onclick = async () => {
   }
   const pays = byOutput ? " (pays its output's share of the fee)" : " (pays fee)";
   const summary = recips.map(r => `  ${r.amount} ${unit} -> ${r.to}${r.subfee ? pays : ""}`).join("\n");
-  const rate = feerate ? `${feerate} sat/vB` : "zecd's own estimate";
+  const rate = feerate ? `${feerate} sat/vB` : "rose's own estimate";
   if (!confirm(`Send\n${summary}\nat ${rate}${replaceable ? "" : ", not replaceable"}?`)) return;
   $("send").disabled = true; msg.textContent = "sending...";
   try {
@@ -685,7 +685,7 @@ document.addEventListener("click", async e => {
     $("txaction").hidden = false; $("txmsg").textContent = "";
   } else if (abandon) {
     const txid = abandon.dataset.abandon;
-    if (!confirm(`Abandon ${txid}?\nIts inputs are released for the next send. zecd refuses while the transaction is still in the mempool - bump it instead.`)) return;
+    if (!confirm(`Abandon ${txid}?\nIts inputs are released for the next send. rose refuses while the transaction is still in the mempool - bump it instead.`)) return;
     try {
       await rpc("abandontransaction", [txid]);
       $("txmsg").className = "msg ok"; $("txmsg").textContent = `abandoned ${txid}`;
@@ -701,7 +701,7 @@ $("txa-go").onclick = async () => {
   if (rate && !/^\d+(\.\d{1,3})?$/.test(rate)) {
     $("txmsg").className = "msg err"; $("txmsg").textContent = "fee rate must be sat/vB with at most 3 decimals"; return;
   }
-  // bumpfee "txid" {fee_rate, replaceable}: a blank rate lets zecd pick Core's default.
+  // bumpfee "txid" {fee_rate, replaceable}: a blank rate lets rose pick Core's default.
   const options = { replaceable: $("txa-replaceable").checked };
   const raw = {};
   if (rate) { options.fee_rate = "__RATE__"; raw.__RATE__ = rate; }

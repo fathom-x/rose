@@ -2,10 +2,10 @@
 //!
 //! # Why
 //!
-//! zecd's sharing unit used to be the wallet: each [`crate::wallet::actor::WalletActor`] dialed
+//! rose's sharing unit used to be the wallet: each [`crate::wallet::actor::WalletActor`] dialed
 //! its own [`AnySource`], polled its own chain tip, ran its own mempool poller, and streamed its
 //! own copy of the subtree roots at connect. That is fine for the one-or-two-wallet deployments
-//! zecd was built for and untenable for a daemon monitoring a fleet: at N wallets a single zebrad
+//! rose was built for and untenable for a daemon monitoring a fleet: at N wallets a single zebrad
 //! sees N connections, N `getblockchaininfo` polls per sync interval, and - the worst of them -
 //! N/2 `getrawmempool` calls **per second**, since the zebra mempool poller ticks every 2s per
 //! wallet. None of that work is wallet-specific: the chain is the same chain for everybody.
@@ -852,7 +852,7 @@ mod tests {
         async fn handler(State(calls): State<Arc<Calls>>, Json(req): Json<Value>) -> Json<Value> {
             let method = req["method"].as_str().unwrap_or_default().to_string();
             *calls.0.lock().unwrap().entry(method.clone()).or_insert(0) += 1;
-            let reply = |v: Value| Json(json!({ "result": v, "error": null, "id": "zecd" }));
+            let reply = |v: Value| Json(json!({ "result": v, "error": null, "id": "rose" }));
             match method.as_str() {
                 "getblockchaininfo" => reply(json!({
                     "chain": "main",
@@ -869,7 +869,7 @@ mod tests {
                 other => Json(json!({
                     "result": null,
                     "error": { "code": -32601, "message": format!("Method not found: {other}") },
-                    "id": "zecd"
+                    "id": "rose"
                 })),
             }
         }

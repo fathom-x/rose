@@ -7,7 +7,7 @@
 //! This module does, at a cost the operator opts into, from one of two sources named in
 //! `[mempool] sources` (the first that can run for the wallet wins):
 //!
-//! - `"p2p"` ([`super::p2p_feed`]): zecd's own relay connection to one node - by default
+//! - `"p2p"` ([`super::p2p_feed`]): rose's own relay connection to one node - by default
 //!   the wallet's `kyoto://` trusted peer - announcing every transaction entering its
 //!   mempool over the Bitcoin P2P protocol. No server, raw-size bandwidth, and with
 //!   `p2p_snapshot` a BIP 35 mempool snapshot at connect and periodically (evictions).

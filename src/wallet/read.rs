@@ -149,7 +149,7 @@ pub struct BalanceInfo {
     /// NU6.3 activates and the wallet holds ironwood notes - so 0 on mainnet, and on testnet until
     /// NU6.3 activates at height 4_134_000.
     pub ironwood_spendable: u64,
-    /// Spendable transparent (unshielded) value. Spendable here means "usable as an input": zecd
+    /// Spendable transparent (unshielded) value. Spendable here means "usable as an input": rose
     /// spends transparent UTXOs by auto-shielding them into a shielded send.
     pub transparent_spendable: u64,
     pub total_spendable: u64,
@@ -560,7 +560,7 @@ fn tx_unexpired_sql(alias: &str) -> String {
 /// `zcash_client_sqlite` 0.22.0-rc.6 the view's received arm resolves pool 0 through
 /// `addresses.cached_transparent_receiver_address` rather than the enclosing unified address,
 /// and prefers the recipient recorded at construction time for outputs the wallet created. So
-/// `to_address` is already the address observably paid on chain, and zecd does no rewriting of
+/// `to_address` is already the address observably paid on chain, and rose does no rewriting of
 /// its own (it used to map the unified encoding back to the t-address here).
 /// The statement [`load_outputs`] runs: one transaction's outputs, ordered by
 /// `(output_pool, output_index)`.
@@ -792,7 +792,7 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
 /// reorg paid that cost on every miss.
 ///
 /// This selects the transaction by its unique `txid` index and reconstructs the two aggregate
-/// columns zecd reads. `expired_unmined` is the view's own expression. `account_balance_delta`
+/// columns rose reads. `expired_unmined` is the view's own expression. `account_balance_delta`
 /// is the view's `SUM(notes.value)` over the same `notes` relation: outputs the account
 /// received in this transaction, positive, and outputs of the account spent by it, negative.
 /// The `involved` count is what makes the row exist at all: `v_transactions` only emits a
@@ -1261,7 +1261,7 @@ pub fn unmined_raw_txs(engine_dir: &Path, tip: u32) -> anyhow::Result<Vec<(Strin
 /// setting leave every RPC except the memo fields exact - see `request_in_scope`.
 ///
 /// Spends are recorded by the compact scan itself (nullifier matches for the shielded pools,
-/// zecd's own transparent-input matcher for pool 0), so this is populated on a from-seed restore
+/// rose's own transparent-input matcher for pool 0), so this is populated on a from-seed restore
 /// before any enhancement runs - the case the whole setting exists for. It reads the four
 /// `*_spends` tables directly rather than `v_received_output_spends`: the view adds a join to
 /// each note table for an `account_id` this has no use for, and this runs on the actor's sync
@@ -1475,7 +1475,7 @@ pub fn list_unspent(
     }
 
     let mut out = Vec::new();
-    // All shielded pools zecd supports; a note only exists if the wallet received it, so querying
+    // All shielded pools rose supports; a note only exists if the wallet received it, so querying
     // every pool is safe regardless of which pools are enabled in config.
     #[allow(unused_mut)]
     let mut protocols: Vec<ShieldedPool> = crate::pools::Receiver::SUPPORTED
@@ -1719,7 +1719,7 @@ pub fn list_unspent(
 
 /// Every address the wallet has generated, encoded for the network (for
 /// `listreceivedbyaddress` with `include_empty`). Includes the wallet's exposed transparent
-/// receivers as base58 t-addresses (a no-op for zecd wallets, which never expose any).
+/// receivers as base58 t-addresses (a no-op for rose wallets, which never expose any).
 pub fn all_addresses(network: ZNetwork, engine_dir: &Path, scope: AccountScope) -> Vec<String> {
     let Ok(db) = open_read(network, engine_dir) else {
         return Vec::new();
@@ -1756,7 +1756,7 @@ pub fn all_addresses(network: ZNetwork, engine_dir: &Path, scope: AccountScope) 
 ///    stateless (or any) from-seed restore that was never funded, so the scan never re-added it
 ///    to the `addresses` table.
 ///
-/// Both shielded pools zecd supports - Sapling and Orchard - are covered. A multi-receiver
+/// Both shielded pools rose supports - Sapling and Orchard - are covered. A multi-receiver
 /// Unified Address is attributed as ours **only when *every* shielded receiver is ours at one
 /// diversifier index** (the [`UaReceivers::MineConsistent`] verdict), not when merely one
 /// receiver matches: see the threat-model note in the body - a UA that pairs the wallet's
@@ -1766,7 +1766,7 @@ pub fn all_addresses(network: ZNetwork, engine_dir: &Path, scope: AccountScope) 
 /// (layer 1b, its `cached_transparent_receiver_address`); the cryptographic path never attributes
 /// transparent receivers - an unrecorded one can't be attributed to a viewing key without a
 /// gap-limit derivation scan (a funded one is re-recorded by the scan, so it then matches layer 1b).
-/// A transparent receiver **inside a UA** is still disqualifying: zecd hands out transparent only as
+/// A transparent receiver **inside a UA** is still disqualifying: rose hands out transparent only as
 /// a bare t-address, never mixed into a UA, so a UA that carries one can only be a splice (a
 /// transparent-only sender would pay the attacker), rejected even when a shielded receiver alongside
 /// it genuinely is the wallet's.
@@ -1821,7 +1821,7 @@ pub fn is_mine(network: ZNetwork, engine_dir: &Path, scope: AccountScope, addr: 
             // nothing to splice, so the plain viewing-key membership test stands (this is what
             // still recognizes a wallet-generated-but-unrecorded address after a restore).
             Address::Unified(ua) if ua.transparent().is_some() => {
-                // A transparent receiver is itself a splice zecd can never have issued: zecd
+                // A transparent receiver is itself a splice rose can never have issued: rose
                 // receives only into shielded pools, so it never puts a transparent receiver in a
                 // UA it hands out. An attacker can therefore staple *their* transparent receiver
                 // onto the victim's Orchard/Sapling receiver - the shielded receiver is genuinely
@@ -1968,7 +1968,7 @@ pub fn classify_unified_receivers(
     let Some(Address::Unified(ua)) = Address::decode(&network, addr) else {
         return UaReceivers::NotApplicable;
     };
-    // Only meaningful when there are two shielded receivers to cross-check; zecd's shielded pools
+    // Only meaningful when there are two shielded receivers to cross-check; rose's shielded pools
     // are Sapling and Orchard, so that is exactly {sapling, orchard}.
     if u8::from(ua.sapling().is_some()) + u8::from(ua.orchard().is_some()) < 2 {
         return UaReceivers::NotApplicable;
@@ -2050,7 +2050,7 @@ pub fn diversifier_index_of(
 /// under a *different* encoding of the same index. The recorded string is not a stable identity:
 /// `getnewaddress` writes the `[pools] default_receivers` encoding, while the block scan, meeting
 /// an index with no row yet, writes `zcash_client_sqlite`'s all-receivers one (see
-/// [`crate::address::issued_encoding`]). Since a from-seed restore or `zecd rescan` rebuilds the
+/// [`crate::address::issued_encoding`]). Since a from-seed restore or `rose rescan` rebuilds the
 /// table from the scan alone, which of the two is on disk is not something a caller can know.
 ///
 /// The index is recovered cryptographically and the lookup is a point read on the
@@ -2104,7 +2104,7 @@ pub fn recorded_encodings_of(
 
 /// Where a transparent address the wallet owns sits in its BIP 44 derivation - the answer to
 /// "which index did `getnewaddress "" "transparent"` just hand me?", which is otherwise
-/// unanswerable (the RPC returns a bare string, and zecd persists no off-chain issuance log).
+/// unanswerable (the RPC returns a bare string, and rose persists no off-chain issuance log).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransparentDerivation {
     /// The ZIP 32 account index the address derives from, when the account records its

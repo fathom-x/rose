@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Regenerate THIRD-PARTY-LICENSES.txt - the bundled license texts of every crate
-# compiled into the zecd binary. Committed to the repo (not generated at build time)
+# compiled into the rose binary. Committed to the repo (not generated at build time)
 # so the reproducible StageX (amd64) / Alpine (arm64) Docker builds stay tooling-free; the packaging
 # (build-deb.sh, the release tarball, the Docker runtime image) just ships this file.
 #

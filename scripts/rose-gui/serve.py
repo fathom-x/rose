@@ -1,55 +1,55 @@
 #!/usr/bin/env python3
-"""Tiny same-origin dev UI server for zecd's Bitcoin wallet RPC.
+"""Tiny same-origin dev UI server for rose's Bitcoin wallet RPC.
 
-zecd speaks bitcoind's RPC dialect on purpose: HTTP Basic auth, no CORS headers. A
+rose speaks bitcoind's RPC dialect on purpose: HTTP Basic auth, no CORS headers. A
 browser page therefore cannot call it cross-origin, and the RPC password has no
 business living in browser JS. This server closes both gaps the way every bitcoind
-dashboard does: it serves the static page AND forwards POST /rpc to zecd with the
+dashboard does: it serves the static page AND forwards POST /rpc to rose with the
 credentials injected server-side, so the page and the RPC share one origin.
 
-Stdlib only, no dependencies. Every value can come from a zecd config file (default:
-deploy/zecd.btc-testnet4.toml) OR from the environment, so the image can run with no
+Stdlib only, no dependencies. Every value can come from a rose config file (default:
+deploy/rose.btc-testnet4.toml) OR from the environment, so the image can run with no
 config mounted at all. Each is resolved flag > env > config > default: the user via
---rpc-user / ZECD_RPC_USER / [rpc] user, and the password via ZECD_RPC_PASSWORD /
+--rpc-user / ROSE_RPC_USER / [rpc] user, and the password via ROSE_RPC_PASSWORD /
 [rpc] password (no flag - a secret has no business on a command line), matching the
-precedence zecd itself gives ZECD_RPC_PASSWORD over the file. When --conf points at a
+precedence rose itself gives ROSE_RPC_PASSWORD over the file. When --conf points at a
 file that is not present, it is skipped rather than an error. The two config-derived
 values the page shows - the network (picks the BTC/tBTC unit) and the backend - then come
-from ZECD_NETWORK and ZECD_BACKEND (kyoto|bitcoind). The fee estimate is zecd's own
+from ROSE_NETWORK and ROSE_BACKEND (kyoto|bitcoind). The fee estimate is rose's own
 `estimatesmartfee`, forwarded like any other call, so there is no fee logic here to keep
 in step with the wallet.
 
 The upstream address is likewise separable from the credentials. --rpc-url (env:
-ZECD_RPC_URL) gives the whole base URL - correct for reaching a host zecd from a
+ROSE_RPC_URL) gives the whole base URL - correct for reaching a host rose from a
 container or a compose sibling by service name, where the config's own 127.0.0.1
 [rpc] bind is the container's own loopback. When it is unset the base URL is composed
-from parts: --rpc-host / ZECD_RPC_HOST (a bare hostname - e.g. an orchestrator service
-reference that cannot have a scheme string-composed onto it), --rpc-port / ZECD_RPC_PORT,
-and --rpc-scheme / ZECD_RPC_SCHEME (default http), each falling back to [rpc] bind/port.
+from parts: --rpc-host / ROSE_RPC_HOST (a bare hostname - e.g. an orchestrator service
+reference that cannot have a scheme string-composed onto it), --rpc-port / ROSE_RPC_PORT,
+and --rpc-scheme / ROSE_RPC_SCHEME (default http), each falling back to [rpc] bind/port.
 
 Usage, from the repository root:
 
-    python3 scripts/zecd-gui/serve.py                      # testnet4 stack defaults
-    python3 scripts/zecd-gui/serve.py --conf deploy/zecd.btc-testnet3.toml --port 8081
-    python3 scripts/zecd-gui/serve.py --wallet btc         # route via /wallet/<name>
+    python3 scripts/rose-gui/serve.py                      # testnet4 stack defaults
+    python3 scripts/rose-gui/serve.py --conf deploy/rose.btc-testnet3.toml --port 8081
+    python3 scripts/rose-gui/serve.py --wallet btc         # route via /wallet/<name>
 
-    # from a container, against a zecd on the host (macOS/Windows Docker Desktop)
-    python3 scripts/zecd-gui/serve.py --rpc-url http://host.docker.internal:48242
+    # from a container, against a rose on the host (macOS/Windows Docker Desktop)
+    python3 scripts/rose-gui/serve.py --rpc-url http://host.docker.internal:48242
 
     # no config mounted: user, password and upstream all from the environment
-    ZECD_RPC_USER=view ZECD_RPC_PASSWORD=... ZECD_RPC_HOST=zecd-btc ZECD_RPC_PORT=18232 \
-        python3 scripts/zecd-gui/serve.py
+    ROSE_RPC_USER=view ROSE_RPC_PASSWORD=... ROSE_RPC_HOST=rose-btc ROSE_RPC_PORT=18232 \
+        python3 scripts/rose-gui/serve.py
 
-    # a zecd inside a Caution enclave: every call rides an attested STEVE session
-    ZECD_RPC_USER=btc ZECD_RPC_PASSWORD=... python3 scripts/zecd-gui/serve.py \
-        --conf <deployment>/zecd.toml --rpc-url http://<enclave-ip>/ \
+    # a rose inside a Caution enclave: every call rides an attested STEVE session
+    ROSE_RPC_USER=btc ROSE_RPC_PASSWORD=... python3 scripts/rose-gui/serve.py \
+        --conf <deployment>/rose.toml --rpc-url http://<enclave-ip>/ \
         --steve-pcrs <deployment>/.caution/trusted_hashes.json
 
 Then open http://127.0.0.1:8080/.
 
-Enclave mode (--steve-pcrs / ZECD_STEVE_PCRS): the enclave's RPC answers only through
+Enclave mode (--steve-pcrs / ROSE_STEVE_PCRS): the enclave's RPC answers only through
 STEVE, the attested end-to-end channel, so the proxy hands each call to `steve-cli`
-(--steve-cli / ZECD_STEVE_CLI, default on PATH) with the PCR file the deployment's
+(--steve-cli / ROSE_STEVE_CLI, default on PATH) with the PCR file the deployment's
 runner committed; steve-cli verifies the enclave's attestation against it, opens a
 session, sends the one request and prints the answer. About a second per call, which a
 dashboard tolerates; a session per call is what the one-request CLI offers, and nothing
@@ -112,7 +112,7 @@ def watch_and_reexec(paths, interval=RELOAD_POLL_SECS):
 
 
 def read_config(conf_path):
-    """Parse a zecd.toml into a {section: {key: value}} dict.
+    """Parse a rose.toml into a {section: {key: value}} dict.
 
     Uses tomllib when available (Python 3.11+); otherwise a line-based fallback
     that understands the flat key = value shape these deploy configs use (the
@@ -179,16 +179,16 @@ ALLOWED_METHODS = frozenset({
 
 def machine_name(flag):
     """The name of the machine this proxy runs on, for the page header: the --machine flag,
-    else ZECD_GUI_MACHINE, else the hostname. A container on a bridge network has a random
+    else ROSE_GUI_MACHINE, else the hostname. A container on a bridge network has a random
     container id for a hostname, which names nothing an operator would recognise, so the
-    compose stacks pass ZECD_GUI_MACHINE through from deploy/.env; a host-network container
+    compose stacks pass ROSE_GUI_MACHINE through from deploy/.env; a host-network container
     (the mainnet stack) already sees the host's own name."""
-    name = (flag or os.environ.get("ZECD_GUI_MACHINE") or "").strip()
+    name = (flag or os.environ.get("ROSE_GUI_MACHINE") or "").strip()
     if name:
         return name
     host = socket.gethostname()
     if Path("/.dockerenv").exists() and re.fullmatch(r"[0-9a-f]{12}", host):
-        return f"container {host} (set ZECD_GUI_MACHINE to name the host)"
+        return f"container {host} (set ROSE_GUI_MACHINE to name the host)"
     return host
 
 
@@ -248,7 +248,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
         # One request at a time, and only the methods the page uses; a batch or an unlisted
-        # method is refused with the shape the page already understands (zecd's own
+        # method is refused with the shape the page already understands (rose's own
         # method-not-found), and never reaches the wallet.
         try:
             call = json.loads(body)
@@ -269,7 +269,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             },
             method="POST",
         )
-        # zecd maps JSON-RPC errors onto non-2xx HTTP statuses (404 for unknown
+        # rose maps JSON-RPC errors onto non-2xx HTTP statuses (404 for unknown
         # methods, 500 for most errors) with a JSON body; pass both through
         # verbatim so the page sees exactly what a direct client would.
         try:
@@ -281,13 +281,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.relay(
                 502,
                 json.dumps(
-                    {"result": None, "error": {"code": -1, "message": f"zecd unreachable: {e}"}, "id": None}
+                    {"result": None, "error": {"code": -1, "message": f"rose unreachable: {e}"}, "id": None}
                 ).encode(),
             )
 
     def relay_via_steve(self, body):
         """One attested request through steve-cli. It prints the response body alone (no
-        status line), so a JSON answer is relayed as 200 whatever zecd's HTTP status was -
+        status line), so a JSON answer is relayed as 200 whatever rose's HTTP status was -
         the page reads the JSON-RPC error object, not the status - and anything else is a
         502 naming steve-cli's complaint (a PCR mismatch, an unreachable enclave)."""
         cli, pcrs = self.steve
@@ -305,7 +305,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             # steve-cli's stderr starts with its trust verdict ("PCR trust: Pinned"), which is
             # not the failure; the complaint, if any, follows it. No complaint and no body is
-            # zecd answering 401: the credentials, not the enclave.
+            # rose answering 401: the credentials, not the enclave.
             detail = [l for l in out.stderr.decode("utf-8", "replace").splitlines()
                       if l.strip() and not l.startswith("PCR trust:")]
             why = detail[-1] if detail else "the enclave answered with no body (credentials refused?)"
@@ -322,7 +322,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_request(self, code="-", size="-"):
         # Successful requests stay off the terminal (the page is the operator's view);
-        # anything the proxy or zecd refused is logged, since a refusal that leaves no
+        # anything the proxy or rose refused is logged, since a refusal that leaves no
         # trace is how a misconfigured or probed proxy goes unnoticed.
         try:
             failed = int(code) >= 400
@@ -334,7 +334,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--conf", default="deploy/zecd.btc-testnet4.toml", help="zecd config to read [rpc] from")
+    ap.add_argument("--conf", default="deploy/rose.btc-testnet4.toml", help="rose config to read [rpc] from")
     ap.add_argument("--bind", default="127.0.0.1", help="address to serve the UI on")
     ap.add_argument("--port", type=int, default=8080, help="port to serve the UI on")
     ap.add_argument("--wallet", default="", help="route RPCs via /wallet/<name> (empty = default wallet)")
@@ -342,56 +342,56 @@ def main():
         "--machine",
         default="",
         help="the name the page header shows for the machine this proxy runs on (default: "
-             "ZECD_GUI_MACHINE, else the hostname)",
+             "ROSE_GUI_MACHINE, else the hostname)",
     )
     ap.add_argument(
         "--rpc-user",
         default="",
-        help="zecd RPC username, overriding [rpc] user from the config. Env: ZECD_RPC_USER. "
-             "(The password has no flag - it is a secret; set it via ZECD_RPC_PASSWORD or the "
+        help="rose RPC username, overriding [rpc] user from the config. Env: ROSE_RPC_USER. "
+             "(The password has no flag - it is a secret; set it via ROSE_RPC_PASSWORD or the "
              "config.)",
     )
     ap.add_argument(
         "--rpc-url",
         default="",
-        help="zecd JSON-RPC base URL, overriding [rpc] bind/port from the config (e.g. "
-             "http://host.docker.internal:48242 to reach a host zecd from a container, or "
-             "http://zecd:18232 for a compose sibling). Credentials still come from the "
-             "config/env. Env: ZECD_RPC_URL",
+        help="rose JSON-RPC base URL, overriding [rpc] bind/port from the config (e.g. "
+             "http://host.docker.internal:48242 to reach a host rose from a container, or "
+             "http://rose:18232 for a compose sibling). Credentials still come from the "
+             "config/env. Env: ROSE_RPC_URL",
     )
     ap.add_argument(
         "--steve-pcrs",
         default="",
         help="enclave mode: the deployment's trusted-hashes file (PCRs); every call then goes "
-             "through steve-cli's attested session to --rpc-url. Env: ZECD_STEVE_PCRS",
+             "through steve-cli's attested session to --rpc-url. Env: ROSE_STEVE_PCRS",
     )
     ap.add_argument(
         "--steve-cli",
         default="",
-        help="path to steve-cli for --steve-pcrs; default: steve-cli on PATH. Env: ZECD_STEVE_CLI",
+        help="path to steve-cli for --steve-pcrs; default: steve-cli on PATH. Env: ROSE_STEVE_CLI",
     )
     ap.add_argument(
         "--rpc-host",
         default="",
-        help="zecd RPC host, used to compose the base URL when --rpc-url/ZECD_RPC_URL is unset. "
+        help="rose RPC host, used to compose the base URL when --rpc-url/ROSE_RPC_URL is unset. "
              "Takes a bare hostname (e.g. an orchestrator's service reference that cannot have a "
-             "scheme composed onto it). Env: ZECD_RPC_HOST",
+             "scheme composed onto it). Env: ROSE_RPC_HOST",
     )
     ap.add_argument(
         "--rpc-port",
         default="",
-        help="zecd RPC port for the composed base URL (with --rpc-host). Env: ZECD_RPC_PORT",
+        help="rose RPC port for the composed base URL (with --rpc-host). Env: ROSE_RPC_PORT",
     )
     ap.add_argument(
         "--rpc-scheme",
         default="",
-        help="scheme for the composed base URL (with --rpc-host); default http. Env: ZECD_RPC_SCHEME",
+        help="scheme for the composed base URL (with --rpc-host); default http. Env: ROSE_RPC_SCHEME",
     )
     ap.add_argument(
         "--bitcoind-url",
         default="",
         help="ignored; kept so existing deployments still start. The fee estimate now comes "
-             "from zecd's own estimatesmartfee, which is what a send uses",
+             "from rose's own estimatesmartfee, which is what a send uses",
     )
     ap.add_argument(
         "--reload",
@@ -410,43 +410,43 @@ def main():
     rpc = config.get("rpc", {})
 
     # Precedence for each value: explicit flag, then env, then the config, then a default -
-    # matching how zecd itself lets ZECD_RPC_PASSWORD win over the file. The password keeps its
+    # matching how rose itself lets ROSE_RPC_PASSWORD win over the file. The password keeps its
     # env-over-file rule and has no flag (a secret has no business on a command line).
-    user = args.rpc_user or os.environ.get("ZECD_RPC_USER") or rpc.get("user", "")
-    password = os.environ.get("ZECD_RPC_PASSWORD") or rpc.get("password", "")
+    user = args.rpc_user or os.environ.get("ROSE_RPC_USER") or rpc.get("user", "")
+    password = os.environ.get("ROSE_RPC_PASSWORD") or rpc.get("password", "")
     if not user or not password:
-        sys.exit("no RPC credentials: set ZECD_RPC_USER and ZECD_RPC_PASSWORD (or [rpc] "
+        sys.exit("no RPC credentials: set ROSE_RPC_USER and ROSE_RPC_PASSWORD (or [rpc] "
                  f"user/password in a mounted --conf; this run read {conf_label})")
-    # The shipped configs carry a placeholder that zecd itself refuses to start on (every
+    # The shipped configs carry a placeholder that rose itself refuses to start on (every
     # network), so a proxy holding it can only ever fail auth: say so up front, the same way.
     if password.strip().lower() == "change-me":
-        sys.exit("[rpc] password is still the CHANGE-ME placeholder; zecd refuses to start on "
-                 "it - set ZECD_RPC_PASSWORD to the password the daemon runs with")
+        sys.exit("[rpc] password is still the CHANGE-ME placeholder; rose refuses to start on "
+                 "it - set ROSE_RPC_PASSWORD to the password the daemon runs with")
 
-    # Where zecd listens. --rpc-url (or ZECD_RPC_URL) gives the whole base URL; otherwise it is
+    # Where rose listens. --rpc-url (or ROSE_RPC_URL) gives the whole base URL; otherwise it is
     # composed from host/port/scheme parts, each with the same flag > env > config > default
     # precedence. The parts exist for callers that have only a bare hostname to hand in - e.g. an
     # orchestrator service reference that cannot have a scheme/port string-composed onto it in the
-    # deployment blueprint - so ZECD_RPC_HOST takes that reference and ZECD_RPC_PORT/SCHEME the
+    # deployment blueprint - so ROSE_RPC_HOST takes that reference and ROSE_RPC_PORT/SCHEME the
     # literals. The config's own [rpc] bind/port is the fallback (right when the proxy runs beside
     # the daemon; wrong from a container, where 127.0.0.1 is the container's own loopback).
-    base = args.rpc_url or os.environ.get("ZECD_RPC_URL")
+    base = args.rpc_url or os.environ.get("ROSE_RPC_URL")
     if not base:
-        host = args.rpc_host or os.environ.get("ZECD_RPC_HOST") or rpc.get("bind", "127.0.0.1")
-        port = args.rpc_port or os.environ.get("ZECD_RPC_PORT") or rpc.get("port", 8232)
-        scheme = (args.rpc_scheme or os.environ.get("ZECD_RPC_SCHEME") or "http").rstrip(":/")
+        host = args.rpc_host or os.environ.get("ROSE_RPC_HOST") or rpc.get("bind", "127.0.0.1")
+        port = args.rpc_port or os.environ.get("ROSE_RPC_PORT") or rpc.get("port", 8232)
+        scheme = (args.rpc_scheme or os.environ.get("ROSE_RPC_SCHEME") or "http").rstrip(":/")
         base = f"{scheme}://{host}:{port}"
     path = f"/wallet/{args.wallet}" if args.wallet else "/"
     Handler.upstream_url = base.rstrip("/") + path
     token = base64.b64encode(f"{user}:{password}".encode()).decode()
     Handler.auth_header = f"Basic {token}"
-    pcrs = args.steve_pcrs or os.environ.get("ZECD_STEVE_PCRS", "")
+    pcrs = args.steve_pcrs or os.environ.get("ROSE_STEVE_PCRS", "")
     if pcrs:
         if not os.path.isfile(pcrs):
             sys.exit(f"--steve-pcrs: no such file: {pcrs}")
-        cli = args.steve_cli or os.environ.get("ZECD_STEVE_CLI", "") or shutil.which("steve-cli")
+        cli = args.steve_cli or os.environ.get("ROSE_STEVE_CLI", "") or shutil.which("steve-cli")
         if not cli or not os.path.isfile(cli):
-            sys.exit("--steve-pcrs needs steve-cli (on PATH, --steve-cli, or ZECD_STEVE_CLI)")
+            sys.exit("--steve-pcrs needs steve-cli (on PATH, --steve-cli, or ROSE_STEVE_CLI)")
         Handler.steve = (cli, pcrs)
 
     bd = config.get("bitcoind", {})
@@ -454,20 +454,20 @@ def main():
     # Which configuration the page is looking at, so it can say so. These feed the header, and
     # the network picks the unit label (BTC on mainnet, else tBTC). Neither is exposed by a
     # Bitcoin-wallet RPC, so
-    # when no config is mounted they come from ZECD_NETWORK / ZECD_BACKEND instead - the same
+    # when no config is mounted they come from ROSE_NETWORK / ROSE_BACKEND instead - the same
     # values the config would have supplied. Precedence: env, then the config, then a default.
     wallet_name = args.wallet or config.get("default_wallet", "default")
     wallet_cfg = config.get("wallets", {}).get(wallet_name) or config.get(f"wallets.{wallet_name}") or {}
     srv = wallet_cfg.get("server") or bd.get("server")
     # Backend: read from the wallet's `server` token (nested under tomllib, flat
     # "wallets.<name>" under the fallback parser), else the global [bitcoind] server, else the
-    # built-in default - unless ZECD_BACKEND overrides it (kyoto|bitcoind; anything else ignored).
-    backend_env = (os.environ.get("ZECD_BACKEND") or "").strip().lower()
+    # built-in default - unless ROSE_BACKEND overrides it (kyoto|bitcoind; anything else ignored).
+    backend_env = (os.environ.get("ROSE_BACKEND") or "").strip().lower()
     if backend_env in ("kyoto", "bitcoind"):
         backend = backend_env
     else:
         backend = "kyoto" if (srv or "").lower().startswith("kyoto") else "bitcoind"
-    net = os.environ.get("ZECD_NETWORK") or config.get("btc_testnet") or config.get("network") or "?"
+    net = os.environ.get("ROSE_NETWORK") or config.get("btc_testnet") or config.get("network") or "?"
     Handler.info_json = json.dumps({
         "conf": conf_label,
         "machine": machine_name(args.machine),
@@ -482,9 +482,9 @@ def main():
         watch_and_reexec(sorted(UI_DIR.glob("*.py")))
         print(f"reload: watching {UI_DIR} (index.html is read per request; a .py change re-execs)")
     print(f"UI:   http://{args.bind}:{args.port}/")
-    cred_src = "environment" if os.environ.get("ZECD_RPC_PASSWORD") else conf_label
-    print(f"zecd: {Handler.upstream_url}  (user={user!r}, credentials from {cred_src})")
-    print("fee:  zecd's estimatesmartfee through /rpc (the same estimate a send uses)")
+    cred_src = "environment" if os.environ.get("ROSE_RPC_PASSWORD") else conf_label
+    print(f"rose: {Handler.upstream_url}  (user={user!r}, credentials from {cred_src})")
+    print("fee:  rose's estimatesmartfee through /rpc (the same estimate a send uses)")
     print(f"cfg:  {conf_label}  net={net}  wallet={wallet_name}  backend={backend}  "
           f"machine={machine_name(args.machine)}")
     try:

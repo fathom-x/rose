@@ -43,10 +43,10 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Rose, RoseConfig,
 };
+use serde_json::json;
 
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
@@ -100,22 +100,22 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
         .expect("zebra getblockcount before the authoring wallet")
         .as_u64()
         .expect("height") as u32;
-    let zecd_rpc = pick_port().expect("pick zecd rpc port");
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, zecd_rpc);
+    let rose_rpc = pick_port().expect("pick rose rpc port");
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, rose_rpc);
     cfg.transparent = true;
     cfg.restore_mnemonic = Some(AUTHORING_MNEMONIC.to_string());
     cfg.birthday = Some(authoring_birthday);
-    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    let _rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
-        .expect("attach zecd backend");
-    let zecd = Zecd::start(&cfg)
+        .expect("attach rose backend");
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start the authoring zecd with transparent receiving");
+        .expect("start the authoring rose with transparent receiving");
 
     // Hand out NUM_ADDRESSES sequential transparent addresses; fund only the last (highest index).
     let mut addresses = Vec::with_capacity(NUM_ADDRESSES);
     for _ in 0..NUM_ADDRESSES {
-        let a = zecd
+        let a = rose
             .call("getnewaddress", json!(["", "transparent"]))
             .await
             .expect("getnewaddress transparent")
@@ -138,20 +138,20 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     // ran 1..=NUM_ADDRESSES and the funded address sits exactly at FUNDED_INDEX. If a future
     // change shifts issuance (or the phrase), this fails here with the real indices rather than
     // as a mysterious miss/find inversion later.
-    let first_index = address_index(&zecd, &addresses[0]).await;
+    let first_index = address_index(&rose, &addresses[0]).await;
     assert_eq!(
         first_index, 1,
         "issuance must start at external index 1 - index 0 is the account default address \
          (pinned phrase); a different value means the index accounting below is off"
     );
-    let funded_index = address_index(&zecd, &funded_addr).await;
+    let funded_index = address_index(&rose, &funded_addr).await;
     assert_eq!(
         funded_index, FUNDED_INDEX,
         "the funded (last handed-out) address must sit at index NUM_ADDRESSES"
     );
 
     // Wait until the authoring instance is caught up (mempool stream open) before funding.
-    wait_for_ready(&zecd, FUND_TIMEOUT).await;
+    wait_for_ready(&rose, FUND_TIMEOUT).await;
 
     // Birthday anchor for the later restores: the chain height just before the funding tx.
     let pre_fund_height = zebrad
@@ -179,8 +179,8 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
         .expect("height");
 
     // The authoring instance finds the funds (the funded index is explicitly exposed).
-    wait_for_balance_at_least(&zecd, 1.0, FUND_TIMEOUT).await;
-    let authored_balance = zecd
+    wait_for_balance_at_least(&rose, 1.0, FUND_TIMEOUT).await;
+    let authored_balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance on the authoring instance")
@@ -190,14 +190,14 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
         (authored_balance - 1.0).abs() < 1e-8,
         "authoring instance sees the 1-ZEC transparent receive at the high index: {authored_balance}"
     );
-    drop(zecd);
+    drop(rose);
 
     // 7. Restore with TOO SMALL a gap: the scan covers only indices 0..=SMALL_GAP (the account
     //    rows plus the gap lookahead past the default-address frontier), never reaches the funded
     //    index, so the funds are permanently missed. This is the load-bearing assertion - it
     //    fails if the configured gap is ignored (the default of 20 would find the funded index)
     //    or if transparent discovery scans unbounded.
-    let mut miss_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
+    let mut miss_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
     miss_cfg.transparent = true;
     miss_cfg.transparent_gap_limit = Some(SMALL_GAP);
     miss_cfg.restore_mnemonic = Some(AUTHORING_MNEMONIC.to_string());
@@ -205,9 +205,9 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     let _miss_lwd = attach_backend(&mut miss_cfg, zebrad.rpc_port)
         .await
         .expect("attach miss-restore backend");
-    let miss = Zecd::start(&miss_cfg)
+    let miss = Rose::start(&miss_cfg)
         .await
-        .expect("restore zecd with a too-small transparent gap limit");
+        .expect("restore rose with a too-small transparent gap limit");
     assert_eq!(
         miss.call("getwalletinfo", json!([]))
             .await
@@ -282,7 +282,7 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
 
     // 8. Restore with a SUFFICIENT gap: the same seed, same chain - now the scan exposes the funded
     //    index, so the block-scan matcher finds the receive and the balance comes back.
-    let mut find_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
+    let mut find_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
     find_cfg.transparent = true;
     find_cfg.transparent_gap_limit = Some(LARGE_GAP);
     find_cfg.restore_mnemonic = Some(AUTHORING_MNEMONIC.to_string());
@@ -290,9 +290,9 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     let _find_lwd = attach_backend(&mut find_cfg, zebrad.rpc_port)
         .await
         .expect("attach find-restore backend");
-    let find = Zecd::start(&find_cfg)
+    let find = Rose::start(&find_cfg)
         .await
-        .expect("restore zecd with a sufficient transparent gap limit");
+        .expect("restore rose with a sufficient transparent gap limit");
     find.wait_until_synced(tip, FUND_TIMEOUT)
         .await
         .expect("the large-gap restore scans to the tip");
@@ -314,7 +314,7 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     //    The pre-exposure of indices 0..INITIAL_SCAN means the receive is recovered *without* paying
     //    for a large sliding gap. This is the exchange's "10 000 addresses, only #9000 funded" case
     //    at small indices.
-    let mut a18_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
+    let mut a18_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
     a18_cfg.transparent = true;
     a18_cfg.transparent_gap_limit = Some(SMALL_GAP); // too small on its own (step 7 missed)
     a18_cfg.transparent_initial_scan = Some(LARGE_GAP); // but pre-exposes past the funded index
@@ -323,9 +323,9 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
     let _a18_lwd = attach_backend(&mut a18_cfg, zebrad.rpc_port)
         .await
         .expect("attach a18-restore backend");
-    let a18 = Zecd::start(&a18_cfg)
+    let a18 = Rose::start(&a18_cfg)
         .await
-        .expect("restore zecd with a small gap + large initial scan depth");
+        .expect("restore rose with a small gap + large initial scan depth");
     assert_eq!(
         a18.call("getwalletinfo", json!([]))
             .await
@@ -391,15 +391,15 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
 
     // 11. The from-seed proof: same small gap, same initial_scan - the floor-index receive sits at
     //     index >= initial_scan, so only the gap lookahead past the floor can recover it.
-    let mut horizon_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
+    let mut horizon_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
     horizon_cfg.transparent = true;
     horizon_cfg.transparent_gap_limit = Some(SMALL_GAP);
     horizon_cfg.transparent_initial_scan = Some(LARGE_GAP);
     horizon_cfg.restore_mnemonic = Some(AUTHORING_MNEMONIC.to_string());
     horizon_cfg.birthday = Some(pre_fund_height);
-    let horizon = Zecd::start(&horizon_cfg)
+    let horizon = Rose::start(&horizon_cfg)
         .await
-        .expect("restore zecd with the same small gap + initial scan (horizon config)");
+        .expect("restore rose with the same small gap + initial scan (horizon config)");
     horizon
         .wait_until_synced(tip2, FUND_TIMEOUT)
         .await
@@ -422,19 +422,19 @@ async fn regtest_transparent_gap_limit_bounds_restore_recovery() {
 
 /// The external child index behind one of the wallet's own transparent addresses, via
 /// `getaddressinfo`'s `address_index` extension.
-async fn address_index(zecd: &Zecd, addr: &str) -> u64 {
-    zecd.call("getaddressinfo", json!([addr]))
+async fn address_index(rose: &Rose, addr: &str) -> u64 {
+    rose.call("getaddressinfo", json!([addr]))
         .await
         .expect("getaddressinfo on an own transparent address")["address_index"]
         .as_u64()
         .expect("address_index present for an own transparent address")
 }
 
-/// Block until zecd reports its upstream peer `ready` (caught up; the mempool stream is open).
-async fn wait_for_ready(zecd: &Zecd, timeout: Duration) {
+/// Block until rose reports its upstream peer `ready` (caught up; the mempool stream is open).
+async fn wait_for_ready(rose: &Rose, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -447,7 +447,7 @@ async fn wait_for_ready(zecd: &Zecd, timeout: Duration) {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached ready: {peers}"
+            "rose never reached ready: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -455,10 +455,10 @@ async fn wait_for_ready(zecd: &Zecd, timeout: Duration) {
 }
 
 /// Poll `getbalance` until it reaches at least `target` ZEC, or panic on timeout.
-async fn wait_for_balance_at_least(zecd: &Zecd, target: f64, timeout: Duration) {
+async fn wait_for_balance_at_least(rose: &Rose, target: f64, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let bal = zecd
+        let bal = rose
             .call("getbalance", json!([]))
             .await
             .ok()
@@ -469,7 +469,7 @@ async fn wait_for_balance_at_least(zecd: &Zecd, target: f64, timeout: Duration) 
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached {target} ZEC (got {bal})"
+            "rose never reached {target} ZEC (got {bal})"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

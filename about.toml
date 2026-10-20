@@ -1,6 +1,6 @@
 # cargo-about configuration for generating THIRD-PARTY-LICENSES.txt.
 #
-# zecd is a statically linked binary, so every dependency's license text travels
+# rose is a statically linked binary, so every dependency's license text travels
 # in the shipped artifact. `scripts/generate-licenses.sh` runs `cargo about generate`
 # against this config + about.hbs to produce the committed THIRD-PARTY-LICENSES.txt
 # (CI verifies it is current). Keep the `accepted` set in lockstep with deny.toml's

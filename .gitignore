@@ -4,8 +4,8 @@
 Cargo.lock.orig
 
 # Local runtime data / wallets (never commit secrets). /data-btc* covers the datadirs the
-# Bitcoin dev-stack samples (deploy/zecd.btc-testnet*.toml) document, which sit in the repo
-# root because zecd runs on the host there - the entries below catch a datadir's contents but
+# Bitcoin dev-stack samples (deploy/rose.btc-testnet*.toml) document, which sit in the repo
+# root because rose runs on the host there - the entries below catch a datadir's contents but
 # not its `.lock`, so without this the directory itself shows up untracked.
 /data
 /data-btc*
@@ -17,7 +17,7 @@ keys.toml
 *.cookie
 .cookie
 identity.txt
-zecd.toml
+rose.toml
 # Compose sources stack credentials from a .env, so an operator following the instructions
 # creates a credential-bearing file. Unanchored (no leading slash), so it matches at EVERY
 # level, not just deploy/: compose reads the .env in its *project* directory, which is the
@@ -30,5 +30,5 @@ zecd.toml
 # ...but the .example templates are intentional (checked-in examples, no real secrets).
 !.env.example
 !.env.*.example
-!/deploy/zecd.toml
+!/deploy/rose.toml
 __pycache__/

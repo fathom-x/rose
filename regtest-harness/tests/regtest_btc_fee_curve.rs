@@ -5,15 +5,15 @@
 //! block, `estimatesmartfee` answers that rate at every target, 2 through 1008.
 //!
 //! 1. The node's curve is flat at 50 sat/vB (the precondition).
-//! 2. On a test network zecd treats a flat curve above the floor as no estimate:
+//! 2. On a test network rose treats a flat curve above the floor as no estimate:
 //!    `estimatesmartfee` answers Core's `errors` shape.
 //! 3. A send without `fee_rate` takes the test-network fallback, 1 sat/vB, and says so in
 //!    `fee_reason`.
 //!
-//! Skips cleanly without a bitcoind or a zecd built without the `bitcoin` feature.
+//! Skips cleanly without a bitcoind or a rose built without the `bitcoin` feature.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::{json, Value};
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 /// A BTC amount as satoshis.
 fn sats(v: &Value) -> u64 {
@@ -56,16 +56,16 @@ async fn btc_a_flat_node_fee_curve_is_no_estimate_on_a_test_network() {
         );
     }
 
-    let mut zecd = ZecdBtc::prepare(
-        dir.path().join("zecddata"),
+    let mut rose = RoseBtc::prepare(
+        dir.path().join("rosedata"),
         BtcBackend::Bitcoind,
         &node,
         &["btc"],
     );
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(190).await;
-    let addr = zecd
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(190).await;
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -73,11 +73,11 @@ async fn btc_a_flat_node_fee_curve_is_no_estimate_on_a_test_network() {
         .await
         .expect("fund");
     node.mine(1).await;
-    zecd.wait_height(191).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
+    rose.wait_height(191).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
 
     // 2. No estimate.
-    let estimate = zecd
+    let estimate = rose
         .call("estimatesmartfee", json!([6]))
         .await
         .expect("estimatesmartfee");
@@ -85,7 +85,7 @@ async fn btc_a_flat_node_fee_curve_is_no_estimate_on_a_test_network() {
     assert!(estimate["errors"].is_array(), "{estimate}");
 
     // 3. The send takes the fallback, not the node's 50 sat/vB.
-    let sent = zecd
+    let sent = rose
         .call(
             "sendtoaddress",
             json!([miner, 0.1, null, null, false, null, null, null, null, null, true]),

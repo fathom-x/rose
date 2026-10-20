@@ -6,19 +6,19 @@
 //! checkpoint persistence across a daemon restart.
 //!
 //! Skips cleanly when either half is not provisioned, so plain `cargo test` and the
-//! standard CI legs (which build zecd without the `bitcoin` feature and carry no bitcoind)
+//! standard CI legs (which build rose without the `bitcoin` feature and carry no bitcoind)
 //! still validate that the harness compiles:
 //!  * `BITCOIND_BIN` (or a `bitcoind` on PATH) selects the node binary - Bitcoin Core
 //!    v30.x is what the bdk_bitcoind_rpc line is tested against upstream;
-//!  * the zecd under test must carry the `bitcoin` cargo feature (probed via
+//!  * the rose under test must carry the `bitcoin` cargo feature (probed via
 //!    `config check` on a `coin = "bitcoin"` config - a default build refuses it).
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use rose_regtest_harness::{pick_port, rose_bin};
 use serde_json::{json, Value};
-use zecd_regtest_harness::{pick_port, zecd_bin};
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -33,16 +33,16 @@ fn bitcoind_bin() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Whether the zecd under test carries the `bitcoin` feature: a default build's
+/// Whether the rose under test carries the `bitcoin` feature: a default build's
 /// `config check` refuses `coin = "bitcoin"` ("this build supports: zcash").
-fn zecd_has_bitcoin_feature(datadir: &std::path::Path) -> bool {
+fn rose_has_bitcoin_feature(datadir: &std::path::Path) -> bool {
     let conf = datadir.join("probe.toml");
     std::fs::write(
         &conf,
         "default_wallet = \"btc\"\n[wallets.btc]\ncoin = \"bitcoin\"\n",
     )
     .expect("write probe config");
-    let out = Command::new(zecd_bin())
+    let out = Command::new(rose_bin())
         .args([
             "--datadir",
             datadir.to_str().unwrap(),
@@ -55,7 +55,7 @@ fn zecd_has_bitcoin_feature(datadir: &std::path::Path) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .expect("run zecd config check");
+        .expect("run rose config check");
     let stderr = String::from_utf8_lossy(&out.stderr);
     !stderr.contains("unsupported coin")
 }
@@ -148,7 +148,7 @@ impl BitcoinD {
     }
 }
 
-struct ZecdBtc {
+struct RoseBtc {
     proc: Option<KillOnDrop>,
     client: reqwest::Client,
     url: String,
@@ -157,14 +157,14 @@ struct ZecdBtc {
     rpc_port: u16,
 }
 
-impl ZecdBtc {
+impl RoseBtc {
     fn spawn_daemon(
         datadir: &std::path::Path,
         conf: &std::path::Path,
         rpc_port: u16,
     ) -> KillOnDrop {
         KillOnDrop(
-            Command::new(zecd_bin())
+            Command::new(rose_bin())
                 .args([
                     "--datadir",
                     datadir.to_str().unwrap(),
@@ -181,13 +181,13 @@ impl ZecdBtc {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .expect("spawn zecd"),
+                .expect("spawn rose"),
         )
     }
 
-    async fn start(datadir: PathBuf, bitcoind_rpc_port: u16) -> ZecdBtc {
+    async fn start(datadir: PathBuf, bitcoind_rpc_port: u16) -> RoseBtc {
         std::fs::create_dir_all(&datadir).unwrap();
-        let conf = datadir.join("zecd.toml");
+        let conf = datadir.join("rose.toml");
         // A tight sync interval so the 0-conf mempool pass lands quickly; the health
         // server is disabled to avoid a port pick for a surface this test does not assert.
         std::fs::write(
@@ -207,7 +207,7 @@ impl ZecdBtc {
             ),
         )
         .unwrap();
-        let init = Command::new(zecd_bin())
+        let init = Command::new(rose_bin())
             .args([
                 "--datadir",
                 datadir.to_str().unwrap(),
@@ -219,14 +219,14 @@ impl ZecdBtc {
                 "btc",
             ])
             .output()
-            .expect("run zecd init");
+            .expect("run rose init");
         assert!(
             init.status.success(),
-            "zecd init failed: {}",
+            "rose init failed: {}",
             String::from_utf8_lossy(&init.stderr)
         );
-        let rpc_port = pick_port().expect("pick zecd rpc port");
-        let z = ZecdBtc {
+        let rpc_port = pick_port().expect("pick rose rpc port");
+        let z = RoseBtc {
             proc: Some(Self::spawn_daemon(&datadir, &conf, rpc_port)),
             client: reqwest::Client::new(),
             url: format!("http://127.0.0.1:{rpc_port}/wallet/btc"),
@@ -251,7 +251,7 @@ impl ZecdBtc {
             if self.call("getwalletinfo", json!([])).await.is_ok() {
                 return;
             }
-            assert!(Instant::now() < deadline, "zecd RPC never came up");
+            assert!(Instant::now() < deadline, "rose RPC never came up");
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
@@ -286,7 +286,7 @@ impl ZecdBtc {
             }
             assert!(
                 Instant::now() < deadline,
-                "zecd never synced to height {target}"
+                "rose never synced to height {target}"
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -318,9 +318,9 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         return;
     };
     let dir = tempfile::tempdir().expect("tempdir");
-    if !zecd_has_bitcoin_feature(dir.path()) {
+    if !rose_has_bitcoin_feature(dir.path()) {
         eprintln!(
-            "skipping: the zecd under test was built without the `bitcoin` feature \
+            "skipping: the rose under test was built without the `bitcoin` feature \
              (build with --features bitcoin)"
         );
         return;
@@ -332,8 +332,8 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .await
         .expect("create miner wallet");
 
-    let mut zecd = ZecdBtc::start(dir.path().join("zecddata"), btc_rpc_port).await;
-    let address = zecd
+    let mut rose = RoseBtc::start(dir.path().join("rosedata"), btc_rpc_port).await;
+    let address = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -342,15 +342,15 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
 
     // Sync from genesis past coinbase maturity.
     node.mine(101).await;
-    zecd.wait_height(101).await;
+    rose.wait_height(101).await;
 
     // A mempool receive is visible at 0-conf...
     let fund_txid = node
         .call("sendtoaddress", json!([address, 1.0]))
         .await
-        .expect("fund zecd");
-    zecd.wait_unconfirmed(1.0).await;
-    let listed = zecd
+        .expect("fund rose");
+    rose.wait_unconfirmed(1.0).await;
+    let listed = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
@@ -366,14 +366,14 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     // ...but only through the 0-conf surfaces. Core's getbalance is TRUSTED funds - a
     // foreign unconfirmed receive is excluded - and Core's listunspent defaults to
     // minconf=1; `listunspent 0` opts in and marks the output unsafe.
-    let balance = zecd.call("getbalance", json!([])).await.expect("balance");
+    let balance = rose.call("getbalance", json!([])).await.expect("balance");
     assert_eq!(balance.as_f64(), Some(0.0), "0-conf receive is not trusted");
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
     assert_eq!(unspent, json!([]), "default minconf=1 hides 0-conf");
-    let unspent0 = zecd
+    let unspent0 = rose
         .call("listunspent", json!([0]))
         .await
         .expect("listunspent 0");
@@ -383,10 +383,10 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
 
     // ...and confirms into the spendable balance.
     node.mine(1).await;
-    zecd.wait_height(102).await;
-    let balance = zecd.call("getbalance", json!([])).await.expect("balance");
+    rose.wait_height(102).await;
+    let balance = rose.call("getbalance", json!([])).await.expect("balance");
     assert_eq!(balance.as_f64(), Some(1.0));
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -395,10 +395,10 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     assert_eq!(unspent[0]["safe"], json!(true));
 
     // `listreceivedbyaddress` with `include_empty` enumerates every issued receiving
-    // address with its derivation index (zecd's `address_index` extension) - the one that
+    // address with its derivation index (rose's `address_index` extension) - the one that
     // was funded carries the amount and txid, the default minconf hides nothing at 1 conf,
     // and change never appears. Without `include_empty` only the funded address is listed.
-    let received = zecd
+    let received = rose
         .call("listreceivedbyaddress", json!([0, true]))
         .await
         .expect("listreceivedbyaddress");
@@ -413,7 +413,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     assert_eq!(funded["txids"], json!([fund_txid]));
     assert_eq!(funded["label"], json!(""));
     assert!(funded["address_index"].is_u64(), "{funded}");
-    let only_funded = zecd
+    let only_funded = rose
         .call("listreceivedbyaddress", json!([]))
         .await
         .expect("listreceivedbyaddress default");
@@ -422,7 +422,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
 
     // `listdescriptors` is Core's shape over the two public descriptors, the xpub inside;
     // the private form is refused (the database holds no private material).
-    let descriptors = zecd
+    let descriptors = rose
         .call("listdescriptors", json!([]))
         .await
         .expect("listdescriptors");
@@ -440,7 +440,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         descs[0]["next_index"].as_u64().unwrap() >= 1,
         "{descriptors}"
     );
-    let private = zecd.call("listdescriptors", json!([true])).await;
+    let private = rose.call("listdescriptors", json!([true])).await;
     assert!(private.is_err(), "private descriptors must be refused");
 
     // The wallet builds, signs (seed-derived signers), and broadcasts a send; the node's
@@ -449,10 +449,10 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .call("getnewaddress", json!([]))
         .await
         .expect("miner address");
-    let send_txid = zecd
+    let send_txid = rose
         .call("sendtoaddress", json!([miner_addr, 0.25]))
         .await
-        .expect("zecd send");
+        .expect("rose send");
     let mempool = node
         .call("getrawmempool", json!([]))
         .await
@@ -463,8 +463,8 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     );
 
     node.mine(1).await;
-    zecd.wait_height(103).await;
-    let entries = zecd
+    rose.wait_height(103).await;
+    let entries = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
@@ -491,12 +491,12 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .count();
     assert_eq!(send_entry_count, 1, "change must not appear: {entries}");
     // Change landed on the internal keychain and reports as such.
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
     let change_addr = unspent[0]["address"].as_str().expect("change address");
-    let info = zecd
+    let info = rose
         .call("getaddressinfo", json!([change_addr]))
         .await
         .expect("getaddressinfo");
@@ -509,7 +509,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     // signalled BIP 125 - read off the node's own decoding of the raw transactions.
     let m1 = node.call("getnewaddress", json!([])).await.unwrap();
     let m2 = node.call("getnewaddress", json!([])).await.unwrap();
-    let many_txid = zecd
+    let many_txid = rose
         .call(
             "sendmany",
             json!(["", {m1.as_str().unwrap(): 0.1, m2.as_str().unwrap(): 0.2}, null, null, null, false]),
@@ -532,7 +532,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         sequences(&many_raw).iter().all(|s| *s == 0xFFFF_FFFE),
         "a replaceable=false send must not signal BIP 125: {many_raw}"
     );
-    let unconfirmed = zecd
+    let unconfirmed = rose
         .call("gettransaction", json!([many_txid]))
         .await
         .expect("gettransaction unconfirmed sendmany");
@@ -541,8 +541,8 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         json!("no"),
         "{unconfirmed}"
     );
-    // Already confirmed, and the node keeps no txindex: decode zecd's own copy of it.
-    let first_hex = zecd
+    // Already confirmed, and the node keeps no txindex: decode rose's own copy of it.
+    let first_hex = rose
         .call("gettransaction", json!([send_txid]))
         .await
         .expect("gettransaction default send")["hex"]
@@ -556,8 +556,8 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         "the default send signals BIP 125: {first_raw}"
     );
     node.mine(1).await;
-    zecd.wait_height(104).await;
-    let many = zecd
+    rose.wait_height(104).await;
+    let many = rose
         .call("gettransaction", json!([many_txid]))
         .await
         .expect("gettransaction sendmany");
@@ -581,7 +581,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     // mempool entry proves the paid rate is the caller's number, not an estimate. It also
     // asks for `verbose` (param 10): Core's {txid, fee_reason}, the reason naming the
     // caller's own rate.
-    let rated = zecd
+    let rated = rose
         .call(
             "sendtoaddress",
             json!([miner_addr, 0.05, null, null, false, null, null, null, null, 25, true]),
@@ -604,18 +604,18 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         "explicit fee_rate honored: {rate} sat/vB ({entry})"
     );
     node.mine(1).await;
-    zecd.wait_height(105).await;
+    rose.wait_height(105).await;
 
     // subtractfeefromamount: the recipient receives amount minus fee, and the sender is
     // debited exactly the stated amount - the fee no longer comes out of the change.
-    let balance_before = zecd.call("getbalance", json!([])).await.expect("balance");
-    let sffo_txid = zecd
+    let balance_before = rose.call("getbalance", json!([])).await.expect("balance");
+    let sffo_txid = rose
         .call("sendtoaddress", json!([miner_addr, 0.1, null, null, true]))
         .await
         .expect("subtract-fee send");
     node.mine(1).await;
-    zecd.wait_height(106).await;
-    let tx = zecd
+    rose.wait_height(106).await;
+    let tx = rose
         .call("gettransaction", json!([sffo_txid]))
         .await
         .expect("gettransaction subtract-fee");
@@ -627,7 +627,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         -10_000_000,
         "recipient amount plus fee is exactly the stated amount: {tx}"
     );
-    let balance_after = zecd.call("getbalance", json!([])).await.expect("balance");
+    let balance_after = rose.call("getbalance", json!([])).await.expect("balance");
     let debit =
         ((balance_before.as_f64().unwrap() - balance_after.as_f64().unwrap()) * 1e8).round() as i64;
     assert_eq!(debit, 10_000_000, "sender debited exactly the amount");
@@ -636,7 +636,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     // unlisted one receives its stated amount untouched.
     let m3 = node.call("getnewaddress", json!([])).await.unwrap();
     let m4 = node.call("getnewaddress", json!([])).await.unwrap();
-    let many_txid = zecd
+    let many_txid = rose
         .call(
             "sendmany",
             json!([
@@ -650,8 +650,8 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .await
         .expect("sendmany subtractfeefrom");
     node.mine(1).await;
-    zecd.wait_height(107).await;
-    let many = zecd
+    rose.wait_height(107).await;
+    let many = rose
         .call("gettransaction", json!([many_txid]))
         .await
         .expect("gettransaction sendmany subtractfeefrom");
@@ -673,20 +673,20 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     );
 
     // The synced checkpoint and the balance survive a daemon restart (BDK changesets
-    // persisted through zecd's own rusqlite persister) - the wallet resumes from its
+    // persisted through rose's own rusqlite persister) - the wallet resumes from its
     // checkpoint rather than rescanning from genesis.
-    let balance_before = zecd
+    let balance_before = rose
         .call("getbalance", json!([]))
         .await
         .expect("balance before restart");
-    zecd.restart().await;
-    zecd.wait_height(107).await;
-    let balance_after = zecd
+    rose.restart().await;
+    rose.wait_height(107).await;
+    let balance_after = rose
         .call("getbalance", json!([]))
         .await
         .expect("balance after restart");
     assert_eq!(balance_before, balance_after);
-    let info = zecd
+    let info = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -697,9 +697,9 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     // the wallet - the case the flag exists for, and the one where coin selection must
     // target the amount alone (selecting for amount plus fee would refuse it as
     // insufficient). Run after the restart, so it also proves the resumed wallet spends.
-    let balance = zecd.call("getbalance", json!([])).await.expect("balance");
+    let balance = rose.call("getbalance", json!([])).await.expect("balance");
     assert!(balance.as_f64().unwrap() > 0.0);
-    let drain_txid = zecd
+    let drain_txid = rose
         .call(
             "sendtoaddress",
             json!([miner_addr, balance, null, null, true]),
@@ -707,15 +707,15 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .await
         .expect("whole-balance drain");
     node.mine(1).await;
-    zecd.wait_height(108).await;
-    let tx = zecd
+    rose.wait_height(108).await;
+    let tx = rose
         .call("gettransaction", json!([drain_txid]))
         .await
         .expect("gettransaction drain");
     assert_eq!(tx["confirmations"], json!(1), "{tx}");
-    let balance = zecd.call("getbalance", json!([])).await.expect("balance");
+    let balance = rose.call("getbalance", json!([])).await.expect("balance");
     assert_eq!(balance.as_f64(), Some(0.0), "drained to zero");
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -729,8 +729,8 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .await
         .expect("refund one utxo");
     node.mine(1).await;
-    zecd.wait_height(109).await;
-    let sub_dust_txid = zecd
+    rose.wait_height(109).await;
+    let sub_dust_txid = rose
         .call(
             "sendtoaddress",
             json!([miner_addr, 0.00099850, null, null, true]),
@@ -738,13 +738,13 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .await
         .expect("sub-dust surplus subtract-fee send");
     node.mine(1).await;
-    zecd.wait_height(110).await;
-    let tx = zecd
+    rose.wait_height(110).await;
+    let tx = rose
         .call("gettransaction", json!([sub_dust_txid]))
         .await
         .expect("gettransaction sub-dust");
     assert_eq!(tx["confirmations"], json!(1), "{tx}");
-    let balance = zecd.call("getbalance", json!([])).await.expect("balance");
+    let balance = rose.call("getbalance", json!([])).await.expect("balance");
     assert_eq!(balance.as_f64(), Some(0.0), "sub-dust surplus went to fee");
 
     // Broadcast-failure classification: a rebroadcast of the already-confirmed
@@ -752,7 +752,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     // through (-27 "already in utxo set") - not a blanket -26, and not the -4 transport
     // shape, which is reserved for obtaining no verdict at all.
     let hex = tx["hex"].as_str().expect("tx hex").to_string();
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("sendrawtransaction", json!([hex]))
         .await
         .expect_err("rebroadcast of a confirmed tx must be rejected");
@@ -763,7 +763,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     // error codes, arity, batching, over every method the engine serves. Its send checks
     // all reject at argument parsing, so it moves no funds; the sends above are the live
     // coverage of the send path.
-    run_conformance(zecd.rpc_port);
+    run_conformance(rose.rpc_port);
 }
 
 /// Run `scripts/conformance.py --coin bitcoin` against the regtest daemon, exactly as
@@ -772,7 +772,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
 fn run_conformance(rpc_port: u16) {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("harness lives inside the zecd repo")
+        .expect("harness lives inside the rose repo")
         .join("scripts/conformance.py");
     let out = std::process::Command::new("python3")
         .arg(&script)

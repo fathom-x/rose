@@ -47,8 +47,8 @@ use crate::network::ZNetwork;
 
 /// The default upstream's local zebrad JSON-RPC ports (the ports named by
 /// `config::default_server`). zebra ships with RPC disabled - there is no upstream default port
-/// to inherit - and the zcashd-convention RPC ports (8232/18232) are zecd's own, so the
-/// recommended `rpc.listen_addr` for a zebrad serving zecd sits next to zebra's P2P ports
+/// to inherit - and the zcashd-convention RPC ports (8232/18232) are rose's own, so the
+/// recommended `rpc.listen_addr` for a zebrad serving rose sits next to zebra's P2P ports
 /// (8233/18233) instead.
 pub const ZEBRA_RPC_PORT_MAIN: u16 = 8234;
 pub const ZEBRA_RPC_PORT_TEST: u16 = 18234;
@@ -392,7 +392,7 @@ pub struct CleartextPolicy {
     /// Treat private / non-globally-routable addresses (RFC1918 `10/172.16/192.168`, link-local,
     /// CGNAT `100.64/10`, IPv6 unique-local `fc00::/7` and link-local `fe80::/10`) as "local", so
     /// a credentialed connect to a container/LAN zebra is allowed without an override. Default
-    /// `true` (matches the self-hosted `zebra → zecd` Docker/LAN norm); set `false` for a strict
+    /// `true` (matches the self-hosted `zebra → rose` Docker/LAN norm); set `false` for a strict
     /// loopback-only posture. `[backend] rfc1918_is_local`.
     pub rfc1918_is_local: bool,
     /// Allow credentials over cleartext to *any* host, including globally-routable ones - the
@@ -448,7 +448,7 @@ pub(crate) fn host_is_local(host: &str, rfc1918_is_local: bool) -> bool {
 /// all (chain data is public, so an unauthenticated remote connect is always allowed).
 ///
 /// A free function rather than an inline check in [`ZebraClient::new`] because it decides purely
-/// from configuration - no DNS, no I/O - which lets `zecd config check` report the refusal before
+/// from configuration - no DNS, no I/O - which lets `rose config check` report the refusal before
 /// deployment instead of leaving the operator with a daemon that starts and then never syncs.
 #[cfg(feature = "zcash")]
 pub(crate) fn cleartext_gate(
@@ -463,7 +463,7 @@ pub(crate) fn cleartext_gate(
         bail!(
             "refusing to send zebra RPC credentials in cleartext to the globally-routable \
              host '{host}': the zebra connection is plaintext HTTP, so the Authorization \
-             header would cross the public internet in the clear. Point zecd at a loopback or \
+             header would cross the public internet in the clear. Point rose at a loopback or \
              private-network zebra (127.0.0.1/localhost, an RFC1918/container address), tunnel \
              the RPC port over SSH/WireGuard and use the local end, or set `[backend] \
              allow_remote_cleartext = true` if the hop is already secured."
@@ -741,7 +741,7 @@ impl Server {
 
     /// Run the connect-time checks that need no network, so a misconfiguration that would leave
     /// the daemon retrying a connect it can never complete is reportable up front - this is what
-    /// `zecd config check` calls. [`connect_timeout`](Server::connect_timeout) reaches the same
+    /// `rose config check` calls. [`connect_timeout`](Server::connect_timeout) reaches the same
     /// verdicts through the same helpers, so the two cannot drift.
     pub fn preflight(&self) -> anyhow::Result<()> {
         match self.kind {
@@ -914,7 +914,7 @@ impl Server {
 
 /// Resolve `[backend] server` into an endpoint carrying every setting that applies to it -
 /// `[zebra]` credentials, the locality/cleartext policy, the TLS options, and the transparent
-/// capability assertion. The daemon builds each wallet's endpoint this way, and `zecd config
+/// capability assertion. The daemon builds each wallet's endpoint this way, and `rose config
 /// check` inspects the same value, so what the check reports is what the daemon would dial.
 #[cfg(feature = "zcash")]
 pub fn resolve_configured(config: &crate::config::AppConfig) -> anyhow::Result<Server> {
@@ -1029,7 +1029,7 @@ pub fn apply_transparent_capability_override(server: &mut Server, assume: bool) 
 /// Apply the `[backend] proxy` setting: route this endpoint's traffic through a SOCKS5 proxy.
 ///
 /// Unlike the TLS and capability mutators this applies to *both* endpoint kinds - the point of
-/// the knob is that nothing zecd dials bypasses the proxy.
+/// the knob is that nothing rose dials bypasses the proxy.
 #[cfg(feature = "zcash")]
 pub fn apply_proxy(server: &mut Server, proxy: Option<crate::socks::SocksProxy>) {
     server.proxy = proxy;
@@ -1165,15 +1165,15 @@ mod tests {
             assert_eq!(s.kind, ServerKind::ZebraRpc);
             assert!(s.describe().starts_with("zebra-rpc 127.0.0.1:"));
         }
-        // The default must never clash with zecd's own RPC ports (the wallet would dial
+        // The default must never clash with rose's own RPC ports (the wallet would dial
         // itself).
         assert_ne!(
             ZEBRA_RPC_PORT_MAIN,
-            crate::config::ZECD_DEFAULTS.rpc_port_main
+            crate::config::ROSE_DEFAULTS.rpc_port_main
         );
         assert_ne!(
             ZEBRA_RPC_PORT_TEST,
-            crate::config::ZECD_DEFAULTS.rpc_port_test
+            crate::config::ROSE_DEFAULTS.rpc_port_test
         );
     }
 
@@ -1547,14 +1547,14 @@ mod tests {
     /// The production seam: a wallet may point at its own upstream, and `node.rs` gives each
     /// distinct endpoint its own hub. Driven through a real config so the test covers
     /// `resolve_for_wallet` and the key together - the two halves that decide, for an actual
-    /// `zecd.toml`, which wallets share a connection.
+    /// `rose.toml`, which wallets share a connection.
     #[cfg(feature = "cli")]
     #[test]
     fn wallets_share_a_hub_exactly_when_their_resolved_endpoints_agree() {
         use crate::config::Cli;
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             "[backend]\n\
@@ -1567,7 +1567,7 @@ mod tests {
              server = \"https://testnet.zec.rocks:443\"\n",
         )
         .unwrap();
-        let cli = Cli::parse_from(["zecd", "--testnet", "--conf", conf.to_str().unwrap()]);
+        let cli = Cli::parse_from(["rose", "--testnet", "--conf", conf.to_str().unwrap()]);
         let cfg = crate::config::AppConfig::resolve(&cli).unwrap();
 
         let key = |wallet: &str| {

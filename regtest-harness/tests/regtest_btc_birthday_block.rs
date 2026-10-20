@@ -1,11 +1,11 @@
 //! The birthday block itself is scanned over kyoto. bip157 fetches filters from
 //! `anchor + 1`: the anchor checkpoint is held as the tree's tip with no header of its own,
-//! so its block is never filtered. zecd therefore records a height birthday's anchor one
+//! so its block is never filtered. rose therefore records a height birthday's anchor one
 //! block BELOW it - a restore told `--birthday H` (the height of the first receive, as
 //! `init` instructs) must see a receive mined in block H.
 //!
 //! Regtest ships no scan floor, so a first sync from a bare height runs from genesis and
-//! would find the receive whatever the anchor; what that leg pins is where zecd puts the
+//! would find the receive whatever the anchor; what that leg pins is where rose puts the
 //! anchor it resolves (`H - 1`). The anchor is only consulted on a wallet with no chain
 //! data of its own - what a mainnet `init` records from the per-day table or a bitcoind
 //! node - so the suite then plants the anchor row exactly as `init` would, and runs the
@@ -13,11 +13,11 @@
 //! is missed - bip157's exclusive semantic, the reason for the `- 1`). The last leg is
 //! the control that keeps the others from passing vacuously.
 //!
-//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
+//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::json;
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn btc_kyoto_recovery_from_an_anchor_scans_the_block_above_it() {
@@ -31,18 +31,18 @@ async fn btc_kyoto_recovery_from_an_anchor_scans_the_block_above_it() {
     // The original wallet, over bitcoind: one receive, mined into block 102 - the
     // wallet's birthday block. Buried under a few more so the tip is elsewhere.
     let (mnemonic, address) = {
-        let mut zecd = ZecdBtc::prepare(
+        let mut rose = RoseBtc::prepare(
             dir.path().join("original"),
             BtcBackend::Bitcoind,
             &node,
             &["btc"],
         );
-        let mnemonic = zecd
+        let mnemonic = rose
             .init_ok("btc", &["--birthday", "0"])
             .expect("a fresh init prints its mnemonic");
-        zecd.start().await;
-        zecd.wait_height(101).await;
-        let address = zecd
+        rose.start().await;
+        rose.wait_height(101).await;
+        let address = rose
             .call("getnewaddress", json!([]))
             .await
             .expect("getnewaddress")
@@ -53,9 +53,9 @@ async fn btc_kyoto_recovery_from_an_anchor_scans_the_block_above_it() {
             .await
             .expect("fund the wallet");
         node.mine(1).await;
-        zecd.wait_height(102).await;
-        zecd.wait_wallet_balance("btc", 1.0).await;
-        zecd.stop();
+        rose.wait_height(102).await;
+        rose.wait_wallet_balance("btc", 1.0).await;
+        rose.stop();
         (mnemonic, address)
     };
     std::fs::remove_dir_all(dir.path().join("original")).expect("discard the original");
@@ -66,18 +66,18 @@ async fn btc_kyoto_recovery_from_an_anchor_scans_the_block_above_it() {
     let phrase_file = dir.path().join("phrase.txt");
     std::fs::write(&phrase_file, format!("{mnemonic}\n")).unwrap();
 
-    // 1. What zecd itself records: a restore told `--birthday 102` with no anchor scans
+    // 1. What rose itself records: a restore told `--birthday 102` with no anchor scans
     //    from the regtest genesis floor and resolves the anchor at 101, one below the
     //    birthday (`btc::kyoto::resolution_target`), once the tip is the reorg margin past
     //    it - the placement the two planted legs below then prove inclusive.
     {
-        let mut zecd = ZecdBtc::prepare(
+        let mut rose = RoseBtc::prepare(
             dir.path().join("resolved"),
             BtcBackend::Kyoto,
             &node,
             &["btc"],
         );
-        zecd.init_ok(
+        rose.init_ok(
             "btc",
             &[
                 "--restore",
@@ -87,11 +87,11 @@ async fn btc_kyoto_recovery_from_an_anchor_scans_the_block_above_it() {
                 &birthday.to_string(),
             ],
         );
-        zecd.start().await;
-        zecd.wait_height(tip).await;
-        zecd.wait_wallet_balance("btc", 1.0).await;
+        rose.start().await;
+        rose.wait_height(tip).await;
+        rose.wait_wallet_balance("btc", 1.0).await;
         let expected_hash = node.block_hash(birthday - 1).await;
-        zecd.wait_wallet(
+        rose.wait_wallet(
             "btc",
             "getwalletinfo",
             json!([]),
@@ -102,15 +102,15 @@ async fn btc_kyoto_recovery_from_an_anchor_scans_the_block_above_it() {
             },
         )
         .await;
-        zecd.stop();
+        rose.stop();
     }
 
     // 2. The planted legs: a recovery from a recorded anchor, the path a mainnet init
     //    takes, finds the birthday block from `H - 1` and misses it from `H`.
     for (anchor_height, seen) in [(birthday - 1, true), (birthday, false)] {
         let name = format!("anchor-{anchor_height}");
-        let mut zecd = ZecdBtc::prepare(dir.path().join(&name), BtcBackend::Kyoto, &node, &["btc"]);
-        let printed = zecd.init_ok(
+        let mut rose = RoseBtc::prepare(dir.path().join(&name), BtcBackend::Kyoto, &node, &["btc"]);
+        let printed = rose.init_ok(
             "btc",
             &[
                 "--restore",
@@ -127,11 +127,11 @@ async fn btc_kyoto_recovery_from_an_anchor_scans_the_block_above_it() {
         // What a mainnet init records offline from the per-day table (or a bitcoind init
         // from the node): the anchor row, before the wallet has any chain data.
         let hash = node.block_hash(anchor_height).await;
-        plant_anchor(&zecd.wallet_db_path("btc"), anchor_height, &hash);
+        plant_anchor(&rose.wallet_db_path("btc"), anchor_height, &hash);
 
-        zecd.start().await;
-        zecd.wait_height(tip).await;
-        let info = zecd
+        rose.start().await;
+        rose.wait_height(tip).await;
+        let info = rose
             .call("getwalletinfo", json!([]))
             .await
             .expect("getwalletinfo");
@@ -140,13 +140,13 @@ async fn btc_kyoto_recovery_from_an_anchor_scans_the_block_above_it() {
             Some(anchor_height),
             "the planted anchor drove the scan: {info}"
         );
-        let balance = zecd
+        let balance = rose
             .call("getbalance", json!([]))
             .await
             .expect("getbalance")
             .as_f64()
             .unwrap();
-        let ai = zecd
+        let ai = rose
             .call("getaddressinfo", json!([address]))
             .await
             .expect("getaddressinfo");
@@ -163,7 +163,7 @@ async fn btc_kyoto_recovery_from_an_anchor_scans_the_block_above_it() {
                  must miss its block - the control for the `- 1`: {info}"
             );
         }
-        zecd.stop();
+        rose.stop();
     }
 }
 

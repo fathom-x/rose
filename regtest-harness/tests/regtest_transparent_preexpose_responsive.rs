@@ -26,8 +26,8 @@
 
 use std::time::{Duration, Instant};
 
+use rose_regtest_harness::{pick_port, resolve_node_bin, RegtestNode, Rose, RoseConfig, Zebrad};
 use serde_json::{json, Value};
-use zecd_regtest_harness::{pick_port, resolve_node_bin, RegtestNode, Zebrad, Zecd, ZecdConfig};
 
 /// Deep enough that pre-exposure takes well over ten seconds on CI hardware (derivation is
 /// CPU-bound at ~1k addr/s), giving dozens of probe ticks inside the window - but not so deep the
@@ -74,12 +74,12 @@ async fn regtest_transparent_preexpose_stays_responsive() {
     // Transparent receiving on, with a deep initial scan so pre-exposure is a long, observable
     // window. No restore: a fresh init's account exists immediately, so the actor begins
     // pre-exposing as soon as it connects.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.transparent = true;
     cfg.transparent_initial_scan = Some(TRANSPARENT_INITIAL_SCAN);
-    let zecd = Zecd::start(&cfg)
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd with a deep transparent initial scan");
+        .expect("start rose with a deep transparent initial scan");
 
     // Probe reads continuously until pre-exposure reports complete. Every probe is bounded by
     // `MAX_READ_LATENCY` (via a hard client-side timeout, so a blocked daemon fails the test in
@@ -91,11 +91,11 @@ async fn regtest_transparent_preexpose_stays_responsive() {
 
     loop {
         // `getwalletinfo` is itself a DB-read probe *and* carries the progress surface.
-        let (info, wi_latency) = timed_read(&zecd, "getwalletinfo", json!([])).await;
+        let (info, wi_latency) = timed_read(&rose, "getwalletinfo", json!([])).await;
         max_latency = max_latency.max(wi_latency);
 
         // A pure watch-channel read: isolates runtime-scheduler starvation from DB contention.
-        let (_blocks, bc_latency) = timed_read(&zecd, "getblockcount", json!([])).await;
+        let (_blocks, bc_latency) = timed_read(&rose, "getblockcount", json!([])).await;
         max_latency = max_latency.max(bc_latency);
 
         // The health endpoints are what a monitoring stack actually watches, and they were
@@ -106,7 +106,7 @@ async fn regtest_transparent_preexpose_stays_responsive() {
         // rather than trusting. `/healthz` is included as the control: it does no work at all,
         // so if it stalls too the problem is the runtime rather than anything /status does.
         for path in ["/healthz", "/readyz", "/status"] {
-            let latency = timed_health(&zecd, path).await;
+            let latency = timed_health(&rose, path).await;
             max_latency = max_latency.max(latency);
         }
 
@@ -137,7 +137,7 @@ async fn regtest_transparent_preexpose_stays_responsive() {
          worst read latency {max_latency:?} (bound {MAX_READ_LATENCY:?})"
     );
 
-    drop(zecd);
+    drop(rose);
     // `zebrad` cleans up on drop.
 }
 
@@ -147,9 +147,9 @@ async fn regtest_transparent_preexpose_stays_responsive() {
 /// GET a health endpoint, failing if it does not answer within [`MAX_READ_LATENCY`]. The status
 /// code is deliberately not asserted: `/readyz` answers 503 while the wallet is still working,
 /// which is correct and is not what this measures.
-async fn timed_health(zecd: &Zecd, path: &str) -> Duration {
+async fn timed_health(rose: &Rose, path: &str) -> Duration {
     let start = Instant::now();
-    match tokio::time::timeout(MAX_READ_LATENCY, zecd.health_get(path)).await {
+    match tokio::time::timeout(MAX_READ_LATENCY, rose.health_get(path)).await {
         Err(_) => panic!(
             "GET {path} did not answer within {MAX_READ_LATENCY:?} during transparent \
              pre-exposure: the health endpoints read a cached snapshot and must stay live even \
@@ -160,9 +160,9 @@ async fn timed_health(zecd: &Zecd, path: &str) -> Duration {
     }
 }
 
-async fn timed_read(zecd: &Zecd, method: &str, params: Value) -> (Value, Duration) {
+async fn timed_read(rose: &Rose, method: &str, params: Value) -> (Value, Duration) {
     let start = Instant::now();
-    match tokio::time::timeout(MAX_READ_LATENCY, zecd.call(method, params)).await {
+    match tokio::time::timeout(MAX_READ_LATENCY, rose.call(method, params)).await {
         Err(_) => panic!(
             "{method} did not return within {MAX_READ_LATENCY:?} during transparent pre-exposure: \
              the daemon is blocked on the single-writer actor's initial-scan derivation. Read RPCs \

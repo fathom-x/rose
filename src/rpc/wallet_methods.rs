@@ -40,7 +40,7 @@ fn parse_txid(display_hex: &str) -> Option<TxId> {
 /// `getnewaddress [label] [address_type]` - a fresh diversified unified address for the wallet's
 /// account (new diversifier, not a new derivation path).
 ///
-/// zecd is **stateless**: an address label would land in an off-chain side-table the seed can't
+/// rose is **stateless**: an address label would land in an off-chain side-table the seed can't
 /// rebuild, so the optional `label` argument (param 0) must be empty/omitted - a non-empty label
 /// is rejected `-8`. The address itself derives from the seed and is unaffected. Param 0 is kept
 /// in Bitcoin Core's position so `address_type` stays at param 1.
@@ -57,10 +57,10 @@ pub(crate) async fn getnewaddress(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    // A label has no on-chain source, so zecd (which is stateless) never stores one.
+    // A label has no on-chain source, so rose (which is stateless) never stores one.
     if opt_str(req, 0).is_some_and(|s| !s.is_empty()) {
         return Err(RpcError::invalid_parameter(
-            "labels are not supported (zecd is stateless); call getnewaddress without a label",
+            "labels are not supported (rose is stateless); call getnewaddress without a label",
         ));
     }
     // Param 1 (address_type): parse the receiver-override *syntax* before resolving the wallet,
@@ -91,8 +91,8 @@ pub(crate) async fn getnewaddress(
 /// its syntax (wallet-independent). Returns `Default` for empty / `unified` / `default`,
 /// `Transparent` for a bare `transparent`, `Shielded(set)` for an explicit shielded pool or
 /// comma-separated list, or a `-5` for an unknown token. Transparent cannot be combined with
-/// shielded receivers (zecd hands out one receiver type at a time). Whether the wallet actually
-/// enables the requested type is checked by the caller. `zecd derive-address` parses its
+/// shielded receivers (rose hands out one receiver type at a time). Whether the wallet actually
+/// enables the requested type is checked by the caller. `rose derive-address` parses its
 /// `--address-type` flag with this same function, so the CLI and the RPC can't drift.
 pub(crate) fn parse_receiver_tokens(
     address_type: Option<&str>,
@@ -137,15 +137,15 @@ pub(crate) fn parse_receiver_tokens(
 /// `z_getaddressforaccount account ( ["receiver_type", ...] diversifier_index )` - derive a
 /// Unified Address for the wallet's account, in zcashd's syntax.
 ///
-/// zecd differs from zcashd in two deliberate ways:
+/// rose differs from zcashd in two deliberate ways:
 /// - **One account per wallet:** `account` must be `0` (the wallet's only account). A different
 ///   in-range account is `-4`; an out-of-range value is `-8`. Select a different wallet via the
 ///   `/wallet/<name>` path instead.
 /// - **One receiver kind per call:** the valid `receiver_type`s are this wallet's enabled
 ///   shielded pools (`sapling`/`orchard`) or - on a wallet with `[pools] transparent = true` -
 ///   `p2pkh` **alone**, which derives the *bare* `t1...`/`tm...` address at the requested index
-///   (ZIP-316 forbids a transparent-only UA, and zecd never mixes a transparent receiver into a
-///   UA it hands out). Mixing `p2pkh` with a shielded pool is `-8`, as are `p2sh` (zecd derives
+///   (ZIP-316 forbids a transparent-only UA, and rose never mixes a transparent receiver into a
+///   UA it hands out). Mixing `p2pkh` with a shielded pool is `-8`, as are `p2sh` (rose derives
 ///   no script addresses), a pool the wallet has not enabled, and any unknown token.
 ///
 /// `receiver_types` empty/omitted uses the wallet's configured default (its `default_receivers`,
@@ -183,7 +183,7 @@ pub(crate) async fn z_getaddressforaccount(
     }))
 }
 
-/// Parse `z_getaddressforaccount`'s `account` argument. zecd has a single account per wallet, so
+/// Parse `z_getaddressforaccount`'s `account` argument. rose has a single account per wallet, so
 /// only `0` is valid: a different but in-range account is a `-4` (it "has not been generated"),
 /// while a value outside zcashd's `0..=(2^31)-2` range - or a non-integer - is a `-8`.
 fn parse_account_arg(v: Option<&Value>) -> Result<u64, RpcError> {
@@ -203,7 +203,7 @@ fn parse_account_arg(v: Option<&Value>) -> Result<u64, RpcError> {
     if n != 0 {
         return Err(RpcError::wallet(format!(
             "Error: account {n} has not been generated; \
-             zecd wallets have a single account (account 0)."
+             rose wallets have a single account (account 0)."
         )));
     }
     Ok(0)
@@ -215,7 +215,7 @@ fn parse_account_arg(v: Option<&Value>) -> Result<u64, RpcError> {
 /// address under `transparent_default`).
 ///
 /// `p2pkh` (zcashd's transparent token; `transparent` is accepted as a synonym) selects a bare
-/// transparent address, and must appear **alone**: ZIP-316 forbids a transparent-only UA and zecd
+/// transparent address, and must appear **alone**: ZIP-316 forbids a transparent-only UA and rose
 /// never mixes a transparent receiver into one, so there is no address shape that could carry
 /// both. Every other element must name a shielded pool enabled on this wallet. `p2sh` and any
 /// unknown token are rejected `-8`, as is `p2pkh` on a wallet that has not enabled transparent
@@ -243,7 +243,7 @@ fn parse_receiver_types_array(
         let s = item
             .as_str()
             .ok_or_else(|| RpcError::type_error("receiver type must be a string"))?;
-        // zcashd names the transparent receiver "p2pkh"; accept zecd's own "transparent" spelling
+        // zcashd names the transparent receiver "p2pkh"; accept rose's own "transparent" spelling
         // (the `getnewaddress` address_type token) as a synonym.
         if s.eq_ignore_ascii_case("p2pkh") {
             pools.push(Receiver::Transparent);
@@ -260,7 +260,7 @@ fn parse_receiver_types_array(
         }
     }
     if !invalid.is_empty() {
-        // "p2sh" and any unknown token land here: zecd derives no script addresses, and the
+        // "p2sh" and any unknown token land here: rose derives no script addresses, and the
         // shielded receivers are named by pool.
         let verb = if invalid.len() == 1 {
             "is an invalid receiver type"
@@ -277,7 +277,7 @@ fn parse_receiver_types_array(
             return Err(RpcError::invalid_parameter(
                 "p2pkh cannot be combined with a shielded receiver: a transparent receiver is \
                  handed out as a bare t-address (ZIP-316 forbids a transparent-only unified \
-                 address, and zecd never mixes a transparent receiver into one). Request \
+                 address, and rose never mixes a transparent receiver into one). Request \
                  [\"p2pkh\"] alone for a transparent address.",
             ));
         }
@@ -395,11 +395,11 @@ pub(crate) fn getunconfirmedbalance(
 }
 
 /// `getbalances` - the modern (Bitcoin Core 0.19+) balance triple. The legacy `watchonly`
-/// object is always omitted: like Bitcoin Core's descriptor wallets, a zecd watch-only
+/// object is always omitted: like Bitcoin Core's descriptor wallets, a rose watch-only
 /// (UFVK) wallet reports its funds under `mine` (the addresses are the wallet's own; only
 /// signing is impossible).
 ///
-/// `mine.coinbase` is a zecd extension: the portion of `trusted` that is mature transparent
+/// `mine.coinbase` is a rose extension: the portion of `trusted` that is mature transparent
 /// coinbase, which the regular send paths can never select (consensus requires a coinbase
 /// spend to have an empty `vout`) - it moves only via `z_shieldcoinbase`. A *subset* of
 /// `trusted`, not a fourth bucket, so `trusted + untrusted_pending + immature` still totals
@@ -421,7 +421,7 @@ pub(crate) fn getbalances(state: &AppState, wallet: Option<&str>) -> Result<Valu
         },
     });
     // `lastprocessedblock` (Bitcoin Core 26+): the block the balances are anchored to -
-    // for zecd that is the fully-scanned height, the same anchor as `getblockcount`.
+    // for rose that is the fully-scanned height, the same anchor as `getblockcount`.
     if let Some(h) = handle.status().fully_scanned {
         if let Ok(Some((hash, _))) = read::block_info_at(&handle.engine_dir, h) {
             obj["lastprocessedblock"] = json!({ "hash": hash, "height": h });
@@ -450,10 +450,10 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     // holds at 1.0 through the enhancement drain, whose backlog is an open-ended count surfaced on
     // `/status` and factored into readiness rather than squeezed into this [0,1] field. Matches
     // Bitcoin Core's shape (an object while scanning, `false` when idle).
-    // `pending_enhancements` is a zecd extension inside Core's object: the enhancement backlog
+    // `pending_enhancements` is a rose extension inside Core's object: the enhancement backlog
     // is open-ended work that `progress` (a [0,1] block-scan ratio) cannot express, and until
     // now the count existed only on the health server's `/status` - unreachable for a
-    // `default-features = false` embedder, and for anyone driving zecd purely over JSON-RPC. It
+    // `default-features = false` embedder, and for anyone driving rose purely over JSON-RPC. It
     // is the difference between "scanned to the tip" and "serving complete history", since a
     // scanned-but-unenhanced output still has a NULL memo.
     let scanning = if st.scanning || st.pending_enhancements > 0 {
@@ -481,7 +481,7 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
         "private_keys_enabled": !st.watch_only,
         "avoid_reuse": false,
         "scanning": scanning,
-        // zecd extension, and deliberately **top-level rather than inside `scanning`**: that
+        // rose extension, and deliberately **top-level rather than inside `scanning`**: that
         // object is Core's, and it is the literal `false` once the wallet is idle - which is
         // exactly the moment a consumer following wallet history as a log is ready to advance
         // its cursor, and therefore exactly when it needs this. Nesting it there made the
@@ -489,7 +489,7 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
         // (see `SyncStatus::enhanced_through`), which a consumer must read as "hold the
         // cursor", never as "everything is enhanced".
         "enhanced_through": st.enhanced_through,
-        // zecd extension, the same object the Bitcoin handler reports: the recorded wallet
+        // rose extension, the same object the Bitcoin handler reports: the recorded wallet
         // birthday (where a rebuild scans from). A Zcash birthday is always recorded exactly
         // (`init` resolves a date against the upstream before writing it) and the scan starts
         // at it directly, so `time` and `anchor` are null here; on a Bitcoin wallet they carry
@@ -507,7 +507,7 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     if st.encrypted {
         obj["unlocked_until"] = json!(st.unlocked_until.unwrap_or(0));
     }
-    // zecd extension: `[sync] fetch_memos`. Emitted only when it is off, so the default
+    // rose extension: `[sync] fetch_memos`. Emitted only when it is off, so the default
     // wallet's response shape is unchanged (Bitcoin Core conformance) and its presence alone is
     // the signal. A consumer that reads memos asserts on this at startup rather than inferring
     // the wallet's kind from memo fields that are simply absent - which is indistinguishable
@@ -515,14 +515,14 @@ pub(crate) fn getwalletinfo(state: &AppState, wallet: Option<&str>) -> Result<Va
     if !handle.fetch_memos {
         obj["fetch_memos"] = json!(false);
     }
-    // zecd extension, same only-when-it-applies convention: why this wallet will never get an
+    // rose extension, same only-when-it-applies convention: why this wallet will never get an
     // account. Only a fleet member whose import was refused has one, and without it such a
     // wallet is a healthy-looking zero balance forever. `waitforsync` carries the same field
     // beside `imported`, which is where a caller polling for readiness meets it.
     if let Some(reason) = st.import_errors.get(&handle.name) {
         obj["import_error"] = json!(reason);
     }
-    // zecd extension: surface the transparent receiving configuration so an operator can audit
+    // rose extension: surface the transparent receiving configuration so an operator can audit
     // restore coverage (the `gap_limit` is how far past the last funded address a stateless
     // restore rescans the address index). Present only when transparent receiving is enabled, so
     // a shielded-only wallet's response shape is unchanged (Bitcoin Core conformance).
@@ -628,7 +628,7 @@ pub(crate) fn getaddressinfo(
             addr,
         );
     // For a transparent address the wallet derived, surface where it sits in the BIP 44 chain.
-    // `getnewaddress "" "transparent"` returns a bare string (Bitcoin Core's contract) and zecd
+    // `getnewaddress "" "transparent"` returns a bare string (Bitcoin Core's contract) and rose
     // keeps no off-chain issuance log, so this is how a caller learns which index it was handed -
     // and how an operator reconciles an issued range against `z_getaddressforaccount`.
     let derivation = if ismine {
@@ -669,7 +669,7 @@ pub(crate) fn getaddressinfo(
 /// `z_validateaddress "address"` - zcashd's shielded-address validator.
 ///
 /// zcashd's version answers only for shielded addresses and reports a valid t-address as
-/// `isvalid: false`. zecd's `validateaddress` already validates every address kind, and
+/// `isvalid: false`. rose's `validateaddress` already validates every address kind, and
 /// answering "invalid" about an address the wallet will happily pay is worse than the
 /// divergence, so this accepts all of them and names which in `address_type`. Callers that need
 /// zcashd's narrower behaviour can branch on that field.
@@ -707,7 +707,7 @@ pub(crate) fn z_validateaddress(
 /// This exists because history names each output by the receiver it actually paid (see
 /// `display_address`), so a consumer holding a multi-receiver address it handed out needs
 /// exactly these strings to match a history entry back to it - and had no way to get them from
-/// zecd, short of implementing ZIP 316 parsing itself. Pure and key-free: any valid unified
+/// rose, short of implementing ZIP 316 parsing itself. Pure and key-free: any valid unified
 /// address on this network is taken apart, owned or not, so an integrator can also use it on
 /// addresses it is about to pay. An undecodable or wrong-network address is `-5`; a valid
 /// address of another kind is `-8`, since a bare address is already its one receiver.
@@ -793,7 +793,7 @@ fn addressinfo_json(
         // too; the wallet-level signal is getwalletinfo.private_keys_enabled.
         "solvable": ismine,
         // "(DEPRECATED) Always false" in Bitcoin Core master: per-address watch-only died
-        // with legacy wallets (descriptor wallets are watch-only per wallet, like zecd).
+        // with legacy wallets (descriptor wallets are watch-only per wallet, like rose).
         "iswatchonly": false,
         "isscript": v.is_script,
         "iswitness": false,
@@ -802,7 +802,7 @@ fn addressinfo_json(
         // list (`transparent`/`sapling`/`orchard`), so a client sees what a `u1...` carries.
         "isvalid_orchard": v.is_orchard,
         "receiver_types": v.receiver_types,
-        // zecd is stateless and keeps no address labels; the field is retained empty for
+        // rose is stateless and keeps no address labels; the field is retained empty for
         // Bitcoin Core shape conformance.
         "labels": Vec::<String>::new(),
     });
@@ -812,7 +812,7 @@ fn addressinfo_json(
         out["receivers_consistent"] = json!(consistent);
     }
     // Derivation of an own transparent address. `hdkeypath` and `ischange` are Bitcoin Core's
-    // fields; `address_index` is a zecd extension naming the BIP 44 child index on its own, which
+    // fields; `address_index` is a rose extension naming the BIP 44 child index on its own, which
     // is what `z_getaddressforaccount 0 ["p2pkh"] <index>` takes and what an exchange reconciles
     // its issued range against. All three are omitted for anything without a derivation path.
     if let Some((d, network)) = derivation {
@@ -862,7 +862,7 @@ fn tx_confirmations(st: &SyncStatus, tx: &read::TxRecord) -> i64 {
 /// The `time`/`timereceived` of a wallet transaction: the block time once mined, else when the
 /// wallet first saw it (the actor's transient in-memory first-seen map, populated by the mempool
 /// stream) or created it (librustzcash's `created` column, set for wallet-authored sends). Bitcoin
-/// Core's `GetTxTime` / `nTimeReceived` analog. The first-seen time is never persisted (zecd is
+/// Core's `GetTxTime` / `nTimeReceived` analog. The first-seen time is never persisted (rose is
 /// stateless); after a restart an unmined foreign tx falls back to 0 until the mempool stream
 /// re-observes it or it mines.
 fn tx_time(tx: &read::TxRecord, first_seen: Option<i64>) -> i64 {
@@ -878,7 +878,7 @@ fn tx_time(tx: &read::TxRecord, first_seen: Option<i64>) -> i64 {
 ///   in the rare case the wallet hasn't scanned the block);
 /// - unmined txs carry `trusted` instead, like Bitcoin Core: trusted iff the wallet authored
 ///   the tx (it spends our notes) and it can still be mined;
-/// - `walletconflicts` is always present (zecd tracks no conflict set, so it is empty);
+/// - `walletconflicts` is always present (rose tracks no conflict set, so it is empty);
 /// - `time`/`timereceived` from [`tx_time`].
 fn push_wallet_tx_fields(entry: &mut Value, tx: &read::TxRecord, time: i64) {
     let obj = entry.as_object_mut().expect("entry is a JSON object");
@@ -943,7 +943,7 @@ fn push_memo_fields(entry: &mut Value, memo: Option<&[u8]>) {
 /// this output's pool (`address::single_receiver_for_pool`), so history is identical on the
 /// instance that authored the send and after a restore-from-seed - where only the paid
 /// receiver, never the full UA the caller typed, is recoverable from chain. (This is the
-/// history-display half of zecd's stateless design: the cached recipient UA is off-chain state.)
+/// history-display half of rose's stateless design: the cached recipient UA is off-chain state.)
 /// Received and self-transfer outputs (`to_account` is `Some`) keep their recorded address (the
 /// wallet's own, already single-receiver under the default Orchard-only `default_receivers`).
 fn display_address(network: &crate::network::ZNetwork, out: &read::TxOutputRecord) -> String {
@@ -958,7 +958,7 @@ fn display_address(network: &crate::network::ZNetwork, out: &read::TxOutputRecor
 
 /// Build the `listtransactions`-shaped entries for one wallet transaction: one entry per
 /// non-change, non-internal output, sends negative (Bitcoin Core's sign convention).
-/// `label_filter` of `Some(l)` keeps only entries whose (always-empty, since zecd is stateless)
+/// `label_filter` of `Some(l)` keeps only entries whose (always-empty, since rose is stateless)
 /// label equals `l` - so any non-`""` filter matches nothing. Shared by `listtransactions` and
 /// `listsinceblock`.
 fn tx_entries(
@@ -975,7 +975,7 @@ fn tx_entries(
         }
         let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
         let address = display_address(network, out);
-        // zecd is stateless and keeps no address labels; the field stays empty for Core shape
+        // rose is stateless and keeps no address labels; the field stays empty for Core shape
         // conformance, and a label filter for anything other than "" therefore matches nothing.
         if label_filter.is_some_and(|f| !f.is_empty()) {
             continue;
@@ -992,7 +992,7 @@ fn tx_entries(
                 "amount": signed_zats_to_value(amount),
                 "label": "",
                 "vout": out.output_index,
-                // zecd extension. `vout` is the output index *within its pool's bundle*, not a
+                // rose extension. `vout` is the output index *within its pool's bundle*, not a
                 // transparent outpoint index, so on a transaction with outputs in more than one
                 // pool `(txid, vout)` does not identify an output - which is exactly the key a
                 // consumer following `listsinceblock` as an incremental cursor would reach for.
@@ -1002,7 +1002,7 @@ fn tx_entries(
                 "txid": tx.txid_hex,
                 "bip125-replaceable": "no",
             });
-            // zecd extension, `receive` entries only: the diversifier index of the own address
+            // rose extension, `receive` entries only: the diversifier index of the own address
             // this output landed on. Keyed on the category, not on `to_account`, so the send
             // half of a self-transfer pair stays index-free like every other send. Read from the address row the note links to, so it costs
             // nothing and is identical after a from-seed restore. It is the stateless identity
@@ -1279,7 +1279,7 @@ fn z_tx_entries(
                 "change": false,
                 "outgoing": send,
             });
-            // zecd extension, `receive` entries only: the diversifier index of the own address
+            // rose extension, `receive` entries only: the diversifier index of the own address
             // this output landed on. Keyed on the category, not on `to_account`, so the send
             // half of a self-transfer pair stays index-free like every other send. Read from the address row the note links to, so it costs
             // nothing and is identical after a from-seed restore. It is the stateless identity
@@ -1322,14 +1322,14 @@ fn z_tx_entries(
 }
 
 /// `z_listtransactions [count=10] [from=0] [includeWatchonly=false] [start_height] [end_height]`,
-/// a zecd extension (no such method exists in zcashd) listing per-output history in zcashd's
+/// a rose extension (no such method exists in zcashd) listing per-output history in zcashd's
 /// `z_*` vocabulary: `pool`/`category`/`amount`/`amountZat`/`address`/`outindex`/`outgoing`/
 /// `status`, plus `memo`/`memoStr` for shielded outputs and `fee`/`feeZat` on sends.
 /// `includeWatchonly` is accepted and ignored (no watch-only support); there is no account
 /// filter.
 ///
 /// Pagination is `listtransactions`' (newest-first cursor, oldest-first output). The optional
-/// height range is zecd's own addition, because `count`/`from` alone cannot express an
+/// height range is rose's own addition, because `count`/`from` alone cannot express an
 /// *incremental* read: this is the only method carrying `memo`, `pool` and `outindex` on one
 /// entry, so a consumer following the wallet as a log has to use it - and with an offset-only
 /// cursor, every poll re-reads from the newest end and walks back over history it already has.
@@ -1482,7 +1482,7 @@ fn received_by_address(
 /// Matching is by **diversifier index**, not by the recorded address string: any encoding of an
 /// index the wallet owns - the one `getnewaddress` returned, the all-receivers one the block
 /// scanner records when it meets an index with no `addresses` row (every index after a from-seed
-/// restore or `zecd rescan`), or a narrower re-encoding of either - answers with that index's
+/// restore or `rose rescan`), or a narrower re-encoding of either - answers with that index's
 /// receipts, summed across its receivers. String equality was the rule until it was found to
 /// return `0.00000000` for a wallet's own `getnewaddress` address after a restore, silently, with
 /// the funds reported under an address the wallet never issued. Two halves make it hold: the
@@ -1568,7 +1568,7 @@ pub(crate) fn getreceivedbyaddress(
 /// have not - is rendered through [`received_address_key`], so the enumeration is in the same
 /// spelling `getnewaddress` hands out and feeding any entry back to `getreceivedbyaddress`
 /// answers. Without that the recorded strings leak through, and after a from-seed restore or
-/// `zecd rescan` those are the block scanner's all-receivers encodings: addresses this wallet
+/// `rose rescan` those are the block scanner's all-receivers encodings: addresses this wallet
 /// never issued, carrying a transparent receiver a shielded-only wallet does not even watch.
 pub(crate) fn listreceivedbyaddress(
     state: &AppState,
@@ -1627,7 +1627,7 @@ pub(crate) fn listreceivedbyaddress(
             "address": addr,
             "amount": zats_to_value(amount),
             "confirmations": conf,
-            // zecd is stateless and keeps no address labels; retained empty for Core shape.
+            // rose is stateless and keeps no address labels; retained empty for Core shape.
             "label": "",
             "txids": txids,
         }));
@@ -1644,11 +1644,11 @@ pub(crate) fn listreceivedbyaddress(
 /// Surviving reorgs is the whole point of the `lastblock` cursor: a poller stores the tip hash
 /// and passes it back next call, and that hash is reorged away the first time a 1-block reorg
 /// lands (`perform_rewind` deletes its `blocks` row). Bitcoin Core resolves such a stale hash
-/// via `findCommonAncestor` and lists from the fork point onward. zecd keeps no stale-branch
+/// via `findCommonAncestor` and lists from the fork point onward. rose keeps no stale-branch
 /// index to compute the exact fork point, so a **well-formed** reference hash that is not among
 /// the wallet's scanned blocks is treated as "since the earliest scanned block" (i.e. list
 /// everything): a lower cursor only ever re-reports, never misses, so the poller self-heals
-/// instead of wedging on `-5` forever. A **malformed** hash can never be a cursor zecd handed
+/// instead of wedging on `-5` forever. A **malformed** hash can never be a cursor rose handed
 /// out, so it stays `-5 Block not found` (a clear client error).
 pub(crate) fn listsinceblock(
     state: &AppState,
@@ -1797,16 +1797,16 @@ fn gettransaction_details(network: &crate::network::ZNetwork, rec: &read::TxReco
                 "category": category,
                 "amount": signed_zats_to_value(amount),
                 "vout": out.output_index,
-                // Same zecd extension `tx_entries` carries, for the same reason: `vout` is the
+                // Same rose extension `tx_entries` carries, for the same reason: `vout` is the
                 // index within this output's own pool bundle, so `(txid, vout)` does not
                 // identify an output on a transaction paying more than one pool. These details
                 // are built independently of `tx_entries`, which is why the field has to be
                 // added in both places rather than inherited.
                 "pool": pool_name(out.pool),
-                // zecd is stateless and keeps no address labels; retained empty for Core shape.
+                // rose is stateless and keeps no address labels; retained empty for Core shape.
                 "label": "",
             });
-            // zecd extension, `receive` entries only: the diversifier index of the own address
+            // rose extension, `receive` entries only: the diversifier index of the own address
             // this output landed on. Keyed on the category, not on `to_account`, so the send
             // half of a self-transfer pair stays index-free like every other send. Read from the address row the note links to, so it costs
             // nothing and is identical after a from-seed restore. It is the stateless identity
@@ -1917,7 +1917,7 @@ fn unspent_json(
                 "spendable": true,
                 "solvable": true,
                 "safe": conf > 0 || n.trusted,
-                // Shielded-pool label (zecd extension; Bitcoin Core notes are all transparent):
+                // Shielded-pool label (rose extension; Bitcoin Core notes are all transparent):
                 // "sapling" / "orchard" / "ironwood". Lets a shielded client tell the pool apart.
                 "pool": pool_name(n.pool),
             });
@@ -2006,7 +2006,7 @@ fn build_payment(
     let zaddr = crate::address::parse_recipient_on_network(coin, network, addr)?;
     let decoded = crate::address::decode_on_network(network, addr);
     // A TEX (ZIP 320) recipient can only be paid by a two-transaction proposal (an ephemeral
-    // transparent hop), and zecd sends exactly one transaction per call. Refuse it here, by
+    // transparent hop), and rose sends exactly one transaction per call. Refuse it here, by
     // address, so the caller gets a clear `-8` instead of a refusal from deep in the actor -
     // which still backstops this, on the proposal, before anything is built
     // (`enforce_single_step`).
@@ -2082,7 +2082,7 @@ fn verbose_param(v: Option<&Value>) -> Result<bool, RpcError> {
     }
 }
 
-/// Shape a send result: bare txid by default; `verbose` adds `fee_reason`, which for zecd is
+/// Shape a send result: bare txid by default; `verbose` adds `fee_reason`, which for rose is
 /// always the ZIP-317 conventional fee (there is no estimator to report).
 fn send_result(txid: String, verbose: bool) -> Value {
     if verbose {
@@ -2094,7 +2094,7 @@ fn send_result(txid: String, verbose: bool) -> Value {
 
 /// `sendtoaddress <address> <amount> [...] [verbose] [memo]` - pay one recipient from the
 /// Orchard pool. Sends serialize through the wallet actor (no double-spends under
-/// concurrency); fee is always ZIP-317. The trailing `memo` param is a zecd extension.
+/// concurrency); fee is always ZIP-317. The trailing `memo` param is a rose extension.
 pub(crate) async fn sendtoaddress(
     state: &AppState,
     wallet: Option<&str>,
@@ -2125,7 +2125,7 @@ pub(crate) async fn sendtoaddress(
         ));
     }
     let verbose = verbose_param(req.param(10))?;
-    // Param 11 (memo) is a zecd extension beyond Bitcoin Core's argument list: a
+    // Param 11 (memo) is a rose extension beyond Bitcoin Core's argument list: a
     // hex-encoded ZIP-302 memo for the (shielded) recipient, as in zcashd's z_sendmany.
     let memo = match req.param(11) {
         None | Some(Value::Null) => None,
@@ -2237,14 +2237,14 @@ pub(crate) async fn sendmany(
 
 // ---- Asynchronous operations (zcashd-style `z_sendmany` + `z_getoperation*`) ----
 
-/// Map a zcashd `privacyPolicy` string onto zecd's [`SendPrivacy`] ladder. The leaks a zecd send
+/// Map a zcashd `privacyPolicy` string onto rose's [`SendPrivacy`] ladder. The leaks a rose send
 /// can cause map onto five rungs: `FullPrivacy` (no leak), `AllowRevealedAmounts` (the
 /// Sapling↔Orchard turnstile, revealing the *amount*), `AllowRevealedRecipients` (additionally a
 /// transparent *recipient*), `AllowRevealedSenders` (additionally funding the send from
 /// transparent UTXOs - `z_sendmany`'s transparent `fromaddress` - revealing the *sender*, with
 /// the change shielded), and `AllowFullyTransparent`/`NoPrivacy` (additionally kept-transparent
 /// change - a fully transparent spend). zcashd's `AllowLinkingAccountAddresses` implies revealed
-/// senders and additionally permits linking a *multi-account* wallet's addresses; zecd is
+/// senders and additionally permits linking a *multi-account* wallet's addresses; rose is
 /// single-account, so there is nothing extra to link and it maps onto `AllowRevealedSenders`.
 /// Omitted or `LegacyCompat` fall back to the wallet's configured `[spend] privacy_policy`; an
 /// unknown value is `-8`.
@@ -2321,7 +2321,7 @@ pub(crate) fn z_sendmany(
     } else if fromaddress == "ANY_SAPLING" {
         SendSource::ShieldedFamily(crate::wallet::ShieldedFamily::Sapling)
     } else if fromaddress == "ANY_ORCHARD" {
-        // zecd extension, as in `z_mergetoaddress`: zcashd's wildcard set predates Orchard.
+        // rose extension, as in `z_mergetoaddress`: zcashd's wildcard set predates Orchard.
         // One family - post-NU6.3 an Orchard receiver holds Ironwood notes.
         SendSource::ShieldedFamily(crate::wallet::ShieldedFamily::Orchard)
     } else if fromaddress == "ANY_SPROUT" {
@@ -2396,7 +2396,7 @@ pub(crate) fn z_sendmany(
 
     // A transparent funding source spends transparent UTXOs, revealing the sender's addresses
     // and input amounts on-chain - zcashd gates that behind `AllowRevealedSenders`, and so does
-    // zecd. Rejected synchronously (zcashd surfaces it from the async operation; front-loading
+    // rose. Rejected synchronously (zcashd surfaces it from the async operation; front-loading
     // the cheap check is friendlier) with the same `-4` the actor's authoritative re-check uses.
     if matches!(source, SendSource::Transparent(_)) && !privacy.allows_transparent_inputs() {
         return Err(crate::wallet::actor::insufficient_privacy_for_transparent_sender(privacy));
@@ -2521,7 +2521,7 @@ const SHIELD_COINBASE_DEFAULT_LIMIT: usize = 50;
 /// sweep mature transparent **coinbase** UTXOs into a single shielded output (zcashd's RPC,
 /// zcashd's response shape). Consensus requires a transaction spending a transparent coinbase
 /// output to have no transparent outputs at all, so this - coinbase inputs → one shielded
-/// payment of `input_total - fee`, **no change** - is the only way zecd spends coinbase funds;
+/// payment of `input_total - fee`, **no change** - is the only way rose spends coinbase funds;
 /// the regular send paths exclude them from selection outright.
 ///
 /// The UTXO selection (and the returned `shieldingUTXOs`/`remainingUTXOs` stats) is fixed
@@ -2535,7 +2535,7 @@ pub(crate) async fn z_shieldcoinbase(
     let handle = state.registry.get(wallet)?.clone();
 
     // fromaddress (arg 0): a wallet-owned taddr, or "*" for all of the wallet's taddrs. (zcashd's
-    // wildcard spans its whole legacy keypool; zecd has one account per wallet, so the sweep
+    // wildcard spans its whole legacy keypool; rose has one account per wallet, so the sweep
     // cannot correlate unrelated accounts.)
     let fromaddress = req.require_str(0, "z_shieldcoinbase requires a fromaddress")?;
     let from = if fromaddress == "*" {
@@ -2710,9 +2710,9 @@ const MERGE_DEFAULT_SHIELDED_LIMIT: usize = 200;
 /// `remaining*` stats say what a follow-up would pick up) until the wallet is consolidated.
 ///
 /// Sources are one **class** per call - transparent (`ANY_TADDR` or wallet-owned t-addresses)
-/// or shielded (`ANY_SAPLING`, zecd's `ANY_ORCHARD` = the Orchard+Ironwood family, or a
+/// or shielded (`ANY_SAPLING`, rose's `ANY_ORCHARD` = the Orchard+Ironwood family, or a
 /// wallet-owned shielded/UA address = the account's notes) - never both in one transaction
-/// (zecd's one-source-per-send invariant; zcashd similarly refuses to mix Sprout and Sapling).
+/// (rose's one-source-per-send invariant; zcashd similarly refuses to mix Sprout and Sapling).
 /// The privacy ladder gates the revealing shapes exactly as for `z_sendmany`: a transparent
 /// source needs `AllowRevealedSenders`, a fully transparent t→t merge needs
 /// `AllowFullyTransparent`, and a transparent payout from shielded notes needs
@@ -2758,7 +2758,7 @@ pub(crate) async fn z_mergetoaddress(
         match s {
             "ANY_TADDR" => any_taddr = true,
             "ANY_SAPLING" => any_sapling = true,
-            // zecd extension: zcashd's wildcard set predates Orchard. One family - post-NU6.3
+            // rose extension: zcashd's wildcard set predates Orchard. One family - post-NU6.3
             // an Orchard receiver holds Ironwood notes, so the wildcard spans both.
             "ANY_ORCHARD" => any_orchard = true,
             "ANY_SPROUT" => {
@@ -2861,7 +2861,7 @@ pub(crate) async fn z_mergetoaddress(
 
     // toaddress (arg 1): any own or foreign taddr/zaddr; an unparseable one is zcashd's -8
     // "unknown address format" (unlike fromaddresses entries, which are -5). TEX destinations
-    // are rejected - paying one is a two-transaction ZIP-320 proposal, and zecd rejects
+    // are rejected - paying one is a two-transaction ZIP-320 proposal, and rose rejects
     // multi-transaction proposals everywhere.
     let toaddress = req.require_str(1, "z_mergetoaddress requires a toaddress")?;
     let to_addr =
@@ -3058,7 +3058,7 @@ const MAX_WAIT_OPERATION_TIMEOUT_SECS: i64 = 3600;
 /// `z_waitforoperation "opid" ( timeout )` - block until an async operation
 /// (`z_sendmany`/`z_shieldcoinbase`) finishes, then return its status object: the same shape
 /// `z_getoperationstatus` returns per operation, **plus a `finished` boolean**, so it is a
-/// drop-in for the poll-sleep loop every client otherwise writes by hand. A **zecd extension** -
+/// drop-in for the poll-sleep loop every client otherwise writes by hand. A **rose extension** -
 /// zcashd has no such RPC.
 ///
 /// `timeout` is in seconds (default [`DEFAULT_WAIT_OPERATION_TIMEOUT_SECS`], clamped to
@@ -3243,7 +3243,7 @@ mod tests {
     const NET: crate::network::ZNetwork = crate::network::ZNetwork::Test;
 
     /// The receiver set the renderers canonicalize incoming addresses to. Orchard-only, which is
-    /// zecd's default `[pools] default_receivers` and so what these fixtures should be read
+    /// rose's default `[pools] default_receivers` and so what these fixtures should be read
     /// against; a test that cares about a wider set builds its own.
     fn receivers() -> ReceiverSet {
         ReceiverSet::single(crate::pools::Receiver::Orchard)
@@ -3287,7 +3287,7 @@ mod tests {
     }
 
     /// `load_on_startup = false` asks for the wallet to stay unloaded across restarts, which
-    /// zecd cannot do while its manifest (the startup list) is deliberately left in place. It is
+    /// rose cannot do while its manifest (the startup list) is deliberately left in place. It is
     /// refused rather than ignored, so the wallet cannot silently return at the next restart.
     #[test]
     fn unloadwallet_rejects_a_load_on_startup_it_cannot_honor() {
@@ -3335,7 +3335,7 @@ mod tests {
 
     /// Both receiver-taking RPC arguments must give an ironwood token the same answer the config
     /// key does. They render `ReceiverParseError` rather than their own text precisely so the
-    /// three surfaces cannot disagree about whether zecd supports ironwood; before that, an
+    /// three surfaces cannot disagree about whether rose supports ironwood; before that, an
     /// operator asking these got "unknown address type" and an invalid-receiver list, neither of
     /// which mentions that the support they read about lives at the orchard receiver.
     #[test]
@@ -3420,7 +3420,7 @@ mod tests {
         let enabled = crate::pools::ReceiverSet::single(Receiver::Orchard);
         let t_wallet = handle_with_pools(true, enabled.clone());
 
-        // "p2pkh" - and zecd's own "transparent" spelling - alone request a bare t-address.
+        // "p2pkh" - and rose's own "transparent" spelling - alone request a bare t-address.
         for token in [json!(["p2pkh"]), json!(["P2PKH"]), json!(["transparent"])] {
             assert!(
                 matches!(
@@ -3437,7 +3437,7 @@ mod tests {
         assert_eq!(err.code, RPC_INVALID_PARAMETER);
         assert!(err.message.contains("bare t-address"), "{}", err.message);
 
-        // p2sh is never derivable (zecd holds no redeem scripts).
+        // p2sh is never derivable (rose holds no redeem scripts).
         let err = parse_receiver_types_array(Some(&json!(["p2sh"])), &t_wallet).unwrap_err();
         assert_eq!(err.code, RPC_INVALID_PARAMETER);
 
@@ -3582,7 +3582,7 @@ mod tests {
         );
         // AllowRevealedSenders is a real rung (it gates transparent-funded sends - z_sendmany's
         // transparent fromaddress). AllowLinkingAccountAddresses implies revealed senders in
-        // zcashd; zecd is single-account (nothing extra to link), so it maps onto the same rung.
+        // zcashd; rose is single-account (nothing extra to link), so it maps onto the same rung.
         for p in ["AllowRevealedSenders", "AllowLinkingAccountAddresses"] {
             assert_eq!(
                 privacy_from_policy(Some(p), FullPrivacy).unwrap(),
@@ -4200,7 +4200,7 @@ mod tests {
         .is_ok());
     }
 
-    /// `z_validateaddress` reports the kind of every address zecd understands, not only
+    /// `z_validateaddress` reports the kind of every address rose understands, not only
     /// shielded ones as zcashd does, and carries the ownership flag `validateaddress`
     /// deliberately lacks. An address that does not parse is the bare verdict and nothing else.
     #[test]
@@ -4215,7 +4215,7 @@ mod tests {
             "an unparseable address echoes nothing: {invalid}"
         );
 
-        // A transparent address: zcashd would call this invalid; zecd names its kind.
+        // A transparent address: zcashd would call this invalid; rose names its kind.
         let taddr = "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86";
         let decoded =
             Address::decode(&crate::network::ZNetwork::Test, taddr).expect("decode t-addr");
@@ -4241,7 +4241,7 @@ mod tests {
         let receivers = v["receivers"].as_array().expect("receiver list");
         assert!(
             !receivers.is_empty() && !receivers.iter().any(|r| r == "transparent"),
-            "receivers use zcashd's names, never zecd's `transparent`: {receivers:?}"
+            "receivers use zcashd's names, never rose's `transparent`: {receivers:?}"
         );
         let _ = net;
     }
@@ -4289,7 +4289,7 @@ mod tests {
         // Extension fields: the address's receiver verdicts.
         assert_eq!(o["isvalid_orchard"], json!(true));
         assert_eq!(o["receiver_types"], json!(["orchard"]));
-        // zecd is stateless: the labels field is always empty.
+        // rose is stateless: the labels field is always empty.
         assert_eq!(o["labels"], json!([]));
         // A shielded address carries no BIP 44 derivation, so the transparent derivation fields
         // are absent entirely rather than present-and-null.
@@ -4727,14 +4727,14 @@ mod tests {
     }
 
     #[test]
-    fn label_filter_matches_only_empty_label_since_zecd_is_stateless() {
+    fn label_filter_matches_only_empty_label_since_rose_is_stateless() {
         let t = tx(
             Some(50),
             false,
             None,
             vec![out(false, true, 5, Some("dest"), false)],
         );
-        // zecd keeps no labels: every entry's label is "", so a non-empty filter matches nothing.
+        // rose keeps no labels: every entry's label is "", so a non-empty filter matches nothing.
         assert!(tx_entries(&NET, &t, 1, 0, Some("alice")).is_empty());
         // The default/empty label and the no-filter ("*") case both keep the entry.
         assert_eq!(tx_entries(&NET, &t, 1, 0, Some("")).len(), 1);

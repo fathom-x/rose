@@ -19,17 +19,17 @@
 //! The **>200-notes default-`shielded_limit`** case (a defaults call reporting exactly
 //! `mergingNotes: 200` against a 225-note wallet, then draining the rest) costs ~200 actions of
 //! proving per round on both the fan-out and merge sides, so it lives in the second, extended
-//! -tier test below (`ZECD_REGTEST_EXTENDED=1`, weekly + dispatch), like the other heavy e2es.
+//! -tier test below (`ROSE_REGTEST_EXTENDED=1`, weekly + dispatch), like the other heavy e2es.
 //!
 //! Skips cleanly unless `ZEBRAD_BIN` is set.
 
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
-use zecd_regtest_harness::{
+use rose_regtest_harness::{
     attach_backend, extended_enabled, pick_port, resolve_node_bin, start_funded_chain, Funder,
-    Lightwalletd, RegtestNode, Zebrad, Zecd, ZecdConfig,
+    Lightwalletd, RegtestNode, Rose, RoseConfig, Zebrad,
 };
+use serde_json::{json, Value};
 
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -65,11 +65,11 @@ const N_FANOUT_ZATS: u64 = 500_000; // 0.005 ZEC
 /// 1 stops exercising the limited path at all.
 const NOTE_MERGE_LIMIT: usize = 8;
 
-/// Mine past the untrusted confirmations depth (ZIP-315 default 10) and wait for zecd to scan
+/// Mine past the untrusted confirmations depth (ZIP-315 default 10) and wait for rose to scan
 /// it: the fan-out lands on the wallet's own *external* addresses, which the confirmations
 /// policy treats as third-party receives, and `z_mergetoaddress` has no `minconf` argument
 /// (zcashd has none either) - so merge eligibility always means "10+ confirmations" here.
-async fn confirm_untrusted(zebrad: &Zebrad, zecd: &Zecd) {
+async fn confirm_untrusted(zebrad: &Zebrad, rose: &Rose) {
     zebrad
         .generate_blocks(12)
         .await
@@ -80,15 +80,15 @@ async fn confirm_untrusted(zebrad: &Zebrad, zecd: &Zecd) {
         .expect("zebra getblockcount")
         .as_u64()
         .expect("tip height");
-    zecd.wait_until_synced(tip, SYNC_TIMEOUT)
+    rose.wait_until_synced(tip, SYNC_TIMEOUT)
         .await
-        .expect("zecd scans to the chain tip");
+        .expect("rose scans to the chain tip");
 }
 
 /// Drive a merge/send opid to success via `z_waitforoperation` and return the result object.
-async fn await_op(zecd: &Zecd, opid: &str, what: &str) -> Value {
+async fn await_op(rose: &Rose, opid: &str, what: &str) -> Value {
     assert!(opid.starts_with("opid-"), "{what}: opid shape: {opid}");
-    let waited = zecd
+    let waited = rose
         .call(
             "z_waitforoperation",
             json!([opid, OP_TIMEOUT.as_secs() as i64]),
@@ -104,8 +104,8 @@ async fn await_op(zecd: &Zecd, opid: &str, what: &str) -> Value {
 }
 
 /// Count the wallet's confirmed unspent outputs, split (transparent, shielded) by address shape.
-async fn unspent_counts(zecd: &Zecd) -> (usize, usize) {
-    let lu = zecd
+async fn unspent_counts(rose: &Rose) -> (usize, usize) {
+    let lu = rose
         .call("listunspent", json!([1]))
         .await
         .expect("listunspent");
@@ -117,22 +117,22 @@ async fn unspent_counts(zecd: &Zecd) -> (usize, usize) {
     (transparent, entries.len() - transparent)
 }
 
-/// Bring up chain + funder + a transparent-enabled zecd (Orchard action cap lifted - the merge
+/// Bring up chain + funder + a transparent-enabled rose (Orchard action cap lifted - the merge
 /// proofs exceed the default 50 in the extended test) and wait for readiness. The returned
 /// [`Lightwalletd`] guard (Some on the lwd leg) must be HELD for the test's lifetime - dropping
 /// it kills the light upstream, which is exactly the bug the first lwd CI run hit when this
 /// helper bound it locally.
-async fn merge_stack(zebrad_bin: &std::path::Path) -> (Zebrad, Funder, Zecd, Option<Lightwalletd>) {
+async fn merge_stack(zebrad_bin: &std::path::Path) -> (Zebrad, Funder, Rose, Option<Lightwalletd>) {
     let (zebrad, funder) = start_funded_chain(zebrad_bin)
         .await
         .expect("bring up a funded regtest chain");
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.transparent = true;
     // Only wide enough for one fan-out round's issuance: `funder_fanout_round` mines and syncs
     // before the next round starts, so the longest run of consecutive *unfunded* exposed
     // addresses is T_FANOUT_OUTPUTS (28), not the full 56. Width is not free - recording a
     // transparent receive re-derives the whole gap window per involved address, so the cost of
-    // ingesting one 28-output fan-out tx grows with this limit (zecd says so itself while doing
+    // ingesting one 28-output fan-out tx grows with this limit (rose says so itself while doing
     // it: "recording transparent receives from block scan (each receive re-derives the gap
     // window)"). At 80 that ingest measured ~47s per round against ~78s for the funder's send.
     cfg.transparent_gap_limit = Some(40);
@@ -143,13 +143,13 @@ async fn merge_stack(zebrad_bin: &std::path::Path) -> (Zebrad, Funder, Zecd, Opt
     // Disabling it here keeps the assertion on the limit under test; the node's own relay
     // policy is raised to match on the zakura leg (see `mempool_policy_section`).
     cfg.max_tx_bytes = Some(0);
-    let zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    let rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
-        .expect("attach zecd backend");
-    let zecd = Zecd::start(&cfg).await.expect("start zecd");
+        .expect("attach rose backend");
+    let rose = Rose::start(&cfg).await.expect("start rose");
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -160,20 +160,20 @@ async fn merge_stack(zebrad_bin: &std::path::Path) -> (Zebrad, Funder, Zecd, Opt
         {
             break;
         }
-        assert!(Instant::now() < deadline, "zecd never reached ready");
+        assert!(Instant::now() < deadline, "rose never reached ready");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
-    (zebrad, funder, zecd, zecd_lwd)
+    (zebrad, funder, rose, rose_lwd)
 }
 
-/// One funder fan-out round: pay `zats` to `count` fresh zecd addresses of the given type in a
+/// One funder fan-out round: pay `zats` to `count` fresh rose addresses of the given type in a
 /// single multi-output `z_sendmany`, then confirm it and let the funder's change reconfirm
 /// (its config runs 1-conf trust) so the next round has spendable notes.
 async fn funder_fanout_round(
     zebrad: &Zebrad,
     funder: &Funder,
-    zecd: &Zecd,
+    rose: &Rose,
     count: usize,
     zats: u64,
     transparent: bool,
@@ -185,7 +185,7 @@ async fn funder_fanout_round(
         } else {
             json!([])
         };
-        let addr = zecd
+        let addr = rose
             .call("getnewaddress", params)
             .await
             .expect("getnewaddress")
@@ -223,9 +223,9 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
 
     // 1. Stack + funder-built fixture: 56 transparent UTXOs and exactly 64 notes, none of them
     //    created by the wallet under test.
-    let (zebrad, funder, zecd, _zecd_lwd) = merge_stack(&zebrad_bin).await;
+    let (zebrad, funder, rose, _rose_lwd) = merge_stack(&zebrad_bin).await;
     let funder_taddr = funder.transparent_address().to_string();
-    let own_ua = zecd
+    let own_ua = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress UA")
@@ -237,7 +237,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
         funder_fanout_round(
             &zebrad,
             &funder,
-            &zecd,
+            &rose,
             T_FANOUT_OUTPUTS,
             T_FANOUT_ZATS,
             true,
@@ -249,15 +249,15 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
         funder_fanout_round(
             &zebrad,
             &funder,
-            &zecd,
+            &rose,
             N_FANOUT_OUTPUTS,
             N_FANOUT_ZATS,
             false,
         )
         .await;
     }
-    confirm_untrusted(&zebrad, &zecd).await;
-    let (t_count, z_count) = unspent_counts(&zecd).await;
+    confirm_untrusted(&zebrad, &rose).await;
+    let (t_count, z_count) = unspent_counts(&rose).await;
     assert_eq!(
         t_count,
         T_FANOUT_TXS * T_FANOUT_OUTPUTS,
@@ -271,7 +271,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     phase(&format!("fragmented: {t_count} UTXOs, {z_count} notes"));
 
     // 2. Refusal matrix, all synchronous.
-    let err = zecd
+    let err = rose
         .call("z_mergetoaddress", json!([["ANY_TADDR"], own_ua]))
         .await
         .expect_err("a transparent source needs AllowRevealedSenders");
@@ -280,7 +280,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
         format!("{err}").contains("Insufficient privacy policy"),
         "the -4 names the gate: {err}"
     );
-    let err = zecd
+    let err = rose
         .call(
             "z_mergetoaddress",
             json!([
@@ -296,7 +296,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
         .await
         .expect_err("a fully transparent merge needs AllowFullyTransparent");
     assert_eq!(err.code(), Some(-4), "t->t under senders-only -> -4: {err}");
-    let err = zecd
+    let err = rose
         .call(
             "z_mergetoaddress",
             json!([
@@ -312,7 +312,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
         .await
         .expect_err("a foreign source address is rejected");
     assert_eq!(err.code(), Some(-5), "foreign source -> -5: {err}");
-    let err = zecd
+    let err = rose
         .call(
             "z_mergetoaddress",
             json!([
@@ -332,14 +332,14 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
 
     // 3. t→t merge with an explicit limit: 5 smallest UTXOs into one output at an own
     //    t-address, transparent end to end (no proof at all), under AllowFullyTransparent.
-    let own_taddr = zecd
+    let own_taddr = rose
         .call("getnewaddress", json!(["", "transparent"]))
         .await
         .expect("getnewaddress transparent")
         .as_str()
         .expect("address string")
         .to_string();
-    let resp = zecd
+    let resp = rose
         .call(
             "z_mergetoaddress",
             json!([
@@ -366,9 +366,9 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     );
     assert_eq!(resp["mergingNotes"], json!(0), "no note stats on a t merge");
     let opid = resp["opid"].as_str().expect("opid").to_string();
-    await_op(&zecd, &opid, "t->t merge").await;
-    confirm_untrusted(&zebrad, &zecd).await;
-    let (t_after_t2t, _) = unspent_counts(&zecd).await;
+    await_op(&rose, &opid, "t->t merge").await;
+    confirm_untrusted(&zebrad, &rose).await;
+    let (t_after_t2t, _) = unspent_counts(&rose).await;
     assert_eq!(
         t_after_t2t,
         t_count - 5 + 1,
@@ -379,7 +379,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     // 4. t→z merges at the default transparent_limit (50): the first call reports exactly 50
     //    merging and the rest remaining; the second call drains the remainder. Values are
     //    consistent across rounds: round 1's remaining is exactly round 2's merging.
-    let resp = zecd
+    let resp = rose
         .call(
             "z_mergetoaddress",
             json!([
@@ -406,9 +406,9 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     );
     let remaining_v = resp["remainingTransparentValue"].as_f64().expect("value");
     let opid = resp["opid"].as_str().expect("opid").to_string();
-    await_op(&zecd, &opid, "t->z merge round 1").await;
-    confirm_untrusted(&zebrad, &zecd).await;
-    let resp = zecd
+    await_op(&rose, &opid, "t->z merge round 1").await;
+    confirm_untrusted(&zebrad, &rose).await;
+    let resp = rose
         .call(
             "z_mergetoaddress",
             json!([
@@ -440,9 +440,9 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
          ({remaining_v} vs {merging_v2})"
     );
     let opid = resp["opid"].as_str().expect("opid").to_string();
-    await_op(&zecd, &opid, "t->z merge round 2").await;
-    confirm_untrusted(&zebrad, &zecd).await;
-    let (t_final, z_with_merge_outputs) = unspent_counts(&zecd).await;
+    await_op(&rose, &opid, "t->z merge round 2").await;
+    confirm_untrusted(&zebrad, &rose).await;
+    let (t_final, z_with_merge_outputs) = unspent_counts(&rose).await;
     assert_eq!(t_final, 0, "every transparent UTXO has been shielded");
     assert_eq!(
         z_with_merge_outputs,
@@ -458,12 +458,12 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     // cap back and confirm the same send goes through - all without restarting. That is the
     // whole point: a fragmented payout wallet fails every send until the cap moves, and a live
     // payment wallet should not have to be restarted to change a number.
-    zecd.edit_config(|toml| toml.replace("orchard_action_limit = 0", "orchard_action_limit = 1"))
-        .expect("lower the action cap in zecd.toml");
-    zecd.reload_config().expect("SIGHUP the daemon");
+    rose.edit_config(|toml| toml.replace("orchard_action_limit = 0", "orchard_action_limit = 1"))
+        .expect("lower the action cap in rose.toml");
+    rose.reload_config().expect("SIGHUP the daemon");
 
     let capped =
-        wait_for_send_outcome(&zecd, &own_ua, Some(-8), "the lowered cap takes effect").await;
+        wait_for_send_outcome(&rose, &own_ua, Some(-8), "the lowered cap takes effect").await;
     assert_eq!(
         capped.0,
         Some(-8),
@@ -482,11 +482,11 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     );
 
     // Restore it and the same send succeeds, still without a restart.
-    zecd.edit_config(|toml| toml.replace("orchard_action_limit = 1", "orchard_action_limit = 0"))
+    rose.edit_config(|toml| toml.replace("orchard_action_limit = 1", "orchard_action_limit = 0"))
         .expect("restore the action cap");
-    zecd.reload_config().expect("SIGHUP the daemon again");
+    rose.reload_config().expect("SIGHUP the daemon again");
     let restored =
-        wait_for_send_outcome(&zecd, &own_ua, None, "the restored cap takes effect").await;
+        wait_for_send_outcome(&rose, &own_ua, None, "the restored cap takes effect").await;
     assert_eq!(
         restored.0, None,
         "with the cap back at 0 the send succeeds: {:?}",
@@ -495,17 +495,17 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
 
     // A config the resolver refuses must leave the daemon running on its current values rather
     // than taking it down - a typo in an edited file is not a reason to stop serving.
-    zecd.edit_config(|toml| format!("{toml}\nnot_a_real_key = true\n"))
+    rose.edit_config(|toml| format!("{toml}\nnot_a_real_key = true\n"))
         .expect("write an invalid config");
-    zecd.reload_config().expect("SIGHUP with a bad config");
+    rose.reload_config().expect("SIGHUP with a bad config");
     let after_bad =
-        wait_for_send_outcome(&zecd, &own_ua, None, "a bad config changes nothing").await;
+        wait_for_send_outcome(&rose, &own_ua, None, "a bad config changes nothing").await;
     assert_eq!(
         after_bad.0, None,
         "the daemon keeps serving on its previous config: {:?}",
         after_bad.1
     );
-    zecd.edit_config(|toml| toml.replace("\nnot_a_real_key = true\n", "\n"))
+    rose.edit_config(|toml| toml.replace("\nnot_a_real_key = true\n", "\n"))
         .expect("undo the invalid config");
     phase("SIGHUP reloads [spend] orchard_action_limit");
 
@@ -521,12 +521,12 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     // the arithmetic is unit-tested offline against ZIP 225 and against a transaction zakura
     // measured, but only a real proposal, built against a real wallet, exercises the path from
     // proposal to refusal.
-    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 0", "max_tx_bytes = 1000"))
-        .expect("lower the size ceiling in zecd.toml");
-    zecd.reload_config().expect("SIGHUP the daemon");
+    rose.edit_config(|toml| toml.replace("max_tx_bytes = 0", "max_tx_bytes = 1000"))
+        .expect("lower the size ceiling in rose.toml");
+    rose.reload_config().expect("SIGHUP the daemon");
 
     let too_large = wait_for_send_outcome(
-        &zecd,
+        &rose,
         &own_ua,
         Some(-8),
         "the lowered size ceiling takes effect",
@@ -549,11 +549,11 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
         too_large.1
     );
 
-    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 1000", "max_tx_bytes = 0"))
+    rose.edit_config(|toml| toml.replace("max_tx_bytes = 1000", "max_tx_bytes = 0"))
         .expect("restore the size ceiling");
-    zecd.reload_config().expect("SIGHUP the daemon again");
+    rose.reload_config().expect("SIGHUP the daemon again");
     let restored = wait_for_send_outcome(
-        &zecd,
+        &rose,
         &own_ua,
         None,
         "the restored size ceiling takes effect",
@@ -571,7 +571,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     //     confirm normally, while `ANY_SAPLING` must report insufficient funds rather than
     //     silently drawing on the Orchard notes - which is the whole point of naming a family:
     //     a shortfall in it is an error, not a top-up from the other side of the turnstile.
-    let opid = zecd
+    let opid = rose
         .call(
             "z_sendmany",
             json!(["ANY_ORCHARD", [{"address": own_ua, "amount": 0.01}]]),
@@ -579,7 +579,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
         .await
         .expect("z_sendmany from ANY_ORCHARD");
     let result = await_op(
-        &zecd,
+        &rose,
         opid.as_str().expect("opid string"),
         "ANY_ORCHARD send",
     )
@@ -589,14 +589,14 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
         "the ANY_ORCHARD send produced a txid: {result}"
     );
 
-    let opid = zecd
+    let opid = rose
         .call(
             "z_sendmany",
             json!(["ANY_SAPLING", [{"address": own_ua, "amount": 0.01}]]),
         )
         .await
         .expect("z_sendmany from ANY_SAPLING is accepted, then fails on funds");
-    let waited = zecd
+    let waited = rose
         .call(
             "z_waitforoperation",
             json!([opid, OP_TIMEOUT.as_secs() as i64]),
@@ -620,8 +620,8 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     // number - it has to be read back rather than carried forward. Mining first is what makes
     // the two views agree: `unspent_counts` reads `listunspent 1` while the merge selector
     // honours the untrusted confirmation depth, and 12 blocks satisfies both.
-    confirm_untrusted(&zebrad, &zecd).await;
-    let (_, z_with_merge_outputs) = unspent_counts(&zecd).await;
+    confirm_untrusted(&zebrad, &rose).await;
+    let (_, z_with_merge_outputs) = unspent_counts(&rose).await;
     assert!(
         z_with_merge_outputs > NOTE_MERGE_LIMIT,
         "the fixture must still hold more notes than the explicit limit ({z_with_merge_outputs} \
@@ -631,7 +631,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
 
     // 5. Note merges. Round 1: an explicit shielded_limit that binds (8 against the count just
     //    read back) takes the manual limited-selection path and reports the remainder.
-    let resp = zecd
+    let resp = rose
         .call(
             "z_mergetoaddress",
             json!([["ANY_ORCHARD"], own_ua, null, null, NOTE_MERGE_LIMIT]),
@@ -654,15 +654,15 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
         "no UTXO stats on a note merge"
     );
     let opid = resp["opid"].as_str().expect("opid").to_string();
-    await_op(&zecd, &opid, "note merge round 1").await;
-    confirm_untrusted(&zebrad, &zecd).await;
+    await_op(&rose, &opid, "note merge round 1").await;
+    confirm_untrusted(&zebrad, &rose).await;
 
     // Round 2: defaults (200 does not bind against the handful left) ride librustzcash's
     // `propose_send_max` path wholesale, with a memo on the merged output for coverage - and
     // because round 1's own output is back in the eligible set, this converges the wallet to a
     // single note.
     let memo_hex = "6d6572676564"; // "merged"
-    let resp = zecd
+    let resp = rose
         .call(
             "z_mergetoaddress",
             json!([["ANY_ORCHARD"], own_ua, null, null, null, memo_hex]),
@@ -676,9 +676,9 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     );
     assert_eq!(resp["remainingNotes"], json!(0), "{resp}");
     let opid = resp["opid"].as_str().expect("opid").to_string();
-    await_op(&zecd, &opid, "note merge round 2").await;
-    confirm_untrusted(&zebrad, &zecd).await;
-    let (t_end, z_end) = unspent_counts(&zecd).await;
+    await_op(&rose, &opid, "note merge round 2").await;
+    confirm_untrusted(&zebrad, &rose).await;
+    let (t_end, z_end) = unspent_counts(&rose).await;
     assert_eq!(t_end, 0);
     assert_eq!(
         z_end, 1,
@@ -689,15 +689,15 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     // 6. z→t finale: sweep that note to the funder's t-address under the default policy (the
     //    deshielding direction needs no opt-in), amountless - the exact "send all" that
     //    z_sendmany cannot express without fee arithmetic.
-    let resp = zecd
+    let resp = rose
         .call("z_mergetoaddress", json!([["ANY_ORCHARD"], funder_taddr]))
         .await
         .expect("z->t sweep");
     assert_eq!(resp["mergingNotes"], json!(1), "{resp}");
     let opid = resp["opid"].as_str().expect("opid").to_string();
-    await_op(&zecd, &opid, "z->t sweep").await;
-    confirm_untrusted(&zebrad, &zecd).await;
-    let bal = zecd
+    await_op(&rose, &opid, "z->t sweep").await;
+    confirm_untrusted(&zebrad, &rose).await;
+    let bal = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")
@@ -706,7 +706,7 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
     assert!(bal < 1e-8, "the sweep emptied the wallet (got {bal})");
     phase("z->t sweep done (wallet empty)");
 
-    drop(zecd);
+    drop(rose);
     // `zebrad` and `funder` clean up on drop.
 }
 
@@ -721,20 +721,20 @@ async fn regtest_mergetoaddress_consolidates_a_fragmented_wallet() {
 /// first, not `shielded_limit`).
 ///
 /// ~200 actions of proving on both the fan-out and the merge sides puts this well past the PR
-/// tier's envelope, so it runs on the extended tier (`ZECD_REGTEST_EXTENDED=1`: weekly
+/// tier's envelope, so it runs on the extended tier (`ROSE_REGTEST_EXTENDED=1`: weekly
 /// schedule + workflow dispatch), like the other heavy e2es.
 ///
 /// The 200-input merge serializes to ~634 KB, which a stock zakura node will not relay (its
 /// `[mempool] max_transaction_bytes` defaults to 250 KB - a node-local policy zebra does not
 /// have). The harness raises that ceiling to the consensus block limit on the zakura leg, and
-/// `merge_stack` disables zecd's own, so what the 200 asserts stays the *selection* limit; see
-/// `mempool_policy_section` in the harness for why that hides nothing a default zecd
+/// `merge_stack` disables rose's own, so what the 200 asserts stays the *selection* limit; see
+/// `mempool_policy_section` in the harness for why that hides nothing a default rose
 /// deployment would meet.
 #[tokio::test]
 async fn regtest_mergetoaddress_default_shielded_limit() {
     if !extended_enabled() {
         eprintln!(
-            "SKIP regtest_mergetoaddress_default_shielded_limit: set ZECD_REGTEST_EXTENDED=1 to \
+            "SKIP regtest_mergetoaddress_default_shielded_limit: set ROSE_REGTEST_EXTENDED=1 to \
              run the extended tier."
         );
         return;
@@ -752,8 +752,8 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
 
     // 225 notes across five 45-output funder sends (45 payments + change splits stays under
     // the released funder's default 50-action cap).
-    let (zebrad, funder, zecd, _zecd_lwd) = merge_stack(&zebrad_bin).await;
-    let own_ua = zecd
+    let (zebrad, funder, rose, _rose_lwd) = merge_stack(&zebrad_bin).await;
+    let own_ua = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress UA")
@@ -761,10 +761,10 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
         .expect("address string")
         .to_string();
     for _ in 0..5 {
-        funder_fanout_round(&zebrad, &funder, &zecd, 45, N_FANOUT_ZATS, false).await;
+        funder_fanout_round(&zebrad, &funder, &rose, 45, N_FANOUT_ZATS, false).await;
     }
-    confirm_untrusted(&zebrad, &zecd).await;
-    let (_, z_count) = unspent_counts(&zecd).await;
+    confirm_untrusted(&zebrad, &rose).await;
+    let (_, z_count) = unspent_counts(&rose).await;
     assert_eq!(
         z_count, 225,
         "the funder fan-out produced the full note set"
@@ -786,10 +786,10 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
     // count is the byte arithmetic's business (unit-tested in `tx_size`); what matters here is
     // that the call succeeded, selected far fewer notes than `shielded_limit` would have, and
     // accounted for the rest.
-    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 0", "max_tx_bytes = 20000"))
-        .expect("lower the size ceiling in zecd.toml");
-    zecd.reload_config().expect("SIGHUP the daemon");
-    let resp = zecd
+    rose.edit_config(|toml| toml.replace("max_tx_bytes = 0", "max_tx_bytes = 20000"))
+        .expect("lower the size ceiling in rose.toml");
+    rose.reload_config().expect("SIGHUP the daemon");
+    let resp = rose
         .call("z_mergetoaddress", json!([["ANY_ORCHARD"], own_ua]))
         .await
         .expect("a size-capped merge is planned, not refused");
@@ -804,23 +804,23 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
         "and the rest must be reported as remaining: {resp}"
     );
     let opid = resp["opid"].as_str().expect("opid").to_string();
-    await_op(&zecd, &opid, "size-capped merge").await;
-    confirm_untrusted(&zebrad, &zecd).await;
+    await_op(&rose, &opid, "size-capped merge").await;
+    confirm_untrusted(&zebrad, &rose).await;
     // The merged notes are gone and their single output has taken their place.
     let remaining = 225 - capped + 1;
-    let (_, z_after_cap) = unspent_counts(&zecd).await;
+    let (_, z_after_cap) = unspent_counts(&rose).await;
     assert_eq!(
         z_after_cap as u64, remaining,
         "a truncated merge consolidated its selection and left the rest"
     );
     phase(&format!("size-capped merge done ({capped} notes)"));
 
-    zecd.edit_config(|toml| toml.replace("max_tx_bytes = 20000", "max_tx_bytes = 0"))
+    rose.edit_config(|toml| toml.replace("max_tx_bytes = 20000", "max_tx_bytes = 0"))
         .expect("restore the size ceiling");
-    zecd.reload_config().expect("SIGHUP the daemon again");
+    rose.reload_config().expect("SIGHUP the daemon again");
 
     // Defaults, with only the note limit left to bind: 200 against `remaining` eligible.
-    let resp = zecd
+    let resp = rose
         .call("z_mergetoaddress", json!([["ANY_ORCHARD"], own_ua]))
         .await
         .expect("default-limit note merge");
@@ -835,12 +835,12 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
         "{resp}"
     );
     let opid = resp["opid"].as_str().expect("opid").to_string();
-    await_op(&zecd, &opid, "default-limit note merge").await;
-    confirm_untrusted(&zebrad, &zecd).await;
+    await_op(&rose, &opid, "default-limit note merge").await;
+    confirm_untrusted(&zebrad, &rose).await;
     phase("200-note merge done");
 
     // The follow-up drains the remainder plus the first round's output: one note left.
-    let resp = zecd
+    let resp = rose
         .call("z_mergetoaddress", json!([["ANY_ORCHARD"], own_ua]))
         .await
         .expect("drain merge");
@@ -851,13 +851,13 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
     );
     assert_eq!(resp["remainingNotes"], json!(0), "{resp}");
     let opid = resp["opid"].as_str().expect("opid").to_string();
-    await_op(&zecd, &opid, "drain merge").await;
-    confirm_untrusted(&zebrad, &zecd).await;
-    let (_, z_end) = unspent_counts(&zecd).await;
+    await_op(&rose, &opid, "drain merge").await;
+    confirm_untrusted(&zebrad, &rose).await;
+    let (_, z_end) = unspent_counts(&rose).await;
     assert_eq!(z_end, 1, "225 notes converged to one");
     phase("converged to 1 note");
 
-    drop(zecd);
+    drop(rose);
 }
 
 /// Issue small self-sends until one produces `expect` as its error code (`None` meaning the
@@ -877,7 +877,7 @@ async fn regtest_mergetoaddress_default_shielded_limit() {
 /// coverage is unaffected by the size: with the cap at 1 every shielded send exceeds it, since
 /// the cheapest possible one still has a spend and two outputs.
 async fn wait_for_send_outcome(
-    zecd: &Zecd,
+    rose: &Rose,
     to: &str,
     expect: Option<i64>,
     what: &str,
@@ -885,7 +885,7 @@ async fn wait_for_send_outcome(
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let outcome = match zecd
+        let outcome = match rose
             .call(
                 "z_sendmany",
                 json!([to, [{"address": to, "amount": 0.001}]]),
@@ -896,7 +896,7 @@ async fn wait_for_send_outcome(
             // never be mistaken for the success case (`None`) and time the loop out instead.
             Err(e) => (Some(e.code().unwrap_or(i64::MIN)), format!("{e}")),
             Ok(opid) => {
-                let waited = zecd
+                let waited = rose
                     .call(
                         "z_waitforoperation",
                         json!([opid, OP_TIMEOUT.as_secs() as i64]),

@@ -97,7 +97,7 @@ impl BitcoindAuth {
 }
 
 /// A resolved bitcoind endpoint: everything needed to dial it, plus the connect-time checks
-/// that need no network (`preflight`), which is what `zecd config check` reports from.
+/// that need no network (`preflight`), which is what `rose config check` reports from.
 #[derive(Clone, Debug)]
 pub struct BitcoindEndpoint {
     host: String,
@@ -124,7 +124,7 @@ impl BitcoindEndpoint {
             bail!(
                 "refusing to send bitcoind RPC credentials in cleartext to the \
                  globally-routable host '{}': the bitcoind connection is plaintext HTTP, so \
-                 the credentials would cross the public internet in the clear. Point zecd at \
+                 the credentials would cross the public internet in the clear. Point rose at \
                  a loopback or private-network bitcoind, tunnel the RPC port over \
                  SSH/WireGuard and use the local end, or set `[backend] \
                  allow_remote_cleartext = true` if the hop is already secured.",
@@ -211,7 +211,7 @@ impl BtcEndpoint {
         }
     }
 
-    /// The configuration-only checks a connect would fail on, shared with `zecd config check`
+    /// The configuration-only checks a connect would fail on, shared with `rose config check`
     /// so both dialects report their unreachable-by-construction cases offline.
     pub fn preflight(&self) -> anyhow::Result<()> {
         match self {
@@ -407,7 +407,7 @@ pub fn resolve(token: &str, network: BitcoinNetwork) -> anyhow::Result<(String, 
 /// A **rejection** means the node received the transaction and refused it: retrying the
 /// same bytes cannot succeed, and the node's own verify-family error code and message are
 /// the caller's answer (`-25` missing inputs, `-26` policy, `-27` already known - the same
-/// vocabulary zecd speaks, so they pass through). A **transport** failure means no verdict
+/// vocabulary rose speaks, so they pass through). A **transport** failure means no verdict
 /// was obtained at all: the transaction may or may not have reached the node, retrying is
 /// the right move once the upstream is reachable, and a bitcoind connection is dropped for
 /// redial per the `Conn` convention.
@@ -711,7 +711,7 @@ mod tests {
     fn wallet_server_overrides_the_global_bitcoind_default() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             "network = \"regtest\"\ndatadir = \"/d\"\n\
@@ -720,7 +720,7 @@ mod tests {
              [wallets.overridden]\ncoin = \"bitcoin\"\nserver = \"bitcoind://10.0.0.7:4321\"\n",
         )
         .unwrap();
-        let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = crate::config::Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let config = crate::config::AppConfig::resolve(&cli).unwrap();
         let global = resolve_for_wallet(&config, &config.wallets["global_default"]).unwrap();
         assert_eq!(global.describe(), "bitcoind 10.0.0.9:1234");
@@ -734,7 +734,7 @@ mod tests {
             "network = \"regtest\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n",
         )
         .unwrap();
-        let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = crate::config::Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let config = crate::config::AppConfig::resolve(&cli).unwrap();
         let builtin = resolve_for_wallet(&config, &config.wallets["btc"]).unwrap();
         assert_eq!(builtin.describe(), "bitcoind 127.0.0.1:18443");

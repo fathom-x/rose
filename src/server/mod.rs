@@ -163,7 +163,7 @@ async fn handle(
         // Bitcoin Core inserts a small delay on auth failure to deter brute-forcing.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         warn!(
-            target: "zecd::audit",
+            target: "rose::audit",
             user = auth::basic_auth_username(auth_header)
                 .as_deref()
                 .unwrap_or("<none>"),
@@ -177,7 +177,7 @@ async fn handle(
     // Success is the overwhelmingly common case - one line per authenticated request - so it
     // sits at DEBUG (still under the audit target for a sink that wants it); failures warn.
     tracing::debug!(
-        target: "zecd::audit",
+        target: "rose::audit",
         user = auth::basic_auth_username(auth_header)
             .as_deref()
             .unwrap_or("<none>"),
@@ -206,7 +206,7 @@ async fn handle(
 }
 
 /// A successful call at or above this many milliseconds is logged at INFO rather than DEBUG.
-/// Every RPC zecd serves is meant to be interactive; seconds means something has outgrown its
+/// Every RPC rose serves is meant to be interactive; seconds means something has outgrown its
 /// query, which an operator should be able to see without turning on DEBUG for everything.
 #[cfg(feature = "server")]
 const SLOW_RPC_MS: u64 = 2_000;
@@ -462,7 +462,7 @@ mod tests {
     }
 
     /// End-to-end auth flow over the full HTTP stack using a credential minted by
-    /// `zecd rpcauth`: build the server from a generated `[rpc] auth` entry, then drive a real
+    /// `rose rpcauth`: build the server from a generated `[rpc] auth` entry, then drive a real
     /// request through the router. Covers passwords with characters that could break Basic-auth
     /// parsing or hashing - including `:` (the Basic-auth field separator), `$` (the salt/hash
     /// delimiter in the entry), quotes/backslashes, whitespace, and non-ASCII - to prove the
@@ -486,7 +486,7 @@ mod tests {
                 password: None,
                 auth: vec![entry],
                 cookiefile: Some(
-                    std::env::temp_dir().join(format!("zecd-test-cookie-{}", std::process::id())),
+                    std::env::temp_dir().join(format!("rose-test-cookie-{}", std::process::id())),
                 ),
                 work_queue: 16,
                 allowed_methods: vec![],
@@ -547,7 +547,7 @@ mod tests {
         let v = body_json(r).await;
         assert_eq!(v["error"], Value::Null);
         assert_eq!(v["id"], serde_json::json!(1));
-        assert!(v["result"]["subversion"].as_str().unwrap().contains("zecd"));
+        assert!(v["result"]["subversion"].as_str().unwrap().contains("rose"));
     }
 
     #[tokio::test]
@@ -1337,7 +1337,7 @@ mod tests {
         }
     }
 
-    /// zecd is stateless: it keeps no off-chain label store, so `getnewaddress` stays available
+    /// rose is stateless: it keeps no off-chain label store, so `getnewaddress` stays available
     /// but rejects a non-empty label argument with `-8`.
     ///
     /// The label-dedicated methods (`setlabel`, `getaddressesbylabel`, `listlabels`,

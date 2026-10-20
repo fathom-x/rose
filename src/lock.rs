@@ -1,9 +1,9 @@
 //! Single-instance guard for the data directory.
 //!
-//! Two zecd processes writing one data directory would both open the same `WalletDb` files and
+//! Two rose processes writing one data directory would both open the same `WalletDb` files and
 //! step on each other's writes (the single-writer-actor invariant only serializes writers
 //! *within* one process). To prevent that, every datadir-*writing* entry point - the daemon
-//! ([`crate::daemon::run`]) and `zecd init` ([`crate::init::run`]) - takes an exclusive advisory
+//! ([`crate::daemon::run`]) and `rose init` ([`crate::init::run`]) - takes an exclusive advisory
 //! lock on `<datadir>/.lock` first and holds it for as long as it owns the datadir (the process
 //! lifetime for the daemon). This mirrors zallet's `lock_datadir` (and zcashd before it): the
 //! lockfile is an empty marker, the OS advisory file lock is the real mutex, and a second writer
@@ -19,9 +19,9 @@
 //! # Limitation: the lock is host-local
 //!
 //! The advisory file lock is enforced by the *local* kernel, so it only guards against a second
-//! zecd on the **same host**. It does **not** span hosts: on a network filesystem (NFS, SMB, a
+//! rose on the **same host**. It does **not** span hosts: on a network filesystem (NFS, SMB, a
 //! Kubernetes `ReadWriteMany` volume) mounted by two machines, each host's kernel grants the lock
-//! independently, so two zecd on different hosts sharing one datadir would both believe they hold
+//! independently, so two rose on different hosts sharing one datadir would both believe they hold
 //! it and then corrupt the wallet DB with concurrent SQLite writers. **The data directory must
 //! therefore be host-local** - a local disk, or a volume mounted so exactly one node can write it
 //! (Kubernetes `ReadWriteOnce`) - and must never be shared read-write across hosts. There is no
@@ -39,7 +39,7 @@ use anyhow::{anyhow, Context as _};
 /// Acquire the exclusive lock on `<datadir>/.lock`, returning a guard that releases it when
 /// dropped. Hold the guard for as long as the datadir is in use (the process lifetime).
 ///
-/// The data directory is created if it does not yet exist: `zecd init` can run before any datadir
+/// The data directory is created if it does not yet exist: `rose init` can run before any datadir
 /// has been laid down, and the lockfile's parent must exist before it can be created.
 ///
 /// Returns an error if the lock is already held by another process (the "already running" case),
@@ -49,7 +49,7 @@ use anyhow::{anyhow, Context as _};
 /// read-write across hosts (a network volume); that datadir must be host-local.
 /// The path of the advisory lockfile guarding `datadir`.
 ///
-/// Exposed because an embedder can deliberately share this lock with zecd - taking it around
+/// Exposed because an embedder can deliberately share this lock with rose - taking it around
 /// its own datadir work so that it and a node exclude each other - and that interlock is only
 /// load-bearing if both sides agree on the file. An embedder asserting agreement should compare
 /// against this rather than rebuilding `datadir.join(".lock")` and hoping it stays true.
@@ -63,7 +63,7 @@ pub fn datadir_lock_path(datadir: &Path) -> PathBuf {
 
 const LOCKFILE_NAME: &str = ".lock";
 
-/// The datadir lock is held by another process - i.e. "another zecd is already running".
+/// The datadir lock is held by another process - i.e. "another rose is already running".
 ///
 /// Returned inside the `anyhow::Error` from [`lock_datadir`] (and therefore from
 /// [`crate::node::NodeBuilder::prepare`]) so a caller can `downcast_ref` for it, the same way
@@ -121,7 +121,7 @@ pub fn lock_datadir(datadir: &Path) -> anyhow::Result<fmutex::Guard<'static>> {
             anyhow!(DatadirLocked {
                 datadir: datadir.to_path_buf(),
                 message: format!(
-                    "Cannot lock data directory {}. Another zecd is already running on this \
+                    "Cannot lock data directory {}. Another rose is already running on this \
                      host; the lock clears when it exits, so just retry (no lockfile to \
                      delete). Note the lock is host-local: it does NOT protect a datadir shared \
                      across hosts (e.g. a network/ReadWriteMany volume) - keep the datadir \
@@ -145,7 +145,7 @@ pub fn lock_datadir(datadir: &Path) -> anyhow::Result<fmutex::Guard<'static>> {
 /// Best-effort local hostname for the lockfile diagnostic stamp; `"unknown"` if it can't be read.
 ///
 /// Split per platform because `libc` declares `gethostname` only on Unix - calling it ungated
-/// fails to *compile* for a Windows target rather than failing at runtime. Nothing in zecd's
+/// fails to *compile* for a Windows target rather than failing at runtime. Nothing in rose's
 /// supported deployments is non-Unix, but the crate is a library now, and a consumer building
 /// for Windows should get a link error about a feature they cannot use, not a build break in a
 /// diagnostic breadcrumb. The stamp is advisory either way (see the caller): it identifies the
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn lock_creates_the_datadir_if_missing() {
-        // `zecd init` can run before the datadir exists; locking must create it.
+        // `rose init` can run before the datadir exists; locking must create it.
         let parent = tempfile::tempdir().unwrap();
         let datadir = parent.path().join("not-created-yet");
         assert!(!datadir.exists());
@@ -240,7 +240,7 @@ mod tests {
         assert!(datadir.join(".lock").exists(), "the lockfile was created");
     }
 
-    /// An embedder can share this lock with zecd, so both sides must agree on which file it is.
+    /// An embedder can share this lock with rose, so both sides must agree on which file it is.
     /// Pinning it here means a rename shows up as a failing test rather than as a silently
     /// broken interlock in someone else's process.
     #[test]

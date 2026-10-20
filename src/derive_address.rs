@@ -1,7 +1,7 @@
-//! `zecd derive-address`: derive a wallet's receiving addresses offline.
+//! `rose derive-address`: derive a wallet's receiving addresses offline.
 //!
-//! Every other way to learn a zecd address needs infrastructure: `getnewaddress` needs a running
-//! daemon, and `zecd init` needs a live upstream (it anchors the account on the tree state at
+//! Every other way to learn a rose address needs infrastructure: `getnewaddress` needs a running
+//! daemon, and `rose init` needs a live upstream (it anchors the account on the tree state at
 //! `birthday - 1`). That makes an address a chicken-and-egg problem whenever it is needed
 //! *before* the wallet has a chain - pre-provisioning deposit addresses, air-gapped or cold
 //! setup, or configuring a miner to pay the wallet that does not exist yet. This command closes
@@ -14,8 +14,8 @@
 //! - an initialized wallet's `keys.toml`, via the account UFVK pinned there (see
 //!   `wallet::binding`) - no seed is decrypted, so this works for a locked, passphrase-encrypted,
 //!   or watch-only wallet;
-//! - a BIP-39 mnemonic (`--mnemonic`, read from `ZECD_MNEMONIC`/`--mnemonic-file`/stdin);
-//! - a Unified Full Viewing Key (`--ufvk`, as `zecd export-ufvk` prints).
+//! - a BIP-39 mnemonic (`--mnemonic`, read from `ROSE_MNEMONIC`/`--mnemonic-file`/stdin);
+//! - a Unified Full Viewing Key (`--ufvk`, as `rose export-ufvk` prints).
 //!
 //! Supplying key material *and* naming a wallet checks the two against each other: the derived
 //! UFVK is compared with that wallet's pin, which is how an operator confirms a `keys.toml`
@@ -33,7 +33,7 @@
 //! cost money.** This command writes nothing: no `addresses` row, no exposure, no matcher
 //! refresh. For a **shielded** address that is harmless - a note is found by trial-decrypting
 //! every output against the account's viewing key, so an index the wallet never recorded is
-//! credited exactly like one it did. For a **transparent** address it is not: zecd discovers
+//! credited exactly like one it did. For a **transparent** address it is not: rose discovers
 //! transparent receives by matching each block's outputs against a set of *exposed* addresses
 //! plus a bounded lookahead (see the transparent design notes), so a payment to a derived index
 //! outside that window is not credited until something exposes the index and the wallet rescans.
@@ -134,7 +134,7 @@ impl std::fmt::Display for DeriveNote {
             ),
             DeriveNote::NoPinUnchecked { wallet, keys_path } => write!(
                 f,
-                "note: wallet '{wallet}' pins no viewing key in {} (created by an older zecd), \
+                "note: wallet '{wallet}' pins no viewing key in {} (created by an older rose), \
                  so the supplied key was not checked against it.",
                 keys_path.display()
             ),
@@ -250,7 +250,7 @@ pub fn run(config: &AppConfig, args: &DeriveAddressArgs) -> anyhow::Result<()> {
     if args.xpub.is_some() {
         bail!(
             "--xpub takes a Bitcoin account key, and this is a Zcash wallet; derive from its \
-             viewing key with --ufvk (as `zecd export-ufvk` prints), from --mnemonic, or from \
+             viewing key with --ufvk (as `rose export-ufvk` prints), from --mnemonic, or from \
              the wallet's keys.toml"
         );
     }
@@ -383,7 +383,7 @@ fn load_key(
     if !WalletStore::exists(keys_path) {
         bail!(
             "wallet '{wallet}' is not initialized ({} missing). Derive from key material \
-             instead: --mnemonic (phrase on stdin, ZECD_MNEMONIC, or --mnemonic-file) or \
+             instead: --mnemonic (phrase on stdin, ROSE_MNEMONIC, or --mnemonic-file) or \
              --ufvk <key>.",
             keys_path.display()
         );
@@ -393,7 +393,7 @@ fn load_key(
     let pinned = store.pinned_ufvk().ok_or_else(|| {
         anyhow!(
             "wallet '{wallet}' has no unified full viewing key pinned in {} (it was created by \
-             an older zecd; the daemon records one at the next startup). Derive from key \
+             an older rose; the daemon records one at the next startup). Derive from key \
              material instead: --mnemonic or --ufvk <key>.",
             keys_path.display()
         )
@@ -408,7 +408,7 @@ fn load_key(
     Ok((ufvk, KeySource::KeysFile))
 }
 
-/// The account's UFVK for a BIP-39 seed, at ZIP-32 account index 0 - the single account zecd
+/// The account's UFVK for a BIP-39 seed, at ZIP-32 account index 0 - the single account rose
 /// creates per wallet, and the one `wallet::binding` pins.
 fn ufvk_from_seed(
     network: ZNetwork,
@@ -625,7 +625,7 @@ impl Report<'_> {
             return;
         }
 
-        // Everything except the addresses themselves goes to stderr, so `$(zecd derive-address
+        // Everything except the addresses themselves goes to stderr, so `$(rose derive-address
         // ...)` is the address and a `--count` run pipes straight into a provisioning script. The
         // indices are the header's range, in order, so no per-line marker is needed.
         let range = match outcome.addresses.as_slice() {

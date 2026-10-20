@@ -5032,7 +5032,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zecd"
+name = "rose"
 version = "0.7.0"
 dependencies = [
  "age",

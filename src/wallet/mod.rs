@@ -69,7 +69,7 @@ use crate::pools::ReceiverSet;
 use crate::wallet::store::Passphrase;
 
 /// Transient, in-memory first-seen wall-clock times for **unmined** wallet transactions, keyed
-/// by display-hex txid. zecd is stateless - this is never persisted (it is rebuilt naturally as
+/// by display-hex txid. rose is stateless - this is never persisted (it is rebuilt naturally as
 /// the mempool stream re-observes pending txs, and lost on restart, exactly like the async-op
 /// registry). It exists only because an unmined tx has no on-chain time yet: the actor stamps the
 /// clock when it first stores a tx from the mempool stream, and the history RPCs surface it as
@@ -245,7 +245,7 @@ pub struct SyncStatus {
     /// below it has had its full data fetched, so its memos are readable. `None` means "not
     /// currently known" - never "everything is enhanced".
     ///
-    /// This exists because zecd scans and enhances separately, which makes `fully_scanned` the
+    /// This exists because rose scans and enhances separately, which makes `fully_scanned` the
     /// wrong bound for anything reading memos. A scanned-but-unenhanced output is *present*
     /// with a NULL memo, so a consumer that treats "scanned" as "memos available" - or filters
     /// on `memo IS NOT NULL` and advances a cursor past what it saw - silently and permanently
@@ -419,7 +419,7 @@ pub enum SendSource {
 #[derive(Clone, Debug)]
 pub enum ShieldCoinbaseFrom {
     /// zcashd's `"*"`: sweep coinbase UTXOs from every transparent receiver the wallet has
-    /// exposed. Safe for zecd (one account per wallet), unlike a cross-account wildcard.
+    /// exposed. Safe for rose (one account per wallet), unlike a cross-account wildcard.
     AnyTaddr,
     /// A single wallet-owned transparent address.
     Address(TransparentAddress),
@@ -844,7 +844,7 @@ impl WalletHandle {
 
     /// Snapshot of the transient first-seen times for unmined txs (display-hex txid → unix time),
     /// for joining into history responses. Empty after a restart until the mempool stream
-    /// re-observes still-pending txs (zecd is stateless; these times are never persisted).
+    /// re-observes still-pending txs (rose is stateless; these times are never persisted).
     pub fn first_seen(&self) -> HashMap<String, i64> {
         self.first_seen
             .lock()

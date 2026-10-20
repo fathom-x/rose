@@ -16,14 +16,14 @@
 //! surfaces, address/history details) are that test's job.
 //!
 //! Skips cleanly under the same two probes as `regtest_btc.rs`: no bitcoind provisioned,
-//! or a zecd built without the `bitcoin` feature.
+//! or a rose built without the `bitcoin` feature.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use rose_regtest_harness::{pick_port, rose_bin};
 use serde_json::{json, Value};
-use zecd_regtest_harness::{pick_port, zecd_bin};
 
 /// Generous: a kyoto first sync downloads headers and filters for the whole regtest chain
 /// and only reports at tip, and the node builds its filter index in the background.
@@ -40,16 +40,16 @@ fn bitcoind_bin() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Whether the zecd under test carries the `bitcoin` feature: a default build's
+/// Whether the rose under test carries the `bitcoin` feature: a default build's
 /// `config check` refuses `coin = "bitcoin"` ("this build supports: zcash").
-fn zecd_has_bitcoin_feature(datadir: &std::path::Path) -> bool {
+fn rose_has_bitcoin_feature(datadir: &std::path::Path) -> bool {
     let conf = datadir.join("probe.toml");
     std::fs::write(
         &conf,
         "default_wallet = \"btc\"\n[wallets.btc]\ncoin = \"bitcoin\"\n",
     )
     .expect("write probe config");
-    let out = Command::new(zecd_bin())
+    let out = Command::new(rose_bin())
         .args([
             "--datadir",
             datadir.to_str().unwrap(),
@@ -62,7 +62,7 @@ fn zecd_has_bitcoin_feature(datadir: &std::path::Path) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .expect("run zecd config check");
+        .expect("run rose config check");
     let stderr = String::from_utf8_lossy(&out.stderr);
     !stderr.contains("unsupported coin")
 }
@@ -181,7 +181,7 @@ impl BitcoinD {
     }
 }
 
-struct ZecdKyoto {
+struct RoseKyoto {
     proc: Option<KillOnDrop>,
     client: reqwest::Client,
     url: String,
@@ -190,14 +190,14 @@ struct ZecdKyoto {
     rpc_port: u16,
 }
 
-impl ZecdKyoto {
+impl RoseKyoto {
     fn spawn_daemon(
         datadir: &std::path::Path,
         conf: &std::path::Path,
         rpc_port: u16,
     ) -> KillOnDrop {
         KillOnDrop(
-            Command::new(zecd_bin())
+            Command::new(rose_bin())
                 .args([
                     "--datadir",
                     datadir.to_str().unwrap(),
@@ -214,13 +214,13 @@ impl ZecdKyoto {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .expect("spawn zecd"),
+                .expect("spawn rose"),
         )
     }
 
-    async fn start(datadir: PathBuf, bitcoind_p2p_port: u16) -> ZecdKyoto {
+    async fn start(datadir: PathBuf, bitcoind_p2p_port: u16) -> RoseKyoto {
         std::fs::create_dir_all(&datadir).unwrap();
-        let conf = datadir.join("zecd.toml");
+        let conf = datadir.join("rose.toml");
         // The kyoto grammar: an explicit trusted peer (the bare token is refused on
         // regtest, which has no DNS seeds), which also makes the light client
         // whitelist-only with required_peers capped at 1. No [bitcoind] credentials -
@@ -247,7 +247,7 @@ impl ZecdKyoto {
         // Kyoto init is fully offline; height 0 (also what a regtest kyoto wallet now
         // defaults to) scans the whole (tiny) regtest chain from the genesis recovery
         // floor. Kept explicit so the suite pins the flag's height path too.
-        let init = Command::new(zecd_bin())
+        let init = Command::new(rose_bin())
             .args([
                 "--datadir",
                 datadir.to_str().unwrap(),
@@ -261,14 +261,14 @@ impl ZecdKyoto {
                 "0",
             ])
             .output()
-            .expect("run zecd init");
+            .expect("run rose init");
         assert!(
             init.status.success(),
-            "zecd init failed: {}",
+            "rose init failed: {}",
             String::from_utf8_lossy(&init.stderr)
         );
-        let rpc_port = pick_port().expect("pick zecd rpc port");
-        let z = ZecdKyoto {
+        let rpc_port = pick_port().expect("pick rose rpc port");
+        let z = RoseKyoto {
             proc: Some(Self::spawn_daemon(&datadir, &conf, rpc_port)),
             client: reqwest::Client::new(),
             url: format!("http://127.0.0.1:{rpc_port}/wallet/btc"),
@@ -293,7 +293,7 @@ impl ZecdKyoto {
             if self.call("getwalletinfo", json!([])).await.is_ok() {
                 return;
             }
-            assert!(Instant::now() < deadline, "zecd RPC never came up");
+            assert!(Instant::now() < deadline, "rose RPC never came up");
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
@@ -330,7 +330,7 @@ impl ZecdKyoto {
             }
             assert!(
                 Instant::now() < deadline,
-                "zecd never synced to height {target}"
+                "rose never synced to height {target}"
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -344,9 +344,9 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
         return;
     };
     let dir = tempfile::tempdir().expect("tempdir");
-    if !zecd_has_bitcoin_feature(dir.path()) {
+    if !rose_has_bitcoin_feature(dir.path()) {
         eprintln!(
-            "skipping: the zecd under test was built without the `bitcoin` feature \
+            "skipping: the rose under test was built without the `bitcoin` feature \
              (build with --features bitcoin)"
         );
         return;
@@ -364,13 +364,13 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
     node.call("createwallet", json!(["miner"]))
         .await
         .expect("create miner wallet");
-    // Mine past coinbase maturity BEFORE zecd starts: the first kyoto sync then covers a
+    // Mine past coinbase maturity BEFORE rose starts: the first kyoto sync then covers a
     // real chain span (headers + filters from genesis) rather than an empty one.
     node.mine(110).await;
 
-    let mut zecd = ZecdKyoto::start(dir.path().join("zecddata"), btc_p2p_port).await;
-    zecd.wait_height(110).await;
-    let address = zecd
+    let mut rose = RoseKyoto::start(dir.path().join("rosedata"), btc_p2p_port).await;
+    rose.wait_height(110).await;
+    let address = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -384,10 +384,10 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
     // against a backend that did see the mempool.
     node.call("sendtoaddress", json!([address, 1.0]))
         .await
-        .expect("fund zecd");
+        .expect("fund rose");
     let hold = std::time::Instant::now();
     while hold.elapsed() < std::time::Duration::from_secs(6) {
-        let unconfirmed = zecd
+        let unconfirmed = rose
             .call("getunconfirmedbalance", json!([]))
             .await
             .expect("getunconfirmedbalance");
@@ -402,10 +402,10 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
     // Confirming it makes the block's filter match the wallet's script; kyoto downloads
     // that one block and the receive lands.
     node.mine(1).await;
-    zecd.wait_height(111).await;
-    let balance = zecd.call("getbalance", json!([])).await.expect("balance");
+    rose.wait_height(111).await;
+    let balance = rose.call("getbalance", json!([])).await.expect("balance");
     assert_eq!(balance.as_f64(), Some(1.0));
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -421,13 +421,13 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
         .call("getnewaddress", json!([]))
         .await
         .expect("miner address");
-    let send_txid = zecd
+    let send_txid = rose
         .call("sendtoaddress", json!([miner_addr, 0.25]))
         .await
-        .expect("zecd send over kyoto");
+        .expect("rose send over kyoto");
     node.wait_mempool_contains(&send_txid).await;
     // The wallet records its own send at 0-conf (it authored it; no mempool needed).
-    let entries = zecd
+    let entries = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
@@ -441,8 +441,8 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
     assert_eq!(send_entry["confirmations"], json!(0));
 
     node.mine(1).await;
-    zecd.wait_height(112).await;
-    let entries = zecd
+    rose.wait_height(112).await;
+    let entries = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
@@ -458,18 +458,18 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
     // The checkpoint survives a restart: the resumed wallet takes `ScanType::Sync` (its
     // latest checkpoint is now well above 0) instead of re-running the recovery scan,
     // and its balance is intact.
-    let balance_before = zecd
+    let balance_before = rose
         .call("getbalance", json!([]))
         .await
         .expect("balance before restart");
-    zecd.restart().await;
-    zecd.wait_height(112).await;
-    let balance_after = zecd
+    rose.restart().await;
+    rose.wait_height(112).await;
+    let balance_after = rose
         .call("getbalance", json!([]))
         .await
         .expect("balance after restart");
     assert_eq!(balance_before, balance_after);
-    let info = zecd
+    let info = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -482,7 +482,7 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
     // (param 9, sat/vB): on this backend that is the one way to price a send trusting
     // neither mempool.space nor the peers' coarse signals, and the node's mempool entry
     // proves the caller's number is what got paid.
-    let second_txid = zecd
+    let second_txid = rose
         .call(
             "sendtoaddress",
             json!([miner_addr, 0.1, null, null, false, null, null, null, null, 3]),
@@ -503,8 +503,8 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
         "explicit fee_rate honored over kyoto: {rate} sat/vB ({entry})"
     );
     node.mine(1).await;
-    zecd.wait_height(113).await;
-    let balance = zecd
+    rose.wait_height(113).await;
+    let balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("final balance");

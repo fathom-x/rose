@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch a Bitcoin node and one or more zecd wallets through live reorgs.
+"""Watch a Bitcoin node and one or more rose wallets through live reorgs.
 
 Testnet4 contests CPU-mined tips daily, and `scripts/btc-miner.py` mines a lone
 min-difficulty block for every unconfirmed wallet transaction - exactly the block a
@@ -22,13 +22,13 @@ reads the node's best block and `getchaintips`, and each wallet's `getwalletinfo
     mainnet (`--allow-mainnet` overrides), priced at an explicit `--fee-rate` (never a
     wallet estimate), and skipped while the balance is under `--min-balance`.
 
-Stdlib only. Wallet RPCs are zecd's; the node's are Bitcoin Core's. Output is one line
+Stdlib only. Wallet RPCs are rose's; the node's are Bitcoin Core's. Output is one line
 per event, timestamped, to stdout (tee it to a file for a day).
 
-    ZECD_RPC_PASSWORD=... python3 scripts/btc-reorg-watch.py \\
+    ROSE_RPC_PASSWORD=... python3 scripts/btc-reorg-watch.py \\
         --node http://btc:btc@127.0.0.1:48332 \\
-        --wallet bitcoind=http://btc:$ZECD_RPC_PASSWORD@172.17.0.1:48232 \\
-        --wallet kyoto=http://btc:$ZECD_RPC_PASSWORD@127.0.0.1:48233 \\
+        --wallet bitcoind=http://btc:$ROSE_RPC_PASSWORD@172.17.0.1:48232 \\
+        --wallet kyoto=http://btc:$ROSE_RPC_PASSWORD@127.0.0.1:48233 \\
         --send-every 30
 """
 
@@ -151,7 +151,7 @@ def self_send(wallet, amount, fee_rate, min_balance):
         addr = rpc(wallet.url, "getnewaddress", [])
         # address, amount, comment, comment_to, subtractfeefromamount, replaceable,
         # conf_target, estimate_mode, avoid_reuse, fee_rate - the estimation pair stays
-        # null (zecd refuses it alongside fee_rate, as Core does).
+        # null (rose refuses it alongside fee_rate, as Core does).
         txid = rpc(wallet.url, "sendtoaddress", [addr, amount, "", "", False, None, None, None, None, fee_rate])
         log("SEND", f"[{wallet.label}] {amount} to own {addr[-10:]} at {fee_rate} sat/vB: {txid}")
     except Exception as e:
@@ -161,7 +161,7 @@ def self_send(wallet, amount, fee_rate, min_balance):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--node", required=True, help="bitcoind RPC URL with credentials")
-    ap.add_argument("--wallet", action="append", default=[], metavar="LABEL=URL", help="zecd wallet RPC URL (repeatable)")
+    ap.add_argument("--wallet", action="append", default=[], metavar="LABEL=URL", help="rose wallet RPC URL (repeatable)")
     ap.add_argument("--poll", type=int, default=20, help="seconds between polls")
     ap.add_argument("--send-every", type=int, default=0, help="minutes between self-payments from the first wallet (0 = never)")
     ap.add_argument("--send-amount", type=float, default=0.0001)

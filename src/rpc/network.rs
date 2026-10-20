@@ -25,7 +25,7 @@ fn connected(state: &AppState) -> bool {
     }
 }
 
-/// zecd's own version in Bitcoin Core's numeric encoding (major*10000 + minor*100 + patch),
+/// rose's own version in Bitcoin Core's numeric encoding (major*10000 + minor*100 + patch),
 /// derived from Cargo.toml so it can't drift from the crate version.
 fn version_number() -> u64 {
     // Each component's leading digit run, so a pre-release suffix (e.g. "0-rc0") still encodes.
@@ -54,7 +54,7 @@ pub(crate) fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
 pub(crate) fn networkinfo_json(up: bool) -> Value {
     json!({
         "version": version_number(),
-        "subversion": format!("/zecd:{}/", env!("CARGO_PKG_VERSION")),
+        "subversion": format!("/rose:{}/", env!("CARGO_PKG_VERSION")),
         "protocolversion": 170100,
         "localservices": "0000000000000000",
         "localservicesnames": [],
@@ -82,7 +82,7 @@ pub(crate) fn getconnectioncount(state: &AppState) -> Result<Value, RpcError> {
 /// with its `conn_state` (down|syncing|ready) as an extension field.
 #[cfg(feature = "zcash")]
 pub(crate) fn getpeerinfo(state: &AppState) -> Result<Value, RpcError> {
-    // zecd's single "peer" is the active chain upstream. Report it (with its connection
+    // rose's single "peer" is the active chain upstream. Report it (with its connection
     // state) when connected; otherwise an empty peer list, as bitcoind does with no peers.
     let Ok(w) = state.registry.get(None) else {
         return Ok(Value::Array(vec![]));

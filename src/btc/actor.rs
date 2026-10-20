@@ -441,7 +441,7 @@ pub struct BtcSendOptions {
     /// keys on output order, not the order the `subtractfeefrom` array listed them.
     /// Empty = the sender's change pays, as ever.
     pub subtract_fee_from: Vec<usize>,
-    /// How the recipients in `subtract_fee_from` share the fee (zecd's `fee_split`).
+    /// How the recipients in `subtract_fee_from` share the fee (rose's `fee_split`).
     pub fee_split: BtcFeeSplit,
     /// Core's `replaceable = false`: build every input with `nSequence = 0xFFFFFFFE`
     /// (locktime still enforced for anti-fee-sniping, no BIP 125 signal) instead of BDK's
@@ -450,7 +450,7 @@ pub struct BtcSendOptions {
     pub non_replaceable: bool,
 }
 
-/// How the recipients that pay a send's fee share it (zecd's `fee_split` extension).
+/// How the recipients that pay a send's fee share it (rose's `fee_split` extension).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BtcFeeSplit {
     /// Core's `subtractfeefrom`: the whole fee, divided equally among the paying recipients.
@@ -465,10 +465,10 @@ pub enum BtcFeeSplit {
 
 /// What a completed send reports: the txid, and Core's `fee_reason` - where the fee rate
 /// came from, the second half of `sendtoaddress`/`sendmany`'s `verbose` answer. Core's own
-/// strings where zecd prices the same way ("PayTxFee set" for an explicit `fee_rate`,
+/// strings where rose prices the same way ("PayTxFee set" for an explicit `fee_rate`,
 /// "Fallback fee" for the test-network floor); otherwise the source that answered
 /// (`estimatesmartfee`, or a `[fees]` tier name on kyoto), since Core's estimator-horizon
-/// strings describe a computation zecd does not do.
+/// strings describe a computation rose does not do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BtcSent {
     pub txid: String,
@@ -874,7 +874,7 @@ pub fn spawn(
             let keys = keys.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "wallet database is empty and no key material (seed or imported xpub) \
-                     is available to create it (run `zecd init` for this wallet first)"
+                     is available to create it (run `rose init` for this wallet first)"
                 )
             })?;
             PersistedWallet::create(
@@ -1806,7 +1806,7 @@ impl BtcActor {
                     BlockPull::AtTip(applied) => {
                         let (tx, rx) = std::sync::mpsc::sync_channel(1);
                         let spawned = std::thread::Builder::new()
-                            .name("zecd-btc-mempool".into())
+                            .name("rose-btc-mempool".into())
                             .spawn(move || {
                                 let event = pull.mempool();
                                 // A closed receiver means the connection was dropped
@@ -3032,7 +3032,7 @@ impl BtcActor {
                 let address = self.wallet.reveal_next_address(KeychainKind::External);
                 if address.index > horizon {
                     warn!(
-                        target: "zecd::audit",
+                        target: "rose::audit",
                         index = address.index,
                         horizon,
                         "issued an address past the recovery horizon: a restore from seed \
@@ -4133,7 +4133,7 @@ impl BtcActor {
             "abandontransaction",
         );
         info!(
-            target: "zecd::audit",
+            target: "rose::audit",
             %txid,
             descendants = abandoned.len() - 1,
             "abandoned an unconfirmed transaction; its inputs are released"
@@ -4240,7 +4240,7 @@ impl BtcActor {
         };
         let (new_txid, outcome) = self.relay_committed(&tx, seen_at, "fee bump").await?;
         info!(
-            target: "zecd::audit",
+            target: "rose::audit",
             original = %txid,
             replacement = %new_txid,
             orig_fee,
@@ -5045,7 +5045,7 @@ mod tests {
 
     /// Micro-benchmark for the read path's growth with the UTXO set, on the
     /// real handlers through the handle: a wallet paid once per block at `N` consecutive
-    /// addresses (`ZECD_MICRO_UTXOS`, default 2000), the deposit shape the capacity
+    /// addresses (`ROSE_MICRO_UTXOS`, default 2000), the deposit shape the capacity
     /// benchmark builds, without a node. Ignored: it prints timings and asserts nothing.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "timing only; run with --include-ignored --nocapture"]
@@ -5054,7 +5054,7 @@ mod tests {
         use bdk_wallet::bitcoin::{absolute, transaction, Amount, BlockHash, TxIn, TxOut};
         use bdk_wallet::chain::{BlockId, ConfirmationBlockTime, TxUpdate};
         use std::time::Instant;
-        let n: u32 = std::env::var("ZECD_MICRO_UTXOS")
+        let n: u32 = std::env::var("ROSE_MICRO_UTXOS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2000);
@@ -5814,7 +5814,7 @@ mod tests {
     async fn missing_database_without_seed_fails_the_spawn() {
         let dir = tempfile::tempdir().unwrap();
         let err = spawn(offline_config(dir.path(), None)).unwrap_err();
-        assert!(err.to_string().contains("zecd init"), "{err:#}");
+        assert!(err.to_string().contains("rose init"), "{err:#}");
     }
 
     /// Sends and broadcasts against a wallet with no upstream fail actionably (`-4`), and a

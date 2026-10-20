@@ -65,7 +65,7 @@ fn wallet_ready(st: &SyncStatus, cfg: &HealthConfig) -> bool {
         },
         // Lenient: ready as soon as the backend is connected and its tip is past our birthday - a
         // cheap sanity check that we're talking to the right, live network. Does NOT wait for the
-        // scan to finish, so RPC clients can reach zecd while it catches up, and readiness doesn't
+        // scan to finish, so RPC clients can reach rose while it catches up, and readiness doesn't
         // flap during a long sync.
         ReadinessMode::Connected => match (st.chain_tip, st.birthday) {
             (Some(tip), Some(birthday)) => tip > birthday,
@@ -467,7 +467,7 @@ mod tests {
     fn connected_mode_only_requires_a_live_upstream_past_the_birthday() {
         let connected = cfg(ReadinessMode::Connected);
         // Far behind on the scan (gap 357k) but connected and the tip is past birthday 50: ready.
-        // This is the whole point - RPC clients can reach zecd while it catches up.
+        // This is the whole point - RPC clients can reach rose while it catches up.
         assert!(wallet_ready(
             &st(true, Some(4_080_983), Some(3_724_064)),
             &connected

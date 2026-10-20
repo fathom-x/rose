@@ -1,35 +1,35 @@
-//! Light-mode regtest end-to-end: the zecd under test runs against a **lightwalletd** upstream
+//! Light-mode regtest end-to-end: the rose under test runs against a **lightwalletd** upstream
 //! (`server = "http://127.0.0.1:<grpc>"`), exercising the whole light path - init (tree state +
 //! tip over gRPC), compact-block sync via `GetBlockRange`, 0-conf via the native
 //! `GetMempoolStream`, memo enhancement via `GetTransaction`, a real Orchard spend broadcast
 //! via `SendTransaction`, an upstream outage/reconnect, and the full `conformance.py`
 //! wire-format suite against the funded light-mode daemon.
 //!
-//! A second zecd instance runs against the same chain **directly on zebrad's JSON-RPC**, and
+//! A second rose instance runs against the same chain **directly on zebrad's JSON-RPC**, and
 //! the two must agree on chain state (`getblockcount`, `getbestblockhash`) at every checkpoint.
 //! That is the system-level proof that the two backends derive the same chain view (a byte-order
 //! or conversion bug would skew hashes, balances, or history), and the mirror image of the
 //! pre-zebra-only `regtest_zebra.rs` equivalence test.
 //!
-//! The offline-window recovery case - a transparent output received *and spent* while zecd
+//! The offline-window recovery case - a transparent output received *and spent* while rose
 //! wasn't watching, which only the compact blocks' transparent data can reconstruct - used to
 //! have a leg of its own here. It is now `regtest_transparent_offline_restore.rs`, which runs
-//! that same shape on whichever backend `ZECD_REGTEST_BACKEND` selects and so covers light mode
+//! that same shape on whichever backend `ROSE_REGTEST_BACKEND` selects and so covers light mode
 //! on this very leg; the version here differed only in that its *authoring* wallet was
 //! zebra-backed, which the restore cannot observe.
 //!
-//! Unlike the suites that honor `ZECD_REGTEST_BACKEND`, this test is always light-mode (it IS
-//! the lightwalletd e2e), so it needs `LIGHTWALLETD_BIN` for the zecd under test. The funder is
+//! Unlike the suites that honor `ROSE_REGTEST_BACKEND`, this test is always light-mode (it IS
+//! the lightwalletd e2e), so it needs `LIGHTWALLETD_BIN` for the rose under test. The funder is
 //! zebra-backed like everywhere else, which is what makes the outage phases below safe: pausing or
-//! killing zecd's lightwalletd cannot stall it. Skips cleanly unless `ZEBRAD_BIN` and
+//! killing rose's lightwalletd cannot stall it. Skips cleanly unless `ZEBRAD_BIN` and
 //! `LIGHTWALLETD_BIN` are set.
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    pick_port, resolve_bin, start_funded_chain, Lightwalletd, Zebrad, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    pick_port, resolve_bin, start_funded_chain, Lightwalletd, Rose, RoseConfig, Zebrad,
 };
+use serde_json::json;
 
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
@@ -55,23 +55,23 @@ async fn regtest_lwd_e2e() {
         .await
         .expect("bring up a funded regtest chain");
 
-    // 3. The system under test: zecd in light mode, on its own dedicated lightwalletd.
-    //    `Zecd::start` also runs `zecd init` against the light endpoint (tip + tree state
+    // 3. The system under test: rose in light mode, on its own dedicated lightwalletd.
+    //    `Rose::start` also runs `rose init` against the light endpoint (tip + tree state
     //    over gRPC).
-    let zecd_lwd_upstream = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
+    let rose_lwd_upstream = Lightwalletd::start(&lwd_bin, zebrad.rpc_port)
         .await
-        .expect("start zecd's lightwalletd");
-    let mut lwd_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
-    lwd_cfg.lightwalletd_grpc_port = Some(zecd_lwd_upstream.grpc_port);
-    let zecd = Zecd::start(&lwd_cfg)
+        .expect("start rose's lightwalletd");
+    let mut lwd_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
+    lwd_cfg.lightwalletd_grpc_port = Some(rose_lwd_upstream.grpc_port);
+    let rose = Rose::start(&lwd_cfg)
         .await
-        .expect("start zecd in light mode");
+        .expect("start rose in light mode");
 
-    // The comparison instance: identical zecd, directly against zebrad.
-    let zebra_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
-    let zecd_zebra = Zecd::start(&zebra_cfg)
+    // The comparison instance: identical rose, directly against zebrad.
+    let zebra_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
+    let rose_zebra = Rose::start(&zebra_cfg)
         .await
-        .expect("start the zebra-backed comparison zecd");
+        .expect("start the zebra-backed comparison rose");
 
     // 4. Both instances scan the same chain to the same tip...
     let tip = zebrad
@@ -80,25 +80,25 @@ async fn regtest_lwd_e2e() {
         .expect("zebrad getblockchaininfo")["blocks"]
         .as_u64()
         .expect("blocks is a number");
-    zecd.wait_until_synced(tip, FUND_TIMEOUT)
+    rose.wait_until_synced(tip, FUND_TIMEOUT)
         .await
-        .expect("light-mode zecd syncs to the tip");
-    zecd_zebra
+        .expect("light-mode rose syncs to the tip");
+    rose_zebra
         .wait_until_synced(tip, FUND_TIMEOUT)
         .await
-        .expect("zebra-backed zecd syncs to the tip");
+        .expect("zebra-backed rose syncs to the tip");
 
     // ...and must agree on what that chain is. This pins the lightwalletd backend's hash byte
     // order and tip handling against the zebra backend's, end to end.
-    assert_chain_views_agree(&zecd, &zecd_zebra).await;
-    let info = zecd
+    assert_chain_views_agree(&rose, &rose_zebra).await;
+    let info = rose
         .call("getblockchaininfo", json!([]))
         .await
         .expect("getblockchaininfo");
     assert_eq!(info["chain"].as_str(), Some("regtest"), "{info}");
 
     // The single "peer" is the light upstream.
-    let peers = zecd
+    let peers = rose
         .call("getpeerinfo", json!([]))
         .await
         .expect("getpeerinfo");
@@ -109,23 +109,23 @@ async fn regtest_lwd_e2e() {
     );
 
     // 5. Fund the light-mode wallet with a real Orchard note carrying a memo.
-    let zecd_ua = zecd
+    let rose_ua = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
-    let zecd_ua = zecd_ua.as_str().expect("address string").to_string();
-    assert!(zecd_ua.starts_with("uregtest1"), "got {zecd_ua}");
+    let rose_ua = rose_ua.as_str().expect("address string").to_string();
+    assert!(rose_ua.starts_with("uregtest1"), "got {rose_ua}");
     let memo = "light mode e2e memo";
     funder
-        .send_with_memo(&zecd_ua, FUND_ZATOSHIS, Some(memo))
+        .send_with_memo(&rose_ua, FUND_ZATOSHIS, Some(memo))
         .await
-        .expect("send Orchard funds (with memo) to zecd");
+        .expect("send Orchard funds (with memo) to rose");
 
     // 0-conf: before anything is mined, the native GetMempoolStream must surface the incoming
     // payment.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let unconfirmed = zecd
+        let unconfirmed = rose
             .call("getunconfirmedbalance", json!([]))
             .await
             .ok()
@@ -148,7 +148,7 @@ async fn regtest_lwd_e2e() {
         .expect("confirm funding send");
     let deadline = Instant::now() + FUND_TIMEOUT;
     let funding_txid = loop {
-        let bal = zecd
+        let bal = rose
             .call("getbalance", json!([]))
             .await
             .ok()
@@ -156,7 +156,7 @@ async fn regtest_lwd_e2e() {
             .unwrap_or(0.0);
         if bal > 0.0 {
             assert_eq!(bal, 1.0, "the funded 1 ZEC is spendable");
-            let txs = zecd
+            let txs = rose
                 .call("listtransactions", json!([]))
                 .await
                 .expect("listtransactions");
@@ -170,7 +170,7 @@ async fn regtest_lwd_e2e() {
             break recv["txid"].as_str().expect("txid").to_string();
         }
         if Instant::now() >= deadline {
-            panic!("light-mode zecd did not see the funded Orchard note within {FUND_TIMEOUT:?}");
+            panic!("light-mode rose did not see the funded Orchard note within {FUND_TIMEOUT:?}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
@@ -178,7 +178,7 @@ async fn regtest_lwd_e2e() {
     // missed the tx; poll briefly.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let gt = zecd
+        let gt = rose
             .call("gettransaction", json!([funding_txid]))
             .await
             .expect("gettransaction on the funding tx");
@@ -198,22 +198,22 @@ async fn regtest_lwd_e2e() {
     // 6. Spend: a real Orchard send back to the funder, broadcast via SendTransaction,
     //    confirmed by mining.
     let funder_ua = funder.unified_address().to_string();
-    let txid = zecd
+    let txid = rose
         .call("sendtoaddress", json!([funder_ua, 0.4]))
         .await
         .expect("sendtoaddress through the light backend");
     let txid = txid.as_str().expect("txid is a string").to_string();
     assert_eq!(txid.len(), 64);
-    mine_until_confirmed(&zebrad, &zecd, &txid, "light-mode send").await;
+    mine_until_confirmed(&zebrad, &rose, &txid, "light-mode send").await;
 
-    // 7. Outage + reconnect: kill zecd's lightwalletd; the daemon must notice (conn_state
+    // 7. Outage + reconnect: kill rose's lightwalletd; the daemon must notice (conn_state
     //    leaves "ready") and, when a fresh lightwalletd comes back on the same port, reconnect
     //    and catch up. (A fresh data dir re-ingests the regtest chain from zebra in seconds.)
-    let grpc_port = zecd_lwd_upstream.grpc_port;
-    zecd_lwd_upstream.stop();
+    let grpc_port = rose_lwd_upstream.grpc_port;
+    rose_lwd_upstream.stop();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -226,46 +226,46 @@ async fn regtest_lwd_e2e() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never noticed the dead light upstream: {peers}"
+            "rose never noticed the dead light upstream: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let zecd_lwd_upstream = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, grpc_port)
+    let rose_lwd_upstream = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, grpc_port)
         .await
-        .expect("restart zecd's lightwalletd on the same port");
+        .expect("restart rose's lightwalletd on the same port");
     zebrad.generate_blocks(2).await.expect("advance the chain");
-    let tip = zecd_zebra_tip(&zebrad).await;
-    zecd.wait_until_synced(tip, FUND_TIMEOUT)
+    let tip = rose_zebra_tip(&zebrad).await;
+    rose.wait_until_synced(tip, FUND_TIMEOUT)
         .await
-        .expect("light-mode zecd reconnects and catches up");
-    drop(zecd_lwd_upstream);
+        .expect("light-mode rose reconnects and catches up");
+    drop(rose_lwd_upstream);
 
     // 8. After all activity, the two instances still agree on the chain.
-    let tip = zecd_zebra_tip(&zebrad).await;
-    zecd.wait_until_synced(tip, FUND_TIMEOUT)
+    let tip = rose_zebra_tip(&zebrad).await;
+    rose.wait_until_synced(tip, FUND_TIMEOUT)
         .await
-        .expect("light-mode zecd at the final tip");
-    zecd_zebra
+        .expect("light-mode rose at the final tip");
+    rose_zebra
         .wait_until_synced(tip, FUND_TIMEOUT)
         .await
-        .expect("comparison zecd catches up");
-    assert_chain_views_agree(&zecd, &zecd_zebra).await;
+        .expect("comparison rose catches up");
+    assert_chain_views_agree(&rose, &rose_zebra).await;
 
-    // Note: zecd's lightwalletd was dropped above, so the conformance run below exercises the
+    // Note: rose's lightwalletd was dropped above, so the conformance run below exercises the
     // daemon with a dead upstream for chain-independent methods too - but conformance needs a
     // live wallet view, so bring an upstream back first.
-    let zecd_lwd_upstream = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, grpc_port)
+    let rose_lwd_upstream = Lightwalletd::start_on(&lwd_bin, zebrad.rpc_port, grpc_port)
         .await
         .expect("bring the light upstream back for conformance");
 
     // 9. The full Bitcoin-Core wire-format suite against the funded light-mode daemon.
     run_conformance(lwd_cfg.rpc_port, &lwd_cfg.rpc_user, &lwd_cfg.rpc_password);
-    drop(zecd_lwd_upstream);
-    drop(zecd);
-    drop(zecd_zebra);
+    drop(rose_lwd_upstream);
+    drop(rose);
+    drop(rose_zebra);
 }
 
-async fn zecd_zebra_tip(zebrad: &Zebrad) -> u64 {
+async fn rose_zebra_tip(zebrad: &Zebrad) -> u64 {
     zebrad
         .rpc("getblockcount", json!([]))
         .await
@@ -275,7 +275,7 @@ async fn zecd_zebra_tip(zebrad: &Zebrad) -> u64 {
 }
 
 /// The light-mode and zebra-backed instances must report the identical chain.
-async fn assert_chain_views_agree(lwd: &Zecd, zebra: &Zecd) {
+async fn assert_chain_views_agree(lwd: &Rose, zebra: &Rose) {
     let (hl, hz) = (
         lwd.block_count().await.expect("light-mode getblockcount"),
         zebra
@@ -300,13 +300,13 @@ async fn assert_chain_views_agree(lwd: &Zecd, zebra: &Zecd) {
     );
 }
 
-/// Mine one block at a time (giving the scan loop time between blocks) until zecd reports
+/// Mine one block at a time (giving the scan loop time between blocks) until rose reports
 /// the tx confirmed. Panics after ~30 rounds.
-async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &str) {
+async fn mine_until_confirmed(zebrad: &Zebrad, rose: &Rose, txid: &str, what: &str) {
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_secs(2)).await;
         zebrad.generate_blocks(1).await.expect("mine a block");
-        let gt = zecd
+        let gt = rose
             .call("gettransaction", json!([txid]))
             .await
             .expect("gettransaction while polling for confirmation");
@@ -322,7 +322,7 @@ async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &s
 fn run_conformance(rpc_port: u16, user: &str, password: &str) {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("harness lives inside the zecd repo")
+        .expect("harness lives inside the rose repo")
         .join("scripts/conformance.py");
     let out = std::process::Command::new("python3")
         .arg(&script)

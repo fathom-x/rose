@@ -1,6 +1,6 @@
-# The zecd wallet dashboard (scripts/zecd-gui): a stdlib-only same-origin proxy in front of
-# zecd's RPC. Published to GHCR as `<repo>-gui` by the Release workflow's `docker-gui` job
-# (multi-arch, semver-tagged), so it can be pulled like the main zecd image instead of built
+# The rose wallet dashboard (scripts/rose-gui): a stdlib-only same-origin proxy in front of
+# rose's RPC. Published to GHCR as `<repo>-gui` by the Release workflow's `docker-gui` job
+# (multi-arch, semver-tagged), so it can be pulled like the main rose image instead of built
 # locally. The compose stacks also build it from this same Dockerfile, so the pulled image and
 # a compose-built one are identical.
 FROM python:3.12-slim
@@ -15,8 +15,8 @@ WORKDIR /app
 COPY serve.py index.html ./
 
 # Run as a non-root user.
-RUN useradd -m -u 1000 zecd-ui
-USER zecd-ui
+RUN useradd -m -u 1000 rose-ui
+USER rose-ui
 
 # Liveness via the server's own /info endpoint. urllib, not curl: the slim image has no curl,
 # so a compose-level curl healthcheck would only ever report unhealthy.
@@ -26,11 +26,11 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
 # The default UI port.
 EXPOSE 8080
 
-# Default: serve testnet4, read config from /config/zecd.btc-testnet4.toml. Two ways to run:
-#   - mount a config:  docker run ... -e ZECD_RPC_PASSWORD=... -v /path:/config ... --conf ... --rpc-url ...
-#   - no config (env): docker run ... -e ZECD_RPC_USER=view -e ZECD_RPC_PASSWORD=... \
-#                        -e ZECD_RPC_HOST=zecd-btc -e ZECD_RPC_PORT=18232 \
-#                        [-e ZECD_NETWORK=main -e ZECD_BACKEND=kyoto for the info panel] ...
+# Default: serve testnet4, read config from /config/rose.btc-testnet4.toml. Two ways to run:
+#   - mount a config:  docker run ... -e ROSE_RPC_PASSWORD=... -v /path:/config ... --conf ... --rpc-url ...
+#   - no config (env): docker run ... -e ROSE_RPC_USER=view -e ROSE_RPC_PASSWORD=... \
+#                        -e ROSE_RPC_HOST=rose-btc -e ROSE_RPC_PORT=18232 \
+#                        [-e ROSE_NETWORK=main -e ROSE_BACKEND=kyoto for the info panel] ...
 # A --conf path that isn't mounted is skipped, not an error - see serve.py's header.
 ENTRYPOINT ["python3", "serve.py"]
-CMD ["--conf", "/config/zecd.btc-testnet4.toml", "--bind", "0.0.0.0", "--port", "8080"]
+CMD ["--conf", "/config/rose.btc-testnet4.toml", "--bind", "0.0.0.0", "--port", "8080"]

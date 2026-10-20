@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Spending smoke test for a running zecd daemon (validates the methods that move funds).
+"""Spending smoke test for a running rose daemon (validates the methods that move funds).
 
-Requires a daemon with TWO wallets loaded (default + w2, see zecd.example.toml), where the
+Requires a daemon with TWO wallets loaded (default + w2, see rose.example.toml), where the
 `default` wallet holds at least ~0.05 spendable balance. It validates:
 
   - walletlock      -> a subsequent send returns RPC_WALLET_UNLOCK_NEEDED (-13)

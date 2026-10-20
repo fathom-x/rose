@@ -1,5 +1,5 @@
 [package]
-name = "zecd"
+name = "rose"
 version = "0.7.0"
 edition = "2021"
 rust-version = "1.91"
@@ -10,7 +10,7 @@ repository = "https://github.com/zecrocks/zecd"
 homepage = "https://zecd.org"
 
 [[bin]]
-name = "zecd"
+name = "rose"
 path = "src/main.rs"
 # The binary is the full product: HTTP servers + CLI. Library consumers can instead build with
 # `default-features = false` (the embeddable node + the CLI cores, no axum/clap).
@@ -47,7 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # base64/hmac/sha2/ripemd are held at the versions the rest of the tree already compiles
 # (`age` and `zcash_client_backend` on base64 0.22, the whole librustzcash stack on the
 # RustCrypto 0.10/0.12 generation). Newer majors exist - base64 0.23, hmac 0.13, sha2 0.11,
-# ripemd 0.2 - but taking them here would compile a second copy of each for zecd's own two
+# ripemd 0.2 - but taking them here would compile a second copy of each for rose's own two
 # call sites without changing any behaviour, so they stay in lockstep instead.
 base64 = "0.22"
 subtle = "2"
@@ -62,7 +62,7 @@ ripemd = { version = "0.1", optional = true }
 # tree via the zcash crates; matches zallet's pin.
 secp256k1 = { version = "0.29", features = ["recovery"], optional = true }
 # rand 0.10 is the generation the Zakura Common stack speaks (`WalletDb`'s RNG parameter and
-# the transaction `Builder` take a `rand_core 0.10` RNG), so zecd's own RNG use follows it.
+# the transaction `Builder` take a `rand_core 0.10` RNG), so rose's own RNG use follows it.
 # `thread_rng` implies `std`/`std_rng`/`sys_rng`; `rand::rngs::SysRng` (the OS RNG) is what the
 # wallet database is opened with.
 rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
@@ -73,7 +73,7 @@ hex = "0.4"
 # i18n-embed-fl 0.10, which carries the deterministic-argument-order fix that the vendored
 # 0.9.4 used to backport for the reproducible Docker builds. It also adds the age v2 hybrid
 # recipient types, so hpke/ml-kem/p256/sha3 arrive as non-optional transitive dependencies;
-# the x25519 and scrypt formats zecd writes are unchanged, so existing `keys.toml` files
+# the x25519 and scrypt formats rose writes are unchanged, so existing `keys.toml` files
 # decrypt exactly as before.
 age = { version = "0.12", features = ["armor"] }
 bip0039 = { version = "0.14", features = ["std", "all-languages"] }
@@ -105,7 +105,7 @@ hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 # so the SOCKS connector needs only this, not all of `tower` (which stays a dev-dependency).
 tokio-socks = "0.5"
 tower-service = "0.3"
-# rusqlite 0.37 is `zcash_client_sqlite`'s own requirement; zecd opens connections to the
+# rusqlite 0.37 is `zcash_client_sqlite`'s own requirement; rose opens connections to the
 # same database, so the two must be the same crate version, not merely compatible ones.
 # `bundled` compiles SQLite in: the Zcash wallet crate asks for it anyway, and a Bitcoin-only
 # static build has no system libsqlite3 to link against.
@@ -155,7 +155,7 @@ zcash_address = { package = "zakura-address", version = "2.2", optional = true }
 # 0.5 exists but taking it would add a second copy for one call site.
 zcash_encoding = { version = "0.4", optional = true }
 # `transparent-inputs` lets transparent receivers surface in getrawtransaction/getaddressinfo
-# and the received-by-address read paths; zecd's own wallets never expose transparent receivers.
+# and the received-by-address read paths; rose's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the
 # build/prove/store seam that lets the proving step take a cached Orchard proving key.
 zcash_client_backend = { package = "zakura-client-backend", version = "0.1.0-rc7", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "pczt"], optional = true }
@@ -180,7 +180,7 @@ pczt = { package = "zakura-pczt", version = "0.1.0-rc4", default-features = fals
 zip32 = { version = "0.2", optional = true }
 zip321 = { package = "zakura-zip321", version = "2.2", optional = true }
 libc = "0.2.186"
-# Single-instance guard: an advisory exclusive lock on `<datadir>/.lock` so two zecd processes
+# Single-instance guard: an advisory exclusive lock on `<datadir>/.lock` so two rose processes
 # can't operate on the same data directory at once (mirrors zallet / zcashd). Linux only needs
 # libc (already in-tree); windows-sys is pulled in transitively on Windows.
 fmutex = "0.3"
@@ -189,12 +189,12 @@ fmutex = "0.3"
 # re-exports `bitcoin`, `miniscript` and `bdk_chain`, so the whole engine surface arrives
 # through this dependency and its types stay confined to `src/btc/` (the engine-boundary rule
 # below). Deliberately WITHOUT bdk's `rusqlite` persistence feature: `bdk_chain` pins
-# `rusqlite ^0.31`, whose `libsqlite3-sys` conflicts with zecd's `rusqlite 0.37` (`links =
+# `rusqlite ^0.31`, whose `libsqlite3-sys` conflicts with rose's `rusqlite 0.37` (`links =
 # "sqlite3"` - only one version may exist in a build graph), so `src/btc/store.rs` implements
-# `WalletPersister` over zecd's own rusqlite instead.
+# `WalletPersister` over rose's own rusqlite instead.
 bdk_wallet = { version = "3.1", optional = true }
 # The `rand_core` generation BDK's `CoinSelectionAlgorithm::coin_select` bounds its RNG on
-# (0.6). zecd's own RNG use is on `rand` 0.10, whose `RngCore` is a different trait, so the
+# (0.6). rose's own RNG use is on `rand` 0.10, whose `RngCore` is a different trait, so the
 # ancestor-aware selector names BDK's directly.
 rand_core = { version = "0.6", optional = true }
 # The BDK engine's bitcoind chain source: a checkpoint-anchored block/mempool emitter over
@@ -252,11 +252,11 @@ cli = ["dep:clap", "dep:tracing-subscriber"]
 # tonic/lightwalletd transport used to be the cautionary precedent for that rule (its types
 # had reached `BackendConfig`, so it could not be gated); it now rides the `zcash` gate, and
 # the TLS value types it left on the shared config (`backend::TlsRoots`, `CertFingerprint`,
-# `TlsOptions`) are zecd-owned and stay in the ungated half of `backend.rs`.
+# `TlsOptions`) are rose-owned and stay in the ungated half of `backend.rs`.
 #
 # The librustzcash-backed Zcash wallet engine: `wallet/`, `sync/`, `chain/` (zebra JSON-RPC and
 # lightwalletd gRPC upstreams), `fleet`, the `z_*` RPCs, `node::Node::send`. On by default. A
-# build without it is a bitcoin-only zecd and carries no Zcash crate at all - the `features`
+# build without it is a bitcoin-only rose and carries no Zcash crate at all - the `features`
 # CI job asserts that with `cargo tree`.
 zcash = [
     "dep:orchard",
@@ -285,7 +285,7 @@ zcash = [
 # The BDK-backed Bitcoin wallet engine (`src/btc/`), off by default: a default build is
 # byte-identical to a pre-BDK one and `coin = "bitcoin"` in a config is refused at resolve
 # ("this build supports: zcash"). Alone (`--no-default-features --features bitcoin,server,cli`)
-# it is the bitcoin-only zecd.
+# it is the bitcoin-only rose.
 bitcoin = ["dep:bdk_wallet", "dep:bdk_bitcoind_rpc", "dep:bdk_kyoto", "dep:rand_core", "dep:hyper-rustls", "dep:tokio-tungstenite"]
 # Use mimalloc as the global allocator. Off by default; the musl release images opt in.
 mimalloc = ["dep:mimalloc"]
@@ -299,13 +299,13 @@ mimalloc-secure = ["mimalloc", "mimalloc/secure"]
 # published ironwood librustzcash line exposes the ironwood APIs unconditionally).
 # Activation is purely consensus-height driven via `is_nu_active(NetworkUpgrade::Nu6_3, ...)`: LIVE
 # on mainnet at height 3_428_143 and on testnet at 4_134_000 (both carried by `zcash_protocol`), and
-# opt-in on regtest via the `ZECD_REGTEST_NU63_HEIGHT` env var, which CI sets to 8 for the whole
+# opt-in on regtest via the `ROSE_REGTEST_NU63_HEIGHT` env var, which CI sets to 8 for the whole
 # regtest tier - so every regtest flow runs NU6.3-active, matching the public networks (the one
 # deliberate exception is `tests/embedded_regtest.rs`, whose chain stays pre-NU6.3). So ironwood
 # is "always built, live on both public networks" with no build flag - a mainnet send past
 # 3_428_143 is an ironwood send. NU7 follows the same model: compiled unconditionally (the 2.x
 # family dropped upstream's `zcash_unstable = "nu7"` cfg gate), activated by height - testnet
-# 4_465_026, mainnet unscheduled - and opt-in on regtest via `ZECD_REGTEST_NU7_HEIGHT`, which
+# 4_465_026, mainnet unscheduled - and opt-in on regtest via `ROSE_REGTEST_NU7_HEIGHT`, which
 # the regtest tier leaves unset. Every dependency here is a crates.io release and there are no
 # git pins or `[patch.crates-io]` entries, but not every one is a *stable* release: the Zakura
 # wallet layer (`zakura-client-backend`/`zakura-client-sqlite` 0.1.0-rc7, `zakura-pczt`
@@ -338,7 +338,7 @@ tower = { version = "0.5", features = ["util"] }
 # existed only because the wallet crates had no ironwood release yet. The
 # shardtree/incrementalmerkletree git pins went with it: this line depends on published
 # `shardtree 0.7` / `incrementalmerkletree 0.8.2`, which carry the explicit-checkpoint-retention
-# APIs and the `clear_flags` checkpoint-pruning panic fix the old pins existed for. Zecd carries
+# APIs and the `clear_flags` checkpoint-pruning panic fix the old pins existed for. Rose carries
 # **no fork of its own, no git pins, and no prerelease requirements beyond the `zakura-*`
 # wallet layer's own `-rc` version numbers**.
 #
@@ -363,15 +363,15 @@ tower = { version = "0.5", features = ["util"] }
 #   re-decrypted the just-stored transaction - is gone. If a future bump ever regresses the
 #   extractor, the symptom is a missing memo on an ironwood send's own outputs on the authoring
 #   node, and only the regtest ironwood tier can see it.
-# - **Pool migration is most of what the 0.22.0 sqlite line added, and zecd does not use it.** The
+# - **Pool migration is most of what the 0.22.0 sqlite line added, and rose does not use it.** The
 #   migration history/cancel/finalize APIs, a `MigrationUuid` identity, two migration views, and
 #   schema migrations reworking those tables (txid to BLOB, uuid + committed_height columns) - all
-#   over tables zecd never writes, so they run empty. Two changes do touch paths zecd is on.
+#   over tables rose never writes, so they run empty. Two changes do touch paths rose is on.
 #   `WalletWrite::store_transactions_to_be_sent` - the fully-transparent t-to-t send path's store
 #   call - upserts each transaction's sent-output records rather than failing on a transaction the
 #   wallet already recorded, and classifies each stored transaction against ZIP 318 at store time
 #   instead of waiting for it to mine; both are strictly more forgiving.
-# - **What the finals added over the last RCs**, none of it requiring a zecd source change.
+# - **What the finals added over the last RCs**, none of it requiring a rose source change.
 #   `Proposal::check_transaction_size` estimates a step's serialized size from its inputs, outputs
 #   and change and rejects a proposal that could not fit in a block (`MAX_BLOCK_BYTES`), as a new
 #   `ProposalError` variant; every `propose_*` call and every build entry point
@@ -381,10 +381,10 @@ tower = { version = "0.5", features = ["util"] }
 #   `z_shieldcoinbase` and an `ANY_TADDR` shield. The size constants behind the estimate are what
 #   `zcash_primitives 0.30.1` publishes.
 #   A new `standalone_address` schema migration relaxes the `addresses` constraint to admit
-#   upstream's new bare-address import (`transparent-key-import`, which zecd does not enable);
+#   upstream's new bare-address import (`transparent-key-import`, which rose does not enable);
 #   it rebuilds the `addresses` table, so an existing wallet database is migrated in place.
 #   Transparent P2SH inputs whose size the wallet has not been told now estimate as
-#   `InputSize::Unknown` (the consensus maximum) rather than being guessed at P2PKH size; zecd
+#   `InputSize::Unknown` (the consensus maximum) rather than being guessed at P2PKH size; rose
 #   spends only P2PKH, so this is inert here.
 # - **`orchard` 0.15.4 speeds up batched trial decryption**, which is how the compact-block scan
 #   decrypts every block's outputs: GLV endomorphism setup is now shared across a whole batch

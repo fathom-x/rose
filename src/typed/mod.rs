@@ -12,7 +12,7 @@
 //! literal on that line, and each method name appears in exactly one wrapper.
 //!
 //! Amounts are [`crate::amount::Amount`]/[`crate::amount::SignedAmount`] - exact zatoshi
-//! values that never round-trip through `f64`. Both carry base units and every coin zecd can
+//! values that never round-trip through `f64`. Both carry base units and every coin rose can
 //! serve uses the same 10^8 scale, so the zatoshi-flavoured accessors have coin-neutral
 //! aliases (`from_base_units`/`base_units`). Txids and block hashes are display-order hex
 //! `String`s (a `Txid` newtype is future work). Heights are `u32`.
@@ -29,8 +29,8 @@ use crate::error::RpcError;
 use crate::node::Node;
 
 /// Error from a typed call: the server-side [`RpcError`] (exactly what the wire returns), or
-/// a client-side decode failure - which means zecd's response shape and the typed struct
-/// disagree, i.e. a zecd bug worth reporting, never a user error.
+/// a client-side decode failure - which means rose's response shape and the typed struct
+/// disagree, i.e. a rose bug worth reporting, never a user error.
 #[derive(Debug)]
 pub enum ClientError {
     Rpc(RpcError),
@@ -46,7 +46,7 @@ impl std::fmt::Display for ClientError {
             ClientError::Rpc(e) => write!(f, "RPC error {}: {}", e.code, e.message),
             ClientError::Decode { method, source } => write!(
                 f,
-                "decoding the {method} response failed (zecd's response shape and the typed \
+                "decoding the {method} response failed (rose's response shape and the typed \
                  struct disagree - please report this): {source}"
             ),
         }
@@ -186,7 +186,7 @@ mod tests {
 
         assert!(c.uptime().await.is_ok());
         assert!(c.ping().await.is_ok());
-        assert!(c.help(None).await.unwrap().contains("zecd"));
+        assert!(c.help(None).await.unwrap().contains("rose"));
         assert!(c.get_rpc_info().await.unwrap().logpath.is_empty());
         let info = c.get_network_info().await.unwrap();
         assert_eq!(info.relayfee.zatoshis(), 1000);

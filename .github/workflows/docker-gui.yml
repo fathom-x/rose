@@ -1,15 +1,15 @@
 name: Docker GUI
 
-# Builds, smoke-tests, and publishes the wallet dashboard image (scripts/zecd-gui) to GHCR,
+# Builds, smoke-tests, and publishes the wallet dashboard image (scripts/rose-gui) to GHCR,
 # standalone.
 #
-# It is deliberately separate from release.yml AND from docker.yml (the zecd binary images): the
+# It is deliberately separate from release.yml AND from docker.yml (the rose binary images): the
 # GUI is a pure-stdlib Python image over python:3.12-slim (nothing to compile), so it builds in
 # seconds, whereas both of those run the slow reproducible StageX/musl builds. Keeping the GUI
 # here means a GUI or README edit smoke-tests just this image, and never triggers those binary
 # builds - and you can publish just the GUI without dragging a whole release along.
 #
-# On a pull request touching scripts/zecd-gui/** the `smoke` job builds the image and runs it
+# On a pull request touching scripts/rose-gui/** the `smoke` job builds the image and runs it
 # (--help) as the PR-time proof that it still works; it does not push. Publishing is three ways:
 #   * a `gui-v*` tag (e.g. `gui-v0.0.0-test`) - the GUI-only route. release.yml listens on `v*`,
 #     which does NOT match `gui-v*`, so this publishes just the GUI and nothing else. Tag-driven
@@ -20,7 +20,7 @@ name: Docker GUI
 #   * workflow_dispatch (with a version input) - the on-demand route once this file is on the
 #     default branch, which is where GitHub requires a workflow to be for the Run workflow button.
 #
-# The image name is `${{ github.repository }}-gui` - the main zecd image's name
+# The image name is `${{ github.repository }}-gui` - the main rose image's name
 # (ghcr.io/${{ github.repository }}) plus a `-gui` suffix - so it lands under whichever repo the
 # workflow runs in: ghcr.io/fathom-x/rose-gui here, ghcr.io/zecrocks/zecd-gui on the
 # public release tree. One buildx job produces a multi-arch (amd64+arm64) image; emulation costs
@@ -29,14 +29,14 @@ name: Docker GUI
 on:
   push:
     # Tags only (no branches/paths): a `paths` filter here would also gate tag pushes, and a tag
-    # whose commit didn't touch scripts/zecd-gui/** would then fail to publish. Branch-push and
+    # whose commit didn't touch scripts/rose-gui/** would then fail to publish. Branch-push and
     # PR smoke-testing rides the pull_request trigger below instead.
     tags:
       - "v*"        # real releases (also triggers release.yml)
       - "gui-v*"    # GUI-only publish (release.yml does NOT match this)
   pull_request:
     paths:
-      - "scripts/zecd-gui/**"
+      - "scripts/rose-gui/**"
       - ".github/workflows/docker-gui.yml"
   workflow_dispatch:
     inputs:
@@ -66,10 +66,10 @@ jobs:
           persist-credentials: false
 
       - name: Build the GUI image
-        run: docker build -t zecd-gui scripts/zecd-gui
+        run: docker build -t rose-gui scripts/rose-gui
 
       - name: Run the GUI container
-        run: docker run --rm zecd-gui --help
+        run: docker run --rm rose-gui --help
 
   # Resolve the version once so tag pushes and manual dispatch share one source of truth,
   # mirroring release.yml's setup job. Publish path only (tag push / dispatch), never on a PR.
@@ -121,7 +121,7 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
-          context: scripts/zecd-gui
+          context: scripts/rose-gui
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

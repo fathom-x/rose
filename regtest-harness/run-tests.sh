@@ -2,14 +2,14 @@
 #
 # Drive the regtest harness test binaries, up to $REGTEST_JOBS of them at a time.
 #
-# Why this exists: every harness test binary brings up its own zebrad (+ lightwalletd, + zecd)
+# Why this exists: every harness test binary brings up its own zebrad (+ lightwalletd, + rose)
 # stack, and much of its wall clock is spent waiting on that stack - mining blocks, polling for a
 # sync to catch up, waiting out a confirmation. Run one at a time the tier's binaries (24 of them
 # when this was written; 22 today) took over twenty minutes. They are fully independent (tempdir datadirs, no shared fixture), so the only
 # thing that stopped them overlapping was the runner having two cores.
 #
 # NB the "mostly idle" half of that premise no longer holds: since NU6.3 went live on the regtest
-# chain and the funder became a zecd, a funded binary runs *two* proving daemons, so the tier is
+# chain and the funder became a rose, a funded binary runs *two* proving daemons, so the tier is
 # bounded by total CPU work over available cores rather than by slot count. Raising REGTEST_JOBS
 # without more cores buys nothing (measured: 6 -> 8 slots on the zebra leg moved elapsed 524s ->
 # 521s while every binary inflated 22-38%), and splitting a slow binary costs a whole extra chain
@@ -21,7 +21,7 @@
 # where almost every binary holds exactly one test. So we build once with `--no-run`, ask cargo for
 # the compiled binary paths, and run those ourselves.
 #
-# Each binary gets a disjoint slice of the loopback port range (ZECD_REGTEST_PORT_LO/_SPAN, see
+# Each binary gets a disjoint slice of the loopback port range (ROSE_REGTEST_PORT_LO/_SPAN, see
 # `pick_port`) so concurrent stacks can't race for the same port, and its own node-log file. Output
 # is captured per binary and replayed in collapsed groups at the end, so interleaved stacks stay
 # readable; a summary table of per-binary wall clock is printed last (that table is how the
@@ -32,7 +32,7 @@
 #   REGTEST_JOBS          how many binaries to run at once (default 1 - the old serial behaviour)
 #   REGTEST_TEST_THREADS  threads within each binary (default 1); see the note on it below
 #   REGTEST_LOG_DIR       where per-binary logs land (default $RUNNER_TEMP/regtest-logs, else ./regtest-logs)
-# Everything else (ZECD_BIN, ZEBRAD_BIN, ...) is inherited by each binary unchanged.
+# Everything else (ROSE_BIN, ZEBRAD_BIN, ...) is inherited by each binary unchanged.
 
 set -uo pipefail
 
@@ -119,8 +119,8 @@ for entry in "${binaries[@]}"; do
   done
 
   started["$name"]=$SECONDS
-  ZECD_REGTEST_PORT_LO=$(( 20000 + idx * span )) \
-  ZECD_REGTEST_PORT_SPAN="$span" \
+  ROSE_REGTEST_PORT_LO=$(( 20000 + idx * span )) \
+  ROSE_REGTEST_PORT_SPAN="$span" \
   ZEBRAD_STDERR="$logdir/$name.node.log" \
     "$exe" --nocapture --test-threads="$test_threads" >"$logdir/$name.log" 2>&1 &
   pid_name[$!]="$name"

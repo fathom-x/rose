@@ -1,9 +1,9 @@
-//! `zecd` - a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash.
+//! `rose` - a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash.
 
 use clap::Parser;
 
-use zecd::config::{AppConfig, Cli, Command, ConfigCommand};
-use zecd::daemon;
+use rose::config::{AppConfig, Cli, Command, ConfigCommand};
+use rose::daemon;
 
 // musl's default allocator contends under Orchard proving's multi-threaded allocation churn
 // (~80x more futex syscalls than mimalloc) - costing ~10% per send on bare metal, several× in
@@ -23,21 +23,21 @@ async fn main() -> anyhow::Result<()> {
     // `rpcauth` is a pure credential generator - it needs no datadir, config file, or wallet,
     // so handle it before resolving config (which can refuse e.g. a placeholder mainnet setup).
     if let Some(Command::Rpcauth(args)) = &cli.command {
-        return zecd::server::auth::run_rpcauth(args);
+        return rose::server::auth::run_rpcauth(args);
     }
 
     // `example-config` likewise: it emits a *starting* config, so it must work when there is no
     // config yet - resolving one first would reject the very situation the command exists for
-    // (no `zecd.toml`, or one whose placeholders `resolve` refuses on mainnet).
+    // (no `rose.toml`, or one whose placeholders `resolve` refuses on mainnet).
     if let Some(Command::ExampleConfig(args)) = &cli.command {
-        return zecd::example_config::run(args);
+        return rose::example_config::run(args);
     }
 
     // `licenses` prints text embedded at compile time. Like the two above it needs no config,
     // datadir or wallet - and the container images are `FROM scratch`, so this is the only way
     // to read the notices from inside one.
     if let Some(Command::Licenses) = &cli.command {
-        return zecd::licenses::run();
+        return rose::licenses::run();
     }
 
     // The `config` subcommands report on the configuration - including one `resolve` rejects,
@@ -45,10 +45,10 @@ async fn main() -> anyhow::Result<()> {
     // tracing (their output is the command's product; log lines would interleave with it).
     match &cli.command {
         Some(Command::Config(ConfigCommand::Check(args))) => {
-            return zecd::config_check::run(&cli, args)
+            return rose::config_check::run(&cli, args)
         }
         Some(Command::Config(ConfigCommand::Show(args))) => {
-            return zecd::config_show::run(&cli, args)
+            return rose::config_show::run(&cli, args)
         }
         _ => {}
     }
@@ -56,28 +56,28 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::resolve(&cli)?;
     daemon::init_tracing(&config.log);
     // Disable core dumps + ptrace before any seed is decrypted (best-effort; see hardening).
-    zecd::hardening::harden_process();
+    rose::hardening::harden_process();
 
     match &cli.command {
-        Some(Command::Init(args)) => zecd::init::run(&config, args).await,
-        Some(Command::ExportUfvk(args)) => zecd::init::export_ufvk(&config, args),
-        Some(Command::ExportXpub(args)) => zecd::init::export_xpub(&config, args),
+        Some(Command::Init(args)) => rose::init::run(&config, args).await,
+        Some(Command::ExportUfvk(args)) => rose::init::export_ufvk(&config, args),
+        Some(Command::ExportXpub(args)) => rose::init::export_xpub(&config, args),
         // `derive-address` and `chain info` are the Zcash engine's (offline address derivation,
         // a lightwalletd/zebra probe). They stay in the subcommand list in every build - so
-        // `zecd --help` names one surface - and refuse at runtime where the engine is absent,
+        // `rose --help` names one surface - and refuse at runtime where the engine is absent,
         // the way `export-xpub` refuses a Zcash wallet.
         Some(Command::DeriveAddress(args)) => derive_address(&config, args),
-        Some(Command::Rescan(args)) => zecd::init::rescan(&config, args).await,
+        Some(Command::Rescan(args)) => rose::init::rescan(&config, args).await,
         #[cfg(feature = "zcash")]
-        Some(Command::ChainInfo(args)) => zecd::chain_probe::run(&config, args).await,
+        Some(Command::ChainInfo(args)) => rose::chain_probe::run(&config, args).await,
         #[cfg(not(feature = "zcash"))]
         Some(Command::ChainInfo(_)) => Err(unsupported_without_zcash("chain-info")),
-        // The daemon, with `run`'s boot-time options; a bare `zecd` is `zecd run` with none.
+        // The daemon, with `run`'s boot-time options; a bare `rose` is `rose run` with none.
         // SIGHUP re-resolves through exactly the path the daemon started with, so a reload
         // sees what a restart would - the same file, the same CLI overrides, the same
         // defaults.
         Some(Command::Run(args)) => {
-            let restore = zecd::init::restore_if_empty_from_args(&config, args)?;
+            let restore = rose::init::restore_if_empty_from_args(&config, args)?;
             let cli_for_reload = cli.clone();
             daemon::run_with_reload(
                 config,
@@ -109,16 +109,16 @@ async fn main() -> anyhow::Result<()> {
 /// `derive-address` answers from the engine the wallet's coin names: BIP 84 for a Bitcoin
 /// wallet (`btc::derive`), Unified/transparent addresses for a Zcash one.
 fn derive_address(
-    config: &zecd::config::AppConfig,
-    args: &zecd::config::DeriveAddressArgs,
+    config: &rose::config::AppConfig,
+    args: &rose::config::DeriveAddressArgs,
 ) -> anyhow::Result<()> {
     #[cfg(feature = "bitcoin")]
-    if zecd::btc::derive::serves(config, args.wallet.as_deref()) {
-        return zecd::btc::derive::run(config, args);
+    if rose::btc::derive::serves(config, args.wallet.as_deref()) {
+        return rose::btc::derive::run(config, args);
     }
     #[cfg(feature = "zcash")]
     {
-        zecd::derive_address::run(config, args)
+        rose::derive_address::run(config, args)
     }
     #[cfg(not(feature = "zcash"))]
     {
@@ -132,8 +132,8 @@ fn derive_address(
 #[cfg(not(feature = "zcash"))]
 fn unsupported_without_zcash(command: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "`zecd {command}` needs the Zcash engine, which this build does not carry (this build \
+        "`rose {command}` needs the Zcash engine, which this build does not carry (this build \
          supports: {})",
-        zecd::coin::Coin::supported_names()
+        rose::coin::Coin::supported_names()
     )
 }

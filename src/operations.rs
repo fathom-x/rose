@@ -1,7 +1,7 @@
 //! In-memory registry of asynchronous RPC operations (zcashd-style `z_*` async ops),
 //! scoped to the send-many flow.
 //!
-//! Ported from Zallet's `asyncop.rs`, adapted to zecd's [`RpcError`], `std::sync::Mutex`
+//! Ported from Zallet's `asyncop.rs`, adapted to rose's [`RpcError`], `std::sync::Mutex`
 //! (every critical section is a short, non-`.await` map/struct update, mirroring
 //! [`crate::state::ActiveCommands`]), and `tokio::spawn`. Operations are transient and held
 //! only in memory - like zcashd's - so they are lost on restart. A send that was already
@@ -10,7 +10,7 @@
 //!
 //! Each operation is tagged with the owning wallet, so the tracking RPCs
 //! (`z_getoperationstatus` / `z_getoperationresult` / `z_listoperationids`) only ever observe
-//! the operations of the wallet they are called on - preserving zecd's multiwallet isolation.
+//! the operations of the wallet they are called on - preserving rose's multiwallet isolation.
 //!
 //! ## Lifecycle, reaping, and the two caps (read before changing the limits)
 //!

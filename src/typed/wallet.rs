@@ -17,7 +17,7 @@ pub struct BalancesMine {
     pub trusted: Amount,
     pub untrusted_pending: Amount,
     pub immature: Amount,
-    /// zecd extension: the mature-transparent-coinbase subset of `trusted`, spendable only
+    /// rose extension: the mature-transparent-coinbase subset of `trusted`, spendable only
     /// via `z_shieldcoinbase`.
     pub coinbase: Amount,
 }
@@ -34,7 +34,7 @@ pub struct WalletDirEntry {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WalletDir {
     pub wallets: Vec<WalletDirEntry>,
-    /// zecd extension: fleet manifests that could not be read, and so name wallets the daemon is
+    /// rose extension: fleet manifests that could not be read, and so name wallets the daemon is
     /// not serving. Empty when there are none (the handler omits the key), which is why a typed
     /// consumer that ignored this could not tell a skipped wallet from one never provisioned.
     #[serde(default)]
@@ -76,17 +76,17 @@ pub struct Balances {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Scanning {
-    /// The in-progress form: `{ duration, progress }`, plus zecd's `pending_enhancements`.
+    /// The in-progress form: `{ duration, progress }`, plus rose's `pending_enhancements`.
     /// `#[non_exhaustive]` on the variant too: it gains fields as the scan status does, and a
     /// pattern listing them exhaustively would break on each one.
     #[non_exhaustive]
     Active {
         duration: u64,
         progress: f64,
-        /// zecd extension: outstanding transaction-enhancement requests. `progress` covers the
+        /// rose extension: outstanding transaction-enhancement requests. `progress` covers the
         /// block scan only, so this is what distinguishes "scanned to the tip" from "serving
         /// complete history" - memos are NULL on a scanned-but-unenhanced output. Defaulted so
-        /// a response from a zecd predating the field still decodes as the `Active` variant
+        /// a response from a rose predating the field still decodes as the `Active` variant
         /// rather than falling through to `Idle`.
         #[serde(default)]
         pending_enhancements: u64,
@@ -123,7 +123,7 @@ pub struct TransparentInitialSync {
 }
 
 /// `getwalletinfo.transparent` - the transparent receiving configuration and restore-coverage
-/// windows (zecd extension; present only when transparent receiving is enabled). There are two
+/// windows (rose extension; present only when transparent receiving is enabled). There are two
 /// of them: the lookahead follows issuance, the recovery horizon bounds a from-seed restore, and
 /// `restorable` compares them for you.
 #[non_exhaustive]
@@ -145,7 +145,7 @@ pub struct TransparentInfo {
 }
 
 /// `getwalletinfo.recovery` - what a from-seed restore of a Bitcoin wallet under its
-/// configuration would recover (zecd extension, Bitcoin wallets only;
+/// configuration would recover (rose extension, Bitcoin wallets only;
 /// `rpc/btc_methods.rs::getwalletinfo`). `horizon` is the highest external index a restore
 /// re-derives without further funding, and `restorable` is false once `getnewaddress` has
 /// issued past it: raise `[wallets.<name>] initial_scan` past `issued_through`.
@@ -177,12 +177,12 @@ pub struct WalletInfo {
     pub private_keys_enabled: bool,
     pub avoid_reuse: bool,
     pub scanning: Scanning,
-    /// zecd extension: the height through which transaction enhancement has completed, so
+    /// rose extension: the height through which transaction enhancement has completed, so
     /// memos are known present at or below it. Top-level rather than inside [`Scanning`]
     /// because that object is `false` on an idle wallet - the moment a cursor consumer is
     /// ready to advance. `None` means "not currently determinable", never "everything is
     /// enhanced": hold the cursor rather than advancing it. Optional so a response from a
-    /// zecd predating the field still decodes.
+    /// rose predating the field still decodes.
     pub enhanced_through: Option<u32>,
     pub descriptors: bool,
     /// Present only for passphrase-encrypted wallets: unix relock time, or 0 while locked.
@@ -192,7 +192,7 @@ pub struct WalletInfo {
     /// `None` here - on a wallet that does, which is the default; a consumer that reads memos
     /// checks this rather than reading empty memo fields as "no memo was attached".
     pub fetch_memos: Option<bool>,
-    /// zecd extension, present only when this wallet's import can never succeed: why. Only a
+    /// rose extension, present only when this wallet's import can never succeed: why. Only a
     /// fleet member whose viewing key the database refused has one, and without it that wallet is
     /// a healthy-looking zero balance forever.
     pub import_error: Option<String>,
@@ -216,21 +216,21 @@ pub struct AddressInfo {
     pub iswatchonly: bool,
     pub isscript: bool,
     pub iswitness: bool,
-    /// zecd extension: Orchard-receiver capability.
+    /// rose extension: Orchard-receiver capability.
     pub isvalid_orchard: bool,
-    /// zecd extension: the pools this address can receive into, canonical order.
+    /// rose extension: the pools this address can receive into, canonical order.
     pub receiver_types: Vec<String>,
-    /// Always empty (zecd keeps no labels).
+    /// Always empty (rose keeps no labels).
     pub labels: Vec<String>,
-    /// zecd extension; present only when computable for a unified address.
+    /// rose extension; present only when computable for a unified address.
     pub receivers_consistent: Option<bool>,
     /// BIP 44 path of an own transparent address (absent for a UFVK watch-only account,
     /// which records no ZIP 32 derivation).
     pub hdkeypath: Option<String>,
     pub ischange: Option<bool>,
-    /// zecd extension: the bare BIP 44 child index (what `z_getaddressforaccount` takes).
+    /// rose extension: the bare BIP 44 child index (what `z_getaddressforaccount` takes).
     pub address_index: Option<u32>,
-    /// zecd extension: the ZIP 32 diversifier index of any own address, shielded or
+    /// rose extension: the ZIP 32 diversifier index of any own address, shielded or
     /// transparent - the stateless identity every encoding of one address shares, and what
     /// history entries report as `diversifier_index`. Absent for a foreign address.
     pub diversifier_index: Option<u64>,
@@ -246,15 +246,15 @@ pub struct TransactionEntry {
     /// `"send"` or `"receive"`.
     pub category: String,
     pub amount: SignedAmount,
-    /// Always empty (zecd keeps no labels).
+    /// Always empty (rose keeps no labels).
     pub label: String,
     pub vout: u32,
-    /// zecd extension: the pool this output lives in (`"transparent"` / `"sapling"` /
+    /// rose extension: the pool this output lives in (`"transparent"` / `"sapling"` /
     /// `"orchard"` / `"ironwood"`). `vout` is the index within this pool's bundle, so
     /// `(txid, pool, vout)` - not `(txid, vout)` - identifies an output. Optional so an entry
-    /// from a zecd predating the field still decodes.
+    /// from a rose predating the field still decodes.
     pub pool: Option<String>,
-    /// zecd extension: the diversifier index of the own address a *received* output landed
+    /// rose extension: the diversifier index of the own address a *received* output landed
     /// on; absent on sends. Restore-stable, and shared by every encoding of that address.
     pub diversifier_index: Option<u64>,
     /// -1 for an expired unmined transaction (it can never confirm).
@@ -295,7 +295,7 @@ pub struct ZTransactionEntry {
     pub walletconflicts: Vec<Value>,
     /// `"transparent"` / `"sapling"` / `"orchard"` / `"ironwood"`.
     pub pool: String,
-    /// zecd extension: the diversifier index of the own address a *received* output landed
+    /// rose extension: the diversifier index of the own address a *received* output landed
     /// on; absent on sends. Restore-stable, and shared by every encoding of that address.
     pub diversifier_index: Option<u64>,
     pub category: String,
@@ -373,7 +373,7 @@ pub struct GetTransaction {
 }
 
 /// One `listunspent` entry (`rpc/wallet_methods.rs::unspent_json`). Shielded notes carry
-/// synthesized `(txid, vout)` outpoints; `pool` is the zecd extension naming the pool.
+/// synthesized `(txid, vout)` outpoints; `pool` is the rose extension naming the pool.
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Unspent {
@@ -388,7 +388,7 @@ pub struct Unspent {
     pub safe: bool,
     /// `"transparent"` / `"sapling"` / `"orchard"` / `"ironwood"`.
     pub pool: String,
-    /// zecd extension: the diversifier index of the own address a *received* output landed
+    /// rose extension: the diversifier index of the own address a *received* output landed
     /// on; absent on sends. Restore-stable, and shared by every encoding of that address.
     pub diversifier_index: Option<u64>,
     /// Transparent entries only: true iff produced by a coinbase transaction.
@@ -415,7 +415,7 @@ pub struct ReceivedByAddress {
     pub confirmations: i64,
     pub label: String,
     pub txids: Vec<String>,
-    /// zecd extension, Bitcoin wallets only (`rpc/btc_methods.rs::listreceivedbyaddress`):
+    /// rose extension, Bitcoin wallets only (`rpc/btc_methods.rs::listreceivedbyaddress`):
     /// the address's external-keychain derivation index.
     #[serde(default)]
     pub address_index: Option<u32>,
@@ -453,7 +453,7 @@ pub struct Bumped {
     pub origfee: Amount,
     /// The replacement's fee.
     pub fee: Amount,
-    /// Core's warning list; always empty from zecd.
+    /// Core's warning list; always empty from rose.
     #[serde(default)]
     pub errors: Vec<String>,
 }
@@ -509,7 +509,7 @@ pub struct ZValidateAddress {
     pub isvalid: bool,
     /// Present only when valid.
     pub address: Option<String>,
-    /// zcashd's kind token: `p2pkh`, `p2sh`, `sapling`, `unified`, or zecd's `tex`.
+    /// zcashd's kind token: `p2pkh`, `p2sh`, `sapling`, `unified`, or rose's `tex`.
     pub address_type: Option<String>,
     /// Whether the routed wallet owns this address.
     pub ismine: Option<bool>,
@@ -631,20 +631,20 @@ pub struct ZRecipient {
 }
 
 /// Optional trailing arguments of `sendtoaddress` (the useful subset: the metadata comments
-/// and zecd's trailing `memo` extension; the money-semantics parameters Bitcoin Core defines
-/// there are rejected by zecd and so not offered).
+/// and rose's trailing `memo` extension; the money-semantics parameters Bitcoin Core defines
+/// there are rejected by rose and so not offered).
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct SendToAddressOptions {
     pub comment: Option<String>,
     pub comment_to: Option<String>,
-    /// Hex-encoded ZIP-302 memo for a shielded recipient (zecd extension, wire param 11).
+    /// Hex-encoded ZIP-302 memo for a shielded recipient (rose extension, wire param 11).
     pub memo: Option<String>,
 }
 
 impl Client<'_> {
     /// `getnewaddress ( "" address_type )`: issue the next receiving address. The label must
-    /// stay empty (zecd keeps no labels - a non-empty one is -8), so only the type is exposed:
+    /// stay empty (rose keeps no labels - a non-empty one is -8), so only the type is exposed:
     /// `unified`, `transparent`, `orchard`, `sapling,orchard`, ... (`None` = wallet default).
     pub async fn get_new_address(&self, address_type: Option<&str>) -> Result<String, ClientError> {
         let params = Self::positional(vec![
@@ -681,7 +681,7 @@ impl Client<'_> {
         self.call_typed("getbalance", params).await
     }
 
-    /// `getbalances`: the modern balance triple (+ zecd's `coinbase` subset).
+    /// `getbalances`: the modern balance triple (+ rose's `coinbase` subset).
     pub async fn get_balances(&self) -> Result<Balances, ClientError> {
         self.call_typed("getbalances", vec![]).await
     }
@@ -718,7 +718,7 @@ impl Client<'_> {
     }
 
     /// `z_listtransactions ( count from includeWatchonly start_height end_height )`: per-output
-    /// history in zcashd's vocabulary (zecd extension method).
+    /// history in zcashd's vocabulary (rose extension method).
     ///
     /// The height range is the incremental cursor: `start_height` is inclusive, `end_height`
     /// exclusive, and an upper bound excludes unmined transactions (they have no height to
@@ -842,9 +842,9 @@ impl Client<'_> {
     /// `createwallet "name" ... {"ufvk": ..., "birthday": ...}`: onboard a view wallet into the
     /// fleet without restarting the daemon (`rpc/control.rs::createwallet`).
     ///
-    /// zecd's arguments ride in Bitcoin Core's options object (param 8), and Core's leading
+    /// rose's arguments ride in Bitcoin Core's options object (param 8), and Core's leading
     /// positional flags are left at their defaults - a fleet wallet is watch-only by definition,
-    /// which is the only shape zecd's `createwallet` accepts.
+    /// which is the only shape rose's `createwallet` accepts.
     pub async fn create_wallet(
         &self,
         name: &str,
@@ -875,7 +875,7 @@ impl Client<'_> {
     /// (`rpc/wallet_methods.rs::unloadwallet`).
     ///
     /// The reply's `warning` says what the call did *not* do: the account stays in its shard and
-    /// is still scanned. Core's `load_on_startup` is deliberately not exposed here - zecd accepts
+    /// is still scanned. Core's `load_on_startup` is deliberately not exposed here - rose accepts
     /// only the value it can honor (`true`), so there is nothing for a typed caller to choose.
     pub async fn unload_wallet(&self, name: &str) -> Result<WalletLoaded, ClientError> {
         self.call_typed("unloadwallet", vec![json!(name)]).await

@@ -1,7 +1,7 @@
 //! [`Password`] - a string-shaped secret whose `Debug` never prints the value.
 //!
-//! Every password zecd holds is configuration: the `[rpc]` credential clients authenticate
-//! with, and the `[zebra]` credential zecd authenticates to zebrad with. Both are
+//! Every password rose holds is configuration: the `[rpc]` credential clients authenticate
+//! with, and the `[zebra]` credential rose authenticates to zebrad with. Both are
 //! spend-equivalent (the first lets a client send; the second is only as sensitive as the
 //! local node, but it is still a credential), and both ride on types that derive `Debug` and
 //! flow through the config resolver, the connection key and the CLI. A bare `String` there is

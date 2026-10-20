@@ -57,7 +57,7 @@ pub struct WalletStore {
     pub birthday_time: Option<u64>,
     seed_ciphertext: Option<String>,
     /// True when the mnemonic is passphrase-encrypted (age scrypt) rather than wrapped to the
-    /// age identity file. This is zecd's analog of Bitcoin Core's `HasEncryptionKeys()`.
+    /// age identity file. This is rose's analog of Bitcoin Core's `HasEncryptionKeys()`.
     encrypted: bool,
     /// The account's pinned Unified Full Viewing Key (network-scoped encoding). `init` records
     /// it and the daemon verifies the wallet database's account against it at every startup
@@ -296,7 +296,7 @@ impl WalletStore {
 
     /// Rewrite the recorded birthday - the height, plus the date kept for a deferred
     /// resolution (or `None` to clear one) - leaving every other field as it is. This is
-    /// `zecd rescan --birthday`'s write: the file's birthday is where the next rebuild
+    /// `rose rescan --birthday`'s write: the file's birthday is where the next rebuild
     /// starts, so it is the one record that has to change for a rescan from elsewhere.
     pub fn set_birthday(
         keys_path: &Path,
@@ -330,7 +330,7 @@ impl WalletStore {
 
         // `init` always records a birthday; this fallback only fires for a hand-edited
         // `keys.toml` missing the field. Default to Orchard activation (NU5) - an Orchard-only
-        // wallet (zecd's default) can hold no notes before it - rather than the older, slower
+        // wallet (rose's default) can hold no notes before it - rather than the older, slower
         // Sapling-activation default. (Receiver-aware resolution lives in `init`, which knows the
         // wallet's enabled pools; this layer does not.)
         let birthday = encoding.birthday.unwrap_or_else(|| nu5_activation(network));

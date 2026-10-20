@@ -1,6 +1,6 @@
 //! Address parsing, validation, and Orchard-receiver checks.
 //!
-//! `zecd` is Orchard-shielded-only for *receiving* (every `getnewaddress` is a Unified
+//! `rose` is Orchard-shielded-only for *receiving* (every `getnewaddress` is a Unified
 //! Address exposing only an Orchard receiver). For *sending* we accept any valid recipient
 //! address on the configured network; librustzcash's proposal machinery enforces the rest.
 
@@ -81,9 +81,9 @@ pub fn receiver_types_of(addr: &Address) -> Vec<&'static str> {
 /// reports it: `p2pkh`, `p2sh`, `sapling`, `unified`, or `tex`.
 ///
 /// The first four are zcashd's own vocabulary, and the same one `z_getaddressforaccount` takes
-/// for its receiver list - note that it calls a transparent receiver `p2pkh`, where zecd's own
+/// for its receiver list - note that it calls a transparent receiver `p2pkh`, where rose's own
 /// `receiver_types` extension says `transparent`. `tex` has no zcashd equivalent (ZIP 320
-/// postdates it) and is zecd's token.
+/// postdates it) and is rose's token.
 pub fn address_type_of(addr: &Address) -> &'static str {
     match addr {
         Address::Transparent(TransparentAddress::PublicKeyHash(_)) => "p2pkh",
@@ -95,7 +95,7 @@ pub fn address_type_of(addr: &Address) -> &'static str {
 }
 
 /// The receivers a (network-checked) address carries, named in zcashd's vocabulary rather than
-/// zecd's: `p2pkh` where [`receiver_types_of`] says `transparent`. Kept separate rather than
+/// rose's: `p2pkh` where [`receiver_types_of`] says `transparent`. Kept separate rather than
 /// translating at the call site so the two vocabularies stay visibly distinct - they belong to
 /// different fields with different audiences, and neither should drift into the other.
 pub fn zcashd_receiver_types_of(addr: &Address) -> Vec<&'static str> {
@@ -168,9 +168,9 @@ pub fn single_receiver_for_pool<P: Parameters>(params: &P, s: &str, pool: i64) -
 ///
 /// The problem it solves: which *encoding* of a diversifier index a payer used never reaches the
 /// chain, so a wallet cannot recover it. When the block scan meets a note at an index it has no
-/// `addresses` row for - every index on a from-seed restore or after `zecd rescan` -
+/// `addresses` row for - every index on a from-seed restore or after `rose rescan` -
 /// `zcash_client_sqlite`'s `ensure_address` derives one with `UnifiedAddressRequest::ALLOW_ALL`
-/// and records *that*, a UA carrying transparent, Sapling and Orchard receivers. zecd issues no
+/// and records *that*, a UA carrying transparent, Sapling and Orchard receivers. rose issues no
 /// such address: `getnewaddress` builds from `default_receivers`, and a transparent receiver is
 /// only ever handed out bare. So the recorded string depends on whether `getnewaddress` or the
 /// scanner wrote the row first, which made a restored wallet report its receipts under an
@@ -211,7 +211,7 @@ pub fn issued_encoding<P: Parameters>(
     let orchard = ua.orchard().filter(|_| keep(Receiver::Orchard)).copied();
     let sapling = ua.sapling().filter(|_| keep(Receiver::Sapling)).copied();
     // The transparent receiver is dropped unconditionally: a `ReceiverSet` is shielded-only, and
-    // zecd hands its transparent receivers out bare rather than inside a unified address.
+    // rose hands its transparent receivers out bare rather than inside a unified address.
     UnifiedAddress::from_receivers(orchard, sapling, None).map(|ua| ua.encode(params))
 }
 
@@ -220,7 +220,7 @@ pub fn issued_encoding<P: Parameters>(
 /// Orchard receiver has no standalone encoding, so it comes back as a single-receiver Unified
 /// Address - the same reduction [`single_receiver_for_pool`] applies to history.
 ///
-/// This is the operation a payment processor needs and could not previously get from zecd:
+/// This is the operation a payment processor needs and could not previously get from rose:
 /// history names each output by the receiver it paid, so matching a history entry back to a
 /// multi-receiver address the site handed out means splitting that address into exactly these
 /// strings. Pure and key-free - a receiver is a receiver whoever owns it.
@@ -502,10 +502,10 @@ mod tests {
         );
     }
 
-    /// The two receiver vocabularies must stay distinct: zecd's own `receiver_types` extension
+    /// The two receiver vocabularies must stay distinct: rose's own `receiver_types` extension
     /// says `transparent`, and zcashd's `z_validateaddress` says `p2pkh` for the same receiver.
     #[test]
-    fn zcashd_receiver_names_differ_from_zecd_s() {
+    fn zcashd_receiver_names_differ_from_rose_s() {
         let net = crate::network::ZNetwork::Test;
         let taddr = decode_on_network(&net, "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86")
             .expect("decode testnet t-addr");
@@ -625,7 +625,7 @@ mod tests {
     /// send detail's address differs from the multi-receiver UA, and it passes on an NU6.3-active
     /// chain, so `sent_notes.output_pool` is evidently still 3 for a payment to an Orchard
     /// receiver. This test guards the code path rather than a reproduced user-visible failure -
-    /// pool 4 plainly does reach zecd's display layer (`pool_name` maps it to "ironwood"), and if
+    /// pool 4 plainly does reach rose's display layer (`pool_name` maps it to "ironwood"), and if
     /// an outgoing row is ever recorded with it, silently falling back is the wrong answer.
     #[test]
     fn ironwood_reduces_to_the_orchard_receiver() {

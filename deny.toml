@@ -12,7 +12,7 @@ ignore = []
 
 [licenses]
 version = 2
-# zecd is MIT OR Apache-2.0; permit the usual permissive set for
+# rose is MIT OR Apache-2.0; permit the usual permissive set for
 # transitive deps. Tighten as needed if `cargo deny` complains.
 allow = [
     "MIT",

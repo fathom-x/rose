@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build a reproducible Debian package (.deb) for zecd from a pre-built binary.
+# Build a reproducible Debian package (.deb) for rose from a pre-built binary.
 #
 # The binary itself is expected to already be a *reproducible* artifact - in CI it is
 # extracted from the `export` stage of the StageX (amd64) / pinned-Alpine (arm64)
@@ -14,7 +14,7 @@
 # Usage:
 #   scripts/build-deb.sh <binary-path> <version> <deb-arch> <output-dir>
 #
-#   <binary-path>  path to the compiled `zecd` binary
+#   <binary-path>  path to the compiled `rose` binary
 #   <version>      package version, e.g. 0.1.0 (no leading "v")
 #   <deb-arch>     Debian architecture: amd64 | arm64
 #   <output-dir>   directory the .deb is written to (created if missing)
@@ -35,25 +35,25 @@ trap 'rm -rf "$STAGE"' EXIT
 chmod 0755 "$STAGE"   # mktemp -d is 0700; the package root (./) should be world-readable
 
 # --- Filesystem layout -----------------------------------------------------------------
-install -D -m 0755 "$BINARY_PATH"                       "$STAGE/usr/bin/zecd"
-install -D -m 0644 "$REPO_ROOT/zecd.example.toml"       "$STAGE/usr/share/doc/zecd/zecd.example.toml"
-install -D -m 0644 "$REPO_ROOT/README.md"               "$STAGE/usr/share/doc/zecd/README.md"
-# Third-party license bundle - zecd is statically linked, so these notices ship with it.
-install -D -m 0644 "$REPO_ROOT/THIRD-PARTY-LICENSES.txt" "$STAGE/usr/share/doc/zecd/THIRD-PARTY-LICENSES.txt"
+install -D -m 0755 "$BINARY_PATH"                       "$STAGE/usr/bin/rose"
+install -D -m 0644 "$REPO_ROOT/rose.example.toml"       "$STAGE/usr/share/doc/rose/rose.example.toml"
+install -D -m 0644 "$REPO_ROOT/README.md"               "$STAGE/usr/share/doc/rose/README.md"
+# Third-party license bundle - rose is statically linked, so these notices ship with it.
+install -D -m 0644 "$REPO_ROOT/THIRD-PARTY-LICENSES.txt" "$STAGE/usr/share/doc/rose/THIRD-PARTY-LICENSES.txt"
 
-# systemd unit (installed, not enabled - the admin opts in with `systemctl enable zecd`).
-install -D -m 0644 /dev/stdin "$STAGE/lib/systemd/system/zecd.service" <<'UNIT'
+# systemd unit (installed, not enabled - the admin opts in with `systemctl enable rose`).
+install -D -m 0644 /dev/stdin "$STAGE/lib/systemd/system/rose.service" <<'UNIT'
 [Unit]
-Description=zecd - Bitcoin-Core-style JSON-RPC server for shielded-first Zcash
+Description=rose - Bitcoin-Core-style JSON-RPC server for shielded-first Zcash
 Documentation=https://github.com/zecrocks/zecd
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=zecd
-Group=zecd
-ExecStart=/usr/bin/zecd --datadir /var/lib/zecd
+User=rose
+Group=rose
+ExecStart=/usr/bin/rose --datadir /var/lib/rose
 Restart=on-failure
 RestartSec=5
 
@@ -63,54 +63,54 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
-ReadWritePaths=/var/lib/zecd
+ReadWritePaths=/var/lib/rose
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
 # Debian copyright file (dual MIT / Apache-2.0).
-install -D -m 0644 /dev/stdin "$STAGE/usr/share/doc/zecd/copyright" <<'COPYRIGHT'
+install -D -m 0644 /dev/stdin "$STAGE/usr/share/doc/rose/copyright" <<'COPYRIGHT'
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: zecd
+Upstream-Name: rose
 Source: https://github.com/zecrocks/zecd
 
 Files: *
-Copyright: The zecd authors
+Copyright: The rose authors
 License: MIT or Apache-2.0
- zecd is dual-licensed under the MIT and Apache-2.0 licenses. The full texts are
+ rose is dual-licensed under the MIT and Apache-2.0 licenses. The full texts are
  distributed with the source at https://github.com/zecrocks/zecd
  (LICENSE-MIT and LICENSE-APACHE). The licenses of the third-party crates compiled
  into the statically linked binary are reproduced in
- /usr/share/doc/zecd/THIRD-PARTY-LICENSES.txt.
+ /usr/share/doc/rose/THIRD-PARTY-LICENSES.txt.
 COPYRIGHT
 
 # Debian changelog (gzip -n keeps it timestamp/name free for reproducibility).
 CHANGELOG_TMP="$(mktemp)"
 cat > "$CHANGELOG_TMP" <<CHANGELOG
-zecd (${VERSION}) unstable; urgency=medium
+rose (${VERSION}) unstable; urgency=medium
 
   * Release ${VERSION}. See https://github.com/zecrocks/zecd/releases for notes.
 
- -- zecd <noreply@users.noreply.github.com>  Thu, 01 Jan 1970 00:00:00 +0000
+ -- rose <noreply@users.noreply.github.com>  Thu, 01 Jan 1970 00:00:00 +0000
 CHANGELOG
-gzip -9nc "$CHANGELOG_TMP" > "$STAGE/usr/share/doc/zecd/changelog.Debian.gz"
-chmod 0644 "$STAGE/usr/share/doc/zecd/changelog.Debian.gz"
+gzip -9nc "$CHANGELOG_TMP" > "$STAGE/usr/share/doc/rose/changelog.Debian.gz"
+chmod 0644 "$STAGE/usr/share/doc/rose/changelog.Debian.gz"
 rm -f "$CHANGELOG_TMP"
 
 # --- Control archive -------------------------------------------------------------------
 INSTALLED_SIZE="$(du -k -s "$STAGE/usr" | cut -f1)"
 install -D -m 0644 /dev/stdin "$STAGE/DEBIAN/control" <<CONTROL
-Package: zecd
+Package: rose
 Version: ${VERSION}
 Architecture: ${DEB_ARCH}
-Maintainer: zecd <noreply@users.noreply.github.com>
+Maintainer: rose <noreply@users.noreply.github.com>
 Installed-Size: ${INSTALLED_SIZE}
 Section: net
 Priority: optional
 Homepage: https://github.com/zecrocks/zecd
 Description: Bitcoin-Core-style JSON-RPC server for shielded and transparent Zcash
- zecd speaks bitcoind's JSON-RPC dialect (method names, response shapes, error
+ rose speaks bitcoind's JSON-RPC dialect (method names, response shapes, error
  codes, HTTP auth) and maps it onto shielded Zcash operations (Ironwood, Orchard
  and Sapling, plus opt-in transparent), built on librustzcash. It runs against
  a local zebrad.
@@ -123,14 +123,14 @@ install -D -m 0755 /dev/stdin "$STAGE/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
-    if ! getent group zecd >/dev/null; then
-        addgroup --system zecd
+    if ! getent group rose >/dev/null; then
+        addgroup --system rose
     fi
-    if ! getent passwd zecd >/dev/null; then
-        adduser --system --ingroup zecd --home /var/lib/zecd \
-            --no-create-home --gecos "zecd daemon" zecd
+    if ! getent passwd rose >/dev/null; then
+        adduser --system --ingroup rose --home /var/lib/rose \
+            --no-create-home --gecos "rose daemon" rose
     fi
-    install -d -o zecd -g zecd -m 0750 /var/lib/zecd
+    install -d -o rose -g rose -m 0750 /var/lib/rose
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
@@ -143,7 +143,7 @@ install -D -m 0755 /dev/stdin "$STAGE/DEBIAN/prerm" <<'PRERM'
 set -e
 if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
     if [ -d /run/systemd/system ]; then
-        systemctl stop zecd.service >/dev/null 2>&1 || true
+        systemctl stop rose.service >/dev/null 2>&1 || true
     fi
 fi
 exit 0
@@ -163,7 +163,7 @@ POSTRM
 find "$STAGE" -exec touch --no-dereference --date="@${SOURCE_DATE_EPOCH}" {} +
 
 mkdir -p "$OUTPUT_DIR"
-DEB_PATH="${OUTPUT_DIR}/zecd_${VERSION}_${DEB_ARCH}.deb"
+DEB_PATH="${OUTPUT_DIR}/rose_${VERSION}_${DEB_ARCH}.deb"
 dpkg-deb --root-owner-group --build "$STAGE" "$DEB_PATH"
 
 echo "$DEB_PATH"

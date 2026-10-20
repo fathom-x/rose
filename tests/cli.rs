@@ -1,4 +1,4 @@
-//! Black-box CLI acceptance tests: run the compiled `zecd` binary as a subprocess and
+//! Black-box CLI acceptance tests: run the compiled `rose` binary as a subprocess and
 //! assert exit codes and output, modeled on zallet's `tests/acceptance.rs`.
 //!
 //! Everything here is offline except the `#[ignore]`d init test, which follows the
@@ -6,15 +6,15 @@
 //! (`cargo test -- --include-ignored`).
 
 // The bin target declares `required-features = ["server", "cli"]`, so under a build without
-// them `CARGO_BIN_EXE_zecd` is never set and this file must vanish rather than fail to expand
+// them `CARGO_BIN_EXE_rose` is never set and this file must vanish rather than fail to expand
 // that env var.
 #![cfg(all(feature = "server", feature = "cli"))]
 
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-fn zecd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_zecd"))
+fn rose() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_rose"))
 }
 
 /// Run to completion, killing the child if it is still alive after `timeout` - a
@@ -25,14 +25,14 @@ fn zecd() -> Command {
 /// after it exits: a child writing more than the pipe buffer (~64 KiB) otherwise blocks in
 /// `write` forever, and the deadline above turns that into "did not exit within 10s" - a
 /// timeout that looks like a hung daemon but is really this harness holding the pipe shut.
-/// `zecd licenses` emits ~290 KiB and hit exactly that.
+/// `rose licenses` emits ~290 KiB and hit exactly that.
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .spawn()
-        .expect("spawning zecd");
+        .expect("spawning rose");
     let mut out_pipe = child.stdout.take().expect("piped stdout");
     let mut err_pipe = child.stderr.take().expect("piped stderr");
     let readers = (
@@ -49,7 +49,7 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     );
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait().expect("polling zecd") {
+        match child.try_wait().expect("polling rose") {
             Some(status) => break status,
             None if Instant::now() >= deadline => {
                 // Killing the child closes its ends of both pipes, so the readers see EOF and
@@ -58,7 +58,7 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
                 child.wait().ok();
                 readers.0.join().ok();
                 readers.1.join().ok();
-                panic!("zecd did not exit within {timeout:?}; expected a fast failure");
+                panic!("rose did not exit within {timeout:?}; expected a fast failure");
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
@@ -78,7 +78,7 @@ fn stderr_of(out: &Output) -> String {
 fn version_prints_name_and_semver() {
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.arg("--version");
             c
         },
@@ -87,7 +87,7 @@ fn version_prints_name_and_semver() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut words = stdout.split_whitespace();
-    assert_eq!(words.next(), Some("zecd"));
+    assert_eq!(words.next(), Some("rose"));
     let version = words.next().expect("version after name");
     assert!(
         version.split('.').count() >= 3
@@ -106,7 +106,7 @@ fn version_prints_name_and_semver() {
 fn help_lists_every_subcommand() {
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.arg("--help");
             c
         },
@@ -144,7 +144,7 @@ fn help_lists_every_subcommand() {
 fn unknown_flag_is_a_usage_error() {
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.arg("--definitely-not-a-flag");
             c
         },
@@ -159,7 +159,7 @@ fn invalid_network_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -181,10 +181,10 @@ fn invalid_network_is_rejected() {
 #[test]
 fn unknown_config_field_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("zecd.toml"), "[rpc]\nbogus_field = 1\n").unwrap();
+    std::fs::write(dir.path().join("rose.toml"), "[rpc]\nbogus_field = 1\n").unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["--datadir", dir.path().to_str().unwrap()]);
             c
         },
@@ -209,7 +209,7 @@ fn placeholder_password_refuses_to_start_on_every_network() {
             let dir = tempfile::tempdir().unwrap();
             let out = run_with_timeout(
                 {
-                    let mut c = zecd();
+                    let mut c = rose();
                     c.args([
                         "--datadir",
                         dir.path().to_str().unwrap(),
@@ -244,7 +244,7 @@ fn malformed_rpcauth_fails_startup() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -265,7 +265,7 @@ fn malformed_rpcauth_fails_startup() {
     );
 }
 
-/// `zecd rpcauth <user> [password]` generates a salted `[rpc] auth` line with no external
+/// `rose rpcauth <user> [password]` generates a salted `[rpc] auth` line with no external
 /// `rpcauth.py`. With an explicit password it emits just the line; without one it also prints
 /// the minted password. The emitted line must be a well-formed `<user>:<salt>$<64 hex>` entry.
 #[test]
@@ -281,7 +281,7 @@ fn rpcauth_generates_credential_line() {
     // Explicit password: line only, no secret printed back.
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["rpcauth", "alice", "hunter2"]);
             c
         },
@@ -304,7 +304,7 @@ fn rpcauth_generates_credential_line() {
     // No password: a secret is generated and printed alongside the line.
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["rpcauth", "bob"]);
             c
         },
@@ -326,13 +326,13 @@ fn rpcauth_generates_credential_line() {
 fn unknown_allowed_method_fails_startup() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("zecd.toml"),
+        dir.path().join("rose.toml"),
         "[rpc]\nallowed_methods = [\"getbalance\", \"not_a_real_method\"]\n",
     )
     .unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -358,13 +358,13 @@ fn unknown_allowed_method_fails_startup() {
 fn default_receivers_not_subset_of_pools_fails_startup() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("zecd.toml"),
+        dir.path().join("rose.toml"),
         "[pools]\nenabled = [\"orchard\"]\ndefault_receivers = [\"sapling\"]\n",
     )
     .unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -389,13 +389,13 @@ fn default_receivers_not_subset_of_pools_fails_startup() {
 fn unknown_pool_name_fails_startup() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("zecd.toml"),
+        dir.path().join("rose.toml"),
         "[pools]\nenabled = [\"ironwood\"]\n",
     )
     .unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -422,7 +422,7 @@ fn init_with_invalid_ufvk_fails_before_any_network_io() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -457,7 +457,7 @@ fn init_ufvk_conflicts_with_restore_and_encrypt() {
         let dir = tempfile::tempdir().unwrap();
         let out = run_with_timeout(
             {
-                let mut c = zecd();
+                let mut c = rose();
                 c.args([
                     "--datadir",
                     dir.path().to_str().unwrap(),
@@ -486,17 +486,17 @@ fn init_ufvk_conflicts_with_restore_and_encrypt() {
 // "not initialized") and one more - that the refusal is its own, not the lock guard's.
 
 /// Single-instance guard: a datadir-writing command (`init`) refuses to start when the datadir
-/// is already locked by another zecd. The test process holds the lock (standing in for a running
-/// daemon); the spawned `zecd init` must bail fast with the "already running" message - the lock
+/// is already locked by another rose. The test process holds the lock (standing in for a running
+/// daemon); the spawned `rose init` must bail fast with the "already running" message - the lock
 /// is taken before any network or filesystem work, so this is offline.
 #[test]
 fn init_refuses_when_datadir_is_already_locked() {
     let dir = tempfile::tempdir().unwrap();
-    let _held = zecd::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
+    let _held = rose::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
 
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -527,11 +527,11 @@ fn init_refuses_when_datadir_is_already_locked() {
 #[test]
 fn export_ufvk_is_not_blocked_by_the_datadir_lock() {
     let dir = tempfile::tempdir().unwrap();
-    let _held = zecd::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
+    let _held = rose::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
 
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -564,11 +564,11 @@ fn export_ufvk_is_not_blocked_by_the_datadir_lock() {
 #[test]
 fn rescan_refuses_when_datadir_is_already_locked() {
     let dir = tempfile::tempdir().unwrap();
-    let _held = zecd::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
+    let _held = rose::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
 
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -600,7 +600,7 @@ fn rescan_refuses_an_uninitialized_wallet() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -622,12 +622,12 @@ fn rescan_refuses_an_uninitialized_wallet() {
 // ---------------------------------------------------------------------------
 
 /// The default mode: emit the annotated config on stdout, byte-for-byte, with nothing else
-/// mixed in - so `zecd example-config > zecd.toml` is a usable starting config.
+/// mixed in - so `rose example-config > rose.toml` is a usable starting config.
 #[test]
 fn example_config_prints_the_annotated_config_to_stdout() {
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.arg("example-config");
             c
         },
@@ -637,7 +637,7 @@ fn example_config_prints_the_annotated_config_to_stdout() {
     let stdout = String::from_utf8(out.stdout).expect("utf-8 config");
     assert_eq!(
         stdout,
-        zecd::example_config::EXAMPLE_CONFIG,
+        rose::example_config::EXAMPLE_CONFIG,
         "stdout must be exactly the shipped example config"
     );
     assert!(stdout.contains("[backend]") && stdout.contains("# Network:"));
@@ -651,7 +651,7 @@ fn example_config_works_without_a_usable_config() {
     // No datadir at all.
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.arg("example-config");
             c
         },
@@ -659,12 +659,12 @@ fn example_config_works_without_a_usable_config() {
     );
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
 
-    // A datadir whose zecd.toml would be rejected by `resolve` (deny_unknown_fields).
+    // A datadir whose rose.toml would be rejected by `resolve` (deny_unknown_fields).
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("zecd.toml"), "[rpc]\nbogus_field = 1\n").unwrap();
+    std::fs::write(dir.path().join("rose.toml"), "[rpc]\nbogus_field = 1\n").unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["--datadir", dir.path().to_str().unwrap(), "example-config"]);
             c
         },
@@ -677,7 +677,7 @@ fn example_config_works_without_a_usable_config() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        zecd::example_config::EXAMPLE_CONFIG
+        rose::example_config::EXAMPLE_CONFIG
     );
 }
 
@@ -686,12 +686,12 @@ fn example_config_works_without_a_usable_config() {
 #[test]
 fn example_config_output_file_refuses_to_clobber_without_force() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("zecd.toml");
+    let path = dir.path().join("rose.toml");
     let path_str = path.to_str().unwrap().to_owned();
 
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["example-config", "-o", &path_str]);
             c
         },
@@ -700,7 +700,7 @@ fn example_config_output_file_refuses_to_clobber_without_force() {
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
-        zecd::example_config::EXAMPLE_CONFIG
+        rose::example_config::EXAMPLE_CONFIG
     );
     assert!(
         out.stdout.is_empty(),
@@ -711,7 +711,7 @@ fn example_config_output_file_refuses_to_clobber_without_force() {
     std::fs::write(&path, "network = \"main\"\n").unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["example-config", "-o", &path_str]);
             c
         },
@@ -731,7 +731,7 @@ fn example_config_output_file_refuses_to_clobber_without_force() {
 
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["example-config", "-o", &path_str, "--force"]);
             c
         },
@@ -740,7 +740,7 @@ fn example_config_output_file_refuses_to_clobber_without_force() {
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
-        zecd::example_config::EXAMPLE_CONFIG
+        rose::example_config::EXAMPLE_CONFIG
     );
 }
 
@@ -756,7 +756,7 @@ fn example_config_output_file_refuses_to_clobber_without_force() {
 fn licenses_prints_the_shipped_bundle_to_stdout() {
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.arg("licenses");
             c
         },
@@ -767,7 +767,7 @@ fn licenses_prints_the_shipped_bundle_to_stdout() {
     let stdout = String::from_utf8(out.stdout).expect("utf-8 licenses");
     assert_eq!(
         stdout,
-        zecd::licenses::THIRD_PARTY_LICENSES,
+        rose::licenses::THIRD_PARTY_LICENSES,
         "stdout must be exactly the shipped license bundle"
     );
     assert!(
@@ -783,10 +783,10 @@ fn licenses_prints_the_shipped_bundle_to_stdout() {
 #[test]
 fn licenses_works_without_a_usable_config_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("zecd.toml"), "[rpc]\nbogus_field = 1\n").unwrap();
+    std::fs::write(dir.path().join("rose.toml"), "[rpc]\nbogus_field = 1\n").unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["--datadir", dir.path().to_str().unwrap(), "licenses"]);
             c
         },
@@ -799,7 +799,7 @@ fn licenses_works_without_a_usable_config_and_writes_nothing() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        zecd::licenses::THIRD_PARTY_LICENSES
+        rose::licenses::THIRD_PARTY_LICENSES
     );
 
     let entries: Vec<_> = std::fs::read_dir(dir.path())
@@ -809,7 +809,7 @@ fn licenses_works_without_a_usable_config_and_writes_nothing() {
     assert_eq!(
         entries.len(),
         1,
-        "only the zecd.toml we wrote: {entries:?} - no lock file, no wallet, no cookie"
+        "only the rose.toml we wrote: {entries:?} - no lock file, no wallet, no cookie"
     );
 }
 
@@ -822,11 +822,11 @@ fn config_check(conf: &std::path::Path, extra: &[&str]) -> Output {
 }
 
 /// `config check` with extra environment - the way a deployment supplies the values a shipped
-/// sample deliberately leaves out (the RPC password, via `ZECD_RPC_PASSWORD`).
+/// sample deliberately leaves out (the RPC password, via `ROSE_RPC_PASSWORD`).
 fn config_check_env(conf: &std::path::Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
     run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["config", "check", "--conf", conf.to_str().unwrap()]);
             c.args(extra);
             for (k, v) in env {
@@ -849,13 +849,13 @@ fn stdout_of(out: &Output) -> String {
 /// across an upgrade or a rollback (every unset key takes the *binary's* default).
 ///
 /// The stream contract (`nginx -t`/`-T`): stdout is the effective configuration and *only* that,
-/// so `zecd config check > effective.txt` captures settings a later version's output can be
+/// so `rose config check > effective.txt` captures settings a later version's output can be
 /// diffed against; the verdict, the findings, and the header are diagnostics on stderr. `-q`
 /// drops the settings, leaving stdout empty - what a CI gate wants.
 #[test]
 fn config_check_puts_the_settings_on_stdout_and_the_verdict_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(
         &conf,
         format!(
@@ -881,10 +881,10 @@ fn config_check_puts_the_settings_on_stdout_and_the_verdict_on_stderr() {
     #[cfg(feature = "zcash")]
     assert!(stdout.contains("zebra-rpc 127.0.0.1:18234"), "{stdout}");
     // Every stdout line is config or comment - no diagnostic leaks in. (Line-based, so the
-    // header comment mentioning "zecd" isn't mistaken for the "zecd <version>" banner.)
+    // header comment mentioning "rose" isn't mistaken for the "rose <version>" banner.)
     for line in stdout.lines() {
         assert!(
-            !["OK:", "warning:", "error:", "config file:", "zecd "]
+            !["OK:", "warning:", "error:", "config file:", "rose "]
                 .iter()
                 .any(|d| line.starts_with(d)),
             "stdout must carry settings only, found {line:?}"
@@ -911,7 +911,7 @@ fn config_check_puts_the_settings_on_stdout_and_the_verdict_on_stderr() {
 #[test]
 fn config_check_rejects_an_unknown_key_and_names_it() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(&conf, "[rpc]\nbogus_field = 1\n").unwrap();
 
     let out = config_check(&conf, &[]);
@@ -935,7 +935,7 @@ fn config_check_refuses_an_empty_rpc_password_file() {
     let dir = tempfile::tempdir().unwrap();
     let pw = dir.path().join("rpc.pw");
     std::fs::write(&pw, "\n").unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(
         &conf,
         format!(
@@ -952,12 +952,12 @@ fn config_check_refuses_an_empty_rpc_password_file() {
     assert!(stderr.contains("password_file"), "{stderr}");
 }
 
-/// `zecd rpcauth <user> ""` would mint a line the daemon refuses, so it refuses up front.
+/// `rose rpcauth <user> ""` would mint a line the daemon refuses, so it refuses up front.
 #[test]
 fn rpcauth_refuses_an_empty_password() {
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["rpcauth", "alice", ""]);
             c
         },
@@ -978,7 +978,7 @@ fn rpcauth_refuses_an_empty_password() {
 #[test]
 fn config_check_reports_the_library_only_multi_spender_option() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
 
     // Off (and absent) resolves cleanly.
     std::fs::write(&conf, "[keys]\nallow_multiple_spending_wallets = false\n").unwrap();
@@ -996,8 +996,8 @@ fn config_check_reports_the_library_only_multi_spender_option() {
     );
     // Names who it *is* for, and what to do instead when running the daemon - without both, an
     // operator has no way to tell a rejected typo from a deliberate library option.
-    assert!(stderr.contains("embedding zecd as a library"), "{stderr}");
-    assert!(stderr.contains("one zecd per wallet"), "{stderr}");
+    assert!(stderr.contains("embedding rose as a library"), "{stderr}");
+    assert!(stderr.contains("one rose per wallet"), "{stderr}");
 }
 
 /// `[log] format` is validated at resolve: `init_tracing` treats anything that isn't "json"
@@ -1006,7 +1006,7 @@ fn config_check_reports_the_library_only_multi_spender_option() {
 #[test]
 fn config_check_rejects_an_unknown_log_format() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(&conf, "[log]\nformat = \"jsonl\"\n").unwrap();
 
     let out = config_check(&conf, &[]);
@@ -1042,7 +1042,7 @@ fn config_check_refuses_a_missing_file() {
 #[test]
 fn config_check_strict_fails_on_warnings_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     // No wallet is initialized in this datadir, which is a warning and nothing more.
     std::fs::write(
         &conf,
@@ -1069,7 +1069,7 @@ fn config_check_strict_fails_on_warnings_alone() {
 #[test]
 fn config_check_accepts_a_socks_proxy_and_reports_it() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(
         &conf,
         format!(
@@ -1100,7 +1100,7 @@ fn config_check_accepts_a_socks_proxy_and_reports_it() {
 #[test]
 fn config_check_rejects_a_malformed_proxy_and_names_the_key() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(
         &conf,
         format!(
@@ -1124,7 +1124,7 @@ fn config_check_rejects_a_malformed_proxy_and_names_the_key() {
 #[test]
 fn config_check_warns_when_a_proxy_is_pointed_at_a_loopback_upstream() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     // `server = "zebra"` resolves to 127.0.0.1, so this is the defaults-plus-proxy shape.
     std::fs::write(
         &conf,
@@ -1154,7 +1154,7 @@ fn config_check_writes_nothing_to_the_datadir() {
     let dir = tempfile::tempdir().unwrap();
     let datadir = dir.path().join("data");
     std::fs::create_dir(&datadir).unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     // No user/password, so this config authenticates by cookie.
     std::fs::write(
         &conf,
@@ -1184,7 +1184,7 @@ fn config_check_reports_a_wallet_awaiting_the_layout_migration() {
     std::fs::create_dir_all(&wallet).unwrap();
     std::fs::write(wallet.join("keys.toml"), "network = \"test\"\n").unwrap();
     std::fs::write(wallet.join("data.sqlite"), b"db").unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(
         &conf,
         format!("network = \"test\"\ndatadir = {datadir:?}\n"),
@@ -1214,8 +1214,8 @@ fn config_check_reports_a_wallet_awaiting_the_layout_migration() {
 #[test]
 fn config_check_is_not_blocked_by_the_datadir_lock() {
     let dir = tempfile::tempdir().unwrap();
-    let _held = zecd::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
-    let conf = dir.path().join("zecd.toml");
+    let _held = rose::lock::lock_datadir(dir.path()).expect("acquire the datadir lock");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(
         &conf,
         format!(
@@ -1230,18 +1230,18 @@ fn config_check_is_not_blocked_by_the_datadir_lock() {
 }
 
 /// The global flags are accepted on both sides of the subcommand, and mean the same thing
-/// either way - `zecd config check --conf FILE` is the spelling this command is reached for.
+/// either way - `rose config check --conf FILE` is the spelling this command is reached for.
 #[test]
 fn config_check_accepts_global_flags_after_the_subcommand() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(&conf, "network = \"test\"\n").unwrap();
     let conf_str = conf.to_str().unwrap().to_owned();
 
     // `--network main` after the subcommand must override the file's `network = "test"`.
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["config", "check", "--conf", &conf_str, "--network", "main"]);
             c
         },
@@ -1253,7 +1253,7 @@ fn config_check_accepts_global_flags_after_the_subcommand() {
     // ...and before it, the historical position, identically.
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["--conf", &conf_str, "--network", "main", "config", "check"]);
             c
         },
@@ -1270,7 +1270,7 @@ fn config_check_accepts_global_flags_after_the_subcommand() {
 fn config_show(conf: &std::path::Path) -> Output {
     run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args(["config", "show", "--conf", conf.to_str().unwrap()]);
             c
         },
@@ -1279,13 +1279,13 @@ fn config_show(conf: &std::path::Path) -> Output {
 }
 
 /// The end-to-end property, run through the real binary: what `config show` prints is a config
-/// zecd itself accepts, and feeding it back produces the same thing. That is what makes the
+/// rose itself accepts, and feeding it back produces the same thing. That is what makes the
 /// output safe to capture before an upgrade and diff against the new build's.
 #[cfg(feature = "zcash")]
 #[test]
-fn config_show_output_is_a_config_zecd_accepts_and_reproduces() {
+fn config_show_output_is_a_config_rose_accepts_and_reproduces() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(
         &conf,
         format!(
@@ -1311,7 +1311,7 @@ fn config_show_output_is_a_config_zecd_accepts_and_reproduces() {
     let checked = config_check(&echoed, &[]);
     assert!(
         checked.status.success(),
-        "the rendered config must be one zecd accepts; stderr: {}",
+        "the rendered config must be one rose accepts; stderr: {}",
         stderr_of(&checked)
     );
     let second = stdout_of(&config_show(&echoed));
@@ -1341,7 +1341,7 @@ fn config_show_streams_and_tolerates_a_missing_file() {
 #[test]
 fn config_show_redacts_credentials() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     std::fs::write(
         &conf,
         format!(
@@ -1362,9 +1362,9 @@ fn config_show_redacts_credentials() {
 // the configuration files this repo ships
 // ---------------------------------------------------------------------------
 //
-// `zecd.example.toml` (shipped in the tarball and the .deb, and printed by `example-config`)
+// `rose.example.toml` (shipped in the tarball and the .deb, and printed by `example-config`)
 // and `deploy/*.toml` (mounted by the docker-compose stack) are handed to operators as
-// starting points. zecd rejects unknown keys, so a knob that is renamed or retired turns every
+// starting points. rose rejects unknown keys, so a knob that is renamed or retired turns every
 // config mentioning it into one the daemon refuses to start on - and nothing here parsed these
 // files, so that drift was invisible until someone deployed. `example-config` is asserted
 // byte-for-byte against the shipped file elsewhere, but byte-equality between two copies that
@@ -1381,9 +1381,9 @@ fn repo_file(rel: &str) -> std::path::PathBuf {
 /// The samples every build must accept: they configure the Zcash engine, which is always
 /// compiled in.
 /// Every one of these ships the `CHANGE-ME` placeholder password, so as written each is refused
-/// on every network and each is valid once `ZECD_RPC_PASSWORD` supplies the one value the
+/// on every network and each is valid once `ROSE_RPC_PASSWORD` supplies the one value the
 /// operator is told to change - both halves asserted below.
-/// The Zcash samples (`zecd.example.toml`, the zecd side of `deploy/docker-compose*.yml`).
+/// The Zcash samples (`rose.example.toml`, the rose side of `deploy/docker-compose*.yml`).
 /// They select the librustzcash engine - the example documents `[pools]` and `[spend]`, the
 /// deploy pair set `[zebra]` - so they are shipped-and-valid only for a build carrying the
 /// `zcash` feature, exactly as the Bitcoin samples below need theirs;
@@ -1399,12 +1399,12 @@ fn zcash_sample_configs() -> &'static [&'static str] {
 }
 
 const ZCASH_SAMPLE_CONFIGS: [&str; 3] = [
-    "zecd.example.toml",
-    "deploy/zecd.toml",
-    "deploy/zecd.mainnet.toml",
+    "rose.example.toml",
+    "deploy/rose.toml",
+    "deploy/rose.mainnet.toml",
 ];
 
-/// The Bitcoin samples (the zecd side of `deploy/docker-compose.btc-*.yml`, plus the mainnet
+/// The Bitcoin samples (the rose side of `deploy/docker-compose.btc-*.yml`, plus the mainnet
 /// watch-only shape).
 /// They select the BDK engine, so they are shipped-and-valid only for a build carrying the
 /// `bitcoin` feature; a default build refuses them, which
@@ -1422,12 +1422,12 @@ fn bitcoin_sample_configs() -> &'static [&'static str] {
 }
 
 const BITCOIN_SAMPLE_CONFIGS: [&str; 6] = [
-    "deploy/zecd.btc-testnet3.toml",
-    "deploy/zecd.btc-testnet4.toml",
-    "deploy/zecd.btc-testnet4-kyoto.toml",
-    "deploy/zecd.btc-testnet4-view.toml",
-    "deploy/zecd.btc-mainnet.toml",
-    "deploy/zecd.btc-mainnet-view.toml",
+    "deploy/rose.btc-testnet3.toml",
+    "deploy/rose.btc-testnet4.toml",
+    "deploy/rose.btc-testnet4-kyoto.toml",
+    "deploy/rose.btc-testnet4-view.toml",
+    "deploy/rose.btc-mainnet.toml",
+    "deploy/rose.btc-mainnet-view.toml",
 ];
 
 /// Every sample config, for whichever engines this build carries.
@@ -1441,7 +1441,7 @@ fn shipped_sample_configs() -> Vec<&'static str> {
 
 /// Every sample config this repo ships must be one *this* build accepts - once the operator has
 /// supplied the one value every sample deliberately leaves as a placeholder (the RPC password,
-/// here the way a deployment does it: `ZECD_RPC_PASSWORD`, which the configs themselves document
+/// here the way a deployment does it: `ROSE_RPC_PASSWORD`, which the configs themselves document
 /// as the ConfigMap-safe way to keep it out of the TOML).
 #[test]
 fn the_sample_configs_this_repo_ships_are_valid_for_this_build() {
@@ -1449,7 +1449,7 @@ fn the_sample_configs_this_repo_ships_are_valid_for_this_build() {
         let out = config_check_env(
             &repo_file(rel),
             &[],
-            &[("ZECD_RPC_PASSWORD", "not-the-placeholder")],
+            &[("ROSE_RPC_PASSWORD", "not-the-placeholder")],
         );
         assert!(
             out.status.success(),
@@ -1544,7 +1544,7 @@ fn the_bitcoin_sample_configs_need_the_engine_they_select() {
         let refused_for_missing_engine = stderr.contains("unknown field `bitcoind`")
             || stderr.contains("unknown field `mempool`")
             || stderr.contains("unknown field `fees`")
-            || stderr.contains("requires a zecd build with the `bitcoin` feature")
+            || stderr.contains("requires a rose build with the `bitcoin` feature")
             || stderr.contains("unsupported coin \"bitcoin\"");
         assert!(
             refused_for_missing_engine,
@@ -1557,7 +1557,7 @@ fn the_bitcoin_sample_configs_need_the_engine_they_select() {
 /// a real deployment config is still a config this build accepts. The fixtures that pin this
 /// elsewhere are small; these files are the widest configs in the tree.
 #[test]
-fn config_show_renders_the_shipped_samples_into_configs_zecd_accepts() {
+fn config_show_renders_the_shipped_samples_into_configs_rose_accepts() {
     let dir = tempfile::tempdir().unwrap();
     for rel in shipped_sample_configs() {
         let shown = config_show(&repo_file(rel));
@@ -1572,13 +1572,13 @@ fn config_show_renders_the_shipped_samples_into_configs_zecd_accepts() {
         let checked = config_check(&rendered, &[]);
         assert!(
             checked.status.success(),
-            "the config rendered from {rel} is not one zecd accepts:\n{}",
+            "the config rendered from {rel} is not one rose accepts:\n{}",
             stderr_of(&checked)
         );
     }
 }
 
-/// Full `zecd init` flow against the public testnet lightwalletd (`--server zecrocks`,
+/// Full `rose init` flow against the public testnet lightwalletd (`--server zecrocks`,
 /// light mode), then a re-init refusal. Network: follows the repo convention for live tests
 /// (`cargo test -- --include-ignored`).
 #[test]
@@ -1589,7 +1589,7 @@ fn init_creates_wallet_and_refuses_reinit() {
 
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 &datadir,
@@ -1632,7 +1632,7 @@ fn init_creates_wallet_and_refuses_reinit() {
     // A second init must refuse rather than overwrite the wallet.
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 &datadir,
@@ -1668,15 +1668,15 @@ const OTHER_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon ab
     abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
     abandon abandon abandon abandon art";
 
-/// Run `derive-address` with the mnemonic supplied out of band (`ZECD_MNEMONIC`), returning the
+/// Run `derive-address` with the mnemonic supplied out of band (`ROSE_MNEMONIC`), returning the
 /// finished output. The datadir is a fresh temp dir that stays empty: the point of the command is
 /// that it needs neither a wallet nor a chain.
 #[cfg(feature = "zcash")]
 fn derive_from_mnemonic(datadir: &std::path::Path, extra: &[&str]) -> Output {
     run_with_timeout(
         {
-            let mut c = zecd();
-            c.env("ZECD_MNEMONIC", TEST_MNEMONIC)
+            let mut c = rose();
+            c.env("ROSE_MNEMONIC", TEST_MNEMONIC)
                 .args([
                     "--datadir",
                     datadir.to_str().unwrap(),
@@ -1742,7 +1742,7 @@ fn derive_address_reads_the_mnemonic_from_stdin() {
     use std::io::Write as _;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut child = zecd()
+    let mut child = rose()
         .args([
             "--datadir",
             dir.path().to_str().unwrap(),
@@ -1754,7 +1754,7 @@ fn derive_address_reads_the_mnemonic_from_stdin() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawning zecd");
+        .expect("spawning rose");
     writeln!(child.stdin.as_mut().unwrap(), "{TEST_MNEMONIC}").unwrap();
     let out = child.wait_with_output().expect("collecting output");
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
@@ -1849,7 +1849,7 @@ fn derive_address_reads_a_keys_file_and_verifies_it_against_the_mnemonic() {
 
     let from_keys_file = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -1887,8 +1887,8 @@ fn derive_address_reads_a_keys_file_and_verifies_it_against_the_mnemonic() {
     // mnemonic, so the check is a key comparison rather than a parse failure.
     let foreign = run_with_timeout(
         {
-            let mut c = zecd();
-            c.env("ZECD_MNEMONIC", OTHER_MNEMONIC).args([
+            let mut c = rose();
+            c.env("ROSE_MNEMONIC", OTHER_MNEMONIC).args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
                 "--testnet",
@@ -1927,7 +1927,7 @@ fn derive_address_refuses_a_mismatched_or_missing_keys_file() {
     let dir = tempfile::tempdir().unwrap();
     let missing = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -1955,7 +1955,7 @@ fn derive_address_refuses_a_mismatched_or_missing_keys_file() {
     .unwrap();
     let wrong_network = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
@@ -1975,7 +1975,7 @@ fn derive_address_refuses_a_mismatched_or_missing_keys_file() {
 }
 
 /// `derive-address` resolves configuration like `init`/`export-ufvk` do, so a deployment's
-/// `zecd.toml` sets the network and receivers its defaults follow - and an *unloadable* config
+/// `rose.toml` sets the network and receivers its defaults follow - and an *unloadable* config
 /// therefore fails the command, even when deriving from a mnemonic that needs nothing from it.
 /// The documented way to derive with no deployment context is to bypass the file and name the
 /// network explicitly; this pins both halves.
@@ -1984,7 +1984,7 @@ fn derive_address_refuses_a_mismatched_or_missing_keys_file() {
 fn derive_address_follows_the_config_file_and_can_bypass_it() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("zecd.toml"),
+        dir.path().join("rose.toml"),
         "this is not = valid toml [[[\n",
     )
     .unwrap();
@@ -1999,8 +1999,8 @@ fn derive_address_follows_the_config_file_and_can_bypass_it() {
 
     let bypassed = run_with_timeout(
         {
-            let mut c = zecd();
-            c.env("ZECD_MNEMONIC", TEST_MNEMONIC).args([
+            let mut c = rose();
+            c.env("ROSE_MNEMONIC", TEST_MNEMONIC).args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
                 "--conf",
@@ -2026,11 +2026,11 @@ fn derive_address_follows_the_config_file_and_can_bypass_it() {
 
     // A loadable config *is* honoured: its network selects the encoding when no flag is given.
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("zecd.toml"), "network = \"main\"\n").unwrap();
+    std::fs::write(dir.path().join("rose.toml"), "network = \"main\"\n").unwrap();
     let from_config = run_with_timeout(
         {
-            let mut c = zecd();
-            c.env("ZECD_MNEMONIC", TEST_MNEMONIC).args([
+            let mut c = rose();
+            c.env("ROSE_MNEMONIC", TEST_MNEMONIC).args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
                 "derive-address",
@@ -2063,7 +2063,7 @@ fn chain_info_fails_on_an_unreachable_upstream_and_writes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = run_with_timeout(
         {
-            let mut c = zecd();
+            let mut c = rose();
             c.arg("--datadir")
                 .arg(dir.path())
                 .arg("--regtest")
@@ -2108,7 +2108,7 @@ fn chain_info_accepts_global_flags_on_either_side() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = run_with_timeout(
             {
-                let mut c = zecd();
+                let mut c = rose();
                 c.arg("--datadir")
                     .arg(dir.path())
                     .args(&args)
@@ -2134,7 +2134,7 @@ fn chain_info_accepts_global_flags_on_either_side() {
 #[test]
 fn config_check_reports_the_coin_key_per_build() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     // The coin an entry gets when it names none - the build's first engine. `config show`
     // omits the key for exactly that coin, so a single-engine config's output is byte-stable
     // across the key's existence.
@@ -2205,7 +2205,7 @@ fn config_check_reports_the_coin_key_per_build() {
 
 /// `derive-address` on a Bitcoin wallet: BIP 84 receiving addresses, offline, pinned to the
 /// BIP 84 specification's own test vector (the `abandon ... about` mnemonic's first two
-/// receiving addresses), so the ground truth is independent of zecd and of BDK. Then the
+/// receiving addresses), so the ground truth is independent of rose and of BDK. Then the
 /// same addresses from the exported account xpub, from an initialized watch-only wallet's
 /// pin, and the cross-check against it - with nothing but `keys.toml` and the wallet
 /// database ever written, and those only by `init`.
@@ -2221,7 +2221,7 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
     let dir = tempfile::tempdir().unwrap();
     let datadir = dir.path().to_str().unwrap();
     std::fs::write(
-        dir.path().join("zecd.toml"),
+        dir.path().join("rose.toml"),
         "network = \"main\"\n[wallets.default]\ncoin = \"bitcoin\"\n",
     )
     .unwrap();
@@ -2232,7 +2232,7 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
             .collect()
     };
 
-    let out = zecd()
+    let out = rose()
         .args([
             "--datadir",
             datadir,
@@ -2241,7 +2241,7 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
             "--count",
             "2",
         ])
-        .env("ZECD_MNEMONIC", BIP84_MNEMONIC)
+        .env("ROSE_MNEMONIC", BIP84_MNEMONIC)
         .output()
         .unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
@@ -2251,11 +2251,11 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(entries, ["zecd.toml"]);
+    assert_eq!(entries, ["rose.toml"]);
 
     // The JSON report carries the account key, and deriving from it gives the same
     // addresses - the pre-provisioning route that never puts a seed on the box.
-    let out = zecd()
+    let out = rose()
         .args([
             "--datadir",
             datadir,
@@ -2263,7 +2263,7 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
             "--mnemonic",
             "--json",
         ])
-        .env("ZECD_MNEMONIC", BIP84_MNEMONIC)
+        .env("ROSE_MNEMONIC", BIP84_MNEMONIC)
         .output()
         .unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
@@ -2271,7 +2271,7 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
     let xpub = report["xpub"].as_str().unwrap().to_string();
     assert!(xpub.starts_with("[73c5da0a/84'/0'/0']xpub"), "{xpub}");
     assert_eq!(report["addresses"][0]["address"], BIP84_RECEIVE[0]);
-    let out = zecd()
+    let out = rose()
         .args([
             "--datadir",
             datadir,
@@ -2288,7 +2288,7 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
 
     // A watch-only wallet built from that key answers from its pin, and the mnemonic
     // verifies against it; a different mnemonic is refused.
-    let out = zecd()
+    let out = rose()
         .args([
             "--datadir",
             datadir,
@@ -2301,13 +2301,13 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
         .output()
         .unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
-    let out = zecd()
+    let out = rose()
         .args(["--datadir", datadir, "derive-address", "--count", "2"])
         .output()
         .unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
     assert_eq!(lines(&out), BIP84_RECEIVE);
-    let out = zecd()
+    let out = rose()
         .args([
             "--datadir",
             datadir,
@@ -2316,12 +2316,12 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
             "default",
             "--mnemonic",
         ])
-        .env("ZECD_MNEMONIC", BIP84_MNEMONIC)
+        .env("ROSE_MNEMONIC", BIP84_MNEMONIC)
         .output()
         .unwrap();
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
     assert!(stderr_of(&out).contains("Verified"), "{}", stderr_of(&out));
-    let out = zecd()
+    let out = rose()
         .args([
             "--datadir",
             datadir,
@@ -2330,7 +2330,7 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
             "default",
             "--mnemonic",
         ])
-        .env("ZECD_MNEMONIC", TEST_MNEMONIC)
+        .env("ROSE_MNEMONIC", TEST_MNEMONIC)
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -2341,7 +2341,7 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
     );
 
     // A Zcash viewing key is the wrong coin's key.
-    let out = zecd()
+    let out = rose()
         .args(["--datadir", datadir, "derive-address", "--ufvk", "uview1x"])
         .output()
         .unwrap();
@@ -2358,14 +2358,14 @@ fn derive_address_derives_bip84_addresses_for_a_bitcoin_wallet() {
 fn derive_address_without_a_wallet_flag_follows_the_configs_default_wallet() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
-        dir.path().join("zecd.toml"),
+        dir.path().join("rose.toml"),
         "network = \"main\"\n[wallets.btc]\ncoin = \"bitcoin\"\n",
     )
     .unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
-            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC).args([
+            let mut c = rose();
+            c.env("ROSE_MNEMONIC", RESTORE_MNEMONIC).args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
                 "derive-address",
@@ -2384,12 +2384,12 @@ fn derive_address_without_a_wallet_flag_follows_the_configs_default_wallet() {
 }
 
 // ---------------------------------------------------------------------------
-// `zecd run --restore-if-empty`: restore-then-serve as one command
+// `rose run --restore-if-empty`: restore-then-serve as one command
 // ---------------------------------------------------------------------------
 //
 // A deployment with no shell (an enclave image, the `FROM scratch` containers) cannot script
 // "`init --restore`, then run", so the daemon does both: with `--restore-if-empty`, a wallet
-// whose `keys.toml` is absent is restored from `ZECD_MNEMONIC`/`--mnemonic-file` before the
+// whose `keys.toml` is absent is restored from `ROSE_MNEMONIC`/`--mnemonic-file` before the
 // daemon serves, and an initialized one is left alone without the secret ever being read.
 
 /// The committed development mnemonic, as a fixed key source for the restore round trip (the
@@ -2413,7 +2413,7 @@ fn run_daemon_until(
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .spawn()
-        .expect("spawning zecd");
+        .expect("spawning rose");
     let mut out_pipe = child.stdout.take().expect("piped stdout");
     let mut err_pipe = child.stderr.take().expect("piped stderr");
     let readers = (
@@ -2430,7 +2430,7 @@ fn run_daemon_until(
     );
     let deadline = Instant::now() + timeout;
     let exited = loop {
-        if let Some(status) = child.try_wait().expect("polling zecd") {
+        if let Some(status) = child.try_wait().expect("polling rose") {
             break Some(status);
         }
         if ready() || Instant::now() >= deadline {
@@ -2440,7 +2440,7 @@ fn run_daemon_until(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let status = exited.unwrap_or_else(|| child.wait().expect("reaping zecd"));
+    let status = exited.unwrap_or_else(|| child.wait().expect("reaping rose"));
     (
         exited,
         Output {
@@ -2478,7 +2478,7 @@ fn run_restore_companion_flags_require_the_restore_flag() {
     ] {
         let out = run_with_timeout(
             {
-                let mut c = zecd();
+                let mut c = rose();
                 c.args([
                     "--datadir",
                     dir.path().to_str().unwrap(),
@@ -2513,7 +2513,7 @@ fn run_restore_companion_flags_require_the_restore_flag() {
 #[test]
 fn an_omitted_wallet_flag_is_refused_when_the_config_implies_none() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = dir.path().join("zecd.toml");
+    let conf = dir.path().join("rose.toml");
     let write = |body: &str| {
         std::fs::write(
             &conf,
@@ -2527,7 +2527,7 @@ fn an_omitted_wallet_flag_is_refused_when_the_config_implies_none() {
     let rescan = || {
         run_with_timeout(
             {
-                let mut c = zecd();
+                let mut c = rose();
                 c.args(["--conf", conf.to_str().unwrap(), "rescan", "--yes"]);
                 c
             },
@@ -2566,8 +2566,8 @@ fn run_restore_if_empty_is_fatal_when_the_restore_fails() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_with_timeout(
         {
-            let mut c = zecd();
-            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC).args([
+            let mut c = rose();
+            c.env("ROSE_MNEMONIC", RESTORE_MNEMONIC).args([
                 "--datadir",
                 dir.path().to_str().unwrap(),
                 "--regtest",
@@ -2615,8 +2615,8 @@ fn run_restore_if_empty_refuses_without_a_mnemonic_source() {
     let conf = write_kyoto_restore_config(dir.path());
     let out = run_with_timeout(
         {
-            let mut c = zecd();
-            c.env_remove("ZECD_MNEMONIC").args([
+            let mut c = rose();
+            c.env_remove("ROSE_MNEMONIC").args([
                 "--conf",
                 conf.to_str().unwrap(),
                 "run",
@@ -2631,7 +2631,7 @@ fn run_restore_if_empty_refuses_without_a_mnemonic_source() {
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
     let stderr = stderr_of(&out);
     assert!(
-        stderr.contains("ZECD_MNEMONIC") && stderr.contains("--mnemonic-file"),
+        stderr.contains("ROSE_MNEMONIC") && stderr.contains("--mnemonic-file"),
         "the refusal should name both mnemonic sources: {stderr}"
     );
     assert!(
@@ -2647,7 +2647,7 @@ fn run_restore_if_empty_refuses_without_a_mnemonic_source() {
 /// declared wallet is the implied one, which is what lets the tests above omit `--wallet`.
 #[cfg(feature = "bitcoin")]
 fn write_kyoto_restore_config(dir: &std::path::Path) -> std::path::PathBuf {
-    let conf = dir.join("zecd.toml");
+    let conf = dir.join("rose.toml");
     std::fs::write(
         &conf,
         format!(
@@ -2664,7 +2664,7 @@ fn write_kyoto_restore_config(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// The whole promise, on the wallet the enclave deployment runs: an empty data directory plus
-/// `ZECD_MNEMONIC` comes up as a restored, serving wallet - the same wallet `init --restore`
+/// `ROSE_MNEMONIC` comes up as a restored, serving wallet - the same wallet `init --restore`
 /// builds from that phrase (asserted by xpub, the key material rather than an address) - with
 /// the phrase on no stream. And a second start of the identical command, *without* the
 /// variable, finds the wallet initialized and serves it as it is: the secret is not needed,
@@ -2676,11 +2676,11 @@ fn run_restore_if_empty_restores_a_kyoto_wallet_then_serves_it() {
     let conf = write_kyoto_restore_config(dir.path());
     let keys = dir.path().join("btc").join("keys.toml");
     let run_cmd = |with_mnemonic: bool| {
-        let mut c = zecd();
+        let mut c = rose();
         if with_mnemonic {
-            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC);
+            c.env("ROSE_MNEMONIC", RESTORE_MNEMONIC);
         } else {
-            c.env_remove("ZECD_MNEMONIC");
+            c.env_remove("ROSE_MNEMONIC");
         }
         c.args([
             "--conf",
@@ -2720,7 +2720,7 @@ fn run_restore_if_empty_restores_a_kyoto_wallet_then_serves_it() {
     let export = |datadir: &std::path::Path| {
         let out = run_with_timeout(
             {
-                let mut c = zecd();
+                let mut c = rose();
                 c.args([
                     "--datadir",
                     datadir.to_str().unwrap(),
@@ -2740,8 +2740,8 @@ fn run_restore_if_empty_restores_a_kyoto_wallet_then_serves_it() {
     let reference_conf = write_kyoto_restore_config(reference.path());
     let init = run_with_timeout(
         {
-            let mut c = zecd();
-            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC).args([
+            let mut c = rose();
+            c.env("ROSE_MNEMONIC", RESTORE_MNEMONIC).args([
                 "--conf",
                 reference_conf.to_str().unwrap(),
                 "init",
@@ -2795,14 +2795,14 @@ fn run_restore_if_empty_restores_a_kyoto_wallet_then_serves_it() {
 
 #[test]
 #[cfg(feature = "bitcoin")]
-fn run_restore_if_empty_creates_a_watch_only_wallet_from_zecd_xpub() {
+fn run_restore_if_empty_creates_a_watch_only_wallet_from_rose_xpub() {
     // The xpub: a reference `init --restore` of the test phrase, exported.
     let reference = tempfile::tempdir().unwrap();
     let reference_conf = write_kyoto_restore_config(reference.path());
     let init = run_with_timeout(
         {
-            let mut c = zecd();
-            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC).args([
+            let mut c = rose();
+            c.env("ROSE_MNEMONIC", RESTORE_MNEMONIC).args([
                 "--conf",
                 reference_conf.to_str().unwrap(),
                 "init",
@@ -2820,7 +2820,7 @@ fn run_restore_if_empty_creates_a_watch_only_wallet_from_zecd_xpub() {
     let export = |datadir: &std::path::Path| {
         let out = run_with_timeout(
             {
-                let mut c = zecd();
+                let mut c = rose();
                 c.args([
                     "--datadir",
                     datadir.to_str().unwrap(),
@@ -2838,16 +2838,16 @@ fn run_restore_if_empty_creates_a_watch_only_wallet_from_zecd_xpub() {
     };
     let xpub = export(reference.path());
 
-    // First boot with only ZECD_XPUB, delivered wrapped in quotes the way Caution's secret
+    // First boot with only ROSE_XPUB, delivered wrapped in quotes the way Caution's secret
     // export hands values over: a watch-only wallet of that account comes up and serves.
     let dir = tempfile::tempdir().unwrap();
     let conf = write_kyoto_restore_config(dir.path());
     let keys = dir.path().join("btc").join("keys.toml");
     let (exited, out) = run_daemon_until(
         {
-            let mut c = zecd();
-            c.env_remove("ZECD_MNEMONIC")
-                .env("ZECD_XPUB", format!("'{xpub}'"))
+            let mut c = rose();
+            c.env_remove("ROSE_MNEMONIC")
+                .env("ROSE_XPUB", format!("'{xpub}'"))
                 .args([
                     "--conf",
                     conf.to_str().unwrap(),
@@ -2886,9 +2886,9 @@ fn run_restore_if_empty_creates_a_watch_only_wallet_from_zecd_xpub() {
     let both_conf = write_kyoto_restore_config(both.path());
     let out = run_with_timeout(
         {
-            let mut c = zecd();
-            c.env("ZECD_MNEMONIC", RESTORE_MNEMONIC)
-                .env("ZECD_XPUB", &xpub)
+            let mut c = rose();
+            c.env("ROSE_MNEMONIC", RESTORE_MNEMONIC)
+                .env("ROSE_XPUB", &xpub)
                 .args([
                     "--conf",
                     both_conf.to_str().unwrap(),
@@ -2905,7 +2905,7 @@ fn run_restore_if_empty_creates_a_watch_only_wallet_from_zecd_xpub() {
     );
     assert!(!out.status.success(), "both sources set must be refused");
     assert!(
-        stderr_of(&out).contains("has both ZECD_XPUB and a mnemonic"),
+        stderr_of(&out).contains("has both ROSE_XPUB and a mnemonic"),
         "stderr: {}",
         stderr_of(&out)
     );

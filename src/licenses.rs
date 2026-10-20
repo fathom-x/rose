@@ -1,16 +1,16 @@
-//! `zecd licenses` - print the third-party license notices to stdout.
+//! `rose licenses` - print the third-party license notices to stdout.
 //!
-//! zecd links every dependency statically, so those crates' license texts travel inside the
+//! rose links every dependency statically, so those crates' license texts travel inside the
 //! binary and most of them require the text and copyright notice to be reproduced when they
 //! do. The packaging ships `THIRD-PARTY-LICENSES.txt` alongside the binary (the release
-//! tarball, `/usr/share/doc/zecd/` in the `.deb` and both container images), but the runtime
+//! tarball, `/usr/share/doc/rose/` in the `.deb` and both container images), but the runtime
 //! images are `FROM scratch` - no shell, no `cat` - so inside a container the file is only
 //! reachable with `docker cp` from a created container. Embedding the same text and printing
-//! it makes the notices readable wherever the binary runs (`docker run zecd licenses`), which
+//! it makes the notices readable wherever the binary runs (`docker run rose licenses`), which
 //! is the one place a user always has.
 //!
 //! Deliberately flagless, unlike `example-config`'s `-o FILE`/`--force`: that command's
-//! natural target is `<datadir>/zecd.toml`, where refusing to clobber a live deployment's
+//! natural target is `<datadir>/rose.toml`, where refusing to clobber a live deployment's
 //! settings is the point. Here there is nothing to protect - a shell redirect is the whole
 //! feature - so there is no file-writing path to get wrong.
 
@@ -38,7 +38,7 @@ mod tests {
     #[test]
     fn embedded_text_is_the_generated_bundle() {
         assert!(
-            THIRD_PARTY_LICENSES.starts_with("zecd - Third-party licenses"),
+            THIRD_PARTY_LICENSES.starts_with("rose - Third-party licenses"),
             "the bundle keeps about.hbs's header"
         );
         assert!(
@@ -49,7 +49,7 @@ mod tests {
 
     /// Every crate in the tree is listed under some license heading as `  - <name> <version>`.
     /// A bundle that lost its crate list would still start with the header above, so assert
-    /// the listing exists and covers a dependency zecd unambiguously links.
+    /// the listing exists and covers a dependency rose unambiguously links.
     #[test]
     fn embedded_text_lists_the_crates_it_covers() {
         let listed = THIRD_PARTY_LICENSES

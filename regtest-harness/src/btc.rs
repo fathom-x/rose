@@ -1,15 +1,15 @@
 //! Drivers for the Bitcoin (BDK engine) regtest suites: a regtest Bitcoin Core and a
-//! `--features bitcoin` zecd over either of its chain sources.
+//! `--features bitcoin` rose over either of its chain sources.
 //!
 //! The first two Bitcoin suites (`regtest_btc.rs`, `regtest_btc_kyoto.rs`) each carry their
 //! own copy of these drivers, on purpose - one stack per binary, nothing shared. The suites
 //! written after them (watch-only pairing, restore, reorg) run the *same* scenario over both
 //! backends and bring up several wallets and daemons per test, which is where a shared
 //! driver earns its keep. The node here always listens on P2P and serves compact block
-//! filters, so one `BitcoinD` serves a bitcoind-dialect zecd and a kyoto one alike.
+//! filters, so one `BitcoinD` serves a bitcoind-dialect rose and a kyoto one alike.
 //!
 //! Provisioning is the same pair of probes as the original suites: `BITCOIND_BIN` (or a
-//! `bitcoind` on PATH) for the node, and a zecd carrying the `bitcoin` feature (probed via
+//! `bitcoind` on PATH) for the node, and a rose carrying the `bitcoin` feature (probed via
 //! `config check` on a `coin = "bitcoin"` config). [`provisioned`] runs both and prints the
 //! standard `skipping:` line, so a plain `cargo test` passes through in milliseconds.
 
@@ -22,9 +22,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::{pick_port, zecd_bin};
+use crate::{pick_port, rose_bin};
 
-/// How long a zecd wallet gets to reach a height, balance, or hash. Generous: a kyoto
+/// How long a rose wallet gets to reach a height, balance, or hash. Generous: a kyoto
 /// first sync downloads headers and filters for the whole regtest chain, and the node
 /// builds its filter index in the background.
 pub const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -40,16 +40,16 @@ pub fn bitcoind_bin() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Whether the zecd under test carries the `bitcoin` feature: a default build's
+/// Whether the rose under test carries the `bitcoin` feature: a default build's
 /// `config check` refuses `coin = "bitcoin"` ("this build supports: zcash").
-pub fn zecd_has_bitcoin_feature(datadir: &Path) -> bool {
+pub fn rose_has_bitcoin_feature(datadir: &Path) -> bool {
     let conf = datadir.join("probe.toml");
     std::fs::write(
         &conf,
         "default_wallet = \"btc\"\n[wallets.btc]\ncoin = \"bitcoin\"\n",
     )
     .expect("write probe config");
-    let out = Command::new(zecd_bin())
+    let out = Command::new(rose_bin())
         .args([
             "--datadir",
             datadir.to_str().unwrap(),
@@ -62,7 +62,7 @@ pub fn zecd_has_bitcoin_feature(datadir: &Path) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .expect("run zecd config check");
+        .expect("run rose config check");
     let stderr = String::from_utf8_lossy(&out.stderr);
     !stderr.contains("unsupported coin")
 }
@@ -75,9 +75,9 @@ pub fn provisioned(datadir: &Path) -> Option<PathBuf> {
         eprintln!("skipping: no bitcoind (set BITCOIND_BIN or put bitcoind on PATH)");
         return None;
     };
-    if !zecd_has_bitcoin_feature(datadir) {
+    if !rose_has_bitcoin_feature(datadir) {
         eprintln!(
-            "skipping: the zecd under test was built without the `bitcoin` feature \
+            "skipping: the rose under test was built without the `bitcoin` feature \
              (build with --features bitcoin)"
         );
         return None;
@@ -95,7 +95,7 @@ impl Drop for KillOnDrop {
 }
 
 /// A regtest Bitcoin Core with a `miner` wallet, listening on P2P and serving compact
-/// block filters (`-blockfilterindex -peerblockfilters`) so a kyoto zecd can use it too.
+/// block filters (`-blockfilterindex -peerblockfilters`) so a kyoto rose can use it too.
 pub struct BitcoinD {
     proc: Option<KillOnDrop>,
     client: reqwest::Client,
@@ -319,7 +319,7 @@ impl BitcoinD {
     }
 }
 
-/// A fault-injecting relay between a zecd and its bitcoind's JSON-RPC port, for the one
+/// A fault-injecting relay between a rose and its bitcoind's JSON-RPC port, for the one
 /// send outcome no signal can reach: a **transport failure at the broadcast itself**. A
 /// SIGSTOP hangs every call, so the sync pass detects the outage first and the send is
 /// refused up front (`-4`, no upstream) before it reaches the broadcast; a kill races the
@@ -423,7 +423,7 @@ async fn read_http_message(stream: &mut TcpStream) -> std::io::Result<Option<Vec
     Ok(Some(buf))
 }
 
-/// Which chain source the zecd under test dials.
+/// Which chain source the rose under test dials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BtcBackend {
     /// `bitcoind://` JSON-RPC against the node.
@@ -441,11 +441,11 @@ impl BtcBackend {
     }
 }
 
-/// A `--features bitcoin` zecd serving one or more `coin = "bitcoin"` wallets over one
-/// backend. Built in two steps - [`ZecdBtc::prepare`] writes the config, then each wallet is
+/// A `--features bitcoin` rose serving one or more `coin = "bitcoin"` wallets over one
+/// backend. Built in two steps - [`RoseBtc::prepare`] writes the config, then each wallet is
 /// initialized with the flags the scenario needs - so a watch-only wallet can be created
 /// from a sibling's exported key before the daemon ever starts.
-pub struct ZecdBtc {
+pub struct RoseBtc {
     proc: Option<KillOnDrop>,
     client: reqwest::Client,
     base_url: String,
@@ -458,21 +458,21 @@ pub struct ZecdBtc {
     default_wallet: String,
 }
 
-impl ZecdBtc {
+impl RoseBtc {
     /// Write the daemon config for `wallets` (the first is `default_wallet`), all on
     /// `backend` against `node`. A tight sync interval so mempool passes land quickly; the
     /// health server is on, on a picked port, so a suite can hold `/readyz` and `/status`
-    /// to the Bitcoin wallets (see [`ZecdBtc::health_url`]).
+    /// to the Bitcoin wallets (see [`RoseBtc::health_url`]).
     pub fn prepare(
         datadir: PathBuf,
         backend: BtcBackend,
         node: &BitcoinD,
         wallets: &[&str],
-    ) -> ZecdBtc {
+    ) -> RoseBtc {
         Self::prepare_with(datadir, backend, node, wallets, "")
     }
 
-    /// [`ZecdBtc::prepare`] with `wallet_extra` (TOML lines) appended to every wallet's
+    /// [`RoseBtc::prepare`] with `wallet_extra` (TOML lines) appended to every wallet's
     /// `[wallets.<name>]` table - a per-wallet knob such as `lookahead = 40`.
     pub fn prepare_with(
         datadir: PathBuf,
@@ -480,11 +480,11 @@ impl ZecdBtc {
         node: &BitcoinD,
         wallets: &[&str],
         wallet_extra: &str,
-    ) -> ZecdBtc {
+    ) -> RoseBtc {
         Self::prepare_full(datadir, backend, node, wallets, wallet_extra, "")
     }
 
-    /// [`ZecdBtc::prepare_with`] plus `global_extra` (TOML, whole tables) appended after the
+    /// [`RoseBtc::prepare_with`] plus `global_extra` (TOML, whole tables) appended after the
     /// wallet tables - a daemon-wide section such as `[mempool]`.
     pub fn prepare_full(
         datadir: PathBuf,
@@ -493,7 +493,7 @@ impl ZecdBtc {
         wallets: &[&str],
         wallet_extra: &str,
         global_extra: &str,
-    ) -> ZecdBtc {
+    ) -> RoseBtc {
         let server = match backend {
             BtcBackend::Bitcoind => format!("bitcoind://127.0.0.1:{}", node.rpc_port),
             BtcBackend::Kyoto => format!("kyoto://127.0.0.1:{}", node.p2p_port),
@@ -510,7 +510,7 @@ impl ZecdBtc {
 
     /// The bitcoind backend dialed at an explicit RPC port rather than the node's own - an
     /// [`RpcProxy`] standing between the two. Credentials are the node's.
-    pub fn prepare_bitcoind_at(datadir: PathBuf, rpc_port: u16, wallets: &[&str]) -> ZecdBtc {
+    pub fn prepare_bitcoind_at(datadir: PathBuf, rpc_port: u16, wallets: &[&str]) -> RoseBtc {
         Self::prepare_at(
             datadir,
             &format!("bitcoind://127.0.0.1:{rpc_port}"),
@@ -528,9 +528,9 @@ impl ZecdBtc {
         wallets: &[&str],
         wallet_extra: &str,
         global_extra: &str,
-    ) -> ZecdBtc {
+    ) -> RoseBtc {
         std::fs::create_dir_all(&datadir).unwrap();
-        let conf = datadir.join("zecd.toml");
+        let conf = datadir.join("rose.toml");
         let mut text = format!("default_wallet = \"{}\"\n", wallets[0]);
         for wallet in wallets {
             text.push_str(&format!(
@@ -544,12 +544,12 @@ impl ZecdBtc {
         if !global_extra.is_empty() && !global_extra.ends_with('\n') {
             text.push('\n');
         }
-        let health_port = pick_port().expect("pick zecd health port");
+        let health_port = pick_port().expect("pick rose health port");
         text.push_str(&format!(
             "[sync]\ninterval_secs = 1\n[health]\nbind = \"127.0.0.1\"\nport = {health_port}\n"
         ));
         std::fs::write(&conf, text).unwrap();
-        ZecdBtc {
+        RoseBtc {
             proc: None,
             client: reqwest::Client::new(),
             base_url: String::new(),
@@ -596,7 +596,7 @@ impl ZecdBtc {
     }
 
     fn cli(&self) -> Command {
-        let mut cmd = Command::new(zecd_bin());
+        let mut cmd = Command::new(rose_bin());
         cmd.args([
             "--datadir",
             self.datadir.to_str().unwrap(),
@@ -607,7 +607,7 @@ impl ZecdBtc {
         cmd
     }
 
-    /// `zecd init --wallet <wallet> <extra...>`. `Ok((stdout, stderr))` on success (stdout
+    /// `rose init --wallet <wallet> <extra...>`. `Ok((stdout, stderr))` on success (stdout
     /// carries a generated mnemonic), `Err(stderr)` on a refusal.
     pub fn init(&self, wallet: &str, extra: &[&str]) -> Result<(String, String), String> {
         let out = self
@@ -615,7 +615,7 @@ impl ZecdBtc {
             .args(["init", "--wallet", wallet])
             .args(extra)
             .output()
-            .expect("run zecd init");
+            .expect("run rose init");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if out.status.success() {
@@ -625,12 +625,12 @@ impl ZecdBtc {
         }
     }
 
-    /// [`ZecdBtc::init`] that must succeed; returns the generated mnemonic when there is
+    /// [`RoseBtc::init`] that must succeed; returns the generated mnemonic when there is
     /// one (the last non-empty stdout line - a restore or an import prints none).
     pub fn init_ok(&self, wallet: &str, extra: &[&str]) -> Option<String> {
         let (stdout, _) = self
             .init(wallet, extra)
-            .unwrap_or_else(|stderr| panic!("zecd init --wallet {wallet} failed: {stderr}"));
+            .unwrap_or_else(|stderr| panic!("rose init --wallet {wallet} failed: {stderr}"));
         stdout
             .lines()
             .map(str::trim)
@@ -638,13 +638,13 @@ impl ZecdBtc {
             .map(str::to_string)
     }
 
-    /// `zecd export-xpub --wallet <wallet>`: the account key, or the refusal's stderr.
+    /// `rose export-xpub --wallet <wallet>`: the account key, or the refusal's stderr.
     pub fn export_xpub(&self, wallet: &str) -> Result<String, String> {
         let out = self
             .cli()
             .args(["export-xpub", "--wallet", wallet])
             .output()
-            .expect("run zecd export-xpub");
+            .expect("run rose export-xpub");
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         } else {
@@ -664,7 +664,7 @@ impl ZecdBtc {
     /// Spawn the daemon (on a fresh RPC port the first time) and wait for its RPC.
     pub async fn start(&mut self) {
         if self.rpc_port == 0 {
-            self.rpc_port = pick_port().expect("pick zecd rpc port");
+            self.rpc_port = pick_port().expect("pick rose rpc port");
             self.base_url = format!("http://127.0.0.1:{}/", self.rpc_port);
         }
         let proc = self
@@ -678,25 +678,25 @@ impl ZecdBtc {
                 &self.rpc_port.to_string(),
             ])
             .stdout(Stdio::null())
-            .stderr(match std::env::var_os("ZECD_REGTEST_BTC_LOG") {
-                // Debug hook: ZECD_REGTEST_BTC_LOG=<dir> keeps each daemon's stderr as
-                // <dir>/zecd-<rpc port>.log (the port makes a rerun's files distinct).
+            .stderr(match std::env::var_os("ROSE_REGTEST_BTC_LOG") {
+                // Debug hook: ROSE_REGTEST_BTC_LOG=<dir> keeps each daemon's stderr as
+                // <dir>/rose-<rpc port>.log (the port makes a rerun's files distinct).
                 Some(dir) => std::fs::File::create(
-                    std::path::Path::new(&dir).join(format!("zecd-{}.log", self.rpc_port)),
+                    std::path::Path::new(&dir).join(format!("rose-{}.log", self.rpc_port)),
                 )
                 .map(Stdio::from)
                 .unwrap_or_else(|_| Stdio::null()),
                 None => Stdio::null(),
             })
             .spawn()
-            .expect("spawn zecd");
+            .expect("spawn rose");
         self.proc = Some(KillOnDrop(proc));
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if self.call("getwalletinfo", json!([])).await.is_ok() {
                 return;
             }
-            assert!(Instant::now() < deadline, "zecd RPC never came up");
+            assert!(Instant::now() < deadline, "rose RPC never came up");
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }

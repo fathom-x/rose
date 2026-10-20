@@ -20,7 +20,7 @@ pub struct ActiveCommand {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RpcInfo {
     pub active_commands: Vec<ActiveCommand>,
-    /// Always empty: zecd logs to stderr/tracing, not a debug.log file.
+    /// Always empty: rose logs to stderr/tracing, not a debug.log file.
     pub logpath: String,
 }
 
@@ -36,7 +36,7 @@ impl Client<'_> {
         self.call_typed("uptime", vec![]).await
     }
 
-    /// `help ( command )`: a short orientation string (zecd has no per-method help pages).
+    /// `help ( command )`: a short orientation string (rose has no per-method help pages).
     pub async fn help(&self, command: Option<&str>) -> Result<String, ClientError> {
         let params = Self::positional(vec![command.map(|c| json!(c))]);
         self.call_typed("help", params).await

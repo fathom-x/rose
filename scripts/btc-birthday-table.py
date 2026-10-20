@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the shipped per-day birthday table for the Bitcoin kyoto backend.
 
-`zecd init` on a kyoto wallet is offline, so a `--birthday` date (or a height below the
+`rose init` on a kyoto wallet is offline, so a `--birthday` date (or a height below the
 shipped scan floor) used to resolve to nothing better than SegWit activation, and the
 first sync had to scan headers from 2017 before it could anchor at the true height. The
 table this script writes gives init an offline answer: for every UTC day since SegWit

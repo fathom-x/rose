@@ -2,8 +2,8 @@
 //! wallet's own costs grow with its history.
 //!
 //! One regtest bitcoind (the funder: its `miner` wallet pays the wallet under test) and one
-//! kyoto zecd, the enclave's backend, on one chain. The wallet is funded in steps to N
-//! received outputs (`ZECD_BENCH_BTC_STEPS`, cumulative), the deposit shape an exchange
+//! kyoto rose, the enclave's backend, on one chain. The wallet is funded in steps to N
+//! received outputs (`ROSE_BENCH_BTC_STEPS`, cumulative), the deposit shape an exchange
 //! wallet sees: by default one transaction per receive, 24 per block (Core's ancestor
 //! limit for the funder's unconfirmed change chain). At every step:
 //!
@@ -14,25 +14,25 @@
 //!   --scope` wrapper the deployment's bench uses: those count a tmpfs datadir too, as the
 //!   enclave's RAM-backed storage does).
 //! * `datadir`: the wallet datadir's size on disk.
-//! * `sends`: `ZECD_BENCH_BTC_SENDS` back-to-back `sendtoaddress` to the funder, each one's
+//! * `sends`: `ROSE_BENCH_BTC_SENDS` back-to-back `sendtoaddress` to the funder, each one's
 //!   RPC latency and the time until the node's mempool holds it; then one `sendmany`
-//!   paying `ZECD_BENCH_BTC_FANOUT` funder addresses.
-//! * `burst`: one block paying `ZECD_BENCH_BTC_BURST` of the wallet's own addresses in one
+//!   paying `ROSE_BENCH_BTC_FANOUT` funder addresses.
+//! * `burst`: one block paying `ROSE_BENCH_BTC_BURST` of the wallet's own addresses in one
 //!   transaction: the catch-up time for a block full of own receives.
 //! * `catchup`: per funding block, mine-to-wallet-at-height (min/median/max per step).
 //! * `restore`: a from-seed restore on a fresh datadir (`init --restore --birthday 0`,
 //!   what every enclave boot does): time to RPC up, time to the tip, time until the
 //!   balance settles, whether it equals the original's (`balance_match`) and how much was
 //!   recovered, then the same reads and memory on the restored daemon. Off with
-//!   `ZECD_BENCH_BTC_RESTORE=0`.
+//!   `ROSE_BENCH_BTC_RESTORE=0`.
 //!
 //! Both wallets run with `[wallets.btc] lookahead` set to cover every address the run
-//! will use (`ZECD_BENCH_BTC_LOOKAHEAD`, default the last step plus the bursts plus 100),
+//! will use (`ROSE_BENCH_BTC_LOOKAHEAD`, default the last step plus the bursts plus 100),
 //! because a kyoto recovery scan watches only the wallet's lookahead past what it has
 //! revealed (100 at least): at the default of 25 a restore of a wallet with more than
 //! about 125 used receive addresses stops short and reports itself synced (measured 138
 //! of 1490 outputs at 1000 receives). The live wallet carries the same lookahead so its
-//! per-block cost is the restorable configuration's. `ZECD_BENCH_BTC_LOOKAHEAD=default`
+//! per-block cost is the restorable configuration's. `ROSE_BENCH_BTC_LOOKAHEAD=default`
 //! leaves both at 25 to measure that shortfall.
 //!
 //! What this does NOT measure: first-sync memory under a fast mainnet filter stream (the
@@ -41,27 +41,27 @@
 //! RPC on loopback); the deployment measures those separately.
 //!
 //! Every line is prefixed `BENCH`; the whole result is one `BENCH_RESULTS <json>` line and,
-//! with `ZECD_BENCH_BTC_OUT=<file>`, that JSON pretty-printed to the file.
+//! with `ROSE_BENCH_BTC_OUT=<file>`, that JSON pretty-printed to the file.
 //!
 //! Configuration (all env; the first is the switch, so a plain `cargo test` skips in
 //! milliseconds and CI never runs this):
-//!   ZECD_BENCH_BTC_STEPS          = "1000,10000"      cumulative received outputs (required)
-//!   ZECD_BENCH_BTC_OUTPUTS_PER_TX = 1                 outputs per funding transaction
-//!   ZECD_BENCH_BTC_TXS_PER_BLOCK  = 24                funding transactions per block
-//!   ZECD_BENCH_BTC_SENDS          = 20                sends per step (0 disables)
-//!   ZECD_BENCH_BTC_FANOUT         = 100               outputs of the fan-out send (0 disables)
-//!   ZECD_BENCH_BTC_BURST          = 500               own outputs in the burst block (0 disables)
-//!   ZECD_BENCH_BTC_RESTORE        = 1                 restore at each step
-//!   ZECD_BENCH_BTC_LOOKAHEAD      = auto              both wallets' lookahead (auto, N, default)
-//!   ZECD_BENCH_BTC_OUT            = <file>            where to write the JSON
-//!   ZECD_BIN (a `bitcoin`-feature zecd; the deployment passes the enclave's own binary),
+//!   ROSE_BENCH_BTC_STEPS          = "1000,10000"      cumulative received outputs (required)
+//!   ROSE_BENCH_BTC_OUTPUTS_PER_TX = 1                 outputs per funding transaction
+//!   ROSE_BENCH_BTC_TXS_PER_BLOCK  = 24                funding transactions per block
+//!   ROSE_BENCH_BTC_SENDS          = 20                sends per step (0 disables)
+//!   ROSE_BENCH_BTC_FANOUT         = 100               outputs of the fan-out send (0 disables)
+//!   ROSE_BENCH_BTC_BURST          = 500               own outputs in the burst block (0 disables)
+//!   ROSE_BENCH_BTC_RESTORE        = 1                 restore at each step
+//!   ROSE_BENCH_BTC_LOOKAHEAD      = auto              both wallets' lookahead (auto, N, default)
+//!   ROSE_BENCH_BTC_OUT            = <file>            where to write the JSON
+//!   ROSE_BIN (a `bitcoin`-feature rose; the deployment passes the enclave's own binary),
 //!   BITCOIND_BIN, as for every Bitcoin suite.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::{json, Value};
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 /// What each funding output pays (0.001 BTC): small, so 50k of them fit in a few coinbases.
 const RECEIVE_BTC: f64 = 0.001;
@@ -152,8 +152,8 @@ fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
-async fn new_address(zecd: &ZecdBtc) -> String {
-    zecd.call("getnewaddress", json!([]))
+async fn new_address(rose: &RoseBtc) -> String {
+    rose.call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress")
         .as_str()
@@ -162,19 +162,19 @@ async fn new_address(zecd: &ZecdBtc) -> String {
 }
 
 /// Mine one block and wait for the wallet to report its height: the catch-up time.
-async fn mine_and_catch_up(node: &BitcoinD, zecd: &ZecdBtc) -> u64 {
+async fn mine_and_catch_up(node: &BitcoinD, rose: &RoseBtc) -> u64 {
     let target = node.height().await + 1;
     node.mine(1).await;
     let t = Instant::now();
-    wait_height(zecd, target, CATCHUP_TIMEOUT).await;
+    wait_height(rose, target, CATCHUP_TIMEOUT).await;
     ms(t.elapsed())
 }
 
-async fn wait_height(zecd: &ZecdBtc, target: u64, timeout: Duration) {
+async fn wait_height(rose: &RoseBtc, target: u64, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     let mut last = Value::Null;
     loop {
-        if let Ok(v) = zecd.call("getblockcount", json!([])).await {
+        if let Ok(v) = rose.call("getblockcount", json!([])).await {
             if v.as_u64() == Some(target) {
                 return;
             }
@@ -189,7 +189,7 @@ async fn wait_height(zecd: &ZecdBtc, target: u64, timeout: Duration) {
 }
 
 /// The read RPCs a GUI or an operator issues, the median of five each.
-async fn reads(zecd: &ZecdBtc) -> Value {
+async fn reads(rose: &RoseBtc) -> Value {
     let mut out = json!({});
     for (name, method, params) in [
         ("getbalance", "getbalance", json!([])),
@@ -204,7 +204,7 @@ async fn reads(zecd: &ZecdBtc) -> Value {
         let mut samples = Vec::new();
         for _ in 0..5 {
             let t = Instant::now();
-            zecd.call(method, params.clone()).await.expect(method);
+            rose.call(method, params.clone()).await.expect(method);
             samples.push(ms(t.elapsed()));
         }
         out[name] = json!(median(samples));
@@ -214,8 +214,8 @@ async fn reads(zecd: &ZecdBtc) -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn regtest_btc_bench() {
-    let Some(steps_spec) = std::env::var("ZECD_BENCH_BTC_STEPS").ok() else {
-        eprintln!("SKIP regtest_btc_bench: set ZECD_BENCH_BTC_STEPS=1000,10000");
+    let Some(steps_spec) = std::env::var("ROSE_BENCH_BTC_STEPS").ok() else {
+        eprintln!("SKIP regtest_btc_bench: set ROSE_BENCH_BTC_STEPS=1000,10000");
         return;
     };
     let steps: Vec<u64> = steps_spec
@@ -223,27 +223,27 @@ async fn regtest_btc_bench() {
         .map(|s| {
             s.trim()
                 .parse()
-                .expect("ZECD_BENCH_BTC_STEPS: comma-separated counts")
+                .expect("ROSE_BENCH_BTC_STEPS: comma-separated counts")
         })
         .collect();
     assert!(
         steps.windows(2).all(|w| w[0] < w[1]),
-        "ZECD_BENCH_BTC_STEPS must increase: {steps:?}"
+        "ROSE_BENCH_BTC_STEPS must increase: {steps:?}"
     );
-    let outputs_per_tx = env_u64("ZECD_BENCH_BTC_OUTPUTS_PER_TX", 1).max(1);
-    let txs_per_block = env_u64("ZECD_BENCH_BTC_TXS_PER_BLOCK", 24).max(1);
-    let sends = env_u64("ZECD_BENCH_BTC_SENDS", 20);
-    let fanout = env_u64("ZECD_BENCH_BTC_FANOUT", 100);
-    let burst = env_u64("ZECD_BENCH_BTC_BURST", 500);
-    let restore = env_u64("ZECD_BENCH_BTC_RESTORE", 1) == 1;
-    let lookahead = match std::env::var("ZECD_BENCH_BTC_LOOKAHEAD").as_deref() {
+    let outputs_per_tx = env_u64("ROSE_BENCH_BTC_OUTPUTS_PER_TX", 1).max(1);
+    let txs_per_block = env_u64("ROSE_BENCH_BTC_TXS_PER_BLOCK", 24).max(1);
+    let sends = env_u64("ROSE_BENCH_BTC_SENDS", 20);
+    let fanout = env_u64("ROSE_BENCH_BTC_FANOUT", 100);
+    let burst = env_u64("ROSE_BENCH_BTC_BURST", 500);
+    let restore = env_u64("ROSE_BENCH_BTC_RESTORE", 1) == 1;
+    let lookahead = match std::env::var("ROSE_BENCH_BTC_LOOKAHEAD").as_deref() {
         Err(_) | Ok("auto") | Ok("") => {
             Some(steps.last().copied().unwrap_or(0) + burst * steps.len() as u64 + 100)
         }
         Ok("default") => None,
         Ok(n) => Some(
             n.parse()
-                .expect("ZECD_BENCH_BTC_LOOKAHEAD: auto, default or a number"),
+                .expect("ROSE_BENCH_BTC_LOOKAHEAD: auto, default or a number"),
         ),
     };
     let wallet_extra = lookahead
@@ -254,13 +254,13 @@ async fn regtest_btc_bench() {
     let Some(bitcoind) = provisioned(dir.path()) else {
         return;
     };
-    let zecd_version = std::process::Command::new(zecd_regtest_harness::zecd_bin())
+    let rose_version = std::process::Command::new(rose_regtest_harness::rose_bin())
         .arg("--version")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     eprintln!(
-        "BENCH btc zecd={zecd_version:?} steps={steps:?} outputs_per_tx={outputs_per_tx} txs_per_block={txs_per_block} sends={sends} fanout={fanout} burst={burst} restore={restore} lookahead={lookahead:?} tmp={}",
+        "BENCH btc rose={rose_version:?} steps={steps:?} outputs_per_tx={outputs_per_tx} txs_per_block={txs_per_block} sends={sends} fanout={fanout} burst={burst} restore={restore} lookahead={lookahead:?} tmp={}",
         dir.path().display()
     );
 
@@ -271,7 +271,7 @@ async fn regtest_btc_bench() {
     node.mine(MATURITY + coinbases).await;
 
     // The wallet under test: kyoto, no mempool feed (the kyoto suite's posture).
-    let mut zecd = ZecdBtc::prepare_full(
+    let mut rose = RoseBtc::prepare_full(
         dir.path().join("wallet"),
         BtcBackend::Kyoto,
         &node,
@@ -279,16 +279,16 @@ async fn regtest_btc_bench() {
         &wallet_extra,
         "[mempool]\nsources = []\n",
     );
-    let mnemonic = zecd
+    let mnemonic = rose
         .init_ok("btc", &["--birthday", "0"])
         .expect("a fresh init prints its mnemonic");
     let t0 = Instant::now();
-    zecd.start().await;
+    rose.start().await;
     let startup_ms = ms(t0.elapsed());
-    wait_height(&zecd, node.height().await, CATCHUP_TIMEOUT).await;
+    wait_height(&rose, node.height().await, CATCHUP_TIMEOUT).await;
     eprintln!(
         "BENCH up port={} startup_ms={startup_ms} height={}",
-        zecd.rpc_port,
+        rose.rpc_port,
         node.height().await
     );
 
@@ -299,7 +299,7 @@ async fn regtest_btc_bench() {
 
     for step in steps {
         // --- fund to `step` received outputs ------------------------------------------
-        let base_balance = zecd
+        let base_balance = rose
             .call("getbalance", json!([]))
             .await
             .expect("getbalance")
@@ -315,7 +315,7 @@ async fn regtest_btc_bench() {
                 let n = outputs_per_tx.min(step - received);
                 let mut outs = serde_json::Map::new();
                 for _ in 0..n {
-                    outs.insert(new_address(&zecd).await, json!(RECEIVE_BTC));
+                    outs.insert(new_address(&rose).await, json!(RECEIVE_BTC));
                 }
                 node.call("sendmany", json!(["", outs]))
                     .await
@@ -323,7 +323,7 @@ async fn regtest_btc_bench() {
                 received += n;
                 in_block += 1;
             }
-            catchup.push(mine_and_catch_up(&node, &zecd).await);
+            catchup.push(mine_and_catch_up(&node, &rose).await);
             blocks += 1;
         }
         let fund_ms = ms(t_fund.elapsed());
@@ -333,7 +333,7 @@ async fn regtest_btc_bench() {
                 / 1e8;
         let deadline = Instant::now() + CATCHUP_TIMEOUT;
         loop {
-            let b = zecd
+            let b = rose
                 .call("getbalance", json!([]))
                 .await
                 .expect("getbalance");
@@ -357,9 +357,9 @@ async fn regtest_btc_bench() {
         );
 
         // --- the live wallet at this size ---------------------------------------------
-        let live_reads = reads(&zecd).await;
-        let live_memory = memory(zecd.pid().expect("live pid"));
-        let live_datadir = dir_size(&zecd.datadir);
+        let live_reads = reads(&rose).await;
+        let live_memory = memory(rose.pid().expect("live pid"));
+        let live_datadir = dir_size(&rose.datadir);
         let height = node.height().await;
         eprintln!(
             "BENCH step={step} live reads={live_reads} memory={live_memory} datadir_bytes={live_datadir}"
@@ -371,7 +371,7 @@ async fn regtest_btc_bench() {
             let sink = node.new_address().await;
             for i in 0..sends {
                 let t = Instant::now();
-                let r = zecd.call("sendtoaddress", json!([sink, 0.0005])).await;
+                let r = rose.call("sendtoaddress", json!([sink, 0.0005])).await;
                 let rpc_ms = ms(t.elapsed());
                 match r {
                     Ok(txid) => {
@@ -405,7 +405,7 @@ async fn regtest_btc_bench() {
                 outs.insert(node.new_address().await, json!(0.0001));
             }
             let t = Instant::now();
-            let r = zecd.call("sendmany", json!(["", outs])).await;
+            let r = rose.call("sendmany", json!(["", outs])).await;
             let rpc_ms = ms(t.elapsed());
             fanout_result = match r {
                 Ok(txid) => {
@@ -421,7 +421,7 @@ async fn regtest_btc_bench() {
         }
         let mut post_send_catchup_ms = None;
         if sends > 0 || fanout > 0 {
-            post_send_catchup_ms = Some(mine_and_catch_up(&node, &zecd).await);
+            post_send_catchup_ms = Some(mine_and_catch_up(&node, &rose).await);
         }
 
         // --- the burst block: many own receives in one transaction ----------------------
@@ -429,23 +429,23 @@ async fn regtest_btc_bench() {
         if burst > 0 {
             let mut outs = serde_json::Map::new();
             for _ in 0..burst {
-                outs.insert(new_address(&zecd).await, json!(RECEIVE_BTC));
+                outs.insert(new_address(&rose).await, json!(RECEIVE_BTC));
             }
             node.call("sendmany", json!(["", outs]))
                 .await
                 .expect("burst sendmany");
             received += burst;
-            let catchup_ms = mine_and_catch_up(&node, &zecd).await;
+            let catchup_ms = mine_and_catch_up(&node, &rose).await;
             burst_result = json!({"outputs": burst, "catchup_ms": catchup_ms});
             eprintln!("BENCH step={step} burst={burst_result}");
         }
 
         // What the wallet holds now, for the restore to match.
-        let balance = zecd
+        let balance = rose
             .call("getbalance", json!([]))
             .await
             .expect("getbalance");
-        let unspent = zecd
+        let unspent = rose
             .call("listunspent", json!([]))
             .await
             .expect("listunspent")
@@ -458,7 +458,7 @@ async fn regtest_btc_bench() {
         let mut restore_result = Value::Null;
         if restore {
             let rdir = dir.path().join(format!("restore-{step}"));
-            let mut restored = ZecdBtc::prepare_full(
+            let mut restored = RoseBtc::prepare_full(
                 rdir.clone(),
                 BtcBackend::Kyoto,
                 &node,
@@ -552,7 +552,7 @@ async fn regtest_btc_bench() {
     }
 
     let all = json!({
-        "zecd": zecd_version,
+        "rose": rose_version,
         "config": {
             "outputs_per_tx": outputs_per_tx, "txs_per_block": txs_per_block,
             "sends": sends, "fanout": fanout, "burst": burst, "restore": restore,
@@ -561,9 +561,9 @@ async fn regtest_btc_bench() {
         "steps": results,
     });
     eprintln!("BENCH_RESULTS {}", serde_json::to_string(&all).unwrap());
-    if let Ok(out) = std::env::var("ZECD_BENCH_BTC_OUT") {
+    if let Ok(out) = std::env::var("ROSE_BENCH_BTC_OUT") {
         std::fs::write(&out, serde_json::to_string_pretty(&all).unwrap()).expect("write results");
         eprintln!("BENCH wrote {out}");
     }
-    zecd.stop();
+    rose.stop();
 }

@@ -32,7 +32,7 @@ use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 
-/// The magic prefix zcashd/zecd/zallet mix into every signed message so a signature over user text
+/// The magic prefix zcashd/rose/zallet mix into every signed message so a signature over user text
 /// can never be replayed as a signature over a transaction (`zcash/zcash` `main.cpp`).
 const MESSAGE_MAGIC: &str = "Zcash Signed Message:\n";
 
@@ -218,7 +218,7 @@ mod tests {
     // The wrong-message and wrong-address rejections are not repeated against this vector:
     // `sign_verify_wrong_message_fails` and `sign_verify_wrong_address_fails` below assert the
     // same `Ok(false)` outcomes on a generated keypair, and the branch is the same either way.
-    // What only this vector can prove is the positive above - that zecd verifies a signature it
+    // What only this vector can prove is the positive above - that rose verifies a signature it
     // did not produce, i.e. cross-implementation compatibility.
 
     #[test]

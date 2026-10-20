@@ -1,12 +1,12 @@
-# zecd configuration for the docker-compose stack (mounted at /etc/zecd/zecd.toml).
+# rose configuration for the docker-compose stack (mounted at /etc/rose/rose.toml).
 # Matches the stack's network - testnet by default; see docker-compose.yml / zebrad.toml.
 
 network = "test"
-datadir = "/var/lib/zecd"
+datadir = "/var/lib/rose"
 default_wallet = "default"
 
 [wallets.default]
-dir = "/var/lib/zecd/default"
+dir = "/var/lib/rose/default"
 
 [backend]
 # The co-located zebra full node's JSON-RPC (zebra:// = direct to zebrad).
@@ -26,14 +26,14 @@ reconnect_max_secs = 60
 bind = "0.0.0.0"
 port = 18232
 user = "zec"
-# Placeholder: zecd refuses to start while the password is `CHANGE-ME`, on every network. The
-# compose stack supplies the real one as ZECD_RPC_PASSWORD (from deploy/.env, gitignored),
+# Placeholder: rose refuses to start while the password is `CHANGE-ME`, on every network. The
+# compose stack supplies the real one as ROSE_RPC_PASSWORD (from deploy/.env, gitignored),
 # which wins over this line - so leave the file alone and set the variable.
 password = "CHANGE-ME"
 
 [keys]
-# age identity written by `zecd init`; used to decrypt the seed for unattended sending.
-age_identity = "/var/lib/zecd/identity.txt"
+# age identity written by `rose init`; used to decrypt the seed for unattended sending.
+age_identity = "/var/lib/rose/identity.txt"
 auto_unlock = true
 
 [sync]
@@ -58,7 +58,7 @@ port = 9233
 #       many transparent UTXOs, where the recurring spend-search backlog flaps the strict mode.
 #   "connected" - ready as soon as the backend is connected and its chain tip is past this wallet's
 #       birthday height (a sanity check that we're on the right, live network). Does NOT wait for
-#       the wallet to finish scanning, so RPC clients can reach zecd while it catches up, and
+#       the wallet to finish scanning, so RPC clients can reach rose while it catches up, and
 #       readiness doesn't flap during a long sync. Reads may lag the tip until caught up (the
 #       per-wallet `scan_lag` in /readyz and /status shows by how much).
 # readiness = "synced"

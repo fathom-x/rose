@@ -1,8 +1,8 @@
-//! The library behind the **`zecd`** binary: a Bitcoin-Core-style JSON-RPC server for
+//! The library behind the **`rose`** binary: a Bitcoin-Core-style JSON-RPC server for
 //! shielded and transparent Zcash (Ironwood, Orchard, Sapling, plus opt-in t-addresses).
 //! The binary is a thin CLI wrapper around [`daemon::run`].
 //!
-//! # Using zecd as a library
+//! # Using rose as a library
 //!
 //! Releases are published to crates.io as [`zecd`](https://crates.io/crates/zecd); depend on
 //! the released crate rather than on a git revision.
@@ -15,7 +15,7 @@
 //!   codes). See `examples/embedded.rs`.
 //! - [`node::Node::send`] + [`node::SendOptions`] - build, prove, and broadcast a send from a
 //!   `zip321::TransactionRequest` the caller already holds, instead of rendering one to
-//!   `z_sendmany`'s JSON for zecd to parse back. It accepts duplicate recipients (paying one
+//!   `z_sendmany`'s JSON for rose to parse back. It accepts duplicate recipients (paying one
 //!   address from several memo-carrying payments in one transaction), which the RPC refuses by
 //!   default for zcashd parity. Everything below it is the RPC send path unchanged.
 //! - [`wallet::read`] - the read-side query API over the wallet database: [`wallet::read::TxQuery`]
@@ -41,7 +41,7 @@
 //!   is not left taking a path that only internal API can produce.
 //! - [`wallet::keys::seed_with_identity`] and [`wallet::keys::pinned_ufvk`] - the seed
 //!   and viewing key of an on-disk wallet, for protocol-layer key derivation (an application
-//!   signing its own payloads with a BIP 44 child key). Deliberately *not* an RPC: zecd exports
+//!   signing its own payloads with a BIP 44 child key). Deliberately *not* an RPC: rose exports
 //!   no key material over the wire, and signing a caller-supplied digest with a wallet key would
 //!   be a spend oracle (that digest can be a transaction sighash). In-process is different -
 //!   the caller already holds the datadir and the age identity file, so these add no reach they
@@ -69,7 +69,7 @@
 //!   that account to start. `account_birthday` is the same function `init` builds its birthday
 //!   with, so an embedder that pins one records what `init` would have. Both take a
 //!   [`chain::ChainSource`] the caller supplies, which is what makes them usable over a
-//!   transport zecd does not configure (a SOCKS5 proxy, say) via
+//!   transport rose does not configure (a SOCKS5 proxy, say) via
 //!   [`chain::lwd::LwdSource::connect`].
 //! - A narrow, supported slice of [`chain`]: the read queries
 //!   [`chain::ChainSource::latest_block`], [`chain::ChainSource::tree_state`] and
@@ -101,7 +101,7 @@
 //! [`hardening::harden_process`] (core-dump/ptrace lockdown) stay the binary's business.
 //!
 //! Logging follows from that: the embedder's own subscriber receives every event, including
-//! the `rpc` and `wallet` spans and the `zecd::audit` target (see the README's "Logging when
+//! the `rpc` and `wallet` spans and the `rose::audit` target (see the README's "Logging when
 //! embedded"). Two things belong to `daemon::init_tracing` rather than to the library, so a
 //! `default-features = false` build has neither - `[log] level`/`[log] format`/`RUST_LOG`
 //! (which still parse, and still appear in [`config_show::render`], but are read only there),
@@ -111,7 +111,7 @@
 //!
 //! One startup side effect an embedder should know about: like the daemon,
 //! [`node::NodeBuilder::start`] takes the exclusive datadir lock and, under it, migrates a data
-//! directory laid out by an older zecd - librustzcash's databases move from a wallet
+//! directory laid out by an older rose - librustzcash's databases move from a wallet
 //! directory's root into `<wallet>/zec/lrz/`, leaving `keys.toml` where it is (see
 //! [`migrate`]). Each file is renamed, it runs before any wallet is opened, and it is a no-op
 //! on a data directory this build created. Two helpers there are supported for embedders that
@@ -143,7 +143,7 @@
 //! inherent to this surface: [`node::Node::send`] takes a `zip321::TransactionRequest` and
 //! [`node::SendOptions`] carries a [`config::SendPrivacy`], so a semver bump of `zip321` is
 //! visible here. That coupling is deliberate - it is the same type `z_sendmany` parses into,
-//! and hiding it behind a zecd-owned mirror would mean a second type to keep in lockstep with
+//! and hiding it behind a rose-owned mirror would mean a second type to keep in lockstep with
 //! librustzcash for no gain.
 //!
 //! # Running several writable wallets
@@ -159,15 +159,15 @@
 //! application is the authorization boundary and names the wallet explicitly on every
 //! [`node::Node::call`] / [`node::Node::send`]. So an application managing several independent
 //! writable stores in one process can set `[keys] allow_multiple_spending_wallets`, which
-//! [`node::NodeBuilder`] honors and the `zecd` daemon **refuses to start on**
+//! [`node::NodeBuilder`] honors and the `rose` daemon **refuses to start on**
 //! ([`config::reject_multiple_spenders_in_daemon`]); that asymmetry is the whole mechanism by
 //! which the option stays library-only. The additional spenders are logged to the
-//! `zecd::audit` target at startup, so the loosened posture is in the record rather than
+//! `rose::audit` target at startup, so the loosened posture is in the record rather than
 //! silent.
 //!
 //! Leaving it off, the alternative is **one node per store** - separate datadirs (each with
 //! its own lock, so a collision fails loudly at startup rather than corrupting a wallet
-//! database), separate ports if the HTTP servers are in play. That is the shape zecd's own
+//! database), separate ports if the HTTP servers are in play. That is the shape rose's own
 //! regtest harness runs, with the funder and the wallet under test as sibling daemons, and it
 //! is the only option under the daemon. Note that `server::run` is public: an embedder that
 //! puts the HTTP server in front of a node with this option set re-creates exactly the
@@ -181,12 +181,12 @@
 // could open - so it is refused here rather than left to fail as a pile of unresolved names.
 #[cfg(not(any(feature = "zcash", feature = "bitcoin")))]
 compile_error!(
-    "zecd needs at least one wallet engine: enable the `zcash` feature (on by default), the \
+    "rose needs at least one wallet engine: enable the `zcash` feature (on by default), the \
      `bitcoin` feature, or both"
 );
 
 // Re-exports of the third-party types that appear on the supported surface, so an embedder
-// depends on the same versions zecd does rather than pinning them independently - where a
+// depends on the same versions rose does rather than pinning them independently - where a
 // mismatch surfaces as a type error naming two identical-looking paths. `zip321` and `TxId`
 // are `node::Node::send`'s parameter and return types, so both ride the `zcash` gate with it.
 #[cfg(feature = "zcash")]

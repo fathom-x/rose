@@ -2,7 +2,7 @@
 //!
 //! A coin is an engine and an engine is a feature (see the shared-layer boundary in the project docs):
 //! this module is the Bitcoin counterpart of the librustzcash-backed `wallet/`+`sync/`+
-//! `chain/` stack, which rides the `zcash` feature the same way - so zecd builds with either
+//! `chain/` stack, which rides the `zcash` feature the same way - so rose builds with either
 //! engine or both, and `--no-default-features --features bitcoin,server,cli` is a
 //! bitcoin-only daemon carrying no Zcash crate at all. Each is self-contained behind the two
 //! sanctioned seams - the wallet registry (`wallet::CoinWallet`) and the RPC handlers. No `bdk_wallet` type may appear in a shared
@@ -11,7 +11,7 @@
 //! `bdk_chain`).
 //!
 //! Phase 1 delivered key derivation from the shared BIP-39 seed (BIP 84 descriptors),
-//! on-disk persistence over zecd's own rusqlite, a single-writer actor mirroring the Zcash
+//! on-disk persistence over rose's own rusqlite, a single-writer actor mirroring the Zcash
 //! one, and the wallet-shaped read slice of the RPC surface. Phase 2 added the chain source:
 //! a local bitcoind over JSON-RPC (`chain`), the actor's sync loop and mempool pass, and the
 //! spend path (seed-derived signers per send, never persisted) - so a bitcoin wallet

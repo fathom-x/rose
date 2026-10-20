@@ -17,7 +17,7 @@
 //! not load-bearing for backward compatibility - it is consulted at `init` only, and a
 //! wallet's anchor lives in its own database - so appending days per release is free.
 //!
-//! Both lookups err low, as every birthday resolution in zecd does: a date resolves to
+//! Both lookups err low, as every birthday resolution in rose does: a date resolves to
 //! the first block of the *previous* day (the shared one-day margin, so a block mined
 //! late on the day with a drifted-back header time is still covered), and a height to
 //! the last day entry at or below it. An anchor a little early only scans a few more

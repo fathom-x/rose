@@ -1,7 +1,7 @@
 //! End-to-end test of the data-directory layout migration (`src/migrate.rs`) on a **funded**
 //! wallet: the flow an operator upgrading across this change actually experiences.
 //!
-//! Older zecd kept librustzcash's databases at the root of each wallet directory, beside
+//! Older rose kept librustzcash's databases at the root of each wallet directory, beside
 //! `keys.toml`. They now live one coin and one engine deeper - `<wallet>/zec/lrz/` - while
 //! `keys.toml` stays at the wallet root, because the seed it wraps serves every coin and is the
 //! one file here that no chain can rebuild. The daemon performs that move once, under the
@@ -15,7 +15,7 @@
 //!
 //! Three properties, in order:
 //!
-//!   1. **Refusal.** The same database in both places is ambiguous - zecd must refuse to start
+//!   1. **Refusal.** The same database in both places is ambiguous - rose must refuse to start
 //!      and say so, leaving both copies intact, rather than pick one.
 //!   2. **Migration.** With only the old layout present, the daemon moves the databases and
 //!      comes back up on the same wallet, funds and history intact.
@@ -27,10 +27,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use serde_json::{json, Value};
-use zecd_regtest_harness::{
-    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zebrad, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Rose, RoseConfig, Zebrad,
 };
+use serde_json::{json, Value};
 
 /// Fund the wallet with 2 ZEC - enough that a lost database is unmistakable in the balance.
 const FUND_ZATOSHIS: u64 = 200_000_000;
@@ -52,10 +52,10 @@ async fn tip(zebrad: &Zebrad) -> u64 {
 }
 
 /// The durable contents of an engine directory: the wallet database, plus the on-disk
-/// block cache (`blockmeta.sqlite`, `blocks/`) a zecd from before the in-memory cache left
+/// block cache (`blockmeta.sqlite`, `blocks/`) a rose from before the in-memory cache left
 /// behind - everything a "move the wallet database and forget the rest" implementation could
 /// silently drop. This build writes only `data.sqlite`; the legacy pair is planted below, since
-/// the migration exists for data directories an older zecd produced.
+/// the migration exists for data directories an older rose produced.
 ///
 /// Deliberately not the raw directory listing: SQLite's `-wal`/`-shm` sidecars come and go
 /// across a clean shutdown, so comparing those would test the journal, not the migration.
@@ -80,14 +80,14 @@ fn move_dir_contents(from: &Path, to: &Path) {
 
 /// The wallet's own view of itself, as the migration must preserve it: confirmed balance, the
 /// funding transaction, and the memo on it.
-async fn wallet_state(zecd: &Zecd, txid: &str) -> (f64, Value) {
-    let balance = zecd
+async fn wallet_state(rose: &Rose, txid: &str) -> (f64, Value) {
+    let balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")
         .as_f64()
         .expect("getbalance is a number");
-    let tx = zecd
+    let tx = rose
         .call("gettransaction", json!([txid]))
         .await
         .expect("gettransaction on the funding payment");
@@ -121,9 +121,9 @@ async fn regtest_data_directory_layout_migration() {
         .await
         .expect("bring up a funded regtest chain");
 
-    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
-    let mut zecd = Zecd::start(&cfg).await.expect("start zecd");
-    let addr = zecd
+    let cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
+    let mut rose = Rose::start(&cfg).await.expect("start rose");
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress")
@@ -134,15 +134,15 @@ async fn regtest_data_directory_layout_migration() {
     funder
         .send_with_memo(&addr, FUND_ZATOSHIS, Some(RECEIVE_MEMO))
         .await
-        .expect("fund zecd with a memo'd payment");
+        .expect("fund rose with a memo'd payment");
     let target = tip(&zebrad).await + CONFIRM_BLOCKS as u64;
     zebrad
         .generate_blocks(CONFIRM_BLOCKS)
         .await
         .expect("confirm the funding payment");
-    zecd.wait_until_synced(target, FUND_TIMEOUT)
+    rose.wait_until_synced(target, FUND_TIMEOUT)
         .await
-        .expect("zecd scans the funding payment");
+        .expect("rose scans the funding payment");
     // "Caught up" has two halves and the wait above is only the first of them. Compact blocks
     // carry no memos, so the received output's memo stays NULL until either the mempool stream
     // stored the full transaction at 0-conf or the enhancement backlog drained. This test mines
@@ -150,7 +150,7 @@ async fn regtest_data_directory_layout_migration() {
     // memo assertion below racing enhancement rather than reading a settled wallet. It lost that
     // race on a faster node, and reported it as a migration failure even though the migration
     // had not run yet. `waitforsync` is the half that waits for the backlog.
-    let sync = zecd
+    let sync = rose
         .call("waitforsync", json!([FUND_TIMEOUT.as_millis() as u64]))
         .await
         .expect("waitforsync");
@@ -161,7 +161,7 @@ async fn regtest_data_directory_layout_migration() {
     );
 
     // Everything the migration has to carry across, recorded from the running daemon.
-    let txid = zecd
+    let txid = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions")
@@ -173,8 +173,8 @@ async fn regtest_data_directory_layout_migration() {
                 .map(str::to_string)
         })
         .expect("the funding receive is in the history");
-    let (balance_before, tx_before) = wallet_state(&zecd, &txid).await;
-    let height_before = zecd.block_count().await.expect("getblockcount");
+    let (balance_before, tx_before) = wallet_state(&rose, &txid).await;
+    let height_before = rose.block_count().await.expect("getblockcount");
     assert!(
         balance_before > 0.0,
         "the wallet must actually hold the funds before the migration (got {balance_before})"
@@ -185,20 +185,20 @@ async fn regtest_data_directory_layout_migration() {
         "the received memo is recorded before the migration: {tx_before}"
     );
 
-    let wallet = zecd.wallet_dir("default");
-    let engine = zecd.engine_dir("default");
+    let wallet = rose.wallet_dir("default");
+    let engine = rose.engine_dir("default");
     assert_eq!(
         durable_contents(&engine),
         vec!["data.sqlite"],
         "a scanned engine directory holds the wallet database and nothing else"
     );
 
-    // ---- 2. Put the databases back at the wallet root, as an older zecd left them ----
+    // ---- 2. Put the databases back at the wallet root, as an older rose left them ----
 
-    zecd.stop_keeping_datadir().await.expect("stop zecd");
+    rose.stop_keeping_datadir().await.expect("stop rose");
     move_dir_contents(&engine, &wallet);
     std::fs::remove_dir_all(wallet.join("zec")).expect("remove the now-empty coin directory");
-    // An older zecd also kept its on-disk block cache beside the database. Plant one, so the
+    // An older rose also kept its on-disk block cache beside the database. Plant one, so the
     // move is asserted over everything a pre-migration layout can hold, not just the file this
     // build happens to write.
     std::fs::write(
@@ -218,15 +218,15 @@ async fn regtest_data_directory_layout_migration() {
     // ---- 3. Refusal: the same database in both places stops startup, keeping both copies ----
 
     // The shape an operator produces by copying a wallet by hand, or by half-finishing this move
-    // themselves. Which database is authoritative is not zecd's call to make.
+    // themselves. Which database is authoritative is not rose's call to make.
     std::fs::create_dir_all(&engine).expect("create the conflicting directory");
     std::fs::copy(wallet.join("data.sqlite"), engine.join("data.sqlite"))
         .expect("plant a second copy of the database");
 
-    let stderr = zecd
+    let stderr = rose
         .respawn_expect_startup_failure()
         .await
-        .expect("zecd must refuse to start with the same database in both layouts");
+        .expect("rose must refuse to start with the same database in both layouts");
     assert!(
         stderr.contains("data.sqlite both at"),
         "the refusal must name the ambiguity, got:\n{stderr}"
@@ -240,9 +240,9 @@ async fn regtest_data_directory_layout_migration() {
 
     // ---- 4. Migration: the daemon moves the databases and comes back up on them ----
 
-    zecd.respawn()
+    rose.respawn()
         .await
-        .expect("zecd starts on a data directory in the older layout");
+        .expect("rose starts on a data directory in the older layout");
 
     assert_eq!(
         durable_contents(&engine),
@@ -263,7 +263,7 @@ async fn regtest_data_directory_layout_migration() {
     // No blocks were mined across the restart, so a wallet that had to rebuild itself from
     // keys.toml would be visible here: a rescan from the birthday, an empty balance, and no
     // history for a transaction it has not re-scanned yet.
-    let (balance_after, tx_after) = wallet_state(&zecd, &txid).await;
+    let (balance_after, tx_after) = wallet_state(&rose, &txid).await;
     assert_eq!(
         balance_after, balance_before,
         "the balance survived the migration unchanged"
@@ -274,11 +274,11 @@ async fn regtest_data_directory_layout_migration() {
         "the received memo survived the migration: {tx_after}"
     );
     assert_eq!(
-        zecd.block_count().await.expect("getblockcount"),
+        rose.block_count().await.expect("getblockcount"),
         height_before,
         "the migrated wallet resumed at its scanned height rather than rescanning"
     );
-    let info = zecd
+    let info = rose
         .call("getaddressinfo", json!([addr]))
         .await
         .expect("getaddressinfo after the migration");
@@ -289,13 +289,13 @@ async fn regtest_data_directory_layout_migration() {
 
     // ---- 5. Idempotence: a second start migrates nothing ----
 
-    zecd.stop_keeping_datadir()
+    rose.stop_keeping_datadir()
         .await
-        .expect("stop the migrated zecd");
-    zecd.respawn()
+        .expect("stop the migrated rose");
+    rose.respawn()
         .await
-        .expect("zecd restarts on the migrated data directory");
-    let (balance_again, _) = wallet_state(&zecd, &txid).await;
+        .expect("rose restarts on the migrated data directory");
+    let (balance_again, _) = wallet_state(&rose, &txid).await;
     assert_eq!(
         balance_again, balance_before,
         "a second start leaves the migrated wallet alone"

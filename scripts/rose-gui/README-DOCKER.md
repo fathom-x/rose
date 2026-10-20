@@ -1,53 +1,53 @@
-# zecd Bitcoin UI - Docker Guide
+# rose Bitcoin UI - Docker Guide
 
-This containerizes the lightweight Python dev server that proxies RPC requests to zecd with server-side credential handling.
+This containerizes the lightweight Python dev server that proxies RPC requests to rose with server-side credential handling.
 
-## Read this first: zecd itself does not run in a container here
+## Read this first: rose itself does not run in a container here
 
 The published `ghcr.io/zecrocks/zecd:latest` image is built **without** the `bitcoin` cargo
 feature (both Dockerfiles pass only `--features mimalloc-secure`), so it refuses
 `coin = "bitcoin"` at config resolution and rejects `[bitcoind]` as an unknown field. A
-containerised zecd for a Bitcoin wallet needs an image built from source with
-`--features bitcoin`; none is shipped. So in every recipe below, **zecd runs on the host**
+containerised rose for a Bitcoin wallet needs an image built from source with
+`--features bitcoin`; none is shipped. So in every recipe below, **rose runs on the host**
 from your own `cargo build --release --features bitcoin` and only the UI is containerised.
 
 ## Config file, or pure environment
 
-`serve.py` can take every value from a mounted zecd config, from the environment, or a mix -
+`serve.py` can take every value from a mounted rose config, from the environment, or a mix -
 each is resolved **flag > env > config > default**. So the image needs no config mounted at
 all: point `--conf` at a path that isn't there and it is skipped (not an error), and the only
 config-derived extras that fall away are the info panel's network/backend labels. The fee
-estimate needs no config: the page asks zecd's own `estimatesmartfee` through the proxy.
+estimate needs no config: the page asks rose's own `estimatesmartfee` through the proxy.
 
 | Value | Flag | Env | Config |
 |---|---|---|---|
-| RPC user | `--rpc-user` | `ZECD_RPC_USER` | `[rpc] user` |
-| RPC password | *(none - it's a secret)* | `ZECD_RPC_PASSWORD` | `[rpc] password` |
-| Upstream URL (whole) | `--rpc-url` | `ZECD_RPC_URL` | - |
-| Upstream host | `--rpc-host` | `ZECD_RPC_HOST` | `[rpc] bind` |
-| Upstream port | `--rpc-port` | `ZECD_RPC_PORT` | `[rpc] port` |
-| Upstream scheme | `--rpc-scheme` | `ZECD_RPC_SCHEME` | *(default `http`)* |
+| RPC user | `--rpc-user` | `ROSE_RPC_USER` | `[rpc] user` |
+| RPC password | *(none - it's a secret)* | `ROSE_RPC_PASSWORD` | `[rpc] password` |
+| Upstream URL (whole) | `--rpc-url` | `ROSE_RPC_URL` | - |
+| Upstream host | `--rpc-host` | `ROSE_RPC_HOST` | `[rpc] bind` |
+| Upstream port | `--rpc-port` | `ROSE_RPC_PORT` | `[rpc] port` |
+| Upstream scheme | `--rpc-scheme` | `ROSE_RPC_SCHEME` | *(default `http`)* |
 
 Env-only, nothing mounted:
 
 ```bash
 docker run --rm -p 127.0.0.1:8080:8080 \
-  -e ZECD_RPC_USER=view \
-  -e ZECD_RPC_PASSWORD \
-  -e ZECD_RPC_HOST=zecd-btc \
-  -e ZECD_RPC_PORT=18232 \
-  -e ZECD_NETWORK=main \
-  -e ZECD_BACKEND=kyoto \
+  -e ROSE_RPC_USER=view \
+  -e ROSE_RPC_PASSWORD \
+  -e ROSE_RPC_HOST=rose-btc \
+  -e ROSE_RPC_PORT=18232 \
+  -e ROSE_NETWORK=main \
+  -e ROSE_BACKEND=kyoto \
   "$GUI_IMAGE" --bind 0.0.0.0
 ```
 
-(`ZECD_NETWORK`/`ZECD_BACKEND` are optional - they only set the info panel's network/backend
+(`ROSE_NETWORK`/`ROSE_BACKEND` are optional - they only set the info panel's network/backend
 labels and the BTC/tBTC unit; the RPC works without them.)
 
-`ZECD_RPC_HOST`/`PORT`/`SCHEME` exist for callers that only have a **bare hostname** to hand in -
+`ROSE_RPC_HOST`/`PORT`/`SCHEME` exist for callers that only have a **bare hostname** to hand in -
 e.g. an orchestrator service reference (`fromService`) that can't have `http://` or a port
-string-composed onto it in the deployment blueprint. Pass the reference as `ZECD_RPC_HOST` and
-the port/scheme as literals; the proxy assembles `scheme://host:port`. When `ZECD_RPC_URL` (or
+string-composed onto it in the deployment blueprint. Pass the reference as `ROSE_RPC_HOST` and
+the port/scheme as literals; the proxy assembles `scheme://host:port`. When `ROSE_RPC_URL` (or
 `--rpc-url`) is set it wins and the parts are ignored.
 
 ## The address problem, and `--rpc-url`
@@ -57,8 +57,8 @@ The credentials travel into a container fine; the address does not. `[rpc] bind`
 which inside a container is the container's own loopback, so an unmodified run reaches
 nothing and every call returns 502.
 
-`--rpc-url` (env: `ZECD_RPC_URL`) overrides the address alone, keeping the config's
-credentials (or compose the address from `ZECD_RPC_HOST`/`PORT`/`SCHEME` as above). Two
+`--rpc-url` (env: `ROSE_RPC_URL`) overrides the address alone, keeping the config's
+credentials (or compose the address from `ROSE_RPC_HOST`/`PORT`/`SCHEME` as above). Two
 consequences worth knowing before you use `--rpc-url`:
 
 - **The host must listen past loopback.** A container reaches the host on the bridge
@@ -75,18 +75,18 @@ consequences worth knowing before you use `--rpc-url`:
 
 ### Preferred: the network compose stacks
 
-`deploy/docker-compose.btc-testnet{3,4}.yml` already carry a `zecd-gui` service wired this
+`deploy/docker-compose.btc-testnet{3,4}.yml` already carry a `rose-gui` service wired this
 way, and each carries its own comments on the config and port it expects. Prefer them over a
 bare `docker run`.
 
 ```bash
-# start zecd on the host, reachable from the container
-# The configs ship a CHANGE-ME placeholder that zecd refuses to start on, so the password
+# start rose on the host, reachable from the container
+# The configs ship a CHANGE-ME placeholder that rose refuses to start on, so the password
 # lives in the environment: once in deploy/.env for compose, once for the host daemon.
-echo "ZECD_RPC_PASSWORD=$(openssl rand -base64 24)" > deploy/.env    # gitignored
-export ZECD_RPC_PASSWORD=$(sed -n 's/^ZECD_RPC_PASSWORD=//p' deploy/.env)
+echo "ROSE_RPC_PASSWORD=$(openssl rand -base64 24)" > deploy/.env    # gitignored
+export ROSE_RPC_PASSWORD=$(sed -n 's/^ROSE_RPC_PASSWORD=//p' deploy/.env)
 # (the config names the datadir, ./data-btc-testnet4 relative to the repo root)
-./target/release/zecd --conf deploy/zecd.btc-testnet4.toml --rpcbind 0.0.0.0
+./target/release/rose --conf deploy/rose.btc-testnet4.toml --rpcbind 0.0.0.0
 
 docker compose -f deploy/docker-compose.btc-testnet4.yml up -d
 ```
@@ -96,7 +96,7 @@ Then open http://127.0.0.1:8080/
 ### Mainnet: host network, nothing published
 
 `deploy/docker-compose.btc-mainnet.yml` runs the UI on the **host network** instead. The
-mainnet config binds zecd's RPC to `127.0.0.1:8232`, and on the host network the container
+mainnet config binds rose's RPC to `127.0.0.1:8232`, and on the host network the container
 reaches that address as-is, so there is no `--rpc-url`, no `host.docker.internal`, and no
 `--rpcbind` past loopback on the daemon: the spend surface never leaves loopback. The UI
 binds `127.0.0.1:8081` on the host (8081 so it can run beside the testnet4 stack's GUI on
@@ -105,14 +105,14 @@ reverse proxy for TLS and auth if it must be reachable remotely. Linux only.
 
 ```bash
 cp deploy/.env.mainnet.example deploy/.env && $EDITOR deploy/.env    # one variable
-export ZECD_RPC_PASSWORD=$(sed -n 's/^ZECD_RPC_PASSWORD=//p' deploy/.env)
-./target/release/zecd --conf deploy/zecd.btc-mainnet.toml init --wallet btc   # once; record the mnemonic
-./target/release/zecd --conf deploy/zecd.btc-mainnet.toml
-docker compose -f deploy/docker-compose.btc-mainnet.yml up -d zecd-gui
+export ROSE_RPC_PASSWORD=$(sed -n 's/^ROSE_RPC_PASSWORD=//p' deploy/.env)
+./target/release/rose --conf deploy/rose.btc-mainnet.toml init --wallet btc   # once; record the mnemonic
+./target/release/rose --conf deploy/rose.btc-mainnet.toml
+docker compose -f deploy/docker-compose.btc-mainnet.yml up -d rose-gui
 ```
 
 To keep the seed off the dashboard host entirely, run the UI against a **watch-only**
-wallet: `zecd export-xpub --wallet btc` on the spender, `zecd init --xpub <key>` where the
+wallet: `rose export-xpub --wallet btc` on the spender, `rose init --xpub <key>` where the
 dashboard runs. The page reads `getwalletinfo.private_keys_enabled`, announces the
 watch-only wallet at the top, and disables its send form.
 
@@ -134,13 +134,13 @@ GUI_IMAGE=ghcr.io/zecrocks/zecd-gui:<version>    # or ...rose-gui:<version> from
 docker pull "$GUI_IMAGE"
 ```
 
-Everything below that says `zecd-gui` (a locally-built tag) works the same against the pulled
+Everything below that says `rose-gui` (a locally-built tag) works the same against the pulled
 image - substitute `"$GUI_IMAGE"`. The compose stacks still build from
-`scripts/zecd-gui/Dockerfile` (the same Dockerfile the image is published from) so their
+`scripts/rose-gui/Dockerfile` (the same Dockerfile the image is published from) so their
 `--reload` dev mount keeps working; to pull instead, replace a stack's `build:` block with
 `image: <that name>:<version>`.
 
-### One-off container against a host zecd
+### One-off container against a host rose
 
 Publish the port on loopback (`-p 127.0.0.1:8080:8080`, as below and as the compose stacks
 do), never on every interface: the proxy holds the wallet's RPC credentials and forwards
@@ -152,23 +152,23 @@ but neither is a substitute for not exposing it.
 ```bash
 # either pull the published image ($GUI_IMAGE from "The published image" above)...
 docker run --rm -p 127.0.0.1:8080:8080 \
-  -e ZECD_RPC_PASSWORD \
+  -e ROSE_RPC_PASSWORD \
   -v $(pwd)/deploy:/config:ro \
   --add-host host.docker.internal:host-gateway \
   "$GUI_IMAGE" \
-  --conf /config/zecd.btc-testnet4-kyoto.toml \
+  --conf /config/rose.btc-testnet4-kyoto.toml \
   --bind 0.0.0.0 \
   --rpc-url http://host.docker.internal:48242
 
 # ...or build it locally
-cd scripts/zecd-gui
-docker build -t zecd-gui .
+cd scripts/rose-gui
+docker build -t rose-gui .
 docker run --rm -p 127.0.0.1:8080:8080 \
-  -e ZECD_RPC_PASSWORD \
+  -e ROSE_RPC_PASSWORD \
   -v $(pwd)/../../deploy:/config:ro \
   --add-host host.docker.internal:host-gateway \
-  zecd-gui \
-  --conf /config/zecd.btc-testnet4-kyoto.toml \
+  rose-gui \
+  --conf /config/rose.btc-testnet4-kyoto.toml \
   --bind 0.0.0.0 \
   --rpc-url http://host.docker.internal:48242
 ```
@@ -179,7 +179,7 @@ The server is stdlib-only, so for local testing this is the shortest path and si
 address problem entirely:
 
 ```bash
-ZECD_RPC_PASSWORD=... python3 scripts/zecd-gui/serve.py --conf deploy/zecd.btc-testnet4-kyoto.toml
+ROSE_RPC_PASSWORD=... python3 scripts/rose-gui/serve.py --conf deploy/rose.btc-testnet4-kyoto.toml
 ```
 
 ## Configuration
@@ -189,25 +189,25 @@ ZECD_RPC_PASSWORD=... python3 scripts/zecd-gui/serve.py --conf deploy/zecd.btc-t
 See the resolution table under "Config file, or pure environment" above for how these layer
 with the flags and the config.
 
-- `ZECD_RPC_PASSWORD` - The RPC password. Effectively required: the shipped configs carry a
-  `CHANGE-ME` placeholder that zecd refuses to start on (every network) and that `serve.py`
+- `ROSE_RPC_PASSWORD` - The RPC password. Effectively required: the shipped configs carry a
+  `CHANGE-ME` placeholder that rose refuses to start on (every network) and that `serve.py`
   refuses for the same reason, so the daemon and the proxy each take the real value from this
   variable. It wins over `[rpc] password` in the file.
-- `ZECD_RPC_USER` - The RPC username, overriding `[rpc] user`. Lets the image run with no
+- `ROSE_RPC_USER` - The RPC username, overriding `[rpc] user`. Lets the image run with no
   config mounted (e.g. `view` for a watch-only wallet).
-- `ZECD_RPC_URL` - The whole upstream base URL, overriding the composed one; wins over the
+- `ROSE_RPC_URL` - The whole upstream base URL, overriding the composed one; wins over the
   host/port/scheme parts below.
-- `ZECD_RPC_HOST` / `ZECD_RPC_PORT` / `ZECD_RPC_SCHEME` - Compose the upstream URL from parts
-  when `ZECD_RPC_URL` is unset. `HOST` takes a bare hostname (an orchestrator service reference
+- `ROSE_RPC_HOST` / `ROSE_RPC_PORT` / `ROSE_RPC_SCHEME` - Compose the upstream URL from parts
+  when `ROSE_RPC_URL` is unset. `HOST` takes a bare hostname (an orchestrator service reference
   that can't have a scheme composed onto it); `SCHEME` defaults to `http`. They fall back to
   `[rpc] bind`/`port` from the config.
-- `ZECD_NETWORK` - The network label for the info panel (`main`/`test`/`testnet3`/`testnet4`).
+- `ROSE_NETWORK` - The network label for the info panel (`main`/`test`/`testnet3`/`testnet4`).
   Only cosmetic-ish: the page picks its unit from it (`BTC` on `main`/`mainnet`, else
   `tBTC`). Set it when running env-only, since no
   Bitcoin-wallet RPC reports the network; falls back to `[btc_testnet]`/`network` from the config.
-- `ZECD_BACKEND` - `kyoto` or `bitcoind`, the chain backend the info panel shows. Set it env-only;
+- `ROSE_BACKEND` - `kyoto` or `bitcoind`, the chain backend the info panel shows. Set it env-only;
   falls back to detecting `kyoto` from the config's `server` token.
-- `ZECD_GUI_MACHINE` - the name the page header shows for the machine the UI runs on (also
+- `ROSE_GUI_MACHINE` - the name the page header shows for the machine the UI runs on (also
   `--machine`). Defaults to the hostname, which is the host's own name under host networking
   (the mainnet stack) but a random container id on a bridge network, so the testnet stacks
   pass it through from `deploy/.env`. The config file the proxy read is on the header's
@@ -218,39 +218,39 @@ with the flags and the config.
 Pass arguments via the docker `CMD`:
 
 ```bash
-docker run zecd-gui \
-  --conf /config/zecd.btc-testnet3.toml \
+docker run rose-gui \
+  --conf /config/rose.btc-testnet3.toml \
   --port 8080 \
   --wallet btc
 ```
 
 Full options:
-- `--conf PATH` - zecd config file (default: `/config/zecd.btc-testnet4.toml`); skipped, not an
+- `--conf PATH` - rose config file (default: `/config/rose.btc-testnet4.toml`); skipped, not an
   error, when the path isn't present, so the image can run env-only
 - `--bind ADDR` - Server bind address (default: `0.0.0.0` in container)
 - `--port PORT` - Server port (default: `8080`)
 - `--wallet NAME` - Route RPC via `/wallet/<name>` (default: default wallet)
-- `--machine NAME` - the machine name the page header shows (env: `ZECD_GUI_MACHINE`; default: the hostname)
-- `--rpc-user NAME` - zecd RPC username, overriding `[rpc] user` (env: `ZECD_RPC_USER`)
-- `--rpc-url URL` - whole zecd JSON-RPC base URL, overriding the config's `[rpc]` bind/port (env: `ZECD_RPC_URL`)
+- `--machine NAME` - the machine name the page header shows (env: `ROSE_GUI_MACHINE`; default: the hostname)
+- `--rpc-user NAME` - rose RPC username, overriding `[rpc] user` (env: `ROSE_RPC_USER`)
+- `--rpc-url URL` - whole rose JSON-RPC base URL, overriding the config's `[rpc]` bind/port (env: `ROSE_RPC_URL`)
 - `--rpc-host HOST` / `--rpc-port PORT` / `--rpc-scheme SCHEME` - compose the base URL from parts
-  when `--rpc-url` is unset (env: `ZECD_RPC_HOST`/`ZECD_RPC_PORT`/`ZECD_RPC_SCHEME`; scheme default `http`)
+  when `--rpc-url` is unset (env: `ROSE_RPC_HOST`/`ROSE_RPC_PORT`/`ROSE_RPC_SCHEME`; scheme default `http`)
 - `--bitcoind-url URL` - ignored, accepted so older deployments still start. The fee estimate
-  is zecd's own `estimatesmartfee` (the estimate a send would use), not a separate bitcoind call
+  is rose's own `estimatesmartfee` (the estimate a send would use), not a separate bitcoind call
 
 ## Networking
 
 Whatever the topology, the rule is the same: credentials come from the config or the env, and
-the upstream address from `--rpc-url` (or the `ZECD_RPC_HOST`/`PORT`/`SCHEME` parts, or the
+the upstream address from `--rpc-url` (or the `ROSE_RPC_HOST`/`PORT`/`SCHEME` parts, or the
 config's `[rpc]` bind/port).
 
-| Where zecd runs | Address | Also needed |
+| Where rose runs | Address | Also needed |
 |---|---|---|
-| Host, UI in a container | `--rpc-url http://host.docker.internal:<rpc port>` | zecd `--rpcbind 0.0.0.0`; `--add-host host.docker.internal:host-gateway` on Linux |
+| Host, UI in a container | `--rpc-url http://host.docker.internal:<rpc port>` | rose `--rpcbind 0.0.0.0`; `--add-host host.docker.internal:host-gateway` on Linux |
 | A container on the same network | `--rpc-url http://<service name>:<rpc port>` | both on one Docker network; needs a `--features bitcoin` image (none published) |
-| An orchestrator service ref (bare hostname) | `ZECD_RPC_HOST=<ref> ZECD_RPC_PORT=<port>` | no config mount needed; also set `ZECD_RPC_USER`/`ZECD_RPC_PASSWORD` |
+| An orchestrator service ref (bare hostname) | `ROSE_RPC_HOST=<ref> ROSE_RPC_PORT=<port>` | no config mount needed; also set `ROSE_RPC_USER`/`ROSE_RPC_PASSWORD` |
 | Host, UI also on the host | omit it | nothing - the config's `127.0.0.1` is already right |
-| Host, UI in a container on the host network (mainnet) | omit it | `network_mode: host`, UI `--bind 127.0.0.1`; zecd stays on loopback |
+| Host, UI in a container on the host network (mainnet) | omit it | `network_mode: host`, UI `--bind 127.0.0.1`; rose stays on loopback |
 
 ## Development
 
@@ -264,17 +264,17 @@ that must not track the checkout drops the mount and the flag and gets the shipp
 A rebuild is only needed when the `Dockerfile` itself changes:
 
 ```bash
-docker build -t zecd-gui .
+docker build -t rose-gui .
 docker run --rm -p 127.0.0.1:8080:8080 \
   -v $(pwd)/../../deploy:/config:ro \
   --add-host host.docker.internal:host-gateway \
-  zecd-gui --bind 0.0.0.0 --rpc-url http://host.docker.internal:48232
+  rose-gui --bind 0.0.0.0 --rpc-url http://host.docker.internal:48232
 ```
 
 Or rebuild through the stack that owns the service:
 
 ```bash
-docker compose -f deploy/docker-compose.btc-testnet4.yml up -d --build zecd-gui
+docker compose -f deploy/docker-compose.btc-testnet4.yml up -d --build rose-gui
 ```
 
 For a fast edit loop, skip the image entirely and run `serve.py` directly - it has no
@@ -282,34 +282,34 @@ dependencies, so there is nothing to install.
 
 ## Troubleshooting
 
-### "zecd unreachable"
+### "rose unreachable"
 
-- Check that zecd is running: `docker ps` or local `ps aux | grep zecd`
-- Verify the RPC password: `echo $ZECD_RPC_PASSWORD`
-- Test the connection: `curl -u "btc:$ZECD_RPC_PASSWORD" http://localhost:48242/` (the kyoto config's port and user)
+- Check that rose is running: `docker ps` or local `ps aux | grep rose`
+- Verify the RPC password: `echo $ROSE_RPC_PASSWORD`
+- Test the connection: `curl -u "btc:$ROSE_RPC_PASSWORD" http://localhost:48242/` (the kyoto config's port and user)
 
 ### "no RPC password" / "still the CHANGE-ME placeholder"
 
-- Set the `ZECD_RPC_PASSWORD` environment variable to the password the host zecd runs with
+- Set the `ROSE_RPC_PASSWORD` environment variable to the password the host rose runs with
   (compose reads it from `deploy/.env`; the daemon needs it in its own environment)
 
 ### "fee estimate: none"
 
-- zecd had no estimate for the chosen target (a fresh regtest chain, or a test network whose
-  node estimator has no usable data). A send without a fee rate then pays zecd's 1 sat/vB
+- rose had no estimate for the chosen target (a fresh regtest chain, or a test network whose
+  node estimator has no usable data). A send without a fee rate then pays rose's 1 sat/vB
   test-network fallback, and is refused on mainnet: type a rate, or pick another target
 
 ### Port already in use
 
 ```bash
 # Use a different port
-docker run -p 127.0.0.1:9000:8080 zecd-gui
+docker run -p 127.0.0.1:9000:8080 rose-gui
 # Then open http://127.0.0.1:9000/
 ```
 
 ## Production Notes
 
-- This image runs as non-root user `zecd-ui` (UID 1000) for security
+- This image runs as non-root user `rose-ui` (UID 1000) for security
 - Credentials are passed via environment variables (not baked into the image)
 - Use `--bind 0.0.0.0` in containers, but consider a reverse proxy (nginx, traefik) in production
 - Mount the config as read-only (`:ro`) to prevent accidental modification

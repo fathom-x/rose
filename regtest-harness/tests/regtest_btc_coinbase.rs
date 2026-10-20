@@ -17,11 +17,11 @@
 //! spender sends the matured reward. Over kyoto the wallet sees the coinbase through
 //! the block filters like any other output; the maturity rule is the wallet's own.
 //!
-//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
+//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::json;
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn btc_immature_coinbase_is_withheld_until_maturity_over_bitcoind() {
@@ -41,20 +41,20 @@ async fn coinbase_flow(backend: BtcBackend) {
     let node = BitcoinD::start(&bitcoind, &dir.path().join("btcdata")).await;
     node.mine(101).await;
 
-    let mut zecd = ZecdBtc::prepare(dir.path().join("zecddata"), backend, &node, &["btc"]);
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(101).await;
+    let mut rose = RoseBtc::prepare(dir.path().join("rosedata"), backend, &node, &["btc"]);
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(101).await;
 
     // A block paid to the wallet: the regtest subsidy is still 50 BTC at this height.
-    let reward_addr = zecd
+    let reward_addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
     let reward_addr = reward_addr.as_str().unwrap().to_string();
     node.mine_to(&reward_addr, 1).await;
-    zecd.wait_height(102).await;
-    zecd.wait_wallet(
+    rose.wait_height(102).await;
+    rose.wait_wallet(
         "btc",
         "getbalances",
         json!([]),
@@ -64,14 +64,14 @@ async fn coinbase_flow(backend: BtcBackend) {
     .await;
 
     // 1. One confirmation: immature on every read.
-    let balances = zecd
+    let balances = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances");
     assert_eq!(balances["mine"]["trusted"], json!(0.0), "{balances}");
     assert_eq!(balances["mine"]["immature"], json!(50.0), "{balances}");
     for params in [json!([]), json!([1])] {
-        let unspent = zecd
+        let unspent = rose
             .call("listunspent", params.clone())
             .await
             .expect("listunspent");
@@ -83,7 +83,7 @@ async fn coinbase_flow(backend: BtcBackend) {
         );
     }
     for params in [json!([]), json!(["*", 1])] {
-        let balance = zecd
+        let balance = rose
             .call("getbalance", params.clone())
             .await
             .expect("getbalance");
@@ -94,7 +94,7 @@ async fn coinbase_flow(backend: BtcBackend) {
             backend.label()
         );
     }
-    let wi = zecd
+    let wi = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -103,8 +103,8 @@ async fn coinbase_flow(backend: BtcBackend) {
 
     // 2. Ninety-nine more blocks on top: 100 confirmations, still one short.
     node.mine(99).await;
-    zecd.wait_height(201).await;
-    let unspent = zecd
+    rose.wait_height(201).await;
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent at 100 confirmations");
@@ -114,7 +114,7 @@ async fn coinbase_flow(backend: BtcBackend) {
         "[{}] one short of maturity",
         backend.label()
     );
-    let balances = zecd
+    let balances = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances at 100 confirmations");
@@ -122,9 +122,9 @@ async fn coinbase_flow(backend: BtcBackend) {
 
     // 3. The hundredth block on top: matured, and every read flips together.
     node.mine(1).await;
-    zecd.wait_height(202).await;
-    zecd.wait_wallet_balance("btc", 50.0).await;
-    let unspent = zecd
+    rose.wait_height(202).await;
+    rose.wait_wallet_balance("btc", 50.0).await;
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent at maturity");
@@ -134,13 +134,13 @@ async fn coinbase_flow(backend: BtcBackend) {
     assert_eq!(unspent[0]["amount"], json!(50.0), "{unspent:?}");
     assert_eq!(unspent[0]["confirmations"], json!(101), "{unspent:?}");
     assert_eq!(unspent[0]["safe"], json!(true), "{unspent:?}");
-    let balances = zecd
+    let balances = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances at maturity");
     assert_eq!(balances["mine"]["trusted"], json!(50.0), "{balances}");
     assert_eq!(balances["mine"]["immature"], json!(0.0), "{balances}");
-    let balance = zecd
+    let balance = rose
         .call("getbalance", json!(["*", 1]))
         .await
         .expect("getbalance 1 at maturity");
@@ -148,14 +148,14 @@ async fn coinbase_flow(backend: BtcBackend) {
 
     // 4. And it spends: the matured reward funds a send.
     let dest = node.new_address().await;
-    let txid = zecd
+    let txid = rose
         .call("sendtoaddress", json!([dest, 1.0]))
         .await
         .expect("send from the matured reward");
     assert!(txid.as_str().is_some_and(|t| t.len() == 64), "{txid}");
     node.mine(1).await;
-    zecd.wait_height(203).await;
-    let tx = zecd
+    rose.wait_height(203).await;
+    let tx = rose
         .call("gettransaction", json!([txid]))
         .await
         .expect("gettransaction");

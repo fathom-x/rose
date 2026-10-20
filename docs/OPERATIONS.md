@@ -119,7 +119,7 @@ being scanned lives in memory, so nothing under the engine directory but `data.s
 worth a snapshot.
 
 > **Upgrading from a data directory without `zec/lrz/`.** Older rose kept the databases at the
-> wallet root (`<datadir>/default/data.sqlite`). The first `rose run` (or `rose init` / `rose
+> wallet root (`<datadir>/default/data.sqlite`). The first `rosed` start (or `rose init` / `rose
 > rescan`) of a version that ships this layout moves them into `<wallet>/zec/lrz/`, under the
 > datadir lock; `keys.toml` is already where it belongs and is not touched. Each file is renamed,
 > not copied: no extra disk space, nothing deleted, and an interrupted move finishes on the next
@@ -163,7 +163,7 @@ false`.
 
 **Nothing on disk at all - not even `keys.toml`.** That is the enclave shape (ephemeral
 storage, and a `FROM scratch` image with no shell to run `init` before the daemon), and
-`rose run --restore-if-empty` covers it: when the named wallet (`--wallet`, else the
+`rosed --restore-if-empty` covers it: when the named wallet (`--wallet`, else the
 config's implied wallet - `default_wallet`, or its one declared wallet) has no `keys.toml`,
 the daemon runs the `init --restore` path first - the phrase
 from `ROSE_MNEMONIC`, else `--mnemonic-file`, never a prompt; the birthday from

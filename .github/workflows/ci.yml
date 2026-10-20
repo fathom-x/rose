@@ -1,7 +1,7 @@
 name: CI
 
-# Offline tier: builds rose and runs the full `cargo test` suite (unit + HTTP integration +
-# the regtest network/lifecycle tests) plus clippy. No network or Docker required, so this is
+# Offline tier: builds both rose binaries and runs the full `cargo test` suite (unit + HTTP
+# integration + the regtest network/lifecycle tests + the black-box CLI tests) plus clippy. No network or Docker required, so this is
 # the gating check that runs on every push/PR - including from automated runs.
 
 on:
@@ -13,9 +13,9 @@ on:
     # docs, the release/docker/regtest workflows, the Dockerfiles, and the release packaging
     # script. (Editing ci.yml itself still runs - it's not ignored.)
     #
-    # `rose.example.toml` and `deploy/**` are deliberately NOT ignored: tests/cli.rs runs
-    # `rose config check` over the sample configs this repo ships, so editing one of them can
-    # fail this tier and must therefore run it.
+    # `rose.example.toml` and `deploy/**` are deliberately NOT ignored: rose-cli/tests/cli.rs
+    # runs `rose config check` over the sample configs this repo ships, so editing one of them
+    # can fail this tier and must therefore run it.
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -70,20 +70,23 @@ jobs:
           cargo fmt --all --check
           cargo fmt --all --check --manifest-path regtest-harness/Cargo.toml
 
+      # The workspace: `rosed` (the library and the daemon) and `rose-cli` (the `rose` command
+      # line). A bare `cargo test` is the root package alone, so every step names the
+      # workspace - the CLI's black-box tests also drive the sibling `rosed` binary.
       - name: Build (both binaries)
-        run: cargo build --bins
+        run: cargo build --workspace --bins
 
       - name: Test (offline - includes the regtest network + wallet-lifecycle tests)
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   # Feature combinations. Two kinds of gate meet here: the transports (`server`, `cli`), which
   # a library consumer drops with `default-features = false`, and the wallet engines (`zcash`,
   # `bitcoin`), at least one of which every build must carry. Every combination they create
-  # must stay warning-free and its tests green. The default-features path is already covered by
-  # the `test` job above.
+  # must stay warning-free and its tests green. The default-features path (the bitcoin-only
+  # daemon and command line) is already covered by the `test` job above.
   features:
     runs-on: ubuntu-latest
     steps:
@@ -117,39 +120,41 @@ jobs:
           cargo clippy --all-targets --no-default-features --features zcash,server -- -D warnings
           cargo clippy --all-targets --no-default-features --features zcash,cli -- -D warnings
           cargo clippy --all-targets --no-default-features --features bitcoin -- -D warnings
-          cargo clippy --all-targets --no-default-features --features bitcoin,server,cli -- -D warnings
-          cargo clippy --all-targets --features bitcoin -- -D warnings
+          cargo clippy --all-targets --no-default-features --features bitcoin,cli -- -D warnings
+          cargo clippy --workspace --all-targets --no-default-features --features zcash,server,cli -- -D warnings
+          cargo clippy --workspace --all-targets --features zcash -- -D warnings
 
       - name: Test library-only (no transports, the Zcash engine alone)
         run: cargo test --no-default-features --features zcash
 
-      # The bitcoin-only binary: the shape the `zcash` gate exists for. Its own `cargo test`
+      # The zcash-only binaries: the shape the `bitcoin` gate exists for. Their own `cargo test`
       # because the shared shell answers differently there (a method the missing engine served
       # reads as method-not-found, `config check` refuses that engine's keys), and those
-      # answers are what the gate is for.
-      - name: Test the bitcoin-only build
-        run: cargo test --no-default-features --features bitcoin,server,cli
+      # answers are what the gate is for. The bitcoin-only shape is the default build, which the
+      # `test` job covers.
+      - name: Test the zcash-only build
+        run: cargo test --workspace --no-default-features --features zcash,server,cli
 
-      # A bitcoin-only rose must carry no Zcash crate at all - the whole point of making them
-      # optional. Compiling proves nothing here: an unused dependency still builds, ships in
-      # the binary, and lands in the licence bundle. `-e normal` excludes dev-dependencies,
-      # which are irrelevant to what a consumer links.
-      - name: A bitcoin-only build carries no Zcash crate
+      # The default (bitcoin-only) rose must carry no Zcash crate at all - the whole point of
+      # making them optional. Compiling proves nothing here: an unused dependency still builds,
+      # ships in the binary, and lands in the licence bundle. `-e normal` excludes
+      # dev-dependencies, which are irrelevant to what a consumer links. Both binaries.
+      - name: The default build carries no Zcash crate
         run: |
-          hits=$(cargo tree -e normal --no-default-features --features bitcoin,server,cli \
+          hits=$(cargo tree --workspace -e normal \
               | grep -icE 'zcash|orchard|sapling|zip32|zip321|pczt|tonic|prost' || true)
           if [ "$hits" != "0" ]; then
-            echo "::error::a bitcoin-only build pulled in $hits Zcash-side crate line(s):"
-            cargo tree -e normal --no-default-features --features bitcoin,server,cli \
+            echo "::error::the bitcoin-only build pulled in $hits Zcash-side crate line(s):"
+            cargo tree --workspace -e normal \
               | grep -iE 'zcash|orchard|sapling|zip32|zip321|pczt|tonic|prost'
             exit 1
           fi
 
       # Both engines: the combination the engine-boundary rule exists for (an engine `use` that
       # leaks into the other's build, or a shared-layer item that only compiles with one engine
-      # present, fails here).
+      # present, fails here). The shape the release images ship.
       - name: Test with both wallet engines
-        run: cargo test --features bitcoin
+        run: cargo test --workspace --features zcash
 
   # Dependency policy: RustSec advisories (vulnerabilities AND unmaintained crates),
   # license allowlist, wildcard-version ban, and registry/git source pinning. Exceptions
@@ -310,4 +315,4 @@ jobs:
         run: cargo check --lib --no-default-features --features bitcoin
 
       - name: Check with default features
-        run: cargo check --all-targets
+        run: cargo check --workspace --all-targets

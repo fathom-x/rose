@@ -50,13 +50,17 @@ ENV RUSTFLAGS="\
 -C link-arg=-Wl,--build-id=none"
 WORKDIR /usr/src/rose
 COPY . .
-# The cargo feature flags of the shipped binary. The default is the image everyone gets:
-# both engines, so one image serves a Zcash or a Bitcoin wallet. A deployment that needs
-# one engine builds a smaller binary faster by overriding this ARG - an enclave deployment,
-# for instance, renders its Dockerfile from this one with the Bitcoin-only set,
-# `--no-default-features --features mimalloc-secure,bitcoin,server,cli`, dropping the Zcash
-# stack's ~190 crates. Only features change; the runtime contract below does not.
-ARG ROSE_CARGO_FEATURES="--features mimalloc-secure,bitcoin"
+# The cargo feature flags of the shipped daemon. The default is the image everyone gets:
+# both engines, so one image serves a Zcash or a Bitcoin wallet (a bare `cargo build` is
+# Bitcoin-only; `zcash` is the opt-in). A deployment that needs one engine builds a smaller
+# binary faster by overriding this ARG - an enclave deployment, for instance,
+# renders its Dockerfile from this one with the Bitcoin-only set, `--no-default-features
+# --features mimalloc-secure,bitcoin,server,cli`, dropping the Zcash stack's ~190 crates.
+# Only features change; the runtime contract below does not.
+ARG ROSE_CARGO_FEATURES="--features mimalloc-secure,bitcoin,zcash"
+# The same choice for the `rose` command line (rose-cli/), whose engine features mirror the
+# daemon's (no allocator feature: it proves nothing). Keep the two ARGs on the same engines.
+ARG ROSE_CLI_CARGO_FEATURES="--features bitcoin,zcash"
 
 # Fetch dependencies
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -65,27 +69,33 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --locked \
         --target ${TARGET_ARCH}
 
-# Build the rose binary
+# Build the two rose binaries: `rosed` (the daemon) and `rose` (the command line)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/rose/target \
     cargo install \
         --frozen \
         --path . \
-        --bin rose \
+        --bin rosed \
         --target ${TARGET_ARCH} \
         # musl's default allocator is ~5-6x slower than glibc under Orchard proving's
         # multi-threaded allocation churn; mimalloc closes the gap. The `-secure` variant adds
         # heap hardening (guard pages, canary free-lists) for <4% on the proving path, recovering
         # the mitigations dropped by replacing musl's malloc-ng. glibc dev/test builds skip this.
         # (mimalloc-sys compiles C the same way libsqlite3-sys already does here.)
-        # `bitcoin` is the BDK wallet engine, off by default for `cargo build` so a dev build
-        # stays byte-identical to a pre-BDK one; the shipped image carries both engines so one
-        # image serves a Zcash or a Bitcoin wallet (a binary without it refuses
-        # `coin = "bitcoin"` at config resolve). THIRD-PARTY-LICENSES.txt is generated with
-        # the same feature set - keep scripts/generate-licenses.sh in step with the ARG's
-        # default (a narrower build embeds the same superset of notices; nothing is missing).
+        # `zcash` is the librustzcash wallet engine, off by default for `cargo build`; the
+        # shipped image carries both engines so one image serves a Zcash or a Bitcoin wallet
+        # (a binary without an engine refuses its `coin` at config resolve).
+        # THIRD-PARTY-LICENSES.txt is generated with the same feature set - keep
+        # scripts/generate-licenses.sh in step with the ARG's default (a narrower build
+        # embeds the same superset of notices; nothing is missing).
         ${ROSE_CARGO_FEATURES} \
+    && cargo install \
+        --frozen \
+        --path rose-cli \
+        --bin rose \
+        --target ${TARGET_ARCH} \
+        ${ROSE_CLI_CARGO_FEATURES} \
     # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the
     # unprivileged runtime user can write its datadirs (and SQLite its temp files).
     && install -d -m 0755 /rootfs/var/lib/rose \
@@ -101,11 +111,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # --- Stage 2: layer for local binary extraction ---
 FROM scratch AS export
 
-# Binary at the root for easy extraction
+# Binaries at the root for easy extraction
+COPY --from=builder /usr/local/cargo/bin/rosed /rosed
 COPY --from=builder /usr/local/cargo/bin/rose /rose
 
 # --- Stage 3: Minimal runtime with stagex ---
 FROM scratch AS runtime
+COPY --from=export /rosed /usr/local/bin/rosed
 COPY --from=export /rose /usr/local/bin/rose
 # License texts - rose is statically linked, so the third-party notices ship with it.
 COPY --from=builder /licenses/ /usr/share/doc/rose/
@@ -117,5 +129,6 @@ USER 10001:10001
 WORKDIR /var/lib/rose
 # rose JSON-RPC (mainnet 8232 / testnet 18232) + health (9233).
 EXPOSE 8232 18232 9233
-ENTRYPOINT ["rose"]
+# The daemon. The command line is beside it: `docker run --entrypoint rose ... init`.
+ENTRYPOINT ["rosed"]
 CMD ["--datadir", "/var/lib/rose"]

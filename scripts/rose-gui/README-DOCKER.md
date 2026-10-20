@@ -9,7 +9,7 @@ The `zecd` release images published up to 0.7.0 (`ghcr.io/zecrocks/zecd`) were b
 resolution and reject `[bitcoind]` as an unknown field. The images built from this tree and
 from the public `fathom-x/rose` tree carry both engines (`ROSE_CARGO_FEATURES` defaults to
 `--features mimalloc-secure,bitcoin`). The recipes below predate that and still run **rose on
-the host** from your own `cargo build --release --features bitcoin`, with only the UI
+the host** from your own `cargo build --release --workspace --bins`, with only the UI
 containerised; a containerised daemon works the same way once pointed at a current image.
 
 ## Config file, or pure environment
@@ -87,7 +87,7 @@ bare `docker run`.
 echo "ROSE_RPC_PASSWORD=$(openssl rand -base64 24)" > deploy/.env    # gitignored
 export ROSE_RPC_PASSWORD=$(sed -n 's/^ROSE_RPC_PASSWORD=//p' deploy/.env)
 # (the config names the datadir, ./data-btc-testnet4 relative to the repo root)
-./target/release/rose --conf deploy/rose.btc-testnet4.toml --rpcbind 0.0.0.0
+./target/release/rosed --conf deploy/rose.btc-testnet4.toml --rpcbind 0.0.0.0
 
 docker compose -f deploy/docker-compose.btc-testnet4.yml up -d
 ```
@@ -108,7 +108,7 @@ reverse proxy for TLS and auth if it must be reachable remotely. Linux only.
 cp deploy/.env.mainnet.example deploy/.env && $EDITOR deploy/.env    # one variable
 export ROSE_RPC_PASSWORD=$(sed -n 's/^ROSE_RPC_PASSWORD=//p' deploy/.env)
 ./target/release/rose --conf deploy/rose.btc-mainnet.toml init --wallet btc   # once; record the mnemonic
-./target/release/rose --conf deploy/rose.btc-mainnet.toml
+./target/release/rosed --conf deploy/rose.btc-mainnet.toml
 docker compose -f deploy/docker-compose.btc-mainnet.yml up -d rose-gui
 ```
 

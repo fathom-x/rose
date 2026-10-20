@@ -4,7 +4,7 @@
 # unchanged, so the same workflow applies - just add `-f docker-compose.mainnet.yml`:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra
-#   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm rose init --wallet default
+#   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm --entrypoint rose rose init --wallet default
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
 #
 # Compose v2 merges service `volumes` by container path, so each mount below replaces its testnet

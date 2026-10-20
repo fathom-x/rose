@@ -1,5 +1,5 @@
 //! Build and query an embedded rose node - no HTTP RPC server, no health server - through
-//! `rose::node::Node::call`, which dispatches with wire-identical semantics (same method
+//! `rosed::node::Node::call`, which dispatches with wire-identical semantics (same method
 //! table, same error codes as the JSON-RPC server).
 //!
 //! Requires an initialized wallet datadir (`rose init`) and a reachable upstream (the
@@ -15,12 +15,12 @@
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let datadir = std::env::args().nth(1).map(std::path::PathBuf::from);
-    let config = rose::config::AppConfig::resolve_overrides(&rose::config::ConfigOverrides {
+    let config = rosed::config::AppConfig::resolve_overrides(&rosed::config::ConfigOverrides {
         datadir,
         ..Default::default()
     })?;
 
-    let node = rose::node::NodeBuilder::new(config).start().await?;
+    let node = rosed::node::NodeBuilder::new(config).start().await?;
 
     // Wire-identical dispatch: the same call a JSON-RPC client would make as
     // {"method": "getblockcount", "params": []}, minus the HTTP transport.

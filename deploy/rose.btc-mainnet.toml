@@ -25,7 +25,7 @@
 # Bring-up (offline: kyoto init does not dial the node):
 #   export ROSE_RPC_PASSWORD=...                       # the value in deploy/.env
 #   ./target/release/rose --conf deploy/rose.btc-mainnet.toml init --wallet btc
-#   ./target/release/rose --conf deploy/rose.btc-mainnet.toml
+#   ./target/release/rosed --conf deploy/rose.btc-mainnet.toml
 #
 # `--wallet btc` is optional (it defaults to `default_wallet`, which names [wallets.btc]). A
 # freshly generated kyoto wallet's birthday defaults to today (funds cannot predate the

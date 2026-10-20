@@ -254,7 +254,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
 
     // The embedded path proper: clap-free config, the init core, the node facade.
     let datadir = tempfile::tempdir().expect("rose datadir");
-    let config = rose::config::AppConfig::resolve_overrides(&rose::config::ConfigOverrides {
+    let config = rosed::config::AppConfig::resolve_overrides(&rosed::config::ConfigOverrides {
         datadir: Some(datadir.path().to_path_buf()),
         regtest: true,
         server: Some(format!("zebra://127.0.0.1:{rpc_port}")),
@@ -262,12 +262,12 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     })
     .expect("config resolves");
 
-    let outcome = rose::init::init_wallet(
+    let outcome = rosed::init::init_wallet(
         &config,
-        rose::init::InitOptions {
+        rosed::init::InitOptions {
             wallet: "default".into(),
-            key: rose::init::InitKey::Generate,
-            encryption: rose::init::EncryptionInput::AgeIdentity,
+            key: rosed::init::InitKey::Generate,
+            encryption: rosed::init::EncryptionInput::AgeIdentity,
             birthday: None,
         },
     )
@@ -279,7 +279,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
         "a generated wallet returns its mnemonic"
     );
 
-    let node = rose::node::NodeBuilder::new(config)
+    let node = rosed::node::NodeBuilder::new(config)
         .start()
         .await
         .expect("node starts");
@@ -323,7 +323,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     let balances = c.get_balances().await.expect("getbalances");
     assert_eq!(balances.mine.trusted.zatoshis(), 0);
     assert!(c
-        .list_unspent(&rose::typed::wallet::ListUnspentOptions::default())
+        .list_unspent(&rosed::typed::wallet::ListUnspentOptions::default())
         .await
         .expect("listunspent")
         .is_empty());
@@ -340,9 +340,9 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     let opid = c
         .z_send_many(
             &address,
-            &[rose::typed::wallet::ZRecipient {
+            &[rosed::typed::wallet::ZRecipient {
                 address: address.clone(),
-                amount: rose::amount::Amount::from_zatoshis(10_000_000),
+                amount: rosed::amount::Amount::from_zatoshis(10_000_000),
                 memo: None,
             }],
             None,
@@ -364,7 +364,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
         waited.finished,
         "the unfunded send must finish (by failing)"
     );
-    assert_eq!(waited.status, rose::typed::wallet::OperationState::Failed);
+    assert_eq!(waited.status, rosed::typed::wallet::OperationState::Failed);
     assert_eq!(
         waited.error.as_ref().map(|e| e.code),
         Some(-6),
@@ -392,7 +392,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
         // Via the crate's own re-export, which is the point of having it: an embedder builds
         // requests with the exact `zip321` rose links, not a separately-pinned copy whose
         // mismatch would surface as a type error naming two identical-looking paths.
-        rose::zip321::Payment::new(
+        rosed::zip321::Payment::new(
             addr,
             Some(zcash_protocol::value::Zatoshis::ZERO),
             Some(zcash_protocol::memo::MemoBytes::from_bytes(&[b'a' + i]).expect("memo")),
@@ -402,15 +402,15 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
         )
         .expect("a zero-valued memo payment to a shielded address")
     };
-    let duplicated = rose::zip321::TransactionRequest::new(vec![memo_payment(0), memo_payment(1)])
+    let duplicated = rosed::zip321::TransactionRequest::new(vec![memo_payment(0), memo_payment(1)])
         .expect("a request paying one address twice is representable");
     let err = node
-        .send(None, duplicated, rose::node::SendOptions::default())
+        .send(None, duplicated, rosed::node::SendOptions::default())
         .await
         .expect_err("an unfunded wallet cannot pay the fee");
     assert_eq!(
         err.code,
-        rose::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS,
+        rosed::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS,
         "duplicate shielded recipients must reach fund selection, not be rejected as \
          duplicates: {err:?}"
     );
@@ -419,7 +419,7 @@ async fn embedded_node_serves_typed_calls_end_to_end() {
     node.shutdown().await;
 }
 
-/// The funded happy path for [`rose::node::Node::send`], which the shape-walk above cannot
+/// The funded happy path for [`rosed::node::Node::send`], which the shape-walk above cannot
 /// reach: it deliberately keeps an empty wallet, so every send there fails for want of funds.
 /// This test completes a real send through the seam - proposal, proof, signature, broadcast -
 /// and is the only place in the tree that does so through the library rather than an RPC.
@@ -459,17 +459,17 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
     //    upstream (it anchors the birthday on a tree state), so without offline derivation
     //    there would be no address to point zebra at before the wallet exists.
     let derive_config =
-        rose::config::AppConfig::resolve_overrides(&rose::config::ConfigOverrides {
+        rosed::config::AppConfig::resolve_overrides(&rosed::config::ConfigOverrides {
             datadir: Some(datadir.path().to_path_buf()),
             regtest: true,
             ..Default::default()
         })
         .expect("config resolves for offline derivation");
-    let derived = rose::derive_address::derive(
+    let derived = rosed::derive_address::derive(
         &derive_config,
-        rose::derive_address::DeriveOptions {
+        rosed::derive_address::DeriveOptions {
             wallet: None,
-            key: rose::derive_address::KeyInput::Mnemonic(phrase()),
+            key: rosed::derive_address::KeyInput::Mnemonic(phrase()),
             address_type: Some("orchard"),
             index: 0,
             count: 1,
@@ -492,20 +492,20 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
 
     // 3. The wallet restored from the phrase its address came from, birthday at genesis so the
     //    coinbase blocks are all in range.
-    let config = rose::config::AppConfig::resolve_overrides(&rose::config::ConfigOverrides {
+    let config = rosed::config::AppConfig::resolve_overrides(&rosed::config::ConfigOverrides {
         datadir: Some(datadir.path().to_path_buf()),
         regtest: true,
         server: Some(format!("zebra://127.0.0.1:{rpc_port}")),
         ..Default::default()
     })
     .expect("config resolves");
-    rose::init::init_wallet(
+    rosed::init::init_wallet(
         &config,
-        rose::init::InitOptions {
+        rosed::init::InitOptions {
             wallet: "default".into(),
-            key: rose::init::InitKey::Restore(rose::init::MnemonicInput::Phrase(phrase())),
-            encryption: rose::init::EncryptionInput::AgeIdentity,
-            birthday: Some(rose::init::Birthday::Height(1)),
+            key: rosed::init::InitKey::Restore(rosed::init::MnemonicInput::Phrase(phrase())),
+            encryption: rosed::init::EncryptionInput::AgeIdentity,
+            birthday: Some(rosed::init::Birthday::Height(1)),
         },
     )
     .await
@@ -519,7 +519,7 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
         .expect("the default wallet is configured")
         .engine_dir();
 
-    let node = rose::node::NodeBuilder::new(config)
+    let node = rosed::node::NodeBuilder::new(config)
         .start()
         .await
         .expect("node starts");
@@ -548,7 +548,7 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
     let account = location.account.expect("a synced wallet has an account");
     assert_eq!(
         location.scope,
-        rose::wallet::read::AccountScope::Only(account),
+        rosed::wallet::read::AccountScope::Only(account),
         "an existing account scopes to itself: {location:?}"
     );
 
@@ -561,7 +561,7 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
     // 5. The send: two zero-valued memo outputs to one address, through `Node::send`.
     let memo_payment = |text: &str| {
         let addr = zcash_address::ZcashAddress::try_from_encoded(&own_ua).expect("own UA");
-        rose::zip321::Payment::new(
+        rosed::zip321::Payment::new(
             addr,
             Some(zcash_protocol::value::Zatoshis::ZERO),
             Some(zcash_protocol::memo::MemoBytes::from_bytes(text.as_bytes()).expect("memo")),
@@ -571,14 +571,14 @@ async fn embedded_node_send_pays_a_funded_duplicate_recipient_batch() {
         )
         .expect("a zero-valued memo payment to a shielded address")
     };
-    let request = rose::zip321::TransactionRequest::new(vec![
+    let request = rosed::zip321::TransactionRequest::new(vec![
         memo_payment("embedded-send-first"),
         memo_payment("embedded-send-second"),
     ])
     .expect("a request paying one address twice is representable");
 
     let txid = node
-        .send(None, request, rose::node::SendOptions::default())
+        .send(None, request, rosed::node::SendOptions::default())
         .await
         .expect("the funded batch send completes");
 

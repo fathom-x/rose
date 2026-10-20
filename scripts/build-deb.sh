@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Build a reproducible Debian package (.deb) for rose from a pre-built binary.
+# Build a reproducible Debian package (.deb) for rose from the two pre-built binaries, the
+# `rosed` daemon and the `rose` command line.
 #
-# The binary itself is expected to already be a *reproducible* artifact - in CI it is
+# The binaries themselves are expected to already be *reproducible* artifacts - in CI they are
 # extracted from the `export` stage of the StageX (amd64) / pinned-Alpine (arm64)
 # Dockerfiles, which carry all the determinism flags (SOURCE_DATE_EPOCH, codegen-units=1,
 # --build-id=none) and produce a static musl binary on both architectures. This script only
@@ -12,19 +13,21 @@
 # honors SOURCE_DATE_EPOCH for the ar member timestamps, yielding a bit-for-bit identical .deb.
 #
 # Usage:
-#   scripts/build-deb.sh <binary-path> <version> <deb-arch> <output-dir>
+#   scripts/build-deb.sh <rosed-path> <rose-path> <version> <deb-arch> <output-dir>
 #
-#   <binary-path>  path to the compiled `rose` binary
+#   <rosed-path>   path to the compiled `rosed` daemon binary
+#   <rose-path>    path to the compiled `rose` command-line binary
 #   <version>      package version, e.g. 0.1.0 (no leading "v")
 #   <deb-arch>     Debian architecture: amd64 | arm64
 #   <output-dir>   directory the .deb is written to (created if missing)
 
 set -euo pipefail
 
-BINARY_PATH="${1:?usage: build-deb.sh <binary-path> <version> <deb-arch> <output-dir>}"
-VERSION="${2:?missing version}"
-DEB_ARCH="${3:?missing deb-arch}"
-OUTPUT_DIR="${4:?missing output-dir}"
+DAEMON_PATH="${1:?usage: build-deb.sh <rosed-path> <rose-path> <version> <deb-arch> <output-dir>}"
+CLI_PATH="${2:?missing rose-path}"
+VERSION="${3:?missing version}"
+DEB_ARCH="${4:?missing deb-arch}"
+OUTPUT_DIR="${5:?missing output-dir}"
 
 # Determinism anchor - keep in lockstep with the Dockerfiles' SOURCE_DATE_EPOCH.
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1}"
@@ -35,7 +38,8 @@ trap 'rm -rf "$STAGE"' EXIT
 chmod 0755 "$STAGE"   # mktemp -d is 0700; the package root (./) should be world-readable
 
 # --- Filesystem layout -----------------------------------------------------------------
-install -D -m 0755 "$BINARY_PATH"                       "$STAGE/usr/bin/rose"
+install -D -m 0755 "$DAEMON_PATH"                       "$STAGE/usr/bin/rosed"
+install -D -m 0755 "$CLI_PATH"                          "$STAGE/usr/bin/rose"
 install -D -m 0644 "$REPO_ROOT/rose.example.toml"       "$STAGE/usr/share/doc/rose/rose.example.toml"
 install -D -m 0644 "$REPO_ROOT/README.md"               "$STAGE/usr/share/doc/rose/README.md"
 # Third-party license bundle - rose is statically linked, so these notices ship with it.
@@ -53,7 +57,7 @@ Wants=network-online.target
 Type=simple
 User=rose
 Group=rose
-ExecStart=/usr/bin/rose --datadir /var/lib/rose
+ExecStart=/usr/bin/rosed --datadir /var/lib/rose
 Restart=on-failure
 RestartSec=5
 
@@ -109,11 +113,12 @@ Installed-Size: ${INSTALLED_SIZE}
 Section: net
 Priority: optional
 Homepage: https://github.com/fathom-x/rose
-Description: Bitcoin-Core-style JSON-RPC server for shielded and transparent Zcash
+Description: Bitcoin-Core-style JSON-RPC wallet server (Bitcoin and Zcash)
  rose speaks bitcoind's JSON-RPC dialect (method names, response shapes, error
- codes, HTTP auth) and maps it onto shielded Zcash operations (Ironwood, Orchard
- and Sapling, plus opt-in transparent), built on librustzcash. It runs against
- a local zebrad.
+ codes, HTTP auth) over a BDK Bitcoin wallet engine (a local bitcoind or the
+ kyoto light client) and a librustzcash Zcash engine (Ironwood, Orchard and
+ Sapling, plus opt-in transparent, against a local zebrad). The package ships
+ the rosed daemon and the rose command line.
 CONTROL
 
 # conffiles: none under /etc - the example config ships read-only under /usr/share/doc.

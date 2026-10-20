@@ -32,7 +32,7 @@
 #   REGTEST_JOBS          how many binaries to run at once (default 1 - the old serial behaviour)
 #   REGTEST_TEST_THREADS  threads within each binary (default 1); see the note on it below
 #   REGTEST_LOG_DIR       where per-binary logs land (default $RUNNER_TEMP/regtest-logs, else ./regtest-logs)
-# Everything else (ROSE_BIN, ZEBRAD_BIN, ...) is inherited by each binary unchanged.
+# Everything else (ROSED_BIN, ROSE_BIN, ZEBRAD_BIN, ...) is inherited by each binary unchanged.
 
 set -uo pipefail
 

@@ -49,6 +49,16 @@ async fn regtest_end_to_end() {
         .await
         .expect("rose scans to the regtest tip");
 
+    // The `rose` command line's RPC client reaches this daemon through the same `rose.toml`
+    // (its `[rpc]` user, password and port) and answers with what the HTTP client sees: the
+    // chain is at rest between the two readings (synced, nothing mined), so they must agree.
+    let cli_height = rose.cli(&["getblockcount"]).expect("rose getblockcount");
+    assert_eq!(
+        cli_height.trim(),
+        rose.block_count().await.expect("getblockcount").to_string(),
+        "`rose getblockcount` disagrees with the HTTP client"
+    );
+
     // ---- rose RPC assertions ----
 
     // Chain identity. Capture the synced height rather than assuming an absolute value (how the

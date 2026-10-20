@@ -187,7 +187,7 @@ pub fn engine_dir_for_reading(entry: &WalletEntry) -> PathBuf {
         return engine;
     }
     warn!(
-        "reading the wallet database from its pre-{}/{}/ location {}; the next `rose run` (or \
+        "reading the wallet database from its pre-{}/{}/ location {}; the next `rosed` start (or \
          `rose init`/`rose rescan`) moves it to {}",
         entry.coin.data_dir(),
         entry.coin.engine_dir(),

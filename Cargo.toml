@@ -1,19 +1,26 @@
 [package]
-name = "rose"
+name = "rosed"
 version = "0.7.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-publish = true
-description = "A Bitcoin-Core-style JSON-RPC server for shielded and transparent Zcash (Ironwood, Orchard, Sapling, plus opt-in t-addresses), built on the Zakura Common librustzcash stack"
-repository = "https://github.com/zecrocks/zecd"
-homepage = "https://zecd.org"
+description = "A Bitcoin-Core-style JSON-RPC wallet server: the rose daemon and the library behind it, with a BDK Bitcoin engine and an opt-in Zakura Common (librustzcash) Zcash engine"
+
+# Two crates over one library: this one is the library plus the `rosed` daemon, and
+# `rose-cli/` is the operator's `rose` binary (the admin subcommands and a bitcoin-cli-style
+# RPC client). The regtest harness is deliberately *not* a member: it keeps its own
+# lockfile, isolated from this crate's pinned wallet stack.
+[workspace]
+members = ["rose-cli"]
+exclude = ["regtest-harness"]
 
 [[bin]]
-name = "rose"
+name = "rosed"
 path = "src/main.rs"
-# The binary is the full product: HTTP servers + CLI. Library consumers can instead build with
-# `default-features = false` (the embeddable node + the CLI cores, no axum/clap).
+# The daemon: the HTTP servers over the embeddable node, with the boot-time flags
+# (`--restore-if-empty`) and nothing else - every subcommand is `rose`'s (rose-cli/). Library
+# consumers build with `default-features = false` (the embeddable node + the CLI cores, no
+# axum/clap).
 required-features = ["server", "cli"]
 
 [dependencies]
@@ -232,11 +239,12 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 mimalloc = { version = "0.1", optional = true }
 
 [features]
-# The binary's full surface, on by default so `cargo build`/`cargo test` and the release
-# images are unchanged: the HTTP transports, the CLI, and the Zcash wallet engine. A library
+# The daemon's full surface, on by default so `cargo build`/`cargo test` produce the shape a
+# Bitcoin deployment ships: the HTTP transports, the CLI cores, and the Bitcoin wallet engine.
+# The Zcash engine is opt-in (`--features zcash`); the release images carry both. A library
 # consumer builds with `default-features = false` plus the engine(s) it wants for the
 # embeddable node (`crate::node`) and the CLI cores, without axum or clap in the tree.
-default = ["server", "cli", "zcash"]
+default = ["server", "cli", "bitcoin"]
 # The HTTP transports: the axum JSON-RPC server (`server::run`) and the health server.
 server = ["dep:axum"]
 # The clap CLI surface (`config::Cli`, the subcommand shells) and `daemon::init_tracing`.
@@ -255,9 +263,9 @@ cli = ["dep:clap", "dep:tracing-subscriber"]
 # `TlsOptions`) are rose-owned and stay in the ungated half of `backend.rs`.
 #
 # The librustzcash-backed Zcash wallet engine: `wallet/`, `sync/`, `chain/` (zebra JSON-RPC and
-# lightwalletd gRPC upstreams), `fleet`, the `z_*` RPCs, `node::Node::send`. On by default. A
-# build without it is a bitcoin-only rose and carries no Zcash crate at all - the `features`
-# CI job asserts that with `cargo tree`.
+# lightwalletd gRPC upstreams), `fleet`, the `z_*` RPCs, `node::Node::send`. Opt-in: the
+# default build is bitcoin-only and carries no Zcash crate at all - the `features` CI job
+# asserts that with `cargo tree`.
 zcash = [
     "dep:orchard",
     "dep:sapling",
@@ -282,10 +290,9 @@ zcash = [
     "dep:prost",
     "dep:rustls",
 ]
-# The BDK-backed Bitcoin wallet engine (`src/btc/`), off by default: a default build is
-# byte-identical to a pre-BDK one and `coin = "bitcoin"` in a config is refused at resolve
-# ("this build supports: zcash"). Alone (`--no-default-features --features bitcoin,server,cli`)
-# it is the bitcoin-only rose.
+# The BDK-backed Bitcoin wallet engine (`src/btc/`), on by default: the default build is the
+# bitcoin-only rose, and `coin = "zcash"` in a config is refused there at resolve ("this
+# build supports: bitcoin"). `--features zcash` adds the other engine.
 bitcoin = ["dep:bdk_wallet", "dep:bdk_bitcoind_rpc", "dep:bdk_kyoto", "dep:rand_core", "dep:hyper-rustls", "dep:tokio-tungstenite"]
 # Use mimalloc as the global allocator. Off by default; the musl release images opt in.
 mimalloc = ["dep:mimalloc"]

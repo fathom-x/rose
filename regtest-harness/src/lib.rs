@@ -979,17 +979,36 @@ const SHIELD_UTXO_LIMIT: u32 = 10;
 /// Upper bound on the blocks [`Funder::wait_until_mined`] will mine waiting for a transaction.
 const MINE_UNTIL_CONFIRMED_BLOCKS: u32 = 20;
 
-/// Locate the binary that plays the **funder**: `$ROSE_FUNDER_BIN` when set (CI extracts it
-/// from a digest-pinned `ghcr.io/zecrocks/zecd` release image, a release from before the
-/// `zecd` -> `rose` rename), else the built binary.
+/// The binaries that play the **funder**: `$ROSE_FUNDER_BIN` when set (CI extracts it from a
+/// digest-pinned `ghcr.io/zecrocks/zecd` release image, a release from before the `zecd` ->
+/// `rose` rename, whose one binary serves and administers alike), else the built pair - the
+/// `rosed` daemon and the `rose` command line.
 ///
 /// Running a *released* daemon as the funder keeps the two sides of every funded test independent: a
 /// regression on this branch cannot mask itself by being present in both the wallet under test and
 /// the wallet paying it. It also makes the funded tier cross-version coverage - the last release
 /// funds HEAD - which is the shape a real deployment upgrades through. Falling back to the built
-/// binary keeps a bare `cargo test` working with no extra setup.
-pub fn funder_bin() -> PathBuf {
-    resolve_bin("ROSE_FUNDER_BIN").unwrap_or_else(rose_bin)
+/// binaries keeps a bare `cargo test` working with no extra setup.
+#[derive(Debug, Clone)]
+pub struct FunderBins {
+    /// Runs the funder's daemon (spawned with no subcommand: a pre-rename release serves
+    /// that way too).
+    pub daemon: PathBuf,
+    /// Runs `init` and `config check` for it.
+    pub cli: PathBuf,
+}
+
+pub fn funder_bin() -> FunderBins {
+    match resolve_bin("ROSE_FUNDER_BIN") {
+        Some(pinned) => FunderBins {
+            daemon: pinned.clone(),
+            cli: pinned,
+        },
+        None => FunderBins {
+            daemon: rosed_bin(),
+            cli: rose_bin(),
+        },
+    }
 }
 
 /// A funding wallet: a second `rose` daemon that owns the regtest chain's coinbase.
@@ -1044,12 +1063,14 @@ impl Funder {
     /// anchors the account on that tree state).
     pub async fn init(zebra_rpc_port: u16) -> Result<Funder> {
         let bin = funder_bin();
-        if !bin.exists() {
-            bail!(
-                "funder rose binary not found at {} - build it first \
-                 (cargo build --release --bin rose) or set $ROSE_FUNDER_BIN",
-                bin.display()
-            );
+        for path in [&bin.daemon, &bin.cli] {
+            if !path.exists() {
+                bail!(
+                    "funder binary not found at {} - build it first (cargo build --release \
+                     --bin rosed && cargo build --release -p rose-cli) or set $ROSE_FUNDER_BIN",
+                    path.display()
+                );
+            }
         }
         let dir = tempfile::tempdir().context("create funder dir")?;
         let cfg = FunderConfig {
@@ -1067,20 +1088,15 @@ impl Funder {
         // `config check` exists for. Ask the funder's own binary whether it accepts the file,
         // which turns a violation into a named unknown key instead of the opaque daemon startup
         // timeout every funded test would otherwise report.
-        assert_funder_config_check_passes(&bin, dir.path())?;
-        funder_init_with_retry(&bin, dir.path(), &cfg).await?;
+        assert_funder_config_check_passes(&bin.cli, dir.path())?;
+        funder_init_with_retry(&bin.cli, dir.path(), &cfg).await?;
 
         // Discard the daemon's logs unless ROSE_STDERR asks for them, exactly like `Rose::start`
         // (both then interleave into the test output under `--nocapture`, each line tagged with
         // its instance so concurrent daemons stay distinguishable).
         let (out, err) = rose_daemon_stdio();
-        let mut child = funder_command(&bin)
-            .args([
-                "--datadir",
-                dir.path().to_str().unwrap(),
-                "--regtest",
-                "run",
-            ])
+        let mut child = funder_command(&bin.daemon)
+            .args(["--datadir", dir.path().to_str().unwrap(), "--regtest"])
             .stdout(out)
             .stderr(err)
             .spawn()
@@ -1142,12 +1158,14 @@ impl Funder {
         taddr: String,
     ) -> Result<Funder> {
         let bin = funder_bin();
-        if !bin.exists() {
-            bail!(
-                "funder rose binary not found at {} - build it first \
-                 (cargo build --release --bin rose) or set $ROSE_FUNDER_BIN",
-                bin.display()
-            );
+        for path in [&bin.daemon, &bin.cli] {
+            if !path.exists() {
+                bail!(
+                    "funder binary not found at {} - build it first (cargo build --release \
+                     --bin rosed && cargo build --release -p rose-cli) or set $ROSE_FUNDER_BIN",
+                    path.display()
+                );
+            }
         }
         let dir = tempfile::tempdir().context("create funder dir")?;
         copy_dir_all(datadir_src, dir.path())
@@ -1161,16 +1179,11 @@ impl Funder {
         };
         // Overwrite the snapshot's config: its ports belong to the stack that built it.
         write_funder_toml(dir.path(), &cfg)?;
-        assert_funder_config_check_passes(&bin, dir.path())?;
+        assert_funder_config_check_passes(&bin.cli, dir.path())?;
 
         let (out, err) = rose_daemon_stdio();
-        let mut child = funder_command(&bin)
-            .args([
-                "--datadir",
-                dir.path().to_str().unwrap(),
-                "--regtest",
-                "run",
-            ])
+        let mut child = funder_command(&bin.daemon)
+            .args(["--datadir", dir.path().to_str().unwrap(), "--regtest"])
             .stdout(out)
             .stderr(err)
             .spawn()
@@ -1848,11 +1861,12 @@ untrusted_confirmations = 1
 const FUNDER_LEGACY_CONF_FILE: &str = "zecd.toml";
 const FUNDER_LEGACY_NU63_HEIGHT_ENV: &str = "ZECD_REGTEST_NU63_HEIGHT";
 
-/// A `Command` for the funder binary, with the regtest NU6.3 height mirrored onto the variable
-/// a pre-rename release reads (see [`FUNDER_LEGACY_NU63_HEIGHT_ENV`]); a `rose` funder reads
+/// A `Command` for a funder binary, with the regtest NU6.3 height mirrored onto the variable
+/// a pre-rename release reads (see [`FUNDER_LEGACY_NU63_HEIGHT_ENV`]); a `rosed` funder reads
 /// `ROSE_REGTEST_NU63_HEIGHT` from the inherited environment as before. Every funder spawn goes
-/// through here: a funder that misses the height commits to the pre-NU6.3 branch id and the
-/// node rejects everything it sends.
+/// through here (the daemon with no subcommand, which a pre-rename release serves on too): a
+/// funder that misses the height commits to the pre-NU6.3 branch id and the node rejects
+/// everything it sends.
 fn funder_command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     if let Some(height) = std::env::var_os("ROSE_REGTEST_NU63_HEIGHT") {
@@ -1930,16 +1944,50 @@ fn run_funder_init(bin: &Path, dir: &Path) -> Result<()> {
 
 // =============================== rose (the system under test) ===============================
 
-/// Locate the built `rose` binary: `$ROSE_BIN` if set, else the parent crate's release build.
+/// Locate the built `rosed` daemon: `$ROSED_BIN` if set, else the parent crate's release
+/// build. Every daemon the harness starts is this binary; the subcommands are [`rose_bin`]'s.
+pub fn rosed_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("ROSED_BIN") {
+        return PathBuf::from(p);
+    }
+    built_bin("rosed")
+}
+
+/// Locate the built `rose` command line (rose-cli): `$ROSE_BIN` if set, else the workspace's
+/// release build. `init`, `config check`, `derive-address`, `export-ufvk` and the RPC client
+/// are its; the daemon is [`rosed_bin`].
 pub fn rose_bin() -> PathBuf {
     if let Ok(p) = std::env::var("ROSE_BIN") {
         return PathBuf::from(p);
     }
+    built_bin("rose")
+}
+
+/// `target/release/<name>` of the workspace this harness sits in.
+fn built_bin(name: &str) -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
-        .map(|p| p.join("target/release/rose"))
-        .unwrap_or_else(|| PathBuf::from("rose"))
+        .map(|p| p.join("target/release").join(name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Both binaries a stack needs, or a message naming the one that is missing and how to build
+/// it: `rosed` runs the daemon, `rose` initialises its wallets and checks its configuration.
+fn require_rose_binaries() -> Result<()> {
+    for (bin, name, build) in [
+        (rosed_bin(), "rosed", "cargo build --release --bin rosed"),
+        (rose_bin(), "rose", "cargo build --release -p rose-cli"),
+    ] {
+        if !bin.exists() {
+            bail!(
+                "{name} binary not found at {} - build it first ({build}) or set ${}_BIN",
+                bin.display(),
+                name.to_uppercase()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The stdout/stderr wiring for a rose daemon spawn: piped when `ROSE_STDERR` asks for the
@@ -2205,13 +2253,8 @@ impl Rose {
         // instance's RPC port so concurrent daemons stay distinguishable (see
         // [`forward_daemon_logs`]).
         let (out, err) = rose_daemon_stdio();
-        let mut child = Command::new(rose_bin())
-            .args([
-                "--datadir",
-                datadir.path().to_str().unwrap(),
-                "--regtest",
-                "run",
-            ])
+        let mut child = Command::new(rosed_bin())
+            .args(["--datadir", datadir.path().to_str().unwrap(), "--regtest"])
             .stdout(out)
             .stderr(err)
             .spawn()
@@ -2244,14 +2287,9 @@ impl Rose {
         name: &str,
     ) -> Result<String> {
         let datadir = tempfile::tempdir().context("create rose datadir")?;
+        require_rose_binaries()?;
+        // The command line, for `init` and `config check`; the daemon spawn is `rosed`.
         let bin = rose_bin();
-        if !bin.exists() {
-            bail!(
-                "rose binary not found at {} - build it first (cargo build --release --bin rose) \
-                 or set $ROSE_BIN",
-                bin.display()
-            );
-        }
         write_rose_toml(datadir.path(), cfg).context("write rose.toml")?;
         init_default_with_retry(&bin, datadir.path(), cfg).await?;
 
@@ -2281,14 +2319,9 @@ impl Rose {
     /// permitted, so extra *spending* wallets are never initialised here.)
     async fn prepare_datadir(cfg: &RoseConfig) -> Result<(tempfile::TempDir, Option<String>)> {
         let datadir = tempfile::tempdir().context("create rose datadir")?;
+        require_rose_binaries()?;
+        // The command line, for `init` and `config check`; the daemon spawn is `rosed`.
         let bin = rose_bin();
-        if !bin.exists() {
-            bail!(
-                "rose binary not found at {} - build it first (cargo build --release --bin rose) \
-                 or set $ROSE_BIN",
-                bin.display()
-            );
-        }
 
         write_rose_toml(datadir.path(), cfg).context("write rose.toml")?;
         // Every regtest is a free assertion that the `rose config` commands agree with the
@@ -2388,12 +2421,11 @@ impl Rose {
     /// with the same config, and wait for the RPC to come back up.
     pub async fn respawn(&mut self) -> Result<()> {
         let (out, err) = rose_daemon_stdio();
-        self.child = Command::new(rose_bin())
+        self.child = Command::new(rosed_bin())
             .args([
                 "--datadir",
                 self._datadir.path().to_str().unwrap(),
                 "--regtest",
-                "run",
             ])
             .stdout(out)
             .stderr(err)
@@ -2409,12 +2441,11 @@ impl Rose {
     /// message). Errors if the daemon comes up or exits cleanly. Used by the binding e2e:
     /// a swapped `data.sqlite` must refuse to serve.
     pub async fn respawn_expect_startup_failure(&mut self) -> Result<String> {
-        let mut child = Command::new(rose_bin())
+        let mut child = Command::new(rosed_bin())
             .args([
                 "--datadir",
                 self._datadir.path().to_str().unwrap(),
                 "--regtest",
-                "run",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -2474,12 +2505,11 @@ impl Rose {
         }
 
         let (out, err) = rose_daemon_stdio();
-        let mut child = Command::new(rose_bin())
+        let mut child = Command::new(rosed_bin())
             .args([
                 "--datadir",
                 self._datadir.path().to_str().unwrap(),
                 "--regtest",
-                "run",
             ])
             .stdout(out)
             .stderr(err)
@@ -2543,12 +2573,11 @@ impl Rose {
             }
         }
         write_rose_toml(self._datadir.path(), cfg).context("rewrite rose.toml for restart")?;
-        self.child = Command::new(rose_bin())
+        self.child = Command::new(rosed_bin())
             .args([
                 "--datadir",
                 self._datadir.path().to_str().unwrap(),
                 "--regtest",
-                "run",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2611,6 +2640,33 @@ impl Rose {
             .with_context(|| format!("body of {url}"))?;
         let json = serde_json::from_str(&body).unwrap_or(Value::String(body));
         Ok((status, json))
+    }
+
+    /// Run the `rose` command line against this daemon's datadir - `rose --datadir <dir>
+    /// --regtest <args...>` - and return its stdout. For an RPC method that is the client
+    /// half of `rose` reaching this daemon through the same `rose.toml` the daemon reads
+    /// (`[rpc]` user, password and port), so a test can hold the two surfaces to one answer.
+    /// `Err` carries stderr, with the exit code, for a refusal.
+    pub fn cli(&self, args: &[&str]) -> Result<String> {
+        let out = Command::new(rose_bin())
+            .args([
+                "--datadir",
+                self._datadir.path().to_str().unwrap(),
+                "--regtest",
+            ])
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .context("spawn rose")?;
+        if !out.status.success() {
+            bail!(
+                "rose {} failed ({}):\n{}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Issue a JSON-RPC call, returning the `result` on success or an error carrying the

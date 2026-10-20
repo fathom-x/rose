@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::{pick_port, rose_bin};
+use crate::{pick_port, rose_bin, rosed_bin};
 
 /// How long a rose wallet gets to reach a height, balance, or hash. Generous: a kyoto
 /// first sync downloads headers and filters for the whole regtest chain, and the node
@@ -595,8 +595,9 @@ impl RoseBtc {
         }
     }
 
-    fn cli(&self) -> Command {
-        let mut cmd = Command::new(rose_bin());
+    /// The global flags that select this instance's datadir and config, on `bin`.
+    fn with_globals(&self, bin: PathBuf) -> Command {
+        let mut cmd = Command::new(bin);
         cmd.args([
             "--datadir",
             self.datadir.to_str().unwrap(),
@@ -605,6 +606,16 @@ impl RoseBtc {
             self.conf.to_str().unwrap(),
         ]);
         cmd
+    }
+
+    /// `rose` (the command line) on this instance: `init`, `export-xpub`, an RPC method.
+    fn cli(&self) -> Command {
+        self.with_globals(rose_bin())
+    }
+
+    /// `rosed` (the daemon) on this instance.
+    fn daemon(&self) -> Command {
+        self.with_globals(rosed_bin())
     }
 
     /// `rose init --wallet <wallet> <extra...>`. `Ok((stdout, stderr))` on success (stdout
@@ -668,7 +679,7 @@ impl RoseBtc {
             self.base_url = format!("http://127.0.0.1:{}/", self.rpc_port);
         }
         let proc = self
-            .cli()
+            .daemon()
             .args([
                 "--rpcuser",
                 "zec",

@@ -224,8 +224,11 @@ jobs:
             regtest-harness
 
       # Release build: debug Orchard/Sapling proving is >20s; release keeps the harness snappy.
+      # Both engines (`zcash` is the opt-in; these legs drive Zcash wallets) and both binaries:
+      # the harness runs `rosed` as the daemon and `rose` for `init`, `config check` and the
+      # RPC client round-trip.
       - name: Build rose (release)
-        run: cargo build --release --bin rose
+        run: cargo build --release --workspace --bins --features zcash
 
       # Pick the node image + tag for this leg. `node` selects the project (zebra/zakura), which
       # fixes the image repo, pinned tag, binary name and the env var the harness reads. The
@@ -395,6 +398,7 @@ jobs:
       # live daemon, so the full Bitcoin-Core wire-format suite is exercised here in CI.
       - name: Run regtest end-to-end harness
         env:
+          ROSED_BIN: ${{ github.workspace }}/target/release/rosed
           ROSE_BIN: ${{ github.workspace }}/target/release/rose
           # Activate NU6.3 (ironwood) at height 8 on the regtest chain, matching the node config the
           # harness writes (regtest-harness's NU6_3_ACTIVATION_HEIGHT). The harness relays the
@@ -500,7 +504,7 @@ jobs:
         if: matrix.node == 'zebra' && matrix.suite == 'rose'
         env:
           ROSE_EMBEDDED_REGTEST: "1"
-        run: cargo test --release --locked --test embedded_regtest -- --ignored --nocapture
+        run: cargo test --release --locked --features zcash --test embedded_regtest -- --ignored --nocapture
 
       # run-tests.sh already replays each failing binary's output and tails its node log, so this
       # only adds what it can't know about: the machine's state, and whether a binary died so
@@ -587,16 +591,18 @@ jobs:
           mkdir -p ~/bitcoin-core
           tar -xzf "$tarball" -C ~/bitcoin-core --strip-components=1
 
-      # The bitcoin-only binary, not a both-engines one: these suites drive a Bitcoin wallet
-      # end to end, so running them against the build a bitcoin-only deployment actually ships
-      # is what proves that shape works. The both-engines shape is covered by the `features`
-      # job's `cargo test --features bitcoin` and by the Docker smoke checks.
+      # The bitcoin-only binaries (the default build), not both-engines ones: these suites
+      # drive a Bitcoin wallet end to end, so running them against the build a bitcoin-only
+      # deployment actually ships is what proves that shape works. The both-engines shape is
+      # covered by the `features` job's `cargo test --workspace --features zcash` and by the
+      # Docker smoke checks.
       - name: Build the bitcoin-only rose
-        run: cargo build --locked --no-default-features --features bitcoin,server,cli --bin rose
+        run: cargo build --locked --workspace --bins
 
       - name: Run the Bitcoin e2es
         working-directory: regtest-harness
         env:
+          ROSED_BIN: ${{ github.workspace }}/target/debug/rosed
           ROSE_BIN: ${{ github.workspace }}/target/debug/rose
         run: |
           # Set in the script rather than the env block: `~` in a YAML env value would reach

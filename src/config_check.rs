@@ -621,7 +621,7 @@ fn check_layout(config: &AppConfig, findings: &mut Vec<Finding>) {
             for m in moves {
                 findings.push(Finding::warning(format!(
                     "wallet '{}' still keeps its databases in the older layout, at the root of \
-                     {}; the next `rose run`, `rose init` or `rose rescan` moves {} into {}",
+                     {}; the next `rosed` start, `rose init` or `rose rescan` moves {} into {}",
                     m.wallet,
                     m.from.display(),
                     m.artifacts.join(", "),
@@ -846,11 +846,22 @@ mod tests {
     use clap::Parser;
     use std::path::Path;
 
-    /// Parse a CLI the way `main` does, so the tests exercise the real argument surface
-    /// (including that the global flags are accepted *after* the subcommand).
+    /// The shape `rose` (rose-cli) builds over [`Cli`] and [`Command`]: the shared flags
+    /// flattened above the subcommands. Parsing through it here exercises the property this
+    /// library owns - every flag on `Cli` is `global`, so it is accepted *after* a subcommand
+    /// too - the way the real binary does.
+    #[derive(Parser)]
+    struct WithSubcommands {
+        #[command(flatten)]
+        globals: Cli,
+        #[command(subcommand)]
+        _command: Option<crate::config::Command>,
+    }
+
     fn cli(args: &[&str]) -> Cli {
-        Cli::try_parse_from(std::iter::once("rose").chain(args.iter().copied()))
+        WithSubcommands::try_parse_from(std::iter::once("rose").chain(args.iter().copied()))
             .expect("parsing the test command line")
+            .globals
     }
 
     fn write_config(dir: &Path, text: &str) -> std::path::PathBuf {

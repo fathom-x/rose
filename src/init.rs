@@ -453,7 +453,7 @@ pub(crate) fn read_mnemonic_phrase(
 }
 
 /// The non-interactive sources of [`read_mnemonic_phrase`] alone - `ROSE_MNEMONIC`, else
-/// `file` - and `None` when neither is set, never a prompt. `run --restore-if-empty` reads
+/// `file` - and `None` when neither is set, never a prompt. `rosed --restore-if-empty` reads
 /// through this: a daemon has no operator at a terminal, so where `init` would prompt it
 /// refuses instead. The value goes through [`unquote_phrase`].
 #[cfg(feature = "cli")]
@@ -611,7 +611,7 @@ pub struct InitOutcome {
     pub generated_mnemonic: Option<Mnemonic<English>>,
 }
 
-/// What `rose run --restore-if-empty` restores - the library form of those flags, and the
+/// What `rosed --restore-if-empty` restores - the library form of those flags, and the
 /// one shape a boot-time restore takes: a seed wallet under age-identity custody, so it can
 /// serve unattended from the moment it exists (a passphrase-encrypted wallet would start
 /// locked with nobody to unlock it, and a watch-only one has nothing to restore from).
@@ -742,7 +742,7 @@ pub async fn init_wallet(config: &AppConfig, opts: InitOptions) -> anyhow::Resul
     }
 }
 
-/// The library core of `rose run --restore-if-empty`: restore `opts.wallet` from its mnemonic
+/// The library core of `rosed --restore-if-empty`: restore `opts.wallet` from its mnemonic
 /// **only if it is not initialized** - its `keys.toml` is absent, the same test the node uses
 /// to decide which wallets to spawn - and otherwise touch nothing, returning `None` without
 /// resolving the mnemonic. A wallet that *is* initialized but has lost its database is not
@@ -793,7 +793,7 @@ pub async fn restore_if_empty(
     .map(Some)
 }
 
-/// Map `rose run`'s flags onto [`RestoreIfEmpty`]: `None` unless `--restore-if-empty` was
+/// Map `rosed`'s flags onto [`RestoreIfEmpty`]: `None` unless `--restore-if-empty` was
 /// given. The wallet is `--wallet`, else the config's `default_wallet`. The key stays behind
 /// a deferred callback that reads the environment only if the wallet needs creating:
 /// `ROSE_XPUB` makes a watch-only Bitcoin wallet, `ROSE_MNEMONIC` (else `--mnemonic-file`)

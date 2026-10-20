@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rose_regtest_harness::{pick_port, rose_bin};
+use rose_regtest_harness::{pick_port, rose_bin, rosed_bin};
 use serde_json::{json, Value};
 
 /// Generous: a kyoto first sync downloads headers and filters for the whole regtest chain
@@ -197,7 +197,7 @@ impl RoseKyoto {
         rpc_port: u16,
     ) -> KillOnDrop {
         KillOnDrop(
-            Command::new(rose_bin())
+            Command::new(rosed_bin())
                 .args([
                     "--datadir",
                     datadir.to_str().unwrap(),

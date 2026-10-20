@@ -44,7 +44,7 @@ pub fn init_tracing(log: &config::LogConfig) {
     }
 }
 
-/// Run the daemon. `restore` is `rose run --restore-if-empty`'s request
+/// Run the daemon. `restore` is `rosed --restore-if-empty`'s request
 /// ([`crate::init::restore_if_empty`]): honored between the banner and the node's fail-fast
 /// phase, so a restore that happens is attributable to this build and datadir in the log,
 /// and one that fails ends the daemon before it has bound anything or spawned any wallet.

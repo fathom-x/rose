@@ -156,7 +156,7 @@ fork does that upstream of zecd, plus a faster `keygen_pk` on top.
 ```sh
 # node + funder as CI pins them (no Docker daemon needed - pull_bin.py walks the image layers)
 export ZEBRAD_BIN=/path/to/zebrad ROSE_FUNDER_BIN=/path/to/rose-0.7.0
-export ROSE_REGTEST_NU63_HEIGHT=8 ROSE_STDERR=1 RUST_LOG=rose=info
+export ROSE_REGTEST_NU63_HEIGHT=8 ROSE_STDERR=1 RUST_LOG=rosed=info
 export ROSE_BENCH_BINS="lrz=/path/to/rose-main,zakura=/path/to/rose-branch"
 cargo test --manifest-path regtest-harness/Cargo.toml --test regtest_bench_stack -- --nocapture
 ```

@@ -254,7 +254,7 @@ async fn regtest_btc_bench() {
     let Some(bitcoind) = provisioned(dir.path()) else {
         return;
     };
-    let rose_version = std::process::Command::new(rose_regtest_harness::rose_bin())
+    let rose_version = std::process::Command::new(rose_regtest_harness::rosed_bin())
         .arg("--version")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())

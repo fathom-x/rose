@@ -7,6 +7,7 @@
 !Cargo.lock
 !rust-toolchain.toml
 !src
+!rose-cli
 # `example-config` embeds this with include_str!, so the build needs it in the context.
 !rose.example.toml
 # License texts shipped in the runtime image (rose is statically linked, so the

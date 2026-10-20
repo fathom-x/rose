@@ -2141,19 +2141,21 @@ impl From<&Cli> for ConfigOverrides {
 }
 
 /// `rose` - a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash.
-// Every flag here is `global`, so it is accepted before *or* after a subcommand
-// (`rose --conf f config check` and `rose config check --conf f` are the same command). That
-// matters most for `config check`, whose whole job is resolving a named config the way the daemon
-// would - having to remember that `--conf` only works in one position would be a trap on the one
-// command an operator reaches for when something is already wrong. (A normal comment, not a doc
-// comment: clap renders the doc comment as the command's help text, and this is a note for
-// readers of the source.)
+// The global flags both binaries share: `rosed` (the daemon) flattens this next to
+// [`RunArgs`], and `rose` (rose-cli) flattens it above its subcommands. Every flag here is
+// `global`, so under `rose` it is accepted before *or* after a subcommand (`rose --conf f
+// config check` and `rose config check --conf f` are the same command). That matters most for
+// `config check`, whose whole job is resolving a named config the way the daemon would - having
+// to remember that `--conf` only works in one position would be a trap on the one command an
+// operator reaches for when something is already wrong. (A normal comment, not a doc comment:
+// clap would render a doc comment as help text, and this is a note for readers of the source.)
+// No `#[command(name, version)]` here: those belong to the binary that flattens this in. The
+// `Parser` derive stays so tests can `Cli::parse_from` the flags on their own.
 // `Clone` so the daemon can keep the parsed CLI for a SIGHUP reload: a reload must re-resolve
 // through exactly the path startup took (the same file, the same overrides, the same defaults),
 // which means holding on to the arguments rather than reconstructing them.
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, Parser)]
-#[command(name = "rose", version)]
 pub struct Cli {
     /// Path to the TOML config file (default: <datadir>/rose.toml, else ./rose.toml).
     #[arg(long, global = true, value_name = "FILE")]
@@ -2218,12 +2220,11 @@ pub struct Cli {
     /// seed can be a mounted Secret while the datadir stays a disposable cache).
     #[arg(long, global = true, value_name = "FILE", env = "ROSE_KEYS_FILE")]
     pub keys_file: Option<PathBuf>,
-
-    /// Subcommand. When omitted, runs the daemon.
-    #[command(subcommand)]
-    pub command: Option<Command>,
 }
 
+/// `rose`'s subcommands (rose-cli): everything an operator does beside running the daemon.
+/// The daemon itself is the `rosed` binary and has no subcommand; the RPC client half of
+/// `rose` is rose-cli's own, built over any word that is not one of these.
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum Command {
@@ -2260,9 +2261,6 @@ pub enum Command {
     /// it answers "can this deployment reach its backend?" and "what birthday should a wallet
     /// created now get?" before `rose init` has run.
     ChainInfo(ChainInfoArgs),
-    /// Run the JSON-RPC daemon (default). Takes the boot-time options a shell-less
-    /// deployment needs (`--restore-if-empty`).
-    Run(RunArgs),
 }
 
 #[cfg(feature = "cli")]
@@ -2329,7 +2327,7 @@ pub struct InitArgs {
     pub birthday: Option<crate::init::Birthday>,
 }
 
-/// `rose run`'s own flags: what the daemon does before it serves. Every one of them exists
+/// `rosed`'s own flags: what the daemon does before it serves. Every one of them exists
 /// for a deployment with no shell to script `init` first - an enclave, or the `FROM scratch`
 /// container images - where the whole "restore into an empty data directory, then serve"
 /// sequence has to be one command.
@@ -2529,7 +2527,7 @@ impl AppConfig {
     /// rose's file/port defaults - the library consumer's entry point ([`Cli`] converts into
     /// The wallet a `--wallet` flag names, or the config's [`implied_wallet`](Self::implied_wallet)
     /// when it was omitted - the one rule for every subcommand's `--wallet` (init,
-    /// export-ufvk, export-xpub, rescan, `run --restore-if-empty`). A config that declares
+    /// export-ufvk, export-xpub, rescan, `rosed --restore-if-empty`). A config that declares
     /// one wallet (`[wallets.btc]`, say) makes every subcommand address it with no flag; one
     /// that declares several and names no `default_wallet` makes the flag required, with an
     /// error listing the candidates. Before this the flags defaulted to the literal

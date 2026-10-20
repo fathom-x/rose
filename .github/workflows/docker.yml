@@ -1,6 +1,6 @@
 name: Docker
 
-# Builds both Docker images and smoke-tests both binaries, mirroring zallet's
+# Builds both Docker images and smoke-tests the two binaries in each, mirroring zallet's
 # test-docker-container workflow:
 #   - Dockerfile - the reproducible StageX build (amd64 only; StageX publishes
 #                         no arm64 images yet)
@@ -76,10 +76,12 @@ jobs:
       - name: Build Docker image
         run: docker build -f ${{ matrix.dockerfile }} -t rose .
 
-      - name: Run rose inside the container
-        run: docker run --rm rose --version
+      - name: Run both binaries inside the container
+        run: |
+          docker run --rm rose --version
+          docker run --rm --entrypoint rose rose --version
 
-      # `--version` proves the static binary loads; it touches nothing else. The first thing
+      # `--version` proves the static binaries load; it touches nothing else. The first thing
       # rose does on a real host is read a config file, so check one - `config check` parses a
       # production-shaped config, resolves every default and probes the datadir, and is
       # read-only (no datadir lock, no wallet DB, no cookie file), so it is safe to run in a
@@ -90,29 +92,30 @@ jobs:
       # real password the same way (deploy/.env).
       - name: Check a production config inside the container
         run: |
-          docker run --rm -e ROSE_RPC_PASSWORD=smoke-test \
+          docker run --rm -e ROSE_RPC_PASSWORD=smoke-test --entrypoint rose \
             -v "$PWD/deploy/rose.toml:/etc/rose/rose.toml:ro" rose \
             config check --conf /etc/rose/rose.toml
 
-      # The images carry the `bitcoin` wallet engine (`--features mimalloc-secure,bitcoin` in
-      # both Dockerfiles), which a default `cargo build` does not - so the step above proves
-      # nothing about it. Check a config that selects it: a binary built without the feature
-      # refuses `coin = "bitcoin"` at config resolve ("this build supports: zcash"), so this
-      # step going green is the proof that the engine shipped in the image.
+      # The images carry both wallet engines (`--features mimalloc-secure,bitcoin,zcash` in
+      # both Dockerfiles) where a default `cargo build` carries Bitcoin alone - so the Zcash
+      # config above already proves the opt-in engine shipped. Check a config that selects the
+      # Bitcoin engine too: a binary built without a feature refuses its `coin` at config
+      # resolve ("this build supports: ..."), so both steps going green is the proof that both
+      # engines are in the image.
       - name: Check a Bitcoin config inside the container
         run: |
-          docker run --rm -e ROSE_RPC_PASSWORD=smoke-test \
+          docker run --rm -e ROSE_RPC_PASSWORD=smoke-test --entrypoint rose \
             -v "$PWD/deploy/rose.btc-mainnet-view.toml:/etc/rose/rose.toml:ro" rose \
             config check --conf /etc/rose/rose.toml
 
       - name: Extract static binaries via the export stage
         run: |
           docker build -f ${{ matrix.dockerfile }} --target export -o ./out .
-          test -x out/rose
-          file out/rose
+          test -x out/rosed && test -x out/rose
+          file out/rosed out/rose
 
       # Logged so any two runs of the same commit can be diffed by hand - they should
       # be bit-for-bit identical (the i18n-embed-fl nondeterminism that once needed a
       # vendored patch is fixed upstream as of age 0.12; see the project docs "Gotchas").
       - name: Print binary hashes
-        run: sha256sum out/rose
+        run: sha256sum out/rosed out/rose

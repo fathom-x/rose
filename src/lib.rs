@@ -1,6 +1,8 @@
-//! The library behind the **`rose`** binary: a Bitcoin-Core-style JSON-RPC server for
-//! shielded and transparent Zcash (Ironwood, Orchard, Sapling, plus opt-in t-addresses).
-//! The binary is a thin CLI wrapper around [`daemon::run`].
+//! The library behind the **`rosed`** daemon and the **`rose`** operator binary (rose-cli): a
+//! Bitcoin-Core-style JSON-RPC wallet server over a BDK Bitcoin engine and an opt-in
+//! librustzcash Zcash engine (Ironwood, Orchard, Sapling, plus opt-in t-addresses). `rosed` is
+//! a thin wrapper around [`daemon::run`]; `rose` wraps the CLI cores listed below and adds a
+//! bitcoin-cli-style RPC client of its own.
 //!
 //! # Using rose as a library
 //!
@@ -58,7 +60,7 @@
 //!   sends and rides through [`node::Node::call`], so the typed surface cannot drift from the
 //!   wire contract; response structs are `#[non_exhaustive]` and use exact-zatoshi amounts.
 //! - The CLI cores, one data-returning function per subcommand: [`init::init_wallet`],
-//!   [`init::restore_if_empty`] (`run --restore-if-empty`'s restore-unless-initialized),
+//!   [`init::restore_if_empty`] (`rosed --restore-if-empty`'s restore-unless-initialized),
 //!   [`init::rescan_wallet`], [`init::export_ufvk_string`], [`derive_address::derive`],
 //!   [`config_check::check`] (and [`config_check::inspect`]), [`config_show::render`],
 //!   [`chain_probe::probe`], [`example_config::EXAMPLE_CONFIG`],

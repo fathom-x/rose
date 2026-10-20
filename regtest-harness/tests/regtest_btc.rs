@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use rose_regtest_harness::{pick_port, rose_bin};
+use rose_regtest_harness::{pick_port, rose_bin, rosed_bin};
 use serde_json::{json, Value};
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -164,7 +164,7 @@ impl RoseBtc {
         rpc_port: u16,
     ) -> KillOnDrop {
         KillOnDrop(
-            Command::new(rose_bin())
+            Command::new(rosed_bin())
                 .args([
                     "--datadir",
                     datadir.to_str().unwrap(),

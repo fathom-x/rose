@@ -1,4 +1,4 @@
-# Development-only Bitcoin Core **testnet3** node, for testing zecd's BDK engine (the
+# Development-only Bitcoin Core **testnet3** node, for testing rose's BDK engine (the
 # off-by-default `bitcoin` cargo feature) with real - valueless - testnet3 coins.
 #
 # The public-testnet sibling of docker-compose.btc-regtest.yml (same image pin, same
@@ -9,10 +9,10 @@
 # the public testnet3 chain and you fund the wallet from a testnet3 faucet.
 #
 # The node serves:
-#   - JSON-RPC on 18332 (bitcoind's testnet3 default - exactly where a testnet3 zecd's
+#   - JSON-RPC on 18332 (bitcoind's testnet3 default - exactly where a testnet3 rose's
 #     bare `server = "bitcoind"` token resolves to)
 #   - compact block filters over P2P on 18333 (-blockfilterindex + -peerblockfilters,
-#     what zecd's kyoto/BIP-157 light mode peers with: server = "kyoto://127.0.0.1:18333")
+#     what rose's kyoto/BIP-157 light mode peers with: server = "kyoto://127.0.0.1:18333")
 #   - -txindex, so getrawtransaction answers for any confirmed tx
 #
 # The image is pinned to Bitcoin Core 30.2, in lockstep with the regtest stack and the CI
@@ -26,8 +26,8 @@
 #       bitcoin-cli -testnet -rpcuser=btc -rpcpassword=btc'
 #   bcli3 getblockchaininfo     # wait for initialblockdownload: false
 #
-# The stack includes bitcoind, zecd (wallet daemon), and a web UI. Point zecd (or a standalone
-# zecd instance) at it. deploy/zecd.btc-testnet3.toml is that
+# The stack includes bitcoind, rose (wallet daemon), and a web UI. Point rose (or a standalone
+# rose instance) at it. deploy/rose.btc-testnet3.toml is that
 # config written out and commented (host-side, not mounted here); in outline:
 #   network = "test"
 #   btc_testnet = "testnet3"    # the default - the line just makes the choice explicit
@@ -37,7 +37,7 @@
 #   rpc_user = "btc"
 #   rpc_password = "btc"
 #
-# zecd keeps its own keys (keys.toml) and does all wallet tracking itself - the node
+# rose keeps its own keys (keys.toml) and does all wallet tracking itself - the node
 # needs no bitcoind wallet. Credentials are fixed dev values: testnet coins are valueless
 # and the RPC port is published on loopback only. Do not reuse this file's shape for
 # mainnet.
@@ -46,7 +46,7 @@
 # keeps this node in its own Compose project so `up -d` on the regtest/testnet4 stacks
 # cannot replace this one's `bitcoind` container.
 
-name: zecd-btc-testnet3
+name: rose-btc-testnet3
 
 services:
   bitcoind:
@@ -70,34 +70,34 @@ services:
     volumes:
       - bitcoind-testnet3-data:/home/bitcoin/.bitcoin
     networks:
-      - zecd-net
+      - rose-net
 
-  zecd-gui:
+  rose-gui:
     build:
-      context: ../scripts/zecd-gui
+      context: ../scripts/rose-gui
       dockerfile: Dockerfile
-    container_name: zecd-gui-testnet3
+    container_name: rose-gui-testnet3
     restart: unless-stopped
     depends_on:
       - bitcoind
     environment:
-      - ZECD_RPC_PASSWORD=zecd
+      - ROSE_RPC_PASSWORD=rose
       # The name the page header shows for this machine: a bridged container's own hostname is
-      # a random id, so set ZECD_GUI_MACHINE (e.g. to `hostname`'s output) in deploy/.env.
-      - ZECD_GUI_MACHINE=${ZECD_GUI_MACHINE:-}
+      # a random id, so set ROSE_GUI_MACHINE (e.g. to `hostname`'s output) in deploy/.env.
+      - ROSE_GUI_MACHINE=${ROSE_GUI_MACHINE:-}
     ports:
       - "127.0.0.1:8081:8080"  # UI on loopback only for dev (different port from testnet4)
     volumes:
-      - ./zecd.btc-testnet3.toml:/config/zecd.btc-testnet3.toml:ro
+      - ./rose.btc-testnet3.toml:/config/rose.btc-testnet3.toml:ro
     networks:
-      - zecd-net
+      - rose-net
     command:
-      - --conf=/config/zecd.btc-testnet3.toml
+      - --conf=/config/rose.btc-testnet3.toml
       - --bind=0.0.0.0
       - --port=8080
 
 networks:
-  zecd-net:
+  rose-net:
     driver: bridge
 
 volumes:

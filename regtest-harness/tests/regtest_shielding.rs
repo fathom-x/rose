@@ -6,7 +6,7 @@
 //! privacy rung: the default policy (`AllowRevealedRecipients`) must refuse to spend transparent
 //! inputs, which is why this daemon deliberately runs without a `[spend] privacy_policy` line.
 //!
-//! Flow: bring up the funder (mine + mature + shield), fund two zecd t-addresses A (1 ZEC) and
+//! Flow: bring up the funder (mine + mature + shield), fund two rose t-addresses A (1 ZEC) and
 //! B (0.3 ZEC), then:
 //!  - refusals: a transparent source without the rung is a synchronous `-4` (config default and
 //!    per-call `AllowRevealedAmounts` alike); a transparent source *plus* a transparent
@@ -24,10 +24,10 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Rose, RoseConfig,
 };
+use serde_json::json;
 
 const FUND_A_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
 const FUND_B_ZATOSHIS: u64 = 30_000_000; // 0.3 ZEC
@@ -40,8 +40,8 @@ const OP_TIMEOUT: Duration = Duration::from_secs(120);
 /// The send is submitted with `minconf 1` and the `AllowRevealedSenders` policy; `from` is the
 /// coin-control source (a wallet t-address or `ANY_TADDR`). Returns the txid.
 async fn shield_send(
-    zecd: &Zecd,
-    zebrad: &zecd_regtest_harness::Zebrad,
+    rose: &Rose,
+    zebrad: &rose_regtest_harness::Zebrad,
     from: &str,
     to: &str,
     amount: f64,
@@ -54,10 +54,10 @@ async fn shield_send(
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd scans to the chain tip before shielding");
-        let opid = zecd
+            .expect("rose scans to the chain tip before shielding");
+        let opid = rose
             .call(
                 "z_sendmany",
                 json!([
@@ -77,7 +77,7 @@ async fn shield_send(
             .expect("opid string")
             .to_string();
         assert!(opid.starts_with("opid-"), "opid shape: {opid}");
-        let waited = zecd
+        let waited = rose
             .call(
                 "z_waitforoperation",
                 json!([opid, OP_TIMEOUT.as_secs() as i64]),
@@ -130,34 +130,34 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         .expect("bring up a funded regtest chain");
     let funder_taddr = funder.transparent_address().to_string();
 
-    // 2. zecd with transparent receiving enabled and NO `[spend] privacy_policy` line: the
+    // 2. rose with transparent receiving enabled and NO `[spend] privacy_policy` line: the
     //    default (`AllowRevealedRecipients`) must be unable to spend transparent inputs, so the
     //    happy paths below all opt in per call via `privacyPolicy`.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.transparent = true;
-    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    let _rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
-        .expect("attach zecd backend");
-    let zecd = Zecd::start(&cfg)
+        .expect("attach rose backend");
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd with transparent receiving");
+        .expect("start rose with transparent receiving");
 
     // Two external t-addresses (A and B) and the wallet's own shielded UA.
-    let taddr_a = zecd
+    let taddr_a = rose
         .call("getnewaddress", json!(["", "transparent"]))
         .await
         .expect("getnewaddress transparent A")
         .as_str()
         .expect("address string")
         .to_string();
-    let taddr_b = zecd
+    let taddr_b = rose
         .call("getnewaddress", json!(["", "transparent"]))
         .await
         .expect("getnewaddress transparent B")
         .as_str()
         .expect("address string")
         .to_string();
-    let own_ua = zecd
+    let own_ua = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress shielded UA")
@@ -170,10 +170,10 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         "the default address is shielded: {own_ua}"
     );
 
-    // 3. Wait until zecd is caught up, then fund A (1 ZEC) and B (0.3 ZEC) and confirm.
+    // 3. Wait until rose is caught up, then fund A (1 ZEC) and B (0.3 ZEC) and confirm.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -186,7 +186,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached ready: {peers}"
+            "rose never reached ready: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -199,7 +199,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
     funder
         .send(&taddr_a, FUND_A_ZATOSHIS)
         .await
-        .expect("fund zecd t-address A");
+        .expect("fund rose t-address A");
     zebrad
         .generate_blocks(12)
         .await
@@ -211,14 +211,14 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
     funder
         .send(&taddr_b, FUND_B_ZATOSHIS)
         .await
-        .expect("fund zecd t-address B");
+        .expect("fund rose t-address B");
     zebrad
         .generate_blocks(12)
         .await
         .expect("confirm the B funding");
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let bal = zecd
+        let bal = rose
             .call("getbalance", json!([]))
             .await
             .ok()
@@ -229,7 +229,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd did not reach the 1.3-ZEC transparent balance within {FUND_TIMEOUT:?} (got {bal})"
+            "rose did not reach the 1.3-ZEC transparent balance within {FUND_TIMEOUT:?} (got {bal})"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -238,7 +238,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
     //
     // 4a. A transparent source under the config default (AllowRevealedRecipients) is -4: the
     //     default must never spend transparent inputs.
-    let err = zecd
+    let err = rose
         .call(
             "z_sendmany",
             json!([taddr_a, [{ "address": own_ua, "amount": 0.5 }]]),
@@ -251,7 +251,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         "the -4 names the gate: {err}"
     );
     // 4b. Same for an explicit weaker per-call policy.
-    let err = zecd
+    let err = rose
         .call(
             "z_sendmany",
             json!([taddr_a, [{ "address": own_ua, "amount": 0.5 }], 1, null, "AllowRevealedAmounts"]),
@@ -261,7 +261,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
     assert_eq!(err.code(), Some(-4), "AllowRevealedAmounts -> -4: {err}");
     // 4c. Transparent source + transparent recipient is a *fully transparent* transaction:
     //     AllowRevealedSenders is not enough (zcashd's split), it needs AllowFullyTransparent.
-    let err = zecd
+    let err = rose
         .call(
             "z_sendmany",
             json!([taddr_a, [{ "address": funder_taddr, "amount": 0.5 }], 1, null, "AllowRevealedSenders"]),
@@ -270,7 +270,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         .expect_err("a fully transparent tx needs AllowFullyTransparent");
     assert_eq!(err.code(), Some(-4), "t->t under senders-only -> -4: {err}");
     // 4d. A foreign t-address as fromaddress stays -5 (ownership is validated first).
-    let err = zecd
+    let err = rose
         .call(
             "z_sendmany",
             json!([funder_taddr, [{ "address": own_ua, "amount": 0.5 }], 1, null, "AllowRevealedSenders"]),
@@ -281,7 +281,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
 
     // 5. THE COIN-CONTROLLED SHIELD: 0.5 ZEC from A to the wallet's own UA. Only A's UTXO may
     //    fund it; the change (~0.5 minus the fee) must shield.
-    let txid = shield_send(&zecd, &zebrad, &taddr_a, &own_ua, 0.5).await;
+    let txid = shield_send(&rose, &zebrad, &taddr_a, &own_ua, 0.5).await;
     // Mine past the UNTRUSTED depth (ZIP-315 default 10), not just 1 conf: the 0.5 payment lands
     // on the wallet's own *external* UA, which the confirmations policy treats as a third-party
     // receive - only the internal change is trusted at 3 - so `getbalance` under the default
@@ -298,10 +298,10 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd syncs the shielding send");
-        let confs = zecd
+            .expect("rose syncs the shielding send");
+        let confs = rose
             .call("gettransaction", json!([txid]))
             .await
             .ok()
@@ -317,7 +317,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
     // 5b. Coin control held: B's UTXO survived untouched, A's is gone, and everything else the
     //     wallet holds is shielded (the payment and the change both landed in the shielded
     //     pool - no transparent change appeared).
-    let lu = zecd
+    let lu = rose
         .call("listunspent", json!([1]))
         .await
         .expect("listunspent");
@@ -351,7 +351,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
             );
         }
     }
-    let bal = zecd
+    let bal = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")
@@ -364,7 +364,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
 
     // 6. ANY_TADDR: shield 0.2 ZEC more. B's UTXO is the only transparent one left, so this
     //    proves the wildcard source; afterwards the wallet holds no transparent UTXOs at all.
-    let txid2 = shield_send(&zecd, &zebrad, "ANY_TADDR", &own_ua, 0.2).await;
+    let txid2 = shield_send(&rose, &zebrad, "ANY_TADDR", &own_ua, 0.2).await;
     // Past the untrusted depth again - the 0.2 payment is an own-external receive like above.
     zebrad
         .generate_blocks(12)
@@ -378,10 +378,10 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd syncs the ANY_TADDR shield");
-        let confs = zecd
+            .expect("rose syncs the ANY_TADDR shield");
+        let confs = rose
             .call("gettransaction", json!([txid2]))
             .await
             .ok()
@@ -396,7 +396,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let lu = zecd
+    let lu = rose
         .call("listunspent", json!([1]))
         .await
         .expect("listunspent after ANY_TADDR");
@@ -407,7 +407,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
             .all(|n| !n["address"].as_str().unwrap_or("").starts_with("tm")),
         "every transparent UTXO is now shielded: {lu}"
     );
-    let bal = zecd
+    let bal = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")
@@ -429,10 +429,10 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd scans before the deshield");
-        let opid = zecd
+            .expect("rose scans before the deshield");
+        let opid = rose
             .call(
                 "z_sendmany",
                 json!([own_ua, [{ "address": funder_taddr, "amount": 0.1 }], 1]),
@@ -442,7 +442,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
             .as_str()
             .expect("opid string")
             .to_string();
-        let waited = zecd
+        let waited = rose
             .call(
                 "z_waitforoperation",
                 json!([opid, OP_TIMEOUT.as_secs() as i64]),
@@ -479,10 +479,10 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd syncs the deshield");
-        let bal = zecd
+            .expect("rose syncs the deshield");
+        let bal = rose
             .call("getbalance", json!([]))
             .await
             .ok()
@@ -497,7 +497,7 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let bal = zecd
+    let bal = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")
@@ -508,6 +508,6 @@ async fn regtest_shielding_via_z_sendmany_fromaddress() {
         "0.1 ZEC left the wallet (plus fees): {bal}"
     );
 
-    drop(zecd);
+    drop(rose);
     // `zebrad` and `funder` clean up on drop.
 }

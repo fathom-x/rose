@@ -22,7 +22,7 @@ use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 
-/// Every RPC method name zecd implements, used to validate the `[rpc] allowed_methods`
+/// Every RPC method name rose implements, used to validate the `[rpc] allowed_methods`
 /// safelist at startup. Keep this in lockstep with the `dispatch` table; the
 /// `all_methods_matches_dispatch_tables` test enforces it.
 pub const ALL_METHODS: &[&str] = &[
@@ -99,16 +99,16 @@ pub const ALL_METHODS: &[&str] = &[
     "z_listunifiedreceivers",
 ];
 
-/// Whether `name` is an RPC method zecd implements (see [`ALL_METHODS`]).
+/// Whether `name` is an RPC method rose implements (see [`ALL_METHODS`]).
 pub fn is_known_method(name: &str) -> bool {
     ALL_METHODS.contains(&name)
 }
 
 /// The maximum number of *positional* parameters each method accepts. Bitcoin Core rejects a
 /// call carrying more positional arguments than the method declares (it raises the help text,
-/// `RPC_MISC_ERROR`/-1); zecd mirrors that via [`check_arity`] in dispatch, closing the gap where
+/// `RPC_MISC_ERROR`/-1); rose mirrors that via [`check_arity`] in dispatch, closing the gap where
 /// handlers silently ignored trailing junk. Counts follow Bitcoin Core's / zcashd's argument
-/// lists, plus zecd's own trailing extension args where they exist (e.g. `sendtoaddress`'s
+/// lists, plus rose's own trailing extension args where they exist (e.g. `sendtoaddress`'s
 /// `memo` at index 11 and `fee_split` at 12 → arity 13). Object params are unaffected: an object request body yields
 /// zero positional params, so an object-shaped call never trips the bound.
 ///
@@ -163,7 +163,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("listwalletdir", 0),
     // Wallet - management (fleet onboarding). `createwallet` keeps Bitcoin Core's eight
     // positional parameters so a Core-shaped client's call is accepted (and its
-    // spending-wallet flags explicitly refused); zecd's own arguments ride in the options
+    // spending-wallet flags explicitly refused); rose's own arguments ride in the options
     // object at param 8.
     ("createwallet", 9),
     ("loadwallet", 2),
@@ -369,7 +369,7 @@ fn check_arity(req: &RpcRequest) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// Route a parsed request to zecd's method table. `wallet` is the wallet name from a
+/// Route a parsed request to rose's method table. `wallet` is the wallet name from a
 /// `/wallet/<name>` path (or `None` for the default wallet).
 pub(crate) async fn dispatch(
     state: &AppState,
@@ -400,7 +400,7 @@ pub(crate) async fn dispatch(
             }
         }
     }
-    dispatch_zecd(state, wallet, req).await
+    dispatch_rose(state, wallet, req).await
 }
 
 /// Run a synchronous handler without holding a runtime worker hostage.
@@ -430,8 +430,8 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// zecd's method table.
-async fn dispatch_zecd(
+/// rose's method table.
+async fn dispatch_rose(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,

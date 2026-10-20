@@ -21,11 +21,11 @@ pub struct ValidateAddress {
     pub script_pub_key: Option<String>,
     pub isscript: Option<bool>,
     pub iswitness: Option<bool>,
-    /// zecd extension: whether this address can receive into the Orchard pool.
+    /// rose extension: whether this address can receive into the Orchard pool.
     pub isvalid_orchard: Option<bool>,
-    /// zecd extension: the pools this address can receive into, canonical order.
+    /// rose extension: the pools this address can receive into, canonical order.
     pub receiver_types: Option<Vec<String>>,
-    /// zecd extension: for a unified address, whether all receivers belong to the routed
+    /// rose extension: for a unified address, whether all receivers belong to the routed
     /// wallet at one diversifier index; absent when not computable.
     pub receivers_consistent: Option<bool>,
     /// Present only when invalid.

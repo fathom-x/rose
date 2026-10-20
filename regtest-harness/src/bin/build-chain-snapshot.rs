@@ -12,10 +12,10 @@
 //! and all build one, racing over the same directory. Building once, up front, has no such
 //! window.
 //!
-//! Usage:  build-chain-snapshot <dest-dir>        (or set ZECD_REGTEST_CHAIN_SNAPSHOT)
+//! Usage:  build-chain-snapshot <dest-dir>        (or set ROSE_REGTEST_CHAIN_SNAPSHOT)
 //!
 //! The node binary comes from `ZEBRAD_BIN`/`ZAKURAD_BIN` as usual, and the funder from
-//! `ZECD_FUNDER_BIN`. A snapshot is only valid for the binaries and the chain schedule that built
+//! `ROSE_FUNDER_BIN`. A snapshot is only valid for the binaries and the chain schedule that built
 //! it, so CI keys its cache on the node kind, the node and funder image pins, and a hash of
 //! `regtest-harness/src/lib.rs` - which is what carries `NU6_3_ACTIVATION_HEIGHT` and the rest of
 //! the bring-up, so a change to any of them rebuilds rather than restoring a mismatched chain.
@@ -23,7 +23,7 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use zecd_regtest_harness::{
+use rose_regtest_harness::{
     resolve_node_bin, save_chain_snapshot, start_funded_chain_live, RegtestNode,
 };
 
@@ -31,10 +31,10 @@ use zecd_regtest_harness::{
 async fn main() -> Result<()> {
     let dest: PathBuf = match std::env::args().nth(1) {
         Some(a) => PathBuf::from(a),
-        None => match std::env::var("ZECD_REGTEST_CHAIN_SNAPSHOT") {
+        None => match std::env::var("ROSE_REGTEST_CHAIN_SNAPSHOT") {
             Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
             _ => {
-                bail!("usage: build-chain-snapshot <dest-dir> (or set ZECD_REGTEST_CHAIN_SNAPSHOT)")
+                bail!("usage: build-chain-snapshot <dest-dir> (or set ROSE_REGTEST_CHAIN_SNAPSHOT)")
             }
         },
     };
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     })?;
 
     // Deliberately the *live* path: this binary is what produces the snapshot, so it must never
-    // restore one, even when ZECD_REGTEST_CHAIN_SNAPSHOT points at an existing (stale) archive.
+    // restore one, even when ROSE_REGTEST_CHAIN_SNAPSHOT points at an existing (stale) archive.
     let (zebrad, funder) = start_funded_chain_live(&node_bin)
         .await
         .context("build the funded chain to archive")?;

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Bitcoin-Core RPC conformance check for zecd.
+"""Bitcoin-Core RPC conformance check for rose.
 
 Uses the same client logic as `python-bitcoinrpc`'s AuthServiceProxy (HTTP Basic auth,
 JSON-RPC 1.0 envelope, amounts decoded as `decimal.Decimal`, errors raised from the
-`{code,message}` object) to prove zecd's wire format is what real Bitcoin RPC clients parse.
+`{code,message}` object) to prove rose's wire format is what real Bitcoin RPC clients parse.
 
 It asserts the fields/types BTCPay-style integrations and Bitcoin RPC libraries read, that
 amounts round-trip as exact decimals (not floats), batching works, and errors carry the
@@ -84,7 +84,7 @@ BOTH = (ZCASH, BITCOIN)
 def read_together(first, second, key=lambda v: v, attempts=6, delay=0.5):
     """Sample two live readings that are required to agree, bracketing the pair.
 
-    zecd is a live daemon under this script: the sync loop, the mempool stream and the
+    rose is a live daemon under this script: the sync loop, the mempool stream and the
     transaction-enhancement drain all keep running while the checks execute, so a value read
     now and a value read twenty calls later describe two different wallets. Comparing them is
     a race, not a conformance property, and it fired in CI: `getbalance` read 0.02932500 and,
@@ -219,7 +219,7 @@ def s_waitfor(ctx):
     # waitforblock watches the tip for one hash: either it is still the tip, or the chain moved on.
     w = rpc.call("waitforblock", best, 250)
     ck("waitforblock(tip) returns that block", w["hash"] == best or w["height"] > count, f"{w} vs {best}@{count}")
-    # waitforsync is zecd's extension: it answers the *other* half of "caught up" - whether the
+    # waitforsync is rose's extension: it answers the *other* half of "caught up" - whether the
     # transaction-enhancement backlog has drained, which is what makes memos readable. The
     # daemon under test is synced, so this returns promptly with synced=True.
     w = rpc.call("waitforsync", 30_000)
@@ -373,7 +373,7 @@ def s_getwalletinfo(ctx):
     if ctx.coin == BITCOIN:
         ck("getwalletinfo.descriptors is True", wi.get("descriptors") is True,
            repr(wi.get("descriptors")))
-        # zecd extension, Bitcoin wallets only: what a from-seed restore under this config
+        # rose extension, Bitcoin wallets only: what a from-seed restore under this config
         # would recover. The horizon is at least the lookahead's worth of indexes, and a
         # wallet that has not issued past it is restorable.
         rec = wi.get("recovery")
@@ -388,7 +388,7 @@ def s_getwalletinfo(ctx):
             ck("recovery.restorable agrees with the horizon",
                rec.get("restorable") == (rec.get("issued_through") is None
                                          or rec["issued_through"] <= rec["horizon"]), rec)
-    # zecd extension, same shape on both engines: the recorded birthday height, its date as a
+    # rose extension, same shape on both engines: the recorded birthday height, its date as a
     # UTC midnight when known (the operator's, or the mainnet per-day table's) or None, and the
     # resolved scan anchor {height, hash} or None (always None on Zcash and bitcoind wallets).
     bd = wi.get("birthday")
@@ -415,7 +415,7 @@ def s_getwalletinfo(ctx):
         # present-and-populated case is asserted by the regtest_transparent e2e.
         ck("getwalletinfo omits transparent block when disabled", "transparent" not in wi)
         # `scanning` is Core's union: an object while scanning or draining the enhancement backlog,
-        # literal False when idle. When it is an object it carries zecd's `pending_enhancements`
+        # literal False when idle. When it is an object it carries rose's `pending_enhancements`
         # extension - the only route to the backlog count for a caller with no health server (an
         # embedded node, or any pure JSON-RPC client). This suite usually runs against a caught-up
         # daemon, so accept either shape and only constrain the object form.
@@ -547,7 +547,7 @@ def s_getbalances(ctx):
     ck("mine.trusted == getbalance", mine.get("trusted") == bal_now,
        f"{mine.get('trusted')} != {bal_now}")
     if ctx.coin == ZCASH:
-        # zecd extension: mine.coinbase is the portion of trusted that is mature transparent
+        # rose extension: mine.coinbase is the portion of trusted that is mature transparent
         # coinbase - spendable only via z_shieldcoinbase, so it is broken out for callers to see
         # how much of trusted cannot move through the regular send paths. A subset of trusted (not
         # a fourth bucket): the Core triple still totals the wallet. This wallet holds no coinbase,
@@ -563,7 +563,7 @@ def s_getbalances(ctx):
 def s_addresses(ctx):
     rpc, ck = ctx.rpc, ctx.ck
     if ctx.coin == ZCASH:
-        # zecd is stateless: getnewaddress takes no label (a label would be off-chain state with no
+        # rose is stateless: getnewaddress takes no label (a label would be off-chain state with no
         # on-chain source). A non-empty label argument is rejected -8 (checked below).
         addr = rpc.call("getnewaddress")
         ck("getnewaddress unified",
@@ -607,7 +607,7 @@ def s_addresses(ctx):
            "address" not in bad and "scriptPubKey" not in bad and "isscript" not in bad)
         ck("invalid validateaddress has error fields",
            "error" in bad and "error_locations" in bad)
-        # z_validateaddress: zcashd's shielded-address validator. zecd's accepts every address kind
+        # z_validateaddress: zcashd's shielded-address validator. rose's accepts every address kind
         # rather than reporting a t-address invalid, and reports ownership - which is the reason it
         # exists alongside validateaddress, whose contract carries no ismine.
         zva = rpc.call("z_validateaddress", addr)
@@ -617,7 +617,7 @@ def s_addresses(ctx):
            zva.get("address_type"))
         ck("z_validateaddress.ismine on our own address", zva.get("ismine") is True)
         # A unified address lists its receivers in zcashd's vocabulary: a transparent receiver is
-        # "p2pkh" there, never zecd's own "transparent" spelling.
+        # "p2pkh" there, never rose's own "transparent" spelling.
         ck("z_validateaddress lists receivers",
            isinstance(zva.get("receivers"), list) and "orchard" in zva["receivers"],
            zva.get("receivers"))
@@ -645,7 +645,7 @@ def s_addresses(ctx):
         for f in ("scriptPubKey", "solvable", "iswatchonly", "isscript", "iswitness", "labels",
                   "isvalid_orchard", "receiver_types"):
             ck(f"getaddressinfo has {f}", f in ai)
-        # zecd is stateless: the labels field is retained for Core shape but is always empty.
+        # rose is stateless: the labels field is retained for Core shape but is always empty.
         ck("getaddressinfo.labels always empty (stateless)", ai["labels"] == [], repr(ai["labels"]))
         # Own addresses are solvable; iswatchonly is deprecated/always false in Core master
         # (these hold on watch-only wallets too - the signal is private_keys_enabled).
@@ -695,7 +695,7 @@ def s_addresses(ctx):
         ck("getaddressinfo.solvable on own address", ai["solvable"] is True)
         ck("getaddressinfo.iswatchonly always False", ai["iswatchonly"] is False)
         # The BIP 84 derivation fields are present for every own address: Core's hdkeypath
-        # (receiving keychain, so /0/<index>) and ischange, plus zecd's address_index.
+        # (receiving keychain, so /0/<index>) and ischange, plus rose's address_index.
         ck("getaddressinfo.ischange False on a receiving address", ai.get("ischange") is False,
            repr(ai.get("ischange")))
         ck("getaddressinfo.address_index is an int", isinstance(ai.get("address_index"), int),
@@ -758,7 +758,7 @@ def s_signmessage(ctx):
 @section("z_getaddressforaccount", ZCASH)
 def s_z_getaddressforaccount(ctx):
     rpc, ck, addr = ctx.rpc, ctx.ck, ctx.addr
-    # zcashd-syntax derivation of a Unified Address for the wallet's single account (0). zecd is
+    # zcashd-syntax derivation of a Unified Address for the wallet's single account (0). rose is
     # shielded-only: the default config is Orchard-only, so a default UA carries just "orchard".
     a = rpc.call("z_getaddressforaccount", 0)
     ck("z_getaddressforaccount.account is 0", a["account"] == 0)
@@ -797,13 +797,13 @@ def s_z_getaddressforaccount(ctx):
     except JSONRPCException as e:
         ck("z_getaddressforaccount p2pkh (transparent off) -> -8", e.code == -8, e.code)
     # p2pkh can never be combined with a shielded receiver: ZIP-316 forbids a transparent-only
-    # unified address, and zecd hands transparent receivers out bare rather than mixing them in.
+    # unified address, and rose hands transparent receivers out bare rather than mixing them in.
     try:
         rpc.call("z_getaddressforaccount", 0, ["p2pkh", "orchard"])
         ck("z_getaddressforaccount p2pkh+orchard raises", False)
     except JSONRPCException as e:
         ck("z_getaddressforaccount p2pkh+orchard -> -8", e.code == -8, e.code)
-    # p2sh is never derivable (zecd holds no redeem scripts).
+    # p2sh is never derivable (rose holds no redeem scripts).
     try:
         rpc.call("z_getaddressforaccount", 0, ["p2sh"])
         ck("z_getaddressforaccount p2sh raises", False)
@@ -906,14 +906,14 @@ def s_received_by_address(ctx):
     ck("listreceivedbyaddress is list", isinstance(lra, list))
     fresh = next((e for e in lra if e.get("address") == addr), None)
     ck("fresh address listed with include_empty", fresh is not None)
-    # include_empty surfaces every generated address (this is zecd's `listaddresses`
+    # include_empty surfaces every generated address (this is rose's `listaddresses`
     # equivalent), and an unused one reports zeros: no amount, no confirmations, no txids.
     if fresh is not None:
         ck("fresh entry amount 0", fresh.get("amount") == 0, repr(fresh.get("amount")))
         ck("fresh entry confirmations 0", fresh.get("confirmations") == 0, repr(fresh.get("confirmations")))
         ck("fresh entry no txids", fresh.get("txids") == [], repr(fresh.get("txids")))
         if ctx.coin == BITCOIN:
-            # zecd extension: the receiving keychain index, the same value getaddressinfo
+            # rose extension: the receiving keychain index, the same value getaddressinfo
             # reports - so an issued range reconciles from this one call.
             ck("entry carries address_index", isinstance(fresh.get("address_index"), int),
                repr(fresh.get("address_index")))
@@ -985,7 +985,7 @@ def s_received_by_address(ctx):
 @section("stateless: label methods are removed", *BOTH)
 def s_labels_removed(ctx):
     rpc, ck, addr = ctx.rpc, ctx.ck, ctx.addr
-    # zecd keeps no off-chain label store, so the label-dedicated methods are not implemented at
+    # rose keeps no off-chain label store, so the label-dedicated methods are not implemented at
     # all - every one is method-not-found (-32601), like any unknown method.
     for m, params in (
         ("setlabel", [addr, "x"]),
@@ -1103,7 +1103,7 @@ def s_bumpfee(ctx):
     # Core's precondition and argument codes, without replacing anything: a confirmed
     # transaction is "mined" (-4), an unknown txid is "non-wallet" (-5), a malformed one fails
     # parsing (-8), a missing one is -1, and the options object is strict - an unknown key is
-    # -3, and the keys zecd cannot honor are refused (-8) rather than ignored. The live bump
+    # -3, and the keys rose cannot honor are refused (-8) rather than ignored. The live bump
     # itself is regtest_btc_bumpfee.rs.
     confirmed = [t for t in rpc.call("listtransactions", "*", 50)
                  if t["confirmations"] > 0 and t["category"] == "send"]
@@ -1184,7 +1184,7 @@ def s_wallets(ctx):
     except JSONRPCException as e:
         ck("createwallet without a birthday -> -8", e.code == -8, e.code)
     try:
-        # zecd loads at most one wallet with spending keys, and it is not created over the wire.
+        # rose loads at most one wallet with spending keys, and it is not created over the wire.
         rpc.call("createwallet", "conformance-tmp", False)
         ck("createwallet asking for spending keys raises", False)
     except JSONRPCException as e:
@@ -1210,7 +1210,7 @@ def s_wallets(ctx):
     ck("the configured wallet is still served after the refusal",
        isinstance(rpc.call("getwalletinfo"), dict))
 
-    # load_on_startup: zecd keeps a fleet wallet's manifest when it unloads (that is what lets
+    # load_on_startup: rose keeps a fleet wallet's manifest when it unloads (that is what lets
     # loadwallet restore it), so `true` is already the case and `false` is a promise this RPC
     # cannot keep. It is refused rather than ignored - silently dropping it would have the wallet
     # reappear at the next restart of a daemon the operator believes it was retired from.
@@ -1253,7 +1253,7 @@ def s_listunspent(ctx):
             ck(f"utxo has {f}", f in u)
         ck("utxo amount is Decimal", isinstance(u["amount"], decimal.Decimal))
         if ctx.coin == ZCASH:
-            # zecd extension: every note is labelled with its shielded pool.
+            # rose extension: every note is labelled with its shielded pool.
             ck("utxo pool is a known shielded pool",
                all(e["pool"] in ("sapling", "orchard", "ironwood") for e in lu),
                [e["pool"] for e in lu])
@@ -1360,7 +1360,7 @@ def s_history(ctx):
 @section("z_listtransactions (extension)", ZCASH)
 def s_z_listtransactions(ctx):
     rpc, ck = ctx.rpc, ctx.ck
-    # z_listtransactions is a zecd EXTENSION (no such method in zcashd) with zcashd's z_*
+    # z_listtransactions is a rose EXTENSION (no such method in zcashd) with zcashd's z_*
     # vocabulary, so it is checked for self-consistency, not held to a bitcoind shape.
     ztx = rpc.call("z_listtransactions", 20)
     ck("z_listtransactions is list", isinstance(ztx, list))
@@ -1386,7 +1386,7 @@ def s_z_listtransactions(ctx):
     except JSONRPCException as e:
         ck("z_listtransactions negative count -> -8", e.code == -8, e.code)
 
-    # The height range is zecd's incremental cursor: [start_height, end_height). An unreachable
+    # The height range is rose's incremental cursor: [start_height, end_height). An unreachable
     # window is empty rather than an error, and an inverted one is rejected outright (it can only
     # ever be empty, so it almost certainly means the arguments were swapped).
     tip = rpc.call("getblockcount")
@@ -1444,7 +1444,7 @@ def s_listsinceblock(ctx):
     ck("since lastblock reports only unconfirmed",
        all(t["confirmations"] < 1 for t in again["transactions"]))
     # A well-formed but unknown blockhash (e.g. a cursor whose block was reorged away) does NOT
-    # wedge the poller: zecd lists from the earliest scanned block (re-reports, never misses)
+    # wedge the poller: rose lists from the earliest scanned block (re-reports, never misses)
     # instead of erroring, so a reorg can't kill the lastblock cursor loop.
     reorged = rpc.call("listsinceblock", "00" * 32)
     ck("reorged-away cursor lists instead of raising",
@@ -1485,13 +1485,13 @@ def s_errors(ctx):
     except JSONRPCException as e:
         ck("unknown address type -> code -5", e.code == -5, e.code)
     try:
-        # Amount as a string (zecd accepts both); the reject fires before any send logic.
+        # Amount as a string (rose accepts both); the reject fires before any send logic.
         rpc.call("sendtoaddress", addr, "0.1", "", "", True)
         ck("subtractfeefromamount raises", False)
     except JSONRPCException as e:
         ck("subtractfeefromamount -> code -8", e.code == -8, e.code)
     try:
-        # A TEX (ZIP 320) recipient needs a two-transaction proposal; zecd sends one
+        # A TEX (ZIP 320) recipient needs a two-transaction proposal; rose sends one
         # transaction per call, so it refuses the address up front rather than building
         # (and storing) a send it cannot complete.
         tex_hrp = {"main": "tex", "test": "textest", "regtest": "texregtest"}[
@@ -1597,7 +1597,7 @@ def s_errors(ctx):
     except JSONRPCException as e:
         ck("z_sendmany unknown privacyPolicy -> code -8", e.code == -8, e.code)
     try:
-        # A repeated recipient is -8, as in zcashd. zecd can be configured to permit repeated
+        # A repeated recipient is -8, as in zcashd. rose can be configured to permit repeated
         # *shielded* recipients ([rpc] allow_duplicate_shielded_recipients, for protocols that
         # batch memo-carrying payments to one address); this daemon runs the default, so the
         # refusal must still stand - the opt-in must not have become the behaviour.
@@ -1880,7 +1880,7 @@ def s_errors(ctx):
        rpc.call("z_getoperationstatus", [_unknown_opid]) == [])
     ck("z_getoperationresult unknown opid omitted",
        rpc.call("z_getoperationresult", [_unknown_opid]) == [])
-    # z_waitforoperation is zecd's blocking alternative to the poll loop: it takes ONE opid (not
+    # z_waitforoperation is rose's blocking alternative to the poll loop: it takes ONE opid (not
     # an array) plus an optional timeout in seconds. Unlike the tracking trio it rejects an
     # unknown opid rather than omitting it - there would be nothing to wait for, so blocking for
     # the full timeout would just hide a client bug. None of these checks ever blocks: they all
@@ -2035,7 +2035,7 @@ def s_errors_bitcoin(ctx):
         ck("sendrawtransaction undecodable raises", False)
     except JSONRPCException as e:
         ck("sendrawtransaction undecodable -> code -22", e.code == -22, e.code)
-    # fee_split, zecd's extension over subtractfeefrom: position 12 on sendtoaddress (after the
+    # fee_split, rose's extension over subtractfeefrom: position 12 on sendtoaddress (after the
     # Zcash engine's memo at 11), 10 on sendmany. Each case is refused while parsing.
     for label, call, code in (
         ("sendtoaddress unknown fee_split",

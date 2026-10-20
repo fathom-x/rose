@@ -1,12 +1,12 @@
 [package]
-name = "zecd-regtest-harness"
+name = "rose-regtest-harness"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "End-to-end regtest integration harness for zecd (zebra, Zcash-Foundation-standard)"
+description = "End-to-end regtest integration harness for rose (zebra, Zcash-Foundation-standard)"
 
 # Standalone workspace on purpose: keeps the harness's e2e-only dependency tree (reqwest etc.)
-# fully isolated from zecd's hard-pinned librustzcash lockfile - `cargo build` in the parent
+# fully isolated from rose's hard-pinned librustzcash lockfile - `cargo build` in the parent
 # never sees these deps. A committed Cargo.lock pins the tree; build with --locked.
 #
 # Note there is NO zebra crate dependency: blocks are mined via zebrad's Regtest-only `generate`
@@ -16,7 +16,7 @@ description = "End-to-end regtest integration harness for zecd (zebra, Zcash-Fou
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "io-util", "net"] }
-# Plaintext HTTP only (zecd + zebra RPC are local http://) - no TLS stack pulled in.
+# Plaintext HTTP only (rose + zebra RPC are local http://) - no TLS stack pulled in.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde_json = "1"
 anyhow = "1"

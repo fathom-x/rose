@@ -1,4 +1,4 @@
-//! `zecd derive-address` for a Bitcoin wallet: BIP 84 receiving addresses, offline.
+//! `rose derive-address` for a Bitcoin wallet: BIP 84 receiving addresses, offline.
 //!
 //! The Bitcoin counterpart of [`crate::derive_address`] (the Zcash command, which rides the
 //! `zcash` feature): no network, no daemon, no datadir lock, so it runs beside a live daemon
@@ -12,7 +12,7 @@
 //! - the wallet itself - the `keys.toml` xpub pin of a watch-only wallet, else the public
 //!   descriptors in its database (what `export-xpub` reads). No seed is decrypted, so a
 //!   locked or watch-only wallet works;
-//! - a BIP-39 mnemonic (`--mnemonic`, from `ZECD_MNEMONIC`/`--mnemonic-file`/stdin), the
+//! - a BIP-39 mnemonic (`--mnemonic`, from `ROSE_MNEMONIC`/`--mnemonic-file`/stdin), the
 //!   air-gapped case;
 //! - an account xpub (`--xpub`, the `[fingerprint/84'/coin'/0']xpub...` form `export-xpub`
 //!   prints, or a bare xpub).
@@ -158,7 +158,7 @@ pub fn run(config: &AppConfig, args: &DeriveAddressArgs) -> anyhow::Result<()> {
     if args.ufvk.is_some() {
         bail!(
             "--ufvk takes a Zcash Unified Full Viewing Key, and this is a Bitcoin wallet; \
-             derive from its account key with --xpub (as `zecd export-xpub` prints), from \
+             derive from its account key with --xpub (as `rose export-xpub` prints), from \
              --mnemonic, or from the wallet itself"
         );
     }
@@ -282,7 +282,7 @@ fn wallet_keys(
     if !WalletStore::exists(&keys_path) {
         bail!(
             "wallet '{wallet}' is not initialized ({} missing). Derive from key material \
-             instead: --mnemonic (phrase on stdin, ZECD_MNEMONIC, or --mnemonic-file) or \
+             instead: --mnemonic (phrase on stdin, ROSE_MNEMONIC, or --mnemonic-file) or \
              --xpub <key>.",
             keys_path.display()
         );

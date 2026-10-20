@@ -101,7 +101,7 @@ impl Amount {
     }
 
     /// [`Amount::from_zatoshis`] under a coin-neutral name. The type carries base units, and
-    /// every coin zecd can serve uses the same 10^8 scale, so the zatoshi-flavoured spelling
+    /// every coin rose can serve uses the same 10^8 scale, so the zatoshi-flavoured spelling
     /// is a Zcash label on a general value rather than a Zcash-only constructor.
     pub const fn from_base_units(units: u64) -> Amount {
         Amount(units)

@@ -8,7 +8,7 @@
 # i18n-embed-fl patch; age now depends on i18n-embed-fl 0.10, which carries the fix, so the
 # tree has no [patch.crates-io] entries at all.)
 #
-#   docker build -t zecd .                      # runtime image (zecd)
+#   docker build -t rose .                      # runtime image (rose)
 #   docker build --target export -o ./out .     # extract the static binaries
 #
 # Dependencies are released crates from crates.io - the Zakura Common `zakura-*` forks of
@@ -30,7 +30,7 @@ ENV SOURCE_DATE_EPOCH=1
 ENV TARGET_ARCH=x86_64-unknown-linux-musl
 ENV CFLAGS=-target\ x86_64-unknown-linux-musl
 ENV CARGO_HOME=/usr/local/cargo
-ENV CARGO_TARGET_DIR="/usr/src/zecd/target"
+ENV CARGO_TARGET_DIR="/usr/src/rose/target"
 ENV CARGO_INCREMENTAL=0
 ENV RUST_BACKTRACE=1
 # Resilience against transient crates.io fetch flakes in CI (seen as curl "[16] Error in the
@@ -48,15 +48,19 @@ ENV RUSTFLAGS="\
 -C link-arg=-ldl \
 -C link-arg=-lm \
 -C link-arg=-Wl,--build-id=none"
-WORKDIR /usr/src/zecd
+WORKDIR /usr/src/rose
 COPY . .
-# The cargo feature flags of the shipped binary. The default is the image everyone gets:
-# both engines, so one image serves a Zcash or a Bitcoin wallet. A deployment that needs
-# one engine builds a smaller binary faster by overriding this ARG - an enclave deployment,
-# for instance, renders its Dockerfile from this one with the Bitcoin-only set,
-# `--no-default-features --features mimalloc-secure,bitcoin,server,cli`, dropping the Zcash
-# stack's ~190 crates. Only features change; the runtime contract below does not.
-ARG ZECD_CARGO_FEATURES="--features mimalloc-secure,bitcoin"
+# The cargo feature flags of the shipped daemon. The default is the image everyone gets:
+# both engines, so one image serves a Zcash or a Bitcoin wallet (a bare `cargo build` is
+# Bitcoin-only; `zcash` is the opt-in). A deployment that needs one engine builds a smaller
+# binary faster by overriding this ARG - an enclave deployment, for instance,
+# renders its Dockerfile from this one with the Bitcoin-only set, `--no-default-features
+# --features mimalloc-secure,bitcoin,server,cli`, dropping the Zcash stack's ~190 crates.
+# Only features change; the runtime contract below does not.
+ARG ROSE_CARGO_FEATURES="--features mimalloc-secure,bitcoin,zcash"
+# The same choice for the `rose` command line (rose-cli/), whose engine features mirror the
+# daemon's (no allocator feature: it proves nothing). Keep the two ARGs on the same engines.
+ARG ROSE_CLI_CARGO_FEATURES="--features bitcoin,zcash"
 
 # Fetch dependencies
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -65,30 +69,36 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --locked \
         --target ${TARGET_ARCH}
 
-# Build the zecd binary
+# Build the two rose binaries: `rosed` (the daemon) and `rose` (the command line)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/zecd/target \
+    --mount=type=cache,target=/usr/src/rose/target \
     cargo install \
         --frozen \
         --path . \
-        --bin zecd \
+        --bin rosed \
         --target ${TARGET_ARCH} \
         # musl's default allocator is ~5-6x slower than glibc under Orchard proving's
         # multi-threaded allocation churn; mimalloc closes the gap. The `-secure` variant adds
         # heap hardening (guard pages, canary free-lists) for <4% on the proving path, recovering
         # the mitigations dropped by replacing musl's malloc-ng. glibc dev/test builds skip this.
         # (mimalloc-sys compiles C the same way libsqlite3-sys already does here.)
-        # `bitcoin` is the BDK wallet engine, off by default for `cargo build` so a dev build
-        # stays byte-identical to a pre-BDK one; the shipped image carries both engines so one
-        # image serves a Zcash or a Bitcoin wallet (a binary without it refuses
-        # `coin = "bitcoin"` at config resolve). THIRD-PARTY-LICENSES.txt is generated with
-        # the same feature set - keep scripts/generate-licenses.sh in step with the ARG's
-        # default (a narrower build embeds the same superset of notices; nothing is missing).
-        ${ZECD_CARGO_FEATURES} \
+        # `zcash` is the librustzcash wallet engine, off by default for `cargo build`; the
+        # shipped image carries both engines so one image serves a Zcash or a Bitcoin wallet
+        # (a binary without an engine refuses its `coin` at config resolve).
+        # THIRD-PARTY-LICENSES.txt is generated with the same feature set - keep
+        # scripts/generate-licenses.sh in step with the ARG's default (a narrower build
+        # embeds the same superset of notices; nothing is missing).
+        ${ROSE_CARGO_FEATURES} \
+    && cargo install \
+        --frozen \
+        --path rose-cli \
+        --bin rose \
+        --target ${TARGET_ARCH} \
+        ${ROSE_CLI_CARGO_FEATURES} \
     # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the
     # unprivileged runtime user can write its datadirs (and SQLite its temp files).
-    && install -d -m 0755 /rootfs/var/lib/zecd \
+    && install -d -m 0755 /rootfs/var/lib/rose \
     && install -d -m 1777 /rootfs/tmp \
     # The license texts, staged with their modes pinned in-container: a file COPY'd straight
     # from the build context keeps the mode git checked it out with, which is the build
@@ -101,21 +111,24 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # --- Stage 2: layer for local binary extraction ---
 FROM scratch AS export
 
-# Binary at the root for easy extraction
-COPY --from=builder /usr/local/cargo/bin/zecd /zecd
+# Binaries at the root for easy extraction
+COPY --from=builder /usr/local/cargo/bin/rosed /rosed
+COPY --from=builder /usr/local/cargo/bin/rose /rose
 
 # --- Stage 3: Minimal runtime with stagex ---
 FROM scratch AS runtime
-COPY --from=export /zecd /usr/local/bin/zecd
-# License texts - zecd is statically linked, so the third-party notices ship with it.
-COPY --from=builder /licenses/ /usr/share/doc/zecd/
+COPY --from=export /rosed /usr/local/bin/rosed
+COPY --from=export /rose /usr/local/bin/rose
+# License texts - rose is statically linked, so the third-party notices ship with it.
+COPY --from=builder /licenses/ /usr/share/doc/rose/
 # CA bundle so native TLS roots can validate public lightwalletd endpoints (e.g. zec.rocks).
 COPY --from=ca-certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 COPY --from=builder --chown=10001:10001 /rootfs/ /
 USER 10001:10001
-WORKDIR /var/lib/zecd
-# zecd JSON-RPC (mainnet 8232 / testnet 18232) + health (9233).
+WORKDIR /var/lib/rose
+# rose JSON-RPC (mainnet 8232 / testnet 18232) + health (9233).
 EXPOSE 8232 18232 9233
-ENTRYPOINT ["zecd"]
-CMD ["--datadir", "/var/lib/zecd"]
+# The daemon. The command line is beside it: `docker run --entrypoint rose ... init`.
+ENTRYPOINT ["rosed"]
+CMD ["--datadir", "/var/lib/rose"]

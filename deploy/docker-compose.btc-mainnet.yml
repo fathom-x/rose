@@ -1,4 +1,4 @@
-# Production Bitcoin Core **mainnet** node + web UI for zecd's BDK engine (the `bitcoin`
+# Production Bitcoin Core **mainnet** node + web UI for rose's BDK engine (the `bitcoin`
 # cargo feature), pinned to the same 30.2 the regtest/testnet stacks and CI run against.
 #
 # This is NOT a copy of the docker-compose.btc-{regtest,testnet3,testnet4}.yml shape -
@@ -6,7 +6,7 @@
 # publish on loopback with valueless coins. This file is hardened for a real-money,
 # internet-facing host, with the UI kept loopback-only by default:
 #   - RPC auth is bitcoind's own cookie (written to the datadir, root-readable on this
-#     host; no static credential exists to leak or rotate). zecd talks to this node over
+#     host; no static credential exists to leak or rotate). rose talks to this node over
 #     kyoto light mode, which is credential-free P2P, so nothing needs an RPC password.
 #   - RPC is published on 127.0.0.1 ONLY, so it is not reachable from the internet, and
 #     -rpcallowip is scoped to this compose network's subnet, not 0.0.0.0/0.
@@ -14,11 +14,11 @@
 # ADOPTS THE EXISTING SYNCED DATADIR at /mnt/data/bitcoin_data (do not resync). That data
 # was synced by the now-retired `txmonitor`/blocktower stack (compose at
 # /home/ubuntu/txmonitor/); blocktower has moved to another machine, so nothing here
-# consumes the node anymore except zecd. Consequently, versus the old node:
-#   - ZMQ (28332/28333/28334) is DROPPED - it only fed blocktower, and zecd's full-mode
+# consumes the node anymore except rose. Consequently, versus the old node:
+#   - ZMQ (28332/28333/28334) is DROPPED - it only fed blocktower, and rose's full-mode
 #     backend polls JSON-RPC (bdk_bitcoind_rpc), it does not use ZMQ. One less exposure.
 #   - P2P 8333 IS published (see the ports block): this node serves compact block filters
-#     to zecd's kyoto light mode, which speaks P2P and needs to reach it. That also means
+#     to rose's kyoto light mode, which speaks P2P and needs to reach it. That also means
 #     accepting inbound Bitcoin peers generally.
 #
 # Flags below match the retired node so adopting its datadir does NOT trigger a reindex:
@@ -32,11 +32,11 @@
 # can no longer be opened by 24.x afterward. 30.2 is the intended target, so this is fine -
 # just be aware a rollback would mean a resync.
 
-# Pointing zecd at this node, in either of its two modes:
+# Pointing rose at this node, in either of its two modes:
 #
 #   FULL MODE (JSON-RPC, this host only) - sees the mempool, so 0-conf receives and
 #   estimatesmartfee work; authenticates with the node's cookie file (root-readable, so
-#   zecd must run as root or the cookie's group).
+#   rose must run as root or the cookie's group).
 #     [bitcoind]
 #     server = "bitcoind"          # -> 127.0.0.1:8332
 #     rpc_cookie = "/mnt/data/bitcoin_data/.cookie"
@@ -55,7 +55,7 @@
 #   Prefer the trusted-peer forms: naming a peer makes the light client whitelist-only, so
 #   its fee signals (the BIP-133 feefilter, the tip-block fee average) and block data all
 #   come from this node rather than from anonymous peers a dishonest one could hide among.
-#   `zecd init` on a kyoto wallet is offline (it will not start a P2P node to read the tip):
+#   `rose init` on a kyoto wallet is offline (it will not start a P2P node to read the tip):
 #   a fresh wallet's birthday defaults to today's date, resolved against the shipped scan
 #   floor, and the first sync refines it to a real (height, hash) from kyoto's own headers.
 #   Pass --birthday <height|YYYY-MM-DD> only to start EARLIER, i.e. restoring a seed with
@@ -82,11 +82,11 @@ services:
       # -rpcauth/-rpcpassword flag, bitcoind auths by its own cookie file (written to the
       # datadir at /mnt/data/bitcoin_data/.cookie, rotated each start, root-readable) -
       # nothing static to provision, leak, or mangle through compose's `$` interpolation.
-      # zecd itself talks to this node over credential-free kyoto P2P (see LIGHT MODE
+      # rose itself talks to this node over credential-free kyoto P2P (see LIGHT MODE
       # above); the RPC port exists for host admin (bitcoin-cli) and optional full mode.
       - -rpcbind=0.0.0.0:8332
       - -rpcallowip=172.28.0.0/24
-      # Compact block filters (BIP158/157), so this node can serve zecd's kyoto LIGHT mode
+      # Compact block filters (BIP158/157), so this node can serve rose's kyoto LIGHT mode
       # (`server = "kyoto://<this host>:8333"`) as well as its own full-mode RPC wallet.
       # blockfilterindex builds once over the full chain (~1-3 h on this NVMe array, a few
       # GB); getindexinfo reports blockfilter synced:false until it finishes, and the node
@@ -118,9 +118,9 @@ services:
       btcmain:
     ports:
       # RPC stays loopback only: it is plaintext HTTP Basic and spend-adjacent. Host
-      # processes (zecd in full mode) reach it at 127.0.0.1:8332; the internet cannot.
+      # processes (rose in full mode) reach it at 127.0.0.1:8332; the internet cannot.
       - "127.0.0.1:8332:8332"
-      # P2P, published to the internet so remote zecd kyoto clients can reach this node.
+      # P2P, published to the internet so remote rose kyoto clients can reach this node.
       #
       # This is a deliberate exposure change, and unlike the RPC port it authenticates
       # nothing - that is fine (the P2P protocol has no credentials and reveals no wallet
@@ -138,11 +138,11 @@ services:
       # ran), so no -datadir flag is needed and the existing chainstate is opened directly.
       - /mnt/data/bitcoin_data:/root/.bitcoin
 
-  zecd-gui:
-    # The wallet dashboard (scripts/zecd-gui), proxying to the zecd that runs ON THE HOST
-    # from deploy/zecd.btc-mainnet.toml (no published image carries the bitcoin engine).
+  rose-gui:
+    # The wallet dashboard (scripts/rose-gui), proxying to the rose that runs ON THE HOST
+    # from deploy/rose.btc-mainnet.toml (no published image carries the bitcoin engine).
     #
-    # Host network, deliberately. That config binds zecd's RPC - the spend credential's
+    # Host network, deliberately. That config binds rose's RPC - the spend credential's
     # surface - to 127.0.0.1, and on the host network the container reaches it at exactly
     # that address, read from the mounted config. So unlike the testnet stacks there is no
     # --rpc-url, no host.docker.internal, and no `--rpcbind` past loopback on the daemon:
@@ -152,29 +152,29 @@ services:
     # which this node's host is.
     #
     # The UI does not talk to bitcoind, so it neither depends on it nor joins its network.
-    # Liveness is the image's own HEALTHCHECK (see scripts/zecd-gui/Dockerfile, urllib-based -
+    # Liveness is the image's own HEALTHCHECK (see scripts/rose-gui/Dockerfile, urllib-based -
     # the image has no curl, so a compose-level curl healthcheck would only ever report
     # unhealthy). The published image (ghcr.io/<repo>-gui) carries the same healthcheck; to
     # pull it instead of building, replace this `build:` block with `image: ghcr.io/<repo>-gui:<ver>`.
     build:
-      context: ../scripts/zecd-gui
-    container_name: zecd-gui-mainnet
+      context: ../scripts/rose-gui
+    container_name: rose-gui-mainnet
     restart: unless-stopped
     network_mode: host
     environment:
-      # The host zecd's RPC password, from deploy/.env (see deploy/.env.mainnet.example).
+      # The host rose's RPC password, from deploy/.env (see deploy/.env.mainnet.example).
       # Required: an unset value fails `up` rather than starting a proxy that can only 401.
-      - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:?set ZECD_RPC_PASSWORD in deploy/.env}
+      - ROSE_RPC_PASSWORD=${ROSE_RPC_PASSWORD:?set ROSE_RPC_PASSWORD in deploy/.env}
     volumes:
-      - ./zecd.btc-mainnet.toml:/config/zecd.btc-mainnet.toml:ro
+      - ./rose.btc-mainnet.toml:/config/rose.btc-mainnet.toml:ro
       # The source, over the image's copy of it, so an edit is live without a rebuild:
       # index.html on the next page load, serve.py via --reload below (the container's
       # PID 1 re-execs itself). The image still carries a copy, so dropping this line and
       # the flag gives the shipped build - do that for a deployment that must not track
       # the checkout.
-      - ../scripts/zecd-gui:/app:ro
+      - ../scripts/rose-gui:/app:ro
     command:
-      - --conf=/config/zecd.btc-mainnet.toml
+      - --conf=/config/rose.btc-mainnet.toml
       - --reload
       - --bind=127.0.0.1
       # 8081, not 8080: the testnet4 stack's GUI publishes 127.0.0.1:8080 on the same

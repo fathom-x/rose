@@ -23,7 +23,7 @@
 # Keep the runtime contract (binary path, user 10001:10001, datadirs, ports, entrypoint) in
 # lockstep with the StageX runtime stage so the two images are interchangeable.
 #
-#   docker build -f Dockerfile.arm64 -t zecd .
+#   docker build -f Dockerfile.arm64 -t rose .
 #   docker build -f Dockerfile.arm64 --target export -o ./out .   # extract the binaries
 #
 # Dependencies are released crates from crates.io - the Zakura Common `zakura-*` forks of
@@ -63,22 +63,26 @@ ENV TARGET_ARCH=aarch64-unknown-linux-musl
 # amd64 StageX stage there is no clang/lld override to do here. +crt-static is the default for
 # musl targets but set explicitly for clarity.
 ENV RUSTFLAGS="-C codegen-units=1 -C target-feature=+crt-static -C link-arg=-Wl,--build-id=none"
-WORKDIR /usr/src/zecd
+WORKDIR /usr/src/rose
 COPY . .
 
-# Build the zecd binary (the aarch64-musl rust-std ships in the base image as the host target).
+# Build the two rose binaries, `rosed` (the daemon) and `rose` (the command line) - the
+# aarch64-musl rust-std ships in the base image as the host target.
 # --features mimalloc-secure: like the amd64 musl image, swap in mimalloc - musl's default
 # allocator is ~5-6x slower than glibc under Orchard proving's multi-threaded allocation churn. The `-secure` variant adds heap hardening (guard pages,
 # canary free-lists) for <4% on the proving path. mimalloc-sys compiles C via the same gcc/cc-rs
 # path that already builds bundled libsqlite3-sys here.
-# --features bitcoin: the BDK wallet engine, off by default for `cargo build`; the shipped
-# images carry both engines (see the amd64 Dockerfile) and the license bundle is generated
-# with the same feature set.
-ARG ZECD_CARGO_FEATURES="--features mimalloc-secure,bitcoin"
-RUN cargo install --locked --path . --bin zecd --target ${TARGET_ARCH} ${ZECD_CARGO_FEATURES} --root /usr/local \
+# --features zcash: the librustzcash wallet engine, off by default for `cargo build`; the
+# shipped images carry both engines (see the amd64 Dockerfile) and the license bundle is
+# generated with the same feature set. ROSE_CLI_CARGO_FEATURES is the command line's
+# mirror of it (no allocator feature there).
+ARG ROSE_CARGO_FEATURES="--features mimalloc-secure,bitcoin,zcash"
+ARG ROSE_CLI_CARGO_FEATURES="--features bitcoin,zcash"
+RUN cargo install --locked --path . --bin rosed --target ${TARGET_ARCH} ${ROSE_CARGO_FEATURES} --root /usr/local \
+    && cargo install --locked --path rose-cli --bin rose --target ${TARGET_ARCH} ${ROSE_CLI_CARGO_FEATURES} --root /usr/local \
     # Skeleton dirs for the scratch runtime, COPY'd below with --chown so the unprivileged
     # runtime user can write its datadirs (and SQLite its temp files).
-    && install -d -m 0755 /rootfs/var/lib/zecd \
+    && install -d -m 0755 /rootfs/var/lib/rose \
     && install -d -m 1777 /rootfs/tmp \
     # The license texts, staged with their modes pinned in-container: a file COPY'd straight
     # from the build context keeps the mode git checked it out with, which is the build
@@ -90,13 +94,15 @@ RUN cargo install --locked --path . --bin zecd --target ${TARGET_ARCH} ${ZECD_CA
 
 # --- layer for local binary extraction ---
 FROM scratch AS export
-COPY --from=builder /usr/local/bin/zecd /zecd
+COPY --from=builder /usr/local/bin/rosed /rosed
+COPY --from=builder /usr/local/bin/rose /rose
 
 # --- runtime (bare scratch, matching the StageX image) ---
 FROM scratch AS runtime
-COPY --from=export /zecd /usr/local/bin/zecd
-# License texts - zecd is statically linked, so the third-party notices ship with it.
-COPY --from=builder /licenses/ /usr/share/doc/zecd/
+COPY --from=export /rosed /usr/local/bin/rosed
+COPY --from=export /rose /usr/local/bin/rose
+# License texts - rose is statically linked, so the third-party notices ship with it.
+COPY --from=builder /licenses/ /usr/share/doc/rose/
 # CA bundle so native TLS roots can validate public lightwalletd endpoints (e.g. zec.rocks).
 # Comes from the digest-pinned base image (Alpine ships ca-certificates-bundle in the base),
 # so no extra apk pin is needed and the bundle is as reproducible as the base itself.
@@ -104,8 +110,9 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifi
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 COPY --from=builder --chown=10001:10001 /rootfs/ /
 USER 10001:10001
-WORKDIR /var/lib/zecd
-# zecd JSON-RPC (mainnet 8232 / testnet 18232) + health (9233).
+WORKDIR /var/lib/rose
+# rose JSON-RPC (mainnet 8232 / testnet 18232) + health (9233).
 EXPOSE 8232 18232 9233
-ENTRYPOINT ["zecd"]
-CMD ["--datadir", "/var/lib/zecd"]
+# The daemon. The command line is beside it: `docker run --entrypoint rose ... init`.
+ENTRYPOINT ["rosed"]
+CMD ["--datadir", "/var/lib/rose"]

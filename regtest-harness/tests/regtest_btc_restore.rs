@@ -14,11 +14,11 @@
 //! `getbestblockhash` (the wallet's own checkpoint, against the node's), and
 //! `validateaddress`.
 //!
-//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
+//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::{json, Value};
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn btc_restore_from_mnemonic_recovers_history_over_bitcoind() {
@@ -53,13 +53,13 @@ async fn restore_flow(restore_backend: BtcBackend) {
     //    but never paid - the gap a restore's lookahead must bridge), then a spend large
     //    enough to need both inputs, whose change lands on the internal keychain.
     let original = {
-        let mut zecd = ZecdBtc::prepare(
+        let mut rose = RoseBtc::prepare(
             dir.path().join("original"),
             BtcBackend::Bitcoind,
             &node,
             &["btc"],
         );
-        let mnemonic = zecd
+        let mnemonic = rose
             .init_ok("btc", &["--birthday", "0"])
             .expect("a fresh init prints its mnemonic on stdout");
         assert_eq!(
@@ -67,12 +67,12 @@ async fn restore_flow(restore_backend: BtcBackend) {
             24,
             "init emits a 24-word phrase: {mnemonic}"
         );
-        let xpub = zecd.export_xpub("btc").expect("export-xpub");
-        zecd.start().await;
-        zecd.wait_height(101).await;
+        let xpub = rose.export_xpub("btc").expect("export-xpub");
+        rose.start().await;
+        rose.wait_height(101).await;
         let mut addresses: [String; 3] = Default::default();
         for slot in addresses.iter_mut() {
-            *slot = zecd
+            *slot = rose
                 .call("getnewaddress", json!([]))
                 .await
                 .expect("getnewaddress")
@@ -88,16 +88,16 @@ async fn restore_flow(restore_backend: BtcBackend) {
             .await
             .expect("fund indexes 0 and 2");
         node.mine(1).await;
-        zecd.wait_height(102).await;
-        zecd.wait_wallet_balance("btc", 1.5).await;
+        rose.wait_height(102).await;
+        rose.wait_wallet_balance("btc", 1.5).await;
         let miner = node.new_address().await;
-        let send_txid = zecd
+        let send_txid = rose
             .call("sendtoaddress", json!([miner, 1.2]))
             .await
             .expect("original send");
         node.mine(1).await;
-        zecd.wait_height(103).await;
-        let balance = zecd
+        rose.wait_height(103).await;
+        let balance = rose
             .call("getbalance", json!([]))
             .await
             .expect("getbalance")
@@ -107,7 +107,7 @@ async fn restore_flow(restore_backend: BtcBackend) {
             balance > 0.29 && balance < 0.3,
             "1.5 - 1.2 - fee: {balance}"
         );
-        zecd.stop();
+        rose.stop();
         Original {
             mnemonic,
             xpub,
@@ -123,7 +123,7 @@ async fn restore_flow(restore_backend: BtcBackend) {
 
     // 2. Restore on a fresh datadir from the phrase alone (a file, the non-interactive
     //    path), scanning from genesis.
-    let mut zecd = ZecdBtc::prepare(
+    let mut rose = RoseBtc::prepare(
         dir.path().join("restored"),
         restore_backend,
         &node,
@@ -131,7 +131,7 @@ async fn restore_flow(restore_backend: BtcBackend) {
     );
     let phrase_file = dir.path().join("phrase.txt");
     std::fs::write(&phrase_file, format!("{}\n", original.mnemonic)).unwrap();
-    let printed = zecd.init_ok(
+    let printed = rose.init_ok(
         "btc",
         &[
             "--restore",
@@ -146,14 +146,14 @@ async fn restore_flow(restore_backend: BtcBackend) {
         "a restore prints no mnemonic (nothing new to back up): {printed:?}"
     );
     // Same seed: the same account key, before any chain data is seen.
-    assert_eq!(zecd.export_xpub("btc").expect("export-xpub"), original.xpub);
-    zecd.start().await;
-    zecd.wait_height(original.height).await;
+    assert_eq!(rose.export_xpub("btc").expect("export-xpub"), original.xpub);
+    rose.start().await;
+    rose.wait_height(original.height).await;
 
     // 3. Full recovery: balance, both receives (across the unused index), the send and
     //    its change - none of which the restored wallet ever saw live.
-    zecd.wait_wallet_balance("btc", original.balance).await;
-    let txs = zecd
+    rose.wait_wallet_balance("btc", original.balance).await;
+    let txs = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
@@ -179,7 +179,7 @@ async fn restore_flow(restore_backend: BtcBackend) {
     assert_eq!(send["category"], json!("send"), "{send}");
     assert_eq!(send["amount"].as_f64(), Some(-1.2), "{send}");
     assert!(send["fee"].as_f64().is_some_and(|f| f < 0.0), "{send}");
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -189,7 +189,7 @@ async fn restore_flow(restore_backend: BtcBackend) {
         "the change: {unspent}"
     );
     let change = unspent[0]["address"].as_str().unwrap();
-    let ai = zecd
+    let ai = rose
         .call("getaddressinfo", json!([change]))
         .await
         .expect("getaddressinfo on the change");
@@ -197,7 +197,7 @@ async fn restore_flow(restore_backend: BtcBackend) {
     // Every issued address belongs to the restored wallet at its original index - the
     // unpaid one included (within the lookahead, never revealed here, still recognised).
     for (index, address) in original.addresses.iter().enumerate() {
-        let ai = zecd
+        let ai = rose
             .call("getaddressinfo", json!([address]))
             .await
             .expect("getaddressinfo");
@@ -209,7 +209,7 @@ async fn restore_flow(restore_backend: BtcBackend) {
     // 4. The reads no other suite exercises. `getbalances` mirrors Core's shape and agrees
     //    with `getbalance`; the wallet's best block is the node's; `validateaddress` is a
     //    parse, never an error.
-    let balances = zecd
+    let balances = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances");
@@ -228,7 +228,7 @@ async fn restore_flow(restore_backend: BtcBackend) {
         Some(0.0),
         "{balances}"
     );
-    let best = zecd
+    let best = rose
         .call("getbestblockhash", json!([]))
         .await
         .expect("getbestblockhash");
@@ -237,19 +237,19 @@ async fn restore_flow(restore_backend: BtcBackend) {
         Some(node.best_hash().await.as_str()),
         "{best}"
     );
-    let valid = zecd
+    let valid = rose
         .call("validateaddress", json!([original.addresses[0]]))
         .await
         .expect("validateaddress");
     assert_eq!(valid["isvalid"], json!(true), "{valid}");
     assert_eq!(valid["address"], json!(original.addresses[0]), "{valid}");
-    let invalid = zecd
+    let invalid = rose
         .call("validateaddress", json!(["bcrt1qnotanaddress"]))
         .await
         .expect("validateaddress on garbage answers, never errors");
     assert_eq!(invalid["isvalid"], json!(false), "{invalid}");
     // A mainnet address is not valid for this regtest wallet.
-    let wrong_net = zecd
+    let wrong_net = rose
         .call(
             "validateaddress",
             json!(["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"]),
@@ -263,7 +263,7 @@ async fn restore_flow(restore_backend: BtcBackend) {
     //    kyoto an explicit fee_rate prices it; over bitcoind estimatesmartfee has no data
     //    on a regtest chain either, so the same explicit rate keeps the legs identical.
     let miner = node.new_address().await;
-    let restored_send = zecd
+    let restored_send = rose
         .call(
             "sendtoaddress",
             json!([miner, 0.2, null, null, false, null, null, null, null, 2]),
@@ -283,13 +283,13 @@ async fn restore_flow(restore_backend: BtcBackend) {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     node.mine(1).await;
-    zecd.wait_height(original.height + 1).await;
-    let tx = zecd
+    rose.wait_height(original.height + 1).await;
+    let tx = rose
         .call("gettransaction", json!([restored_send]))
         .await
         .expect("gettransaction on the restored send");
     assert_eq!(tx["confirmations"], json!(1), "{tx}");
-    let balance = zecd
+    let balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")

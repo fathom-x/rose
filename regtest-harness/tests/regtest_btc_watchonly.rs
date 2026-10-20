@@ -1,5 +1,5 @@
 //! Watch-only (imported xpub) Bitcoin wallet, end to end, over both chain sources: the
-//! operator flow `zecd export-xpub` on the spending wallet, `zecd init --xpub` for a
+//! operator flow `rose export-xpub` on the spending wallet, `rose init --xpub` for a
 //! watch-only sibling in the same daemon, and the two running side by side against one
 //! regtest Bitcoin Core.
 //!
@@ -17,11 +17,11 @@
 //! Over kyoto the same flow runs with no mempool: nothing is visible at 0-conf, and the
 //! spender's send is priced by the P2P fee signals (regtest has no fee oracle).
 //!
-//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
+//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::json;
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 const SPENDER: &str = "btc";
 const VIEW: &str = "view";
@@ -42,19 +42,19 @@ async fn watch_only_flow(backend: BtcBackend) {
         return;
     };
     let node = BitcoinD::start(&bitcoind, &dir.path().join("btcdata")).await;
-    // Past coinbase maturity before zecd starts, so a kyoto first sync covers a real span.
+    // Past coinbase maturity before rose starts, so a kyoto first sync covers a real span.
     node.mine(101).await;
 
     // 1. The spending wallet, then its exported account key - read offline from the
     //    database init just created, before any daemon runs.
-    let mut zecd = ZecdBtc::prepare(
-        dir.path().join("zecddata"),
+    let mut rose = RoseBtc::prepare(
+        dir.path().join("rosedata"),
         backend,
         &node,
         &[SPENDER, VIEW],
     );
-    zecd.init_ok(SPENDER, &["--birthday", "0"]);
-    let xpub = zecd
+    rose.init_ok(SPENDER, &["--birthday", "0"]);
+    let xpub = rose
         .export_xpub(SPENDER)
         .expect("export-xpub on the spender");
     assert!(
@@ -62,13 +62,13 @@ async fn watch_only_flow(backend: BtcBackend) {
         "an origin-qualified testnet account key: {xpub}"
     );
     // `export-ufvk` names the right command for this coin.
-    let ufvk_err = std::process::Command::new(zecd_regtest_harness::zecd_bin())
+    let ufvk_err = std::process::Command::new(rose_regtest_harness::rose_bin())
         .args([
             "--datadir",
-            zecd.datadir.to_str().unwrap(),
+            rose.datadir.to_str().unwrap(),
             "--regtest",
             "--conf",
-            zecd.datadir.join("zecd.toml").to_str().unwrap(),
+            rose.datadir.join("rose.toml").to_str().unwrap(),
             "export-ufvk",
             "--wallet",
             SPENDER,
@@ -83,14 +83,14 @@ async fn watch_only_flow(backend: BtcBackend) {
     );
 
     // 2. A second spender is refused by the per-coin guard; the watch-only sibling is not.
-    let refused = zecd
+    let refused = rose
         .init(VIEW, &["--birthday", "0"])
         .expect_err("a second bitcoin spender must be refused at init");
     assert!(
         refused.contains("at most one spending wallet per coin"),
         "{refused}"
     );
-    let (_, stderr) = zecd
+    let (_, stderr) = rose
         .init(VIEW, &["--xpub", &xpub, "--birthday", "0"])
         .expect("init --xpub");
     assert!(
@@ -98,13 +98,13 @@ async fn watch_only_flow(backend: BtcBackend) {
         "{stderr}"
     );
     assert!(
-        zecd.wallet_db_path(VIEW).exists(),
+        rose.wallet_db_path(VIEW).exists(),
         "init created the database"
     );
 
     // 3. One daemon serves both; the startup invariant admits the pair.
-    zecd.start().await;
-    let wallets = zecd
+    rose.start().await;
+    let wallets = rose
         .call("listwallets", json!([]))
         .await
         .expect("listwallets");
@@ -114,17 +114,17 @@ async fn watch_only_flow(backend: BtcBackend) {
         }),
         "{wallets}"
     );
-    zecd.wait_wallet_height(SPENDER, 101).await;
-    zecd.wait_wallet_height(VIEW, 101).await;
+    rose.wait_wallet_height(SPENDER, 101).await;
+    rose.wait_wallet_height(VIEW, 101).await;
 
     // Same key material, same first address: index 0 on both keychains agrees.
-    let addr = zecd
+    let addr = rose
         .call_wallet(SPENDER, "getnewaddress", json!([]))
         .await
         .expect("spender getnewaddress");
     let addr = addr.as_str().unwrap().to_string();
     assert!(addr.starts_with("bcrt1"), "{addr}");
-    let view_addr = zecd
+    let view_addr = rose
         .call_wallet(VIEW, "getnewaddress", json!([]))
         .await
         .expect("view getnewaddress");
@@ -132,19 +132,19 @@ async fn watch_only_flow(backend: BtcBackend) {
 
     // The wallet-level watch-only signal, exactly as the Zcash side reports it: the
     // per-address flags are byte-identical on both wallets.
-    let wi = zecd
+    let wi = rose
         .call_wallet(VIEW, "getwalletinfo", json!([]))
         .await
         .expect("view getwalletinfo");
     assert_eq!(wi["private_keys_enabled"], json!(false), "{wi}");
     assert_eq!(wi["coin"], json!("bitcoin"), "{wi}");
-    let wi = zecd
+    let wi = rose
         .call_wallet(SPENDER, "getwalletinfo", json!([]))
         .await
         .expect("spender getwalletinfo");
     assert_eq!(wi["private_keys_enabled"], json!(true), "{wi}");
     for wallet in [SPENDER, VIEW] {
-        let ai = zecd
+        let ai = rose
             .call_wallet(wallet, "getaddressinfo", json!([addr]))
             .await
             .expect("getaddressinfo");
@@ -163,7 +163,7 @@ async fn watch_only_flow(backend: BtcBackend) {
         .await
         .expect("fund");
     if backend == BtcBackend::Bitcoind {
-        zecd.wait_wallet(
+        rose.wait_wallet(
             VIEW,
             "getunconfirmedbalance",
             json!([]),
@@ -174,10 +174,10 @@ async fn watch_only_flow(backend: BtcBackend) {
     }
     node.mine(1).await;
     for wallet in [SPENDER, VIEW] {
-        zecd.wait_wallet_height(wallet, 102).await;
-        zecd.wait_wallet_balance(wallet, 1.0).await;
+        rose.wait_wallet_height(wallet, 102).await;
+        rose.wait_wallet_balance(wallet, 1.0).await;
     }
-    let unspent = zecd
+    let unspent = rose
         .call_wallet(VIEW, "listunspent", json!([]))
         .await
         .expect("view listunspent");
@@ -185,7 +185,7 @@ async fn watch_only_flow(backend: BtcBackend) {
     assert_eq!(unspent[0]["txid"], fund_txid, "{unspent}");
     assert_eq!(unspent[0]["spendable"], json!(false), "no keys: {unspent}");
     assert_eq!(unspent[0]["safe"], json!(true), "{unspent}");
-    let unspent = zecd
+    let unspent = rose
         .call_wallet(SPENDER, "listunspent", json!([]))
         .await
         .expect("spender listunspent");
@@ -199,7 +199,7 @@ async fn watch_only_flow(backend: BtcBackend) {
         ("sendtoaddress", json!([miner, 0.1])),
         ("sendmany", json!(["", {miner.clone(): 0.1}])),
     ] {
-        let (code, msg) = zecd
+        let (code, msg) = rose
             .call_wallet(VIEW, method, params)
             .await
             .expect_err("a watch-only send must fail");
@@ -207,7 +207,7 @@ async fn watch_only_flow(backend: BtcBackend) {
         assert!(msg.contains("Private keys are disabled"), "{method}: {msg}");
         assert!(msg.contains("watch-only"), "{method}: {msg}");
     }
-    let (code, _) = zecd
+    let (code, _) = rose
         .call_wallet(VIEW, "walletpassphrase", json!(["pw", 60]))
         .await
         .expect_err("walletpassphrase is not served for bitcoin wallets");
@@ -221,7 +221,7 @@ async fn watch_only_flow(backend: BtcBackend) {
 
     // 6. The spender's send shows up on the watch-only side: the send entry, the debit,
     //    and the change output (internal keychain) - all from public descriptors.
-    let send_txid = zecd
+    let send_txid = rose
         .call_wallet(SPENDER, "sendtoaddress", json!([miner, 0.25]))
         .await
         .expect("spender send");
@@ -231,19 +231,19 @@ async fn watch_only_flow(backend: BtcBackend) {
         .contains(&send_txid.as_str().unwrap().to_string()));
     node.mine(1).await;
     for wallet in [SPENDER, VIEW] {
-        zecd.wait_wallet_height(wallet, 103).await;
+        rose.wait_wallet_height(wallet, 103).await;
     }
-    let spender_balance = zecd
+    let spender_balance = rose
         .call_wallet(SPENDER, "getbalance", json!([]))
         .await
         .expect("spender balance");
-    zecd.wait_wallet_balance(VIEW, spender_balance.as_f64().unwrap())
+    rose.wait_wallet_balance(VIEW, spender_balance.as_f64().unwrap())
         .await;
     assert!(
         spender_balance.as_f64().unwrap() < 0.75 && spender_balance.as_f64().unwrap() > 0.74,
         "1.0 minus 0.25 minus a sat/vB-scale fee: {spender_balance}"
     );
-    let txs = zecd
+    let txs = rose
         .call_wallet(VIEW, "listtransactions", json!([]))
         .await
         .expect("view listtransactions");
@@ -257,7 +257,7 @@ async fn watch_only_flow(backend: BtcBackend) {
     assert_eq!(send_entry["amount"].as_f64(), Some(-0.25), "{send_entry}");
     assert_eq!(send_entry["address"], json!(miner), "{send_entry}");
     assert_eq!(send_entry["confirmations"], json!(1), "{send_entry}");
-    let unspent = zecd
+    let unspent = rose
         .call_wallet(VIEW, "listunspent", json!([]))
         .await
         .expect("view listunspent after the send");
@@ -267,7 +267,7 @@ async fn watch_only_flow(backend: BtcBackend) {
         "the change output: {unspent}"
     );
     let change = unspent[0]["address"].as_str().expect("change address");
-    let ai = zecd
+    let ai = rose
         .call_wallet(VIEW, "getaddressinfo", json!([change]))
         .await
         .expect("getaddressinfo on the change");
@@ -277,20 +277,20 @@ async fn watch_only_flow(backend: BtcBackend) {
     // 7. The key round trip, read from the live daemon's database (lock-free, like
     //    export-ufvk): the watch-only wallet re-exports exactly what it was built from.
     assert_eq!(
-        zecd.export_xpub(VIEW).expect("export-xpub on the view"),
+        rose.export_xpub(VIEW).expect("export-xpub on the view"),
         xpub
     );
     assert_eq!(
-        zecd.export_xpub(SPENDER)
+        rose.export_xpub(SPENDER)
             .expect("export-xpub on the spender"),
         xpub
     );
 
     // 8. Restart: the pinned key verifies the database (the seedless binding check) and
     //    the balance is intact.
-    zecd.restart().await;
-    zecd.wait_wallet_height(VIEW, 103).await;
-    let balance = zecd
+    rose.restart().await;
+    rose.wait_wallet_height(VIEW, 103).await;
+    let balance = rose
         .call_wallet(VIEW, "getbalance", json!([]))
         .await
         .expect("view balance after restart");
@@ -301,18 +301,18 @@ async fn watch_only_flow(backend: BtcBackend) {
 
     // 9. Rebuild from the pin: with the database gone, the daemon recreates it from the
     //    xpub in keys.toml and rescans to the same balance and history.
-    zecd.stop();
-    let db = zecd.wallet_db_path(VIEW);
+    rose.stop();
+    let db = rose.wallet_db_path(VIEW);
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
     }
     assert!(!db.exists());
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    zecd.start().await;
-    zecd.wait_wallet_height(VIEW, 103).await;
-    zecd.wait_wallet_balance(VIEW, spender_balance.as_f64().unwrap())
+    rose.start().await;
+    rose.wait_wallet_height(VIEW, 103).await;
+    rose.wait_wallet_balance(VIEW, spender_balance.as_f64().unwrap())
         .await;
-    let txs = zecd
+    let txs = rose
         .call_wallet(VIEW, "listtransactions", json!([]))
         .await
         .expect("view listtransactions after the rebuild");
@@ -327,7 +327,7 @@ async fn watch_only_flow(backend: BtcBackend) {
             && txids.contains(&send_txid.as_str().unwrap()),
         "the rebuilt watch-only wallet recovered both transactions: {txs}"
     );
-    let wi = zecd
+    let wi = rose
         .call_wallet(VIEW, "getwalletinfo", json!([]))
         .await
         .expect("view getwalletinfo after the rebuild");

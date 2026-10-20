@@ -1,10 +1,10 @@
-# Minimal Zebra config for serving zecd - MAINNET variant.
+# Minimal Zebra config for serving rose - MAINNET variant.
 # Used by docker-compose.mainnet.yml; the default stack uses the testnet zebrad.toml.
 [network]
 network = "Mainnet"
 
 [rpc]
-# Internal JSON-RPC for zecd on the compose network (kept on 18234 for both networks so the
+# Internal JSON-RPC for rose on the compose network (kept on 18234 for both networks so the
 # stack's wiring/ports don't change). Keep this off any public interface.
 listen_addr = "0.0.0.0:18234"
 # The compose network is private; the cookie file isn't shared between containers.

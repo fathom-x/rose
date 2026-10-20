@@ -80,10 +80,10 @@ pub struct TransparentUtxo {
 /// so a hit means one of the wallet's own UTXOs was just spent.
 ///
 /// This is the spend-side counterpart of [`TransparentUtxo`], and it exists because a transparent
-/// spend is otherwise invisible to zecd. The block scan only ever inspected *outputs*, so a spend
+/// spend is otherwise invisible to rose. The block scan only ever inspected *outputs*, so a spend
 /// was discovered solely when librustzcash asked for an address check
 /// (`TransactionDataRequest::TransactionsInvolvingAddress`) - which it does not emit for a UTXO
-/// zecd recorded itself through the block-scan matcher. The result was a wallet that kept an
+/// rose recorded itself through the block-scan matcher. The result was a wallet that kept an
 /// already-spent output in its unspent set: a balance higher than the wallet really held, and an
 /// input that could be selected for a send that then failed at broadcast.
 ///
@@ -154,7 +154,7 @@ pub enum UpgradeStatus {
 }
 
 /// A network upgrade the upstream chain follows (or is about to follow) whose consensus branch
-/// ID this zecd build does not recognize - the "this zecd is outdated" signal. When the NU6.3
+/// ID this rose build does not recognize - the "this rose is outdated" signal. When the NU6.3
 /// (ironwood) upgrade activated, builds that predated it kept fetching post-activation blocks
 /// they could not apply and looped on the same sync error forever with no explanation; this is
 /// the datum that lets the actor say *why* instead.

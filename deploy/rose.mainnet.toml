@@ -1,13 +1,13 @@
-# zecd configuration for the docker-compose stack - MAINNET variant.
+# rose configuration for the docker-compose stack - MAINNET variant.
 # Use with: docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d
-# The default stack is testnet (zecd.toml); this file switches zecd to mainnet.
+# The default stack is testnet (rose.toml); this file switches rose to mainnet.
 
 network = "main"
-datadir = "/var/lib/zecd"
+datadir = "/var/lib/rose"
 default_wallet = "default"
 
 [wallets.default]
-dir = "/var/lib/zecd/default"
+dir = "/var/lib/rose/default"
 
 [backend]
 # The co-located zebra full node's JSON-RPC (zebra:// = direct to zebrad, no lightwalletd).
@@ -25,7 +25,7 @@ user = "zec"
 password = "CHANGE-ME"
 
 [keys]
-age_identity = "/var/lib/zecd/identity.txt"
+age_identity = "/var/lib/rose/identity.txt"
 auto_unlock = true
 
 [sync]

@@ -3,7 +3,7 @@
 //!
 //! # Why a shard exists
 //!
-//! zecd's sharing unit was the wallet: one `WalletDb`, one actor, one scan, one set of
+//! rose's sharing unit was the wallet: one `WalletDb`, one actor, one scan, one set of
 //! note-commitment trees each. Trial decryption is per (viewing key, output) by the protocol's
 //! design and cannot be shared away - but everything wrapped around it can be, and none of it was.
 //! At N monitored wallets a daemon paid N block fetches, N tree-append passes, N SQLite writers

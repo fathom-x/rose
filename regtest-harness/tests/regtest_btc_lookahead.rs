@@ -24,11 +24,11 @@
 //! a missed payment with the set the index now gives, and repeats until a pass reveals
 //! nothing new - six passes here, one per lookahead of history.
 //!
-//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
+//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::json;
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 /// How many receiving addresses the original hands out; the last one is paid.
 const ISSUED: usize = 30;
@@ -73,20 +73,20 @@ async fn btc_restore_over_kyoto_discovers_used_addresses_past_the_recovery_set()
     // 1. The original, over bitcoind: `USED` addresses issued in order and every one paid,
     //    `PER_BLOCK` per transaction and block.
     let (mnemonic, addresses) = {
-        let mut zecd = ZecdBtc::prepare(
+        let mut rose = RoseBtc::prepare(
             dir.path().join("original"),
             BtcBackend::Bitcoind,
             &node,
             &["btc"],
         );
-        let mnemonic = zecd
+        let mnemonic = rose
             .init_ok("btc", &["--birthday", "0"])
             .expect("a generated wallet prints its mnemonic");
-        zecd.start().await;
-        zecd.wait_height(101).await;
+        rose.start().await;
+        rose.wait_height(101).await;
         let mut addresses = Vec::with_capacity(USED);
         for _ in 0..USED {
-            let a = zecd
+            let a = rose
                 .call("getnewaddress", json!([]))
                 .await
                 .expect("getnewaddress");
@@ -103,9 +103,9 @@ async fn btc_restore_over_kyoto_discovers_used_addresses_past_the_recovery_set()
             node.mine(1).await;
         }
         let height = node.height().await;
-        zecd.wait_height(height).await;
-        zecd.wait_wallet_balance("btc", paid_total()).await;
-        zecd.stop();
+        rose.wait_height(height).await;
+        rose.wait_wallet_balance("btc", paid_total()).await;
+        rose.stop();
         (mnemonic, addresses)
     };
     let height = node.height().await;
@@ -118,13 +118,13 @@ async fn btc_restore_over_kyoto_discovers_used_addresses_past_the_recovery_set()
     //    paid an index whose reveal put an unwatched one in the window, with the set the
     //    index now gives, and repeats - each pass a lookahead further - until one reveals
     //    nothing new.
-    let mut zecd = ZecdBtc::prepare(
+    let mut rose = RoseBtc::prepare(
         dir.path().join("restore-kyoto"),
         BtcBackend::Kyoto,
         &node,
         &["btc"],
     );
-    zecd.init_ok(
+    rose.init_ok(
         "btc",
         &[
             "--restore",
@@ -134,17 +134,17 @@ async fn btc_restore_over_kyoto_discovers_used_addresses_past_the_recovery_set()
             "0",
         ],
     );
-    zecd.start().await;
-    zecd.wait_height(height).await;
-    zecd.wait_wallet_balance("btc", paid_total()).await;
+    rose.start().await;
+    rose.wait_height(height).await;
+    rose.wait_wallet_balance("btc", paid_total()).await;
     let last = &addresses[USED - 1];
-    let ai = zecd
+    let ai = rose
         .call("getaddressinfo", json!([last]))
         .await
         .expect("getaddressinfo");
     assert_eq!(ai["ismine"], json!(true), "index {}: {ai}", USED - 1);
     assert_eq!(ai["address_index"], json!(USED - 1), "{ai}");
-    let descriptors = zecd
+    let descriptors = rose
         .call("listdescriptors", json!([]))
         .await
         .expect("listdescriptors");
@@ -154,7 +154,7 @@ async fn btc_restore_over_kyoto_discovers_used_addresses_past_the_recovery_set()
         "the range end is the next index plus the default lookahead: {descriptors}"
     );
     // Once a pass has revealed nothing past its set, the wallet is ready.
-    zecd.wait_readyz(200, "the discovery loop completed").await;
+    rose.wait_readyz(200, "the discovery loop completed").await;
 }
 
 async fn lookahead_flow(restore_backend: BtcBackend) {
@@ -167,20 +167,20 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
 
     // 1. The original: thirty addresses issued, the first and the last paid.
     let (mnemonic, first, last) = {
-        let mut zecd = ZecdBtc::prepare(
+        let mut rose = RoseBtc::prepare(
             dir.path().join("original"),
             BtcBackend::Bitcoind,
             &node,
             &["btc"],
         );
-        let mnemonic = zecd
+        let mnemonic = rose
             .init_ok("btc", &["--birthday", "0"])
             .expect("a generated wallet prints its mnemonic");
-        zecd.start().await;
-        zecd.wait_height(101).await;
+        rose.start().await;
+        rose.wait_height(101).await;
         let mut addresses = Vec::with_capacity(ISSUED);
         for _ in 0..ISSUED {
-            let a = zecd
+            let a = rose
                 .call("getnewaddress", json!([]))
                 .await
                 .expect("getnewaddress");
@@ -190,7 +190,7 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
         let last = addresses[ISSUED - 1].clone();
         // Index 29 lies past the default horizon (24): the daemon warned, and the readout
         // says a restore would miss it...
-        let wi = zecd
+        let wi = rose
             .call("getwalletinfo", json!([]))
             .await
             .expect("getwalletinfo");
@@ -204,16 +204,16 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
             .await
             .expect("pay the last index");
         node.mine(1).await;
-        zecd.wait_height(102).await;
-        zecd.wait_wallet_balance("btc", 3.0).await;
+        rose.wait_height(102).await;
+        rose.wait_wallet_balance("btc", 3.0).await;
         // ...until the payment there leads a restore on: the horizon follows funding.
-        let wi = zecd
+        let wi = rose
             .call("getwalletinfo", json!([]))
             .await
             .expect("getwalletinfo");
         assert_eq!(wi["recovery"]["horizon"], json!(ISSUED - 1 + 25), "{wi}");
         assert_eq!(wi["recovery"]["restorable"], json!(true), "{wi}");
-        zecd.stop();
+        rose.stop();
         (mnemonic, first, last)
     };
     let height = node.height().await;
@@ -225,13 +225,13 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
     //    payment alone. This is the documented gap, pinned so a change in BDK's default
     //    or in the engine's attribution shows up here.
     {
-        let mut zecd = ZecdBtc::prepare(
+        let mut rose = RoseBtc::prepare(
             dir.path().join("restore-default"),
             restore_backend,
             &node,
             &["btc"],
         );
-        zecd.init_ok(
+        rose.init_ok(
             "btc",
             &[
                 "--restore",
@@ -241,12 +241,12 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
                 "0",
             ],
         );
-        zecd.start().await;
-        zecd.wait_height(height).await;
-        zecd.wait_wallet_balance("btc", 1.0).await;
+        rose.start().await;
+        rose.wait_height(height).await;
+        rose.wait_wallet_balance("btc", 1.0).await;
         // Give a late attribution every chance before calling it missed.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let balance = zecd
+        let balance = rose
             .call("getbalance", json!([]))
             .await
             .expect("getbalance");
@@ -257,7 +257,7 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
             restore_backend.label(),
             ISSUED - 2
         );
-        let ai = zecd
+        let ai = rose
             .call("getaddressinfo", json!([last]))
             .await
             .expect("getaddressinfo");
@@ -267,20 +267,20 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
             "index {} is past the default window: {ai}",
             ISSUED - 1
         );
-        zecd.stop();
+        rose.stop();
     }
 
     // 3. Restored with the knob raised past the gap: both payments, the paid address
     //    recognised at its index, and the recovered funds spend.
     {
-        let mut zecd = ZecdBtc::prepare_with(
+        let mut rose = RoseBtc::prepare_with(
             dir.path().join("restore-wide"),
             restore_backend,
             &node,
             &["btc"],
             "lookahead = 40",
         );
-        zecd.init_ok(
+        rose.init_ok(
             "btc",
             &[
                 "--restore",
@@ -290,18 +290,18 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
                 "0",
             ],
         );
-        zecd.start().await;
-        zecd.wait_height(height).await;
-        zecd.wait_wallet_balance("btc", 3.0).await;
+        rose.start().await;
+        rose.wait_height(height).await;
+        rose.wait_wallet_balance("btc", 3.0).await;
         for (index, address) in [(0usize, &first), (ISSUED - 1, &last)] {
-            let ai = zecd
+            let ai = rose
                 .call("getaddressinfo", json!([address]))
                 .await
                 .expect("getaddressinfo");
             assert_eq!(ai["ismine"], json!(true), "index {index}: {ai}");
             assert_eq!(ai["address_index"], json!(index), "{ai}");
         }
-        let descriptors = zecd
+        let descriptors = rose
             .call("listdescriptors", json!([]))
             .await
             .expect("listdescriptors");
@@ -312,14 +312,14 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
             "the range end is the next index plus the lookahead: {descriptors}"
         );
         let dest = node.new_address().await;
-        let txid = zecd
+        let txid = rose
             .call("sendtoaddress", json!([dest, 2.5]))
             .await
             .expect("spend the recovered funds (needs both payments)");
         assert!(txid.as_str().is_some_and(|t| t.len() == 64), "{txid}");
         node.mine(1).await;
-        zecd.wait_height(height + 1).await;
-        let tx = zecd
+        rose.wait_height(height + 1).await;
+        let tx = rose
             .call("gettransaction", json!([txid]))
             .await
             .expect("gettransaction");
@@ -330,14 +330,14 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
     //    revealed at spawn, so the scan watches both paid addresses from its first pass,
     //    and the cursor continues past the floor.
     {
-        let mut zecd = ZecdBtc::prepare_with(
+        let mut rose = RoseBtc::prepare_with(
             dir.path().join("restore-floor"),
             restore_backend,
             &node,
             &["btc"],
             &format!("initial_scan = {ISSUED}"),
         );
-        zecd.init_ok(
+        rose.init_ok(
             "btc",
             &[
                 "--restore",
@@ -347,10 +347,10 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
                 "0",
             ],
         );
-        zecd.start().await;
-        zecd.wait_height(height + 1).await;
+        rose.start().await;
+        rose.wait_height(height + 1).await;
         // Phase 3 spent 2.5 of the 3.0 to the node; what is left is the change (fee off).
-        let balance = zecd
+        let balance = rose
             .call("getbalance", json!([]))
             .await
             .expect("getbalance");
@@ -360,23 +360,23 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
             "[{}] {balance}",
             restore_backend.label()
         );
-        let ai = zecd
+        let ai = rose
             .call("getaddressinfo", json!([last]))
             .await
             .expect("getaddressinfo");
         assert_eq!(ai["ismine"], json!(true), "{ai}");
         assert_eq!(ai["address_index"], json!(ISSUED - 1), "{ai}");
-        let wi = zecd
+        let wi = rose
             .call("getwalletinfo", json!([]))
             .await
             .expect("getwalletinfo");
         assert_eq!(wi["recovery"]["initial_scan"], json!(ISSUED), "{wi}");
         assert_eq!(wi["recovery"]["issued_through"], json!(ISSUED - 1), "{wi}");
         assert_eq!(wi["recovery"]["restorable"], json!(true), "{wi}");
-        let next = zecd
+        let next = rose
             .call(
                 "getaddressinfo",
-                json!([zecd
+                json!([rose
                     .call("getnewaddress", json!([]))
                     .await
                     .expect("getnewaddress")]),

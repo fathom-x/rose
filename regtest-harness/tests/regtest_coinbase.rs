@@ -1,4 +1,4 @@
-//! Coinbase spending end-to-end: prove zecd can spend block rewards mined directly to its own
+//! Coinbase spending end-to-end: prove rose can spend block rewards mined directly to its own
 //! addresses - both kinds Zcash supports.
 //!
 //! **Transparent coinbase** (`regtest_transparent_coinbase_shield_and_spend`): consensus requires
@@ -6,7 +6,7 @@
 //! (`bad-txns-coinbase-spend-has-transparent-outputs`, active on mainnet/testnet), plus the
 //! 100-block maturity rule. So the only legal spend shape is coinbase → shielded with no change -
 //! zcashd's `z_shieldcoinbase` - after which the funds spend as ordinary Orchard notes. This test
-//! mines coinbases to zecd's own t-address and asserts the whole ladder: the receive is
+//! mines coinbases to rose's own t-address and asserts the whole ladder: the receive is
 //! discovered and classified coinbase (`immature_balance`, hidden from `listunspent`); while
 //! immature nothing can spend it (t→t send and `z_shieldcoinbase` both `-6`); once mature it
 //! surfaces (`listunspent` `generated: true`, spendable balance) but the t→t path *still* refuses
@@ -18,17 +18,17 @@
 //! mine directly to a shielded (Orchard) address; such coinbase notes have **no** maturity rule
 //! and no spend restriction - they are ordinary notes from birth (zcashd's
 //! `mining_shielded_coinbase.py` proves the same). This test points zebra's `miner_address` at
-//! zecd's own unified address, receives the Orchard coinbase notes, and spends them long before
+//! rose's own unified address, receives the Orchard coinbase notes, and spends them long before
 //! 100 confirmations. Requires a zebrad whose block template can build shielded coinbase
 //! (zebra ≥ 6.0.0 - 5.0.0 builds an Orchard coinbase whose proof fails its own validation), so
 //! the test probes by mining its seed blocks and self-skips on a rejected template; set
-//! `ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE=1` to make that a hard failure instead (for runs
+//! `ROSE_REGTEST_REQUIRE_SHIELDED_COINBASE=1` to make that a hard failure instead (for runs
 //! against a zebrad known to support it, e.g. the weekly `latest` leg).
 //!
-//! **Neither test restarts zebra.** Both derive zecd's miner address *offline* from
+//! **Neither test restarts zebra.** Both derive rose's miner address *offline* from
 //! [`COINBASE_MNEMONIC`] (`derive_address_offline`, the same trick the funder uses) and start
 //! zebra mining there from genesis, so the chain is in its final shape before the daemon exists.
-//! Do not go back to "start zecd, ask it for an address, restart zebra to mine there": that hands
+//! Do not go back to "start rose, ask it for an address, restart zebra to mine there": that hands
 //! the daemon a chain about to be rewound underneath it - zebra's non-finalized-state backup is
 //! written by an asynchronous task, so the restart silently drops the blocks the daemon just
 //! scanned, and a wallet that young cannot rewind below its own birthday checkpoint. It wedges,
@@ -41,16 +41,16 @@
 //! exactly the blocks mined after startup.
 //!
 //! Neither test needs the funding wallet: the node's own `generate` mines straight
-//! to zecd. Runs against whichever node `ZECD_REGTEST_NODE` selects; skips cleanly unless that
+//! to rose. Runs against whichever node `ROSE_REGTEST_NODE` selects; skips cleanly unless that
 //! node's binary variable (`ZEBRAD_BIN` / `ZAKURAD_BIN`) is set.
 
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
-use zecd_regtest_harness::{
-    attach_backend, derive_address_offline, pick_port, resolve_node_bin, Zebrad, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    attach_backend, derive_address_offline, pick_port, resolve_node_bin, Rose, RoseConfig, Zebrad,
     SEED_MINER_ADDRESS,
 };
+use serde_json::{json, Value};
 
 /// The wallet under test is restored from a known phrase so its miner address can be derived
 /// before the daemon exists (see the module docs). This is the repo's committed throwaway testnet
@@ -58,8 +58,8 @@ use zecd_regtest_harness::{
 const COINBASE_MNEMONIC: &str = "mechanic vehicle helmet decide plug gorilla frost dial october \
 midnight culture idea mountain fame park social drip bid doctor scatter glance defy moment stage";
 
-/// Blocks mined before zecd starts, so `zecd init --restore` has a chain to anchor on. They pay
-/// zecd (zebra mines to it from genesis) but sit below its birthday, so the wallet ignores them.
+/// Blocks mined before rose starts, so `rose init --restore` has a chain to anchor on. They pay
+/// rose (zebra mines to it from genesis) but sit below its birthday, so the wallet ignores them.
 /// Two is the lowest workable count: the birthday is [`BIRTHDAY`] = `SEED_BLOCKS + 1`, and the
 /// restore anchors on the tree state at `birthday - 1`, which genesis does not have.
 const SEED_BLOCKS: u32 = 2;
@@ -70,8 +70,8 @@ const SEED_BLOCKS: u32 = 2;
 /// than the assertions expect.)
 const BIRTHDAY: u32 = SEED_BLOCKS + 1;
 
-/// Coinbases mined to zecd before the maturity/aging phase (the deterministic assertion set).
-const ZECD_COINBASES: u64 = 8;
+/// Coinbases mined to rose before the maturity/aging phase (the deterministic assertion set).
+const ROSE_COINBASES: u64 = 8;
 /// How long the mature-coinbase `-6` refusal may take (step 8). It selects nothing and proves
 /// nothing, so anything beyond a few seconds means the request queued behind the actor rather
 /// than being served; 109s was the measured symptom of the spend-search re-fetch loop that
@@ -81,16 +81,16 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(240);
 const OP_TIMEOUT: Duration = Duration::from_secs(240);
 const SPEND_TIMEOUT: Duration = Duration::from_secs(240);
 
-/// Poll `getpeerinfo` until zecd reports `conn_state == "ready"`.
+/// Poll `getpeerinfo` until rose reports `conn_state == "ready"`.
 ///
 /// **Call this only once a block at or above the wallet's birthday has been mined.** Both tests
 /// restore at a birthday one past the seed blocks, and a wallet whose birthday is above the chain
 /// tip has nothing to scan and never leaves `syncing` - so waiting for readiness before mining
 /// burns the whole timeout and fails the test.
-async fn wait_ready(zecd: &Zecd) {
+async fn wait_ready(rose: &Rose) {
     let deadline = Instant::now() + SYNC_TIMEOUT;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -103,7 +103,7 @@ async fn wait_ready(zecd: &Zecd) {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached ready: {peers}"
+            "rose never reached ready: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -119,12 +119,12 @@ async fn zebra_tip(zebrad: &Zebrad) -> u64 {
         .expect("block count")
 }
 
-/// Sync zecd to zebra's tip and give the caught-up pass a beat to settle.
-async fn sync_to_tip(zecd: &Zecd, zebrad: &Zebrad) {
+/// Sync rose to zebra's tip and give the caught-up pass a beat to settle.
+async fn sync_to_tip(rose: &Rose, zebrad: &Zebrad) {
     let tip = zebra_tip(zebrad).await;
-    zecd.wait_until_synced(tip, SYNC_TIMEOUT)
+    rose.wait_until_synced(tip, SYNC_TIMEOUT)
         .await
-        .expect("zecd sync to tip");
+        .expect("rose sync to tip");
     tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
@@ -133,8 +133,8 @@ async fn sync_to_tip(zecd: &Zecd, zebrad: &Zebrad) {
 /// This is the poll-sleep-check loop `z_waitforoperation` exists to delete: one blocking call
 /// replaces it, and the result is then reaped so the registry doesn't retain it (the wait is
 /// deliberately non-destructive). Doubles as this tier's live coverage of the RPC.
-async fn await_op_txid(zecd: &Zecd, opid: &str) -> String {
-    let waited = zecd
+async fn await_op_txid(rose: &Rose, opid: &str) -> String {
+    let waited = rose
         .call(
             "z_waitforoperation",
             json!([opid, OP_TIMEOUT.as_secs() as i64]),
@@ -157,7 +157,7 @@ async fn await_op_txid(zecd: &Zecd, opid: &str) -> String {
         .to_string();
 
     // The wait left the operation in place, so the reap still finds it exactly once.
-    let reaped = zecd
+    let reaped = rose
         .call("z_getoperationresult", json!([[opid]]))
         .await
         .expect("z_getoperationresult");
@@ -171,8 +171,8 @@ async fn await_op_txid(zecd: &Zecd, opid: &str) -> String {
 }
 
 /// getbalance as float ZEC (fine for assertions against exact zatoshi-derived sums).
-async fn balance_zec(zecd: &Zecd) -> f64 {
-    zecd.call("getbalance", json!([]))
+async fn balance_zec(rose: &Rose) -> f64 {
+    rose.call("getbalance", json!([]))
         .await
         .expect("getbalance")
         .as_f64()
@@ -181,7 +181,7 @@ async fn balance_zec(zecd: &Zecd) -> f64 {
 
 #[tokio::test]
 async fn regtest_transparent_coinbase_shield_and_spend() {
-    // Runs against whichever node the leg selected (`ZECD_REGTEST_NODE`), so the whole coinbase
+    // Runs against whichever node the leg selected (`ROSE_REGTEST_NODE`), so the whole coinbase
     // ladder is exercised on zebra and zakura alike; skips only when that node's binary is absent.
     let Some(zebrad_bin) = resolve_node_bin() else {
         eprintln!(
@@ -191,15 +191,15 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         return;
     };
 
-    // 1. zecd's addresses, derived offline before anything runs (see the module docs). Index 0 is
+    // 1. rose's addresses, derived offline before anything runs (see the module docs). Index 0 is
     //    the miner address: librustzcash exposes it at account creation, so the wallet credits
     //    coinbase mined there from the moment it exists, without ever issuing it.
     let taddr = derive_address_offline(COINBASE_MNEMONIC, "transparent", 0)
-        .expect("derive zecd's miner t-address offline");
+        .expect("derive rose's miner t-address offline");
     let own_ua =
-        derive_address_offline(COINBASE_MNEMONIC, "orchard", 0).expect("derive zecd's UA offline");
+        derive_address_offline(COINBASE_MNEMONIC, "orchard", 0).expect("derive rose's UA offline");
 
-    // 2. zebra mining to zecd from genesis, plus a couple of blocks so zecd can init off a live
+    // 2. zebra mining to rose from genesis, plus a couple of blocks so rose can init off a live
     //    chain. No restart, so no block the assertions rely on can be dropped.
     let zebrad = Zebrad::start_with_miner(&zebrad_bin, &taddr)
         .await
@@ -209,28 +209,28 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         .await
         .expect("seed the chain");
 
-    // 3. zecd with transparent receiving, restored from the phrase the addresses came from.
+    // 3. rose with transparent receiving, restored from the phrase the addresses came from.
     //    `AllowFullyTransparent` so the t→t path is *reachable* - the point of the
     //    immature/mature `-6` assertions below is that even the most permissive
     //    transparent-spend policy refuses coinbase UTXOs. The birthday is the seed height, so the
     //    seed blocks' coinbases stay invisible and every counted coinbase is mined below.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.transparent = true;
     cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
     cfg.restore_mnemonic = Some(COINBASE_MNEMONIC.to_string());
     cfg.birthday = Some(BIRTHDAY);
-    // On the zecd-lwd leg the wallet runs in light mode. That is the leg that matters for the
+    // On the rose-lwd leg the wallet runs in light mode. That is the leg that matters for the
     // maturity ladder: lightwalletd's compact transaction carries no coinbase transaction, so
     // the coinbase marker (`tx_index = 0`) is recorded only because the sync engine fetches the
     // transaction for a coinbase output that pays the wallet. Without that, step 4's
     // immature-coinbase assertions fail there.
-    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    let _rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
         .expect("attach the selected backend");
-    let zecd = Zecd::start(&cfg).await.expect("start zecd");
+    let rose = Rose::start(&cfg).await.expect("start rose");
     // A read RPC, so it needs no readiness - which the wallet cannot report yet, see below.
     assert_eq!(
-        zecd.call("getaddressinfo", json!([taddr.clone()]))
+        rose.call("getaddressinfo", json!([taddr.clone()]))
             .await
             .expect("getaddressinfo")["ismine"],
         json!(true),
@@ -239,17 +239,17 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
 
     let window_start = zebra_tip(&zebrad).await + 1;
     zebrad
-        .generate_blocks(ZECD_COINBASES as u32)
+        .generate_blocks(ROSE_COINBASES as u32)
         .await
-        .expect("mine zecd's coinbases");
-    let hmax = window_start + ZECD_COINBASES - 1;
-    wait_ready(&zecd).await;
-    sync_to_tip(&zecd, &zebrad).await;
+        .expect("mine rose's coinbases");
+    let hmax = window_start + ROSE_COINBASES - 1;
+    wait_ready(&rose).await;
+    sync_to_tip(&rose, &zebrad).await;
 
     // 4. Immature: the receives are discovered and classified coinbase - value rides in
     //    `immature_balance`, spendable balance stays zero, and `listunspent` hides them
     //    (Bitcoin Core's AvailableCoins behavior).
-    let info = zecd
+    let info = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -259,11 +259,11 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         "immature coinbase value must surface in immature_balance: {info}"
     );
     assert_eq!(
-        balance_zec(&zecd).await,
+        balance_zec(&rose).await,
         0.0,
         "immature coinbase must not count as spendable balance"
     );
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([0]))
         .await
         .expect("listunspent");
@@ -276,7 +276,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     // 4a. The getbalances extension: `mine.coinbase` is the *mature* (shieldable) coinbase
     //     value, so while everything is immature it stays zero - the value rides in
     //     `mine.immature` until the maturity boundary.
-    let gb = zecd
+    let gb = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances");
@@ -293,7 +293,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     // 4b. The received-by aggregations apply the same maturity rule as the balance buckets:
     //     by default an immature transparent coinbase is NOT counted as received (Core parity -
     //     a reorg can still revoke it), and `include_immature_coinbase` opts the value back in.
-    let recv = zecd
+    let recv = rose
         .call("getreceivedbyaddress", json!([taddr]))
         .await
         .expect("getreceivedbyaddress while immature")
@@ -303,7 +303,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         recv, 0.0,
         "immature coinbase must not count as received by default"
     );
-    let recv_imm = zecd
+    let recv_imm = rose
         .call("getreceivedbyaddress", json!([taddr, 1, true]))
         .await
         .expect("getreceivedbyaddress include_immature_coinbase")
@@ -313,7 +313,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         (recv_imm - immature).abs() < 1e-8,
         "include_immature_coinbase counts the immature value ({recv_imm} vs {immature})"
     );
-    let lra = zecd
+    let lra = rose
         .call("listreceivedbyaddress", json!([1, false]))
         .await
         .expect("listreceivedbyaddress while immature");
@@ -323,7 +323,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
             .any(|x| x["address"].as_str() == Some(taddr.as_str()))),
         "an all-immature address is not listed by default: {lra}"
     );
-    let lra_imm = zecd
+    let lra_imm = rose
         .call(
             "listreceivedbyaddress",
             json!([1, false, false, null, true]),
@@ -340,7 +340,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
 
     // 5. Immature: nothing may spend it. The t→t send has no eligible UTXO at all, and
     //    z_shieldcoinbase finds no *mature* coinbase.
-    let err = zecd
+    let err = rose
         .call("sendtoaddress", json!([SEED_MINER_ADDRESS, 0.5]))
         .await
         .expect_err("t->t send of immature coinbase must fail");
@@ -349,26 +349,26 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         !err.to_string().contains("z_shieldcoinbase"),
         "no coinbase is mature yet, so the -6 must not point at z_shieldcoinbase: {err}"
     );
-    let err = zecd
+    let err = rose
         .call("z_shieldcoinbase", json!(["*", own_ua]))
         .await
         .expect_err("shielding immature coinbase must fail");
     assert_eq!(err.code(), Some(-6), "expected -6, got {err}");
 
     // 6. Age the coinbases: maturity needs `target_height - mined_height >= 100`, so a tip of
-    //    `hmax + 99` matures all ZECD_COINBASES at once. The tail blocks also pay zecd but are
+    //    `hmax + 99` matures all ROSE_COINBASES at once. The tail blocks also pay rose but are
     //    themselves immature at that tip (their heights are > hmax), so the *mature* set is
-    //    exactly the first ZECD_COINBASES.
+    //    exactly the first ROSE_COINBASES.
     let tip = zebra_tip(&zebrad).await;
     zebrad
         .generate_blocks((hmax + 99 - tip) as u32)
         .await
         .expect("mine the maturity tail");
-    sync_to_tip(&zecd, &zebrad).await;
+    sync_to_tip(&rose, &zebrad).await;
 
     // 7. Mature: the UTXOs surface in listunspent with `generated: true`, and their value moves
     //    from immature to spendable (the still-immature tail coinbases stay in immature_balance).
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -380,8 +380,8 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         .collect();
     assert_eq!(
         entries.len(),
-        ZECD_COINBASES as usize,
-        "exactly the {ZECD_COINBASES} mature coinbase UTXOs are listed: {unspent}"
+        ROSE_COINBASES as usize,
+        "exactly the {ROSE_COINBASES} mature coinbase UTXOs are listed: {unspent}"
     );
     for e in &entries {
         assert_eq!(
@@ -395,12 +395,12 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         .iter()
         .map(|e| e["amount"].as_f64().expect("amount"))
         .sum();
-    let spendable = balance_zec(&zecd).await;
+    let spendable = balance_zec(&rose).await;
     assert!(
         (spendable - coinbase_total).abs() < 1e-8,
         "mature coinbase value is the spendable balance ({spendable} vs {coinbase_total})"
     );
-    let info = zecd
+    let info = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -413,7 +413,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     //     the mature set - which here is the *whole* trusted balance, telling a caller that
     //     none of it can move without `z_shieldcoinbase`. `getwalletinfo`'s transparent block
     //     mirrors the same number.
-    let gb = zecd
+    let gb = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances");
@@ -438,7 +438,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     // 7b. Received-by tracks the maturity boundary: the default now counts exactly the mature
     //     set (the same value listunspent/getbalance surface), while include_immature_coinbase
     //     additionally counts the still-immature tail - strictly more.
-    let recv_mature = zecd
+    let recv_mature = rose
         .call("getreceivedbyaddress", json!([taddr]))
         .await
         .expect("getreceivedbyaddress once mature")
@@ -449,7 +449,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         "the matured coinbase value counts as received by default ({recv_mature} vs \
          {coinbase_total})"
     );
-    let recv_all = zecd
+    let recv_all = rose
         .call("getreceivedbyaddress", json!([taddr, 1, true]))
         .await
         .expect("getreceivedbyaddress include_immature_coinbase once mature")
@@ -463,7 +463,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
 
     // 8. Mature but still coinbase: the regular transparent spend path must refuse it -
     //    spending a transparent coinbase output with transparent outputs (recipient + change)
-    //    is consensus-invalid on mainnet, so zecd's t→t selection excludes coinbase outright.
+    //    is consensus-invalid on mainnet, so rose's t→t selection excludes coinbase outright.
     //    It must also refuse *promptly*. This send does no proving and selects nothing, so the
     //    only thing that can make it slow is waiting for the single-writer actor - and that is a
     //    real regression surface, not a hypothetical: servicing a recurring spend-search used to
@@ -472,7 +472,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     //    generous against a contended CI runner; it is here to catch an actor starved for
     //    minutes, not to police seconds.
     let refusal_started = Instant::now();
-    let err = zecd
+    let err = rose
         .call("sendtoaddress", json!([SEED_MINER_ADDRESS, 0.5]))
         .await
         .expect_err("t->t send must never select coinbase UTXOs");
@@ -492,14 +492,14 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     );
 
     // 9. z_shieldcoinbase with a limit: shield the two highest-value coinbases, leaving the rest.
-    let res = zecd
+    let res = rose
         .call("z_shieldcoinbase", json!(["*", own_ua, null, 2]))
         .await
         .expect("z_shieldcoinbase limit=2");
     assert_eq!(res["shieldingUTXOs"], json!(2), "shape: {res}");
     assert_eq!(
         res["remainingUTXOs"],
-        json!(ZECD_COINBASES - 2),
+        json!(ROSE_COINBASES - 2),
         "shape: {res}"
     );
     let shielding_value = res["shieldingValue"].as_f64().expect("shieldingValue");
@@ -509,7 +509,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         "shielding + remaining covers the eligible set: {res}"
     );
     let opid = res["opid"].as_str().expect("opid").to_string();
-    let shield_txid = await_op_txid(&zecd, &opid).await;
+    let shield_txid = await_op_txid(&rose, &opid).await;
 
     // The shielding tx must have an EMPTY vout - the consensus-legal coinbase-spend shape
     // (all value flows to the shielded output; no transparent change).
@@ -524,31 +524,31 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     );
 
     zebrad.generate_blocks(6).await.expect("confirm the shield");
-    sync_to_tip(&zecd, &zebrad).await;
+    sync_to_tip(&rose, &zebrad).await;
 
     // 10. Sweep the rest with the wildcard + no limit. By now a few tail coinbases have matured
     //     too, so assert the sweep takes everything mature (remaining 0) and at least the
-    //     ZECD_COINBASES - 2 leftovers.
-    let res = zecd
+    //     ROSE_COINBASES - 2 leftovers.
+    let res = rose
         .call("z_shieldcoinbase", json!(["*", own_ua]))
         .await
         .expect("z_shieldcoinbase sweep");
     assert!(
-        res["shieldingUTXOs"].as_u64().expect("shieldingUTXOs") >= ZECD_COINBASES - 2,
+        res["shieldingUTXOs"].as_u64().expect("shieldingUTXOs") >= ROSE_COINBASES - 2,
         "the sweep takes at least the leftovers: {res}"
     );
     assert_eq!(res["remainingUTXOs"], json!(0), "shape: {res}");
     let opid = res["opid"].as_str().expect("opid").to_string();
-    await_op_txid(&zecd, &opid).await;
+    await_op_txid(&rose, &opid).await;
     // Confirm deep enough that the shielded notes (external receives under ZIP-315) become
     // spendable for the final send.
     zebrad.generate_blocks(12).await.expect("confirm the sweep");
-    sync_to_tip(&zecd, &zebrad).await;
+    sync_to_tip(&rose, &zebrad).await;
 
     // 11. The shielded balance now carries the swept coinbase value (minus the two shielding
     //     fees), held as ordinary ironwood notes: `z_shieldcoinbase` paid an Orchard receiver, and
     //     NU6.3 is active on this chain, so the shielded proceeds are Orchard-V3 (ironwood) notes.
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -567,7 +567,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     // 12. Spend the shielded (ex-coinbase) funds with a normal send - the full
     //     coinbase → shield → spend cycle. A self-send to the wallet's own UA is a real Orchard
     //     spend (proof, broadcast, mining) without needing a second wallet.
-    let spend_ua = zecd
+    let spend_ua = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress")
@@ -576,8 +576,8 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         .to_string();
     let deadline = Instant::now() + SPEND_TIMEOUT;
     let spend_txid = loop {
-        sync_to_tip(&zecd, &zebrad).await;
-        match zecd.call("sendtoaddress", json!([spend_ua, 1.0])).await {
+        sync_to_tip(&rose, &zebrad).await;
+        match rose.call("sendtoaddress", json!([spend_ua, 1.0])).await {
             Ok(v) => break v.as_str().expect("txid").to_string(),
             // Notes still awaiting confirmations: mine one more and retry (harness idiom).
             Err(e) if e.code() == Some(-6) => {
@@ -591,8 +591,8 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
         }
     };
     zebrad.generate_blocks(3).await.expect("mine the spend");
-    sync_to_tip(&zecd, &zebrad).await;
-    let tx = zecd
+    sync_to_tip(&rose, &zebrad).await;
+    let tx = rose
         .call("gettransaction", json!([spend_txid]))
         .await
         .expect("gettransaction");
@@ -602,7 +602,7 @@ async fn regtest_transparent_coinbase_shield_and_spend() {
     );
 
     println!(
-        "transparent-coinbase e2e OK: {ZECD_COINBASES} coinbases received ({coinbase_total} ZEC \
+        "transparent-coinbase e2e OK: {ROSE_COINBASES} coinbases received ({coinbase_total} ZEC \
          mature) -> immature guards held -> shielded in 2 txs (empty vout) -> spent {spend_txid}"
     );
 }
@@ -617,14 +617,14 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         );
         return;
     };
-    let require = std::env::var("ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE").is_ok();
+    let require = std::env::var("ROSE_REGTEST_REQUIRE_SHIELDED_COINBASE").is_ok();
 
-    // 1. zecd's unified address, derived offline before anything runs, so zebra can mine ZIP-213
+    // 1. rose's unified address, derived offline before anything runs, so zebra can mine ZIP-213
     //    shielded coinbase straight to it from genesis (see the module docs). A shielded receive
     //    is found by trial decryption, so it needs no prior exposure - any diversifier index of
     //    the account will do.
     let own_ua =
-        derive_address_offline(COINBASE_MNEMONIC, "orchard", 0).expect("derive zecd's UA offline");
+        derive_address_offline(COINBASE_MNEMONIC, "orchard", 0).expect("derive rose's UA offline");
 
     // 2. zebra mining to that UA, probed by the seed blocks. zebra 5.0.0 accepts the config but
     //    its Orchard coinbase proof fails its own validation ("could not validate orchard
@@ -649,20 +649,20 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         return;
     }
 
-    // 3. zecd restored from the phrase the address came from, with the default Orchard-only
+    // 3. rose restored from the phrase the address came from, with the default Orchard-only
     //    config. Its birthday is the seed height, so the seed blocks' coinbase notes are below it
     //    and every note the assertions count is mined after startup.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.restore_mnemonic = Some(COINBASE_MNEMONIC.to_string());
     cfg.birthday = Some(BIRTHDAY);
-    // Light mode on the zecd-lwd leg: the shielded coinbase outputs then arrive as compact-block
+    // Light mode on the rose-lwd leg: the shielded coinbase outputs then arrive as compact-block
     // actions from lightwalletd rather than from a converted full block.
-    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    let _rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
         .expect("attach the selected backend");
-    let zecd = Zecd::start(&cfg).await.expect("start zecd");
+    let rose = Rose::start(&cfg).await.expect("start rose");
 
-    // 4. A few more shielded coinbases, then a confirmations tail - which also pays zecd. The
+    // 4. A few more shielded coinbases, then a confirmations tail - which also pays rose. The
     //    ZIP-315 untrusted-note policy needs 10
     //    confirmations before an external receive is spendable - that is a *confirmations*
     //    floor, not coinbase maturity; the whole point here is that no 100-block rule applies
@@ -676,13 +676,13 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         .generate_blocks(12)
         .await
         .expect("confirmations tail");
-    wait_ready(&zecd).await;
-    sync_to_tip(&zecd, &zebrad).await;
+    wait_ready(&rose).await;
+    sync_to_tip(&rose, &zebrad).await;
 
     // 5. The shielded coinbase notes are ordinary notes: full spendable balance at 1+
     //    confirmations, listed with the shielded pool their mining height implies, and - the key
     //    contrast with transparent coinbase at the same depth - NO immature bucket.
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -692,7 +692,7 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         "every mined shielded coinbase note is listed with no maturity gate: {unspent}"
     );
     // Pool is keyed on the height that minted each note, because this coinbase set **straddles
-    // the NU6.3 activation height**: zebra mines to zecd from genesis and the wallet's birthday is
+    // the NU6.3 activation height**: zebra mines to rose from genesis and the wallet's birthday is
     // the seed height, so the notes below start a few blocks under NU6_3_ACTIVATION_HEIGHT and
     // run past it. A block mined at or after activation carries an Orchard-V3 (ironwood) coinbase
     // output; an earlier one carries Orchard-V2. So a uniform assertion is wrong in both
@@ -700,7 +700,7 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
     // happens to trip first, which is exactly how this showed up in CI (one run reported orchard,
     // the next ironwood, from the same code).
     //
-    // Unlike the transparent ladder above - whose shielded proceeds are ironwood because *zecd*
+    // Unlike the transparent ladder above - whose shielded proceeds are ironwood because *rose*
     // authors the `z_shieldcoinbase` transaction - these outputs are authored by the **miner**, so
     // the pool follows the consensus rules in force at the mining height.
     let tip = zebra_tip(&zebrad).await;
@@ -708,7 +708,7 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         // listunspent reports confirmations, so height = tip - confirmations + 1.
         let confs = e["confirmations"].as_u64().expect("confirmations");
         let height = tip - confs + 1;
-        let expected = if height >= u64::from(zecd_regtest_harness::NU6_3_ACTIVATION_HEIGHT) {
+        let expected = if height >= u64::from(rose_regtest_harness::NU6_3_ACTIVATION_HEIGHT) {
             "ironwood"
         } else {
             "orchard"
@@ -717,7 +717,7 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
             e["pool"],
             json!(expected),
             "shielded coinbase note mined at height {height} (NU6.3 activates at {}): {e}",
-            zecd_regtest_harness::NU6_3_ACTIVATION_HEIGHT
+            rose_regtest_harness::NU6_3_ACTIVATION_HEIGHT
         );
     }
     let coinbase_total: f64 = entries
@@ -737,13 +737,13 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         confirmed_total > 0.0,
         "some shielded coinbase notes have cleared the ZIP-315 floor: {unspent}"
     );
-    let spendable = balance_zec(&zecd).await;
+    let spendable = balance_zec(&rose).await;
     assert!(
         (spendable - confirmed_total).abs() < 1e-8,
         "shielded coinbase is spendable at the ZIP-315 confirmations floor - no 100-block \
          maturity ({spendable} vs {confirmed_total})"
     );
-    let info = zecd
+    let info = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -767,7 +767,7 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         .find(|a| !a.is_empty())
         .expect("a shielded coinbase note records its receiving address")
         .to_string();
-    let recv = zecd
+    let recv = rose
         .call("getreceivedbyaddress", json!([recv_addr]))
         .await
         .expect("getreceivedbyaddress on the shielded-coinbase address")
@@ -779,7 +779,7 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
     );
 
     // 6. Spend one - far inside the 100-block window that would gate a *transparent* coinbase.
-    let spend_ua = zecd
+    let spend_ua = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress")
@@ -788,8 +788,8 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         .to_string();
     let deadline = Instant::now() + SPEND_TIMEOUT;
     let spend_txid = loop {
-        sync_to_tip(&zecd, &zebrad).await;
-        match zecd.call("sendtoaddress", json!([spend_ua, 1.0])).await {
+        sync_to_tip(&rose, &zebrad).await;
+        match rose.call("sendtoaddress", json!([spend_ua, 1.0])).await {
             Ok(v) => break v.as_str().expect("txid").to_string(),
             Err(e) if e.code() == Some(-6) => {
                 assert!(
@@ -809,8 +809,8 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         spend_tip - coinbase_tip
     );
     zebrad.generate_blocks(3).await.expect("mine the spend");
-    sync_to_tip(&zecd, &zebrad).await;
-    let tx = zecd
+    sync_to_tip(&rose, &zebrad).await;
+    let tx = rose
         .call("gettransaction", json!([spend_txid]))
         .await
         .expect("gettransaction");

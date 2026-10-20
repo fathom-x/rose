@@ -1,4 +1,4 @@
-//! Daemon wiring for the `zecd` binary: tracing init, the embeddable node
+//! Daemon wiring for the `rose` binary: tracing init, the embeddable node
 //! ([`crate::node`]) composed with the health and RPC servers, and graceful shutdown.
 
 #[cfg(feature = "server")]
@@ -44,7 +44,7 @@ pub fn init_tracing(log: &config::LogConfig) {
     }
 }
 
-/// Run the daemon. `restore` is `zecd run --restore-if-empty`'s request
+/// Run the daemon. `restore` is `rosed --restore-if-empty`'s request
 /// ([`crate::init::restore_if_empty`]): honored between the banner and the node's fail-fast
 /// phase, so a restore that happens is attributable to this build and datadir in the log,
 /// and one that fails ends the daemon before it has bound anything or spawned any wallet.
@@ -70,16 +70,16 @@ pub async fn run_with_reload(
 ) -> anyhow::Result<()> {
     // One identifying line before anything can fail or connect - ahead of even the datadir
     // lock, so a refusal to start is still attributable to a build and a datadir. Both
-    // documented stuck-sync incidents came down to "which zecd build, on which network,
+    // documented stuck-sync incidents came down to "which rose build, on which network,
     // against which upstream", and the connect path logs the *upstream's* version while
-    // nothing logged zecd's own. This is the binary's banner: an embedded node
+    // nothing logged rose's own. This is the binary's banner: an embedded node
     // (`crate::node`) is started by a host that owns its own startup logging.
     info!(
         version = env!("CARGO_PKG_VERSION"),
         network = config.network.name(),
         datadir = %config.datadir.display(),
         upstreams = %upstream_summary(&config),
-        "starting zecd"
+        "starting rose"
     );
     // Fail-fast phase first (datadir lock, placeholder-password refusal, panic hook), then the
     // HTTP-only startup work, then the wallet spawns - the order the daemon has always had. The
@@ -147,7 +147,7 @@ pub async fn run_with_reload(
             while hangup.recv().await.is_some() {
                 match reresolve() {
                     Err(e) => error!(
-                        target: "zecd::audit",
+                        target: "rose::audit",
                         "SIGHUP: the configuration was not reloaded, the running values are \
                          unchanged: {e:#}"
                     ),
@@ -158,18 +158,18 @@ pub async fn run_with_reload(
                             &reload_state.spend_limits,
                         );
                         if report.is_empty() {
-                            info!(target: "zecd::audit", "SIGHUP: configuration unchanged");
+                            info!(target: "rose::audit", "SIGHUP: configuration unchanged");
                         }
                         for (key, old, new) in &report.applied {
                             info!(
-                                target: "zecd::audit",
+                                target: "rose::audit",
                                 key, old = %old, new = %new,
                                 "SIGHUP: configuration reloaded"
                             );
                         }
                         if !report.requires_restart.is_empty() {
                             warn!(
-                                target: "zecd::audit",
+                                target: "rose::audit",
                                 keys = ?report.requires_restart,
                                 "SIGHUP: these settings differ from the running daemon but only \
                                  a restart can apply them"
@@ -229,7 +229,7 @@ async fn restore_wallet_if_empty(
     match crate::init::restore_if_empty(config, restore).await {
         Ok(Some(outcome)) => {
             info!(
-                target: "zecd::audit",
+                target: "rose::audit",
                 wallet = %outcome.wallet,
                 birthday = outcome.birthday,
                 dir = %outcome.wallet_dir.display(),
@@ -296,7 +296,7 @@ async fn wait_for_shutdown_signal() {
 
 /// True when the RPC password was supplied as a `--rpcpassword` command-line argument (handling
 /// both `--rpcpassword VALUE` and `--rpcpassword=VALUE` forms), as opposed to the
-/// `ZECD_RPC_PASSWORD` environment variable or `[rpc] password_file`. clap merges the flag and its
+/// `ROSE_RPC_PASSWORD` environment variable or `[rpc] password_file`. clap merges the flag and its
 /// env fallback into one field, so the raw argv is the only way to tell them apart. Argv is the
 /// more exposed of the two: `/proc/<pid>/cmdline` is world-readable and shows up in `ps`, while
 /// `/proc/<pid>/environ` is readable only by the process owner - hence the env-var recommendation.
@@ -315,7 +315,7 @@ where
 /// Log the configured RPC authentication method(s) at startup, mirroring the credential union
 /// `Authenticator::from_config` accepts: salted `rpcauth` entries, a bare `rpcuser`/`rpcpassword`
 /// pair, and/or a generated cookie file (used whenever no bare pair is set). A bare password on a
-/// non-loopback bind is called out at WARN: zecd serves plaintext HTTP, so the credential would
+/// non-loopback bind is called out at WARN: rose serves plaintext HTTP, so the credential would
 /// cross the network in the clear. A password passed via `--rpcpassword` on the command line
 /// (`password_on_cli`) is called out separately: it leaks to any local user through
 /// `/proc/<pid>/cmdline` and `ps`, independent of the bind address.
@@ -356,33 +356,33 @@ fn upstream_summary(config: &AppConfig) -> String {
 #[cfg(feature = "server")]
 fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
     if !rpc.auth.is_empty() {
-        info!(target: "zecd::audit", "RPC auth: {} salted rpcauth credential(s)", rpc.auth.len());
+        info!(target: "rose::audit", "RPC auth: {} salted rpcauth credential(s)", rpc.auth.len());
     }
     if rpc.user.is_some() && rpc.password.is_some() {
-        info!(target: "zecd::audit", "RPC auth: rpcuser/rpcpassword (bare password)");
+        info!(target: "rose::audit", "RPC auth: rpcuser/rpcpassword (bare password)");
         if !rpc.bind.is_loopback() {
             warn!(
-                target: "zecd::audit",
+                target: "rose::audit",
                 "RPC is bound to non-loopback {} with a bare rpcpassword; credentials cross the \
-                 network in plaintext (zecd serves plaintext HTTP). Bind to localhost, or place \
-                 zecd behind a TLS-terminating proxy.",
+                 network in plaintext (rose serves plaintext HTTP). Bind to localhost, or place \
+                 rose behind a TLS-terminating proxy.",
                 rpc.bind
             );
         }
     } else if let Some(cookie) = &rpc.cookiefile {
-        info!(target: "zecd::audit", "RPC auth: cookie file {}", cookie.display());
+        info!(target: "rose::audit", "RPC auth: cookie file {}", cookie.display());
     }
     if password_on_cli {
         warn!(
-            target: "zecd::audit",
+            target: "rose::audit",
             "RPC password was passed via --rpcpassword on the command line; it is exposed to \
-             any local user through `ps` and /proc/<pid>/cmdline. Prefer the ZECD_RPC_PASSWORD \
+             any local user through `ps` and /proc/<pid>/cmdline. Prefer the ROSE_RPC_PASSWORD \
              environment variable or `[rpc] password_file` (a mounted Secret) instead."
         );
     }
 }
 
-/// Enforce zecd's single-spending-wallet rule: at most one loaded wallet **per coin** may
+/// Enforce rose's single-spending-wallet rule: at most one loaded wallet **per coin** may
 /// hold spending keys, while any number of watch-only (UFVK) wallets may be loaded alongside
 /// it. Per coin because the rule exists for custody attribution ("which key can this
 /// compromised credential spend?"), and one seed serving two chains through two engines is
@@ -412,7 +412,7 @@ pub(crate) fn ensure_single_spending_wallet(
                     .map(|(name, _, _)| name.as_str())
                     .collect();
                 tracing::warn!(
-                    target: "zecd::audit",
+                    target: "rose::audit",
                     spenders = all.len(),
                     coin = coin.name(),
                     wallets = %all.join(", "),
@@ -422,12 +422,12 @@ pub(crate) fn ensure_single_spending_wallet(
                 continue;
             }
             anyhow::bail!(
-                "multiple {} spending wallets configured ('{first}' and '{second}'); zecd \
+                "multiple {} spending wallets configured ('{first}' and '{second}'); rose \
                  allows at most one wallet with spending keys per coin (any number of \
                  watch-only wallets may be loaded alongside it). Convert one to watch-only \
-                 (`zecd export-ufvk` + `zecd init --ufvk` for Zcash, `zecd export-xpub` + \
-                 `zecd init --xpub` for Bitcoin) or remove it from the configuration. An \
-                 application embedding zecd as a library can instead set \
+                 (`rose export-ufvk` + `rose init --ufvk` for Zcash, `rose export-xpub` + \
+                 `rose init --xpub` for Bitcoin) or remove it from the configuration. An \
+                 application embedding rose as a library can instead set \
                  [keys] allow_multiple_spending_wallets.",
                 coin.name()
             );
@@ -479,7 +479,7 @@ mod tests {
     fn banner_names_each_wallets_resolved_upstream() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         let bitcoin_wallet = if cfg!(feature = "bitcoin") {
             "[wallets.btc]\ncoin = \"bitcoin\"\nserver = \"kyoto://10.0.0.7:48333\"\n"
         } else {
@@ -490,7 +490,7 @@ mod tests {
             dir.path().display()
         );
         std::fs::write(&conf, toml).unwrap();
-        let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = crate::config::Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let cfg = crate::config::AppConfig::resolve(&cli).unwrap();
 
         let summary = super::upstream_summary(&cfg);
@@ -612,8 +612,8 @@ mod tests {
         // The message has to route the reader somewhere: what the option is for, and what to do
         // instead when they are running the daemon.
         assert!(msg.contains("allow_multiple_spending_wallets"), "{msg}");
-        assert!(msg.contains("embedding zecd as a library"), "{msg}");
-        assert!(msg.contains("one zecd per wallet"), "{msg}");
+        assert!(msg.contains("embedding rose as a library"), "{msg}");
+        assert!(msg.contains("one rose per wallet"), "{msg}");
     }
 
     #[cfg(feature = "server")]
@@ -621,23 +621,23 @@ mod tests {
     fn rpcpassword_on_cli_detects_both_flag_forms() {
         // Separate-value form: `--rpcpassword hunter2`.
         assert!(rpcpassword_on_cli([
-            "zecd",
+            "rose",
             "--rpcport",
             "8232",
             "--rpcpassword",
             "hunter2"
         ]));
         // Joined form: `--rpcpassword=hunter2`.
-        assert!(rpcpassword_on_cli(["zecd", "--rpcpassword=hunter2"]));
+        assert!(rpcpassword_on_cli(["rose", "--rpcpassword=hunter2"]));
     }
 
     #[cfg(feature = "server")]
     #[test]
     fn rpcpassword_on_cli_ignores_env_and_other_flags() {
-        // No `--rpcpassword` on argv (the password came from ZECD_RPC_PASSWORD or a file).
-        assert!(!rpcpassword_on_cli(["zecd", "--rpcuser", "u", "--testnet"]));
+        // No `--rpcpassword` on argv (the password came from ROSE_RPC_PASSWORD or a file).
+        assert!(!rpcpassword_on_cli(["rose", "--rpcuser", "u", "--testnet"]));
         // A different flag that merely shares a prefix must not match.
-        assert!(!rpcpassword_on_cli(["zecd", "--rpcpassword-file", "/x"]));
-        assert!(!rpcpassword_on_cli(["zecd"]));
+        assert!(!rpcpassword_on_cli(["rose", "--rpcpassword-file", "/x"]));
+        assert!(!rpcpassword_on_cli(["rose"]));
     }
 }

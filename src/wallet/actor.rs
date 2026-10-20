@@ -100,11 +100,11 @@ type ProposalError = zcash_client_backend::data_api::error::Error<
 /// `Builder::build`, so holding `&'static` references to the same cells means the PCZT prove
 /// path and the fused path (`create_proposed_transactions`, used by Sapling-spending wallets,
 /// transparent-source sends, `z_shieldcoinbase`, `z_mergetoaddress` and `cache_proving_key =
-/// false`) prove with **one** key set. zecd used to build its own copy, which was the whole
+/// false`) prove with **one** key set. rose used to build its own copy, which was the whole
 /// point of this type when the upstream builder regenerated a key per transaction (a
 /// `Params::new` + `keygen_vk` + `keygen_pk`, seconds of work); the fork caches it, reads the
 /// commitment parameters from an embedded artifact instead of regenerating them, and leaves
-/// zecd two jobs: warm the cells in the background at startup rather than on the first send,
+/// rose two jobs: warm the cells in the background at startup rather than on the first send,
 /// and arm the fork's prepared commitment tables (see [`ProvingKeyCache::build`]).
 ///
 /// The **verifying keys** are cloned out of the proving keys (`ProvingKey::verifying_key` copies
@@ -119,7 +119,7 @@ type ProposalError = zcash_client_backend::data_api::error::Error<
 /// are needed. NU6.3 is activated on **both mainnet (height 3_428_143) and testnet (4_134_000)**,
 /// so `ironwood_pk` is built on both; it is `None` only where the network carries no NU6.3
 /// activation height at all - in practice a regtest chain started without
-/// `ZECD_REGTEST_NU63_HEIGHT` - where the PostNu6_3 keygen would be ~4.5 s of wasted startup for a
+/// `ROSE_REGTEST_NU63_HEIGHT` - where the PostNu6_3 keygen would be ~4.5 s of wasted startup for a
 /// key no send can use.
 pub struct ProvingKeyCache {
     /// `FixedPostNu6_2` proving key - proves the V2 Orchard bundle. A reference into the
@@ -140,7 +140,7 @@ impl ProvingKeyCache {
     /// (e.g. under `spawn_blocking`) - [`ProvingKeys::spawn_build`] is the wiring that does.
     /// `build_ironwood` also builds the `PostNu6_3` proving key for the Ironwood bundle; pass it
     /// iff the network has a NU6.3 activation height - **true on both mainnet and testnet**, and
-    /// on regtest only when `ZECD_REGTEST_NU63_HEIGHT` is set - so only a NU6.3-less regtest
+    /// on regtest only when `ROSE_REGTEST_NU63_HEIGHT` is set - so only a NU6.3-less regtest
     /// chain skips a keygen it can't use.
     ///
     /// The two keygens are independent, so they run on **separate threads**: the wall clock is the
@@ -222,7 +222,7 @@ impl ProvingKeyCache {
 ///
 /// Key generation is seconds of CPU (measured on 4 cores, release: 1.8 s for the Orchard key,
 /// 2.0 s for the Ironwood one; several times that single-threaded or on a small VPS). Doing it
-/// before the daemon bound its listeners made zecd unreachable - no `/healthz`, no RPC, no
+/// before the daemon bound its listeners made rose unreachable - no `/healthz`, no RPC, no
 /// sync - for that whole window, to serve a key that **only sends need**. So `daemon::run` now
 /// kicks off [`Self::spawn_build`] and carries straight on to spawning actors and binding the
 /// servers; the first send awaits [`Self::get`], which resolves immediately once the background
@@ -354,7 +354,7 @@ const PERSISTENT_SYNC_ERROR_THRESHOLD: u32 = 3;
 
 /// The operator action line for an unsupported-network-upgrade condition. One place, so the
 /// connect-time announcement and the sync-error attribution can't drift apart.
-const UPGRADE_GUIDANCE: &str = "Update to the latest zecd release; if you are already on the \
+const UPGRADE_GUIDANCE: &str = "Update to the latest rose release; if you are already on the \
      latest release, please report this at https://forum.zcashcommunity.com";
 
 /// Whether a sync failure is **terminal** - retrying it can never succeed, so the actor halts
@@ -363,7 +363,7 @@ const UPGRADE_GUIDANCE: &str = "Update to the latest zecd release; if you are al
 /// Exactly one class qualifies today: [`engine::UnrecoverableReorg`], where no truncation target
 /// below the conflicting block exists, so the block cannot be removed and every batch re-hits it.
 /// Everything else is retried - a transport error is fixed by reconnecting, and even a repeated
-/// apply-side failure (`engine::WalletApplyError`) can clear once the operator updates zecd for a
+/// apply-side failure (`engine::WalletApplyError`) can clear once the operator updates rose for a
 /// network upgrade the running build cannot parse. Keep it that way: halting on a class that can
 /// recover on its own would strand a wallet that only needed to wait.
 fn sync_failure_is_terminal(e: &anyhow::Error) -> bool {
@@ -378,11 +378,11 @@ fn sync_failure_is_terminal(e: &anyhow::Error) -> bool {
 /// be actively harmful. Within that class:
 ///  * an unsupported network upgrade already ruling the chain explains the failure outright
 ///    (the scan is hitting post-activation blocks this build cannot parse), so it is named
-///    immediately - this is the "old zecd after NU6.3 activated" loop; and
+///    immediately - this is the "old rose after NU6.3 activated" loop; and
 ///  * otherwise, once the same error has repeated [`PERSISTENT_SYNC_ERROR_THRESHOLD`] times,
 ///    the wallet database itself is the prime suspect (e.g. a shardtree `Insert(Conflict)`
 ///    that no restart or version upgrade clears), and the guidance points at the
-///    `zecd rescan` rebuild.
+///    `rose rescan` rebuild.
 ///
 /// Pure so it is unit-testable without a [`WalletActor`]; the actor supplies the streak and
 /// the already-relevant upgrade (active, or pending with an activation height at/below the
@@ -402,7 +402,7 @@ fn sync_failure_hint(
             .map(|h| format!(", activated at height {h}"))
             .unwrap_or_default();
         return Some(format!(
-            "likely cause: this zecd build does not support network upgrade '{}' (consensus \
+            "likely cause: this rose build does not support network upgrade '{}' (consensus \
              branch 0x{:08x}{height}), so blocks past its activation cannot be scanned. \
              {UPGRADE_GUIDANCE}",
             sanitize_upstream_msg(&u.name),
@@ -413,10 +413,10 @@ fn sync_failure_hint(
         return Some(format!(
             "the same error has now failed {streak} consecutive sync passes: the upstream is \
              serving blocks but the wallet database cannot apply them, which restarting or \
-             upgrading zecd will not fix if the database itself is inconsistent. Stop the \
-             daemon and run `zecd rescan --wallet {wallet}` to rebuild the wallet database \
+             upgrading rose will not fix if the database itself is inconsistent. Stop the \
+             daemon and run `rose rescan --wallet {wallet}` to rebuild the wallet database \
              from the seed (keys.toml is kept; funds and history are re-derived by rescanning \
-             from the wallet birthday). If this looks like a zecd bug, please report it at \
+             from the wallet birthday). If this looks like a rose bug, please report it at \
              https://forum.zcashcommunity.com"
         ));
     }
@@ -450,7 +450,7 @@ struct TxidRequest<'a> {
 /// (`WalletRead::transaction_data_requests`). Since `zakura-client-backend` 0.1.0-rc7 they come
 /// from three: status observation from `TransactionStatusRead::transaction_status_work`, payload
 /// retrieval from `EnhancePirRead::transaction_enhancement_work`, and transparent history from
-/// `transaction_data_requests`, which now returns only that. zecd services all three the same
+/// `transaction_data_requests`, which now returns only that. rose services all three the same
 /// way it always did, so [`enhance_requests`] merges them back into this one list and the drain,
 /// the backlog count and the `fetch_memos` cut keep a single type to reason about.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -467,7 +467,7 @@ enum EnhanceRequest {
 impl From<TransactionDataRequest> for EnhanceRequest {
     fn from(req: TransactionDataRequest) -> Self {
         // Deliberately exhaustive: `transaction_data_requests` grows a variant only under a
-        // feature zecd does not enable (`spend-index`), and if that ever changes this must stop
+        // feature rose does not enable (`spend-index`), and if that ever changes this must stop
         // compiling rather than drop the new work silently.
         match req {
             TransactionDataRequest::TransactionsInvolvingAddress(r) => {
@@ -554,7 +554,7 @@ fn enhanced_through(fully_scanned: u32, lowest_pending: Option<u32>) -> u32 {
     }
 }
 
-/// Whether an [`EnhanceRequest`] is one zecd can actually service (and therefore one that
+/// Whether an [`EnhanceRequest`] is one rose can actually service (and therefore one that
 /// counts toward the enhancement backlog). All three variants drain: `GetStatus`/`Enhancement` via
 /// `fetch_full_tx`, and `TransactionsInvolvingAddress` via the transparent address-index query
 /// (`fetch_transparent_tx_evidence` + `notify_address_checked`), which converges once the address is
@@ -659,7 +659,7 @@ fn outstanding_requests(
 /// scan itself. The window exists for lightwalletd-style servers (bounded queries, per-request
 /// decorrelation via `request_at`); zebra's always-on address index serves any range in one
 /// indexed call, and the upstream docs explicitly permit a trusted chain-data source to ignore
-/// the decorrelation constraint. So zecd checks straight through to the chain tip in one query.
+/// the decorrelation constraint. So rose checks straight through to the chain tip in one query.
 ///
 /// The start is clamped to 1 (zebra cannot serve genesis). `None` - nothing checkable - happens
 /// when the start is beyond the tip, e.g. a spend-search request whose funding tx is still
@@ -675,7 +675,7 @@ fn tia_check_range(block_range_start: u32, chain_tip: u32) -> Option<(u32, u32)>
 /// Why a connected upstream is unusable for this wallet, if it is: a transparent-enabled wallet
 /// needs a backend whose block scan carries transparent data.
 ///
-/// zecd used to work around a server that could not (lightwalletd before 0.5.0) by polling the
+/// rose used to work around a server that could not (lightwalletd before 0.5.0) by polling the
 /// address index per address - a whole parallel receive-discovery path, quadratically expensive
 /// on a large address set, and one that only ever mattered for servers the ecosystem has since
 /// moved off. Now the requirement is stated instead: transparent receives ride the block scan on
@@ -957,7 +957,7 @@ struct WalletActor {
     /// the in-memory gap lookahead past the issuance frontier (see
     /// [`engine::TransparentMatcher`]). Transient (rebuilt from the DB + viewing key, respects the
     /// stateless invariant). librustzcash never asks us to scan our *receiving* transparent
-    /// addresses for incoming funds (only to find spends of UTXOs we already hold), so zecd owns
+    /// addresses for incoming funds (only to find spends of UTXOs we already hold), so rose owns
     /// receive discovery: it matches each scanned block's (and each mempool tx's) transparent
     /// outputs against this set. Matching is O(outputs) with an O(1) membership test, independent
     /// of the set's size - what lets an exchange track ~100k addresses without per-address
@@ -995,7 +995,7 @@ struct WalletActor {
     transparent_default_frontier: Option<u32>,
     /// Transient first-seen times for unmined txs, shared with the read-path handle. Stamped when
     /// the mempool stream first stores an unmined tx; pruned once the tx mines. Never persisted
-    /// (zecd is stateless). See [`crate::wallet::FirstSeen`].
+    /// (rose is stateless). See [`crate::wallet::FirstSeen`].
     first_seen: FirstSeen,
     /// The wallet's account, or `None` while a bootstrap is pending (empty data directory whose
     /// account hasn't been rebuilt from `keys.toml` yet - e.g. an encrypted wallet awaiting its
@@ -1099,7 +1099,7 @@ struct WalletActor {
     /// does not recognize (captured at each connect from `getblockchaininfo`; see
     /// [`crate::chain::unsupported_upgrades`]). An *active* entry means the chain is already
     /// governed by rules this build can't scan under - the cause behind an otherwise-mysterious
-    /// stuck sync loop - and a *pending* one is the advance warning to update zecd before
+    /// stuck sync loop - and a *pending* one is the advance warning to update rose before
     /// activation. Drives the connect-time announcements and the sync-error attribution.
     unsupported_upgrades: Vec<UnsupportedUpgrade>,
     /// The display text of the most recent sync error, and how many consecutive sync passes
@@ -1131,7 +1131,7 @@ struct WalletActor {
     /// hit: an [`engine::UnrecoverableReorg`], where no truncation target below the conflict
     /// exists, so the conflicting block can never be removed and every batch re-hits it. The rest
     /// of the actor keeps running - reads, address issuance, the RPC surface - but no further
-    /// scan is attempted until the operator rebuilds the wallet database (`zecd rescan`) and
+    /// scan is attempted until the operator rebuilds the wallet database (`rose rescan`) and
     /// restarts, which clears this (it is in-memory, so a restart always re-tries once).
     ///
     /// Without this the actor retried the identical failure forever, dropping and rebuilding the
@@ -1202,14 +1202,14 @@ async fn spawn_inner(
     let is_shard = !cfg.shard_members.is_empty();
     if !is_shard && !store::WalletStore::exists(&cfg.keys_path) {
         return Err(anyhow!(
-            "wallet '{}' is not initialized ({} missing); run `zecd init --wallet {}`",
+            "wallet '{}' is not initialized ({} missing); run `rose init --wallet {}`",
             cfg.name,
             cfg.keys_path.display(),
             cfg.name
         ));
     }
 
-    // The data directory must be writable: zecd creates/updates data.sqlite and blocks/
+    // The data directory must be writable: rose creates/updates data.sqlite and blocks/
     // there. Probe it up front so a read-only mount fails with a clear error now,
     // not later at an awkward moment - e.g. when a `walletpassphrase` arrives and the bootstrap
     // tries to create the account.
@@ -1275,7 +1275,7 @@ async fn spawn_inner(
              listsinceblock and z_listtransactions name the single receiver each output actually \
              paid (a single-receiver Unified Address for orchard, a bare zs address for sapling), \
              incoming and outgoing alike. Only the receiver that was paid reaches the chain - \
-             which envelope the payer used does not - and zecd is stateless, so it keeps no \
+             which envelope the payer used does not - and rose is stateless, so it keeps no \
              recipient-side record of the address it issued and cannot echo one back. To match a \
              payment to an address you handed out, deconstruct that address into its per-pool \
              receivers and compare, or call getreceivedbyaddress, which accepts any encoding of \
@@ -1356,7 +1356,7 @@ async fn spawn_inner(
                                 anyhow!(
                                     "wallet '{}' has an empty data directory and the UFVK \
                                      pinned in keys.toml does not decode on {}: {e}. Recreate \
-                                     it with `zecd init --ufvk`.",
+                                     it with `rose init --ufvk`.",
                                     cfg.name,
                                     cfg.network.name()
                                 )
@@ -1371,13 +1371,13 @@ async fn spawn_inner(
                         "wallet '{}' has an empty data directory, and keys.toml holds neither a \
                          spending seed nor a pinned viewing key (a watch-only keys.toml written \
                          before the pin existed): it cannot be rebuilt. Recreate it with \
-                         `zecd init --ufvk`.",
+                         `rose init --ufvk`.",
                         cfg.name
                     ));
                 };
                 if !cfg.bootstrap {
                     return Err(anyhow!(
-                        "wallet '{}' has no account in {}; run `zecd init`, or enable \
+                        "wallet '{}' has no account in {}; run `rose init`, or enable \
                          [keys] bootstrap_from_keys to rebuild the data directory from keys.toml.",
                         cfg.name,
                         open::data_db_path(&cfg.engine_dir).display()
@@ -1488,9 +1488,9 @@ async fn spawn_inner(
                         }
                         seed.set(s);
                         warn!(
-                            target: "zecd::audit",
+                            target: "rose::audit",
                             "auto-unlocked an unencrypted seed at startup: spend authority is \
-                             resident in memory without a passphrase. Use `zecd init --encrypt` for \
+                             resident in memory without a passphrase. Use `rose init --encrypt` for \
                              the passphrase model if unattended spend authority is not intended");
                     }
                     Ok(None) => {}
@@ -1509,7 +1509,7 @@ async fn spawn_inner(
         warn!(
             "auto_unlock=false on an identity-encrypted wallet: sends will fail (-13) and \
              walletpassphrase cannot unlock it (-15). Enable auto_unlock, or re-create the wallet \
-             passphrase-encrypted with `zecd init --encrypt` (then walletpassphrase unlocks)."
+             passphrase-encrypted with `rose init --encrypt` (then walletpassphrase unlocks)."
         );
     }
 
@@ -1569,7 +1569,7 @@ async fn spawn_inner(
     });
 
     // Shared, transient first-seen map: the actor stamps unmined txs into it and the read-path
-    // handle reads it. Never persisted (zecd is stateless).
+    // handle reads it. Never persisted (rose is stateless).
     let first_seen: FirstSeen =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -1705,7 +1705,7 @@ async fn spawn_inner(
 /// parsed tip height plus its block hash (upstream/internal byte order). This is the first step
 /// of the pre-spend catch-up (`sync_to_tip_for_send`): librustzcash derives a transaction's
 /// target height - and thus its expiry (target + expiry delta) - from the DB's chain tip, so
-/// before a spend the tip must reflect the *real* chain, not zecd's last-scanned height (which
+/// before a spend the tip must reflect the *real* chain, not rose's last-scanned height (which
 /// lags under load). Recording the tip also extends the scan queue up to it, which the catch-up
 /// loop then scans. Extracted from `refresh_tip` as a free function so that "a stale DB tip
 /// advances to the upstream tip" contract can be unit-tested against the fake zebrad without
@@ -1775,10 +1775,10 @@ fn try_select_account(
 fn ensure_dir_writable(dir: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating data directory {}", dir.display()))?;
-    let probe = dir.join(".zecd-write-test");
-    std::fs::write(&probe, b"zecd").with_context(|| {
+    let probe = dir.join(".rose-write-test");
+    std::fs::write(&probe, b"rose").with_context(|| {
         format!(
-            "data directory {} is not writable (zecd must create and update data.sqlite \
+            "data directory {} is not writable (rose must create and update data.sqlite \
              and blocks/ there)",
             dir.display()
         )
@@ -1797,7 +1797,7 @@ fn account_not_ready() -> RpcError {
 }
 
 /// Bitcoin Core's exact refusal for spend/key operations on a wallet without private keys
-/// (`-4`, wallet.cpp); zecd's watch-only (UFVK) wallets surface it for the same calls.
+/// (`-4`, wallet.cpp); rose's watch-only (UFVK) wallets surface it for the same calls.
 fn private_keys_disabled() -> RpcError {
     RpcError::wallet("Error: Private keys are disabled for this wallet")
 }
@@ -1921,7 +1921,7 @@ fn build_signed_transparent_tx(
                 address_index,
             } => (*scope, *address_index),
             // Other sources (imported standalone keys/scripts) only exist with the
-            // `transparent-key-import` feature, which zecd does not enable.
+            // `transparent-key-import` feature, which rose does not enable.
             #[allow(unreachable_patterns)]
             _ => {
                 return Err(RpcError::wallet(
@@ -2497,8 +2497,8 @@ impl WalletActor {
                         //
                         // `note_sync_error` tracks the failure streak and appends recovery
                         // guidance when the failure is diagnosable: an unsupported network
-                        // upgrade (update zecd / report on the forum) or a persistent
-                        // wallet-database apply error (`zecd rescan`).
+                        // upgrade (update rose / report on the forum) or a persistent
+                        // wallet-database apply error (`rose rescan`).
                         // An unrecoverable reorg is the one sync failure retrying cannot fix, so
                         // it stops the scan instead of pacing it forever. Logged once, at ERROR,
                         // naming the operator action; the reason also rides `mark_disconnected`
@@ -2507,7 +2507,7 @@ impl WalletActor {
                             self.sync_halted = true;
                             error!(
                                 "{e}; sync is HALTED for this wallet - retrying cannot \
-                                 remove the conflicting block. Stop the daemon and run `zecd \
+                                 remove the conflicting block. Stop the daemon and run `rose \
                                  rescan --wallet {name}` to rebuild the wallet database from the \
                                  seed (keys.toml is kept) and resync from the wallet birthday. \
                                  Reads, address issuance and the rest of the RPC surface keep \
@@ -2794,7 +2794,7 @@ impl WalletActor {
 
     /// Announce, once per connection, every upstream-reported network upgrade this build does
     /// not recognize. An *active* one is an error - the scan will fail at (or is already
-    /// failing past) its activation, and nothing but a newer zecd fixes that - while a
+    /// failing past) its activation, and nothing but a newer rose fixes that - while a
     /// *pending* one is the advance warning that lets an operator update before the network
     /// switches, instead of discovering the gap later as a stuck sync loop.
     fn log_unsupported_upgrades(&self) {
@@ -2807,7 +2807,7 @@ impl WalletActor {
             if u.active {
                 error!(
                     "the upstream chain has activated network upgrade '{name}' (consensus \
-                     branch 0x{:08x}, activation height {height}) which this zecd build does \
+                     branch 0x{:08x}, activation height {height}) which this rose build does \
                      not support: block scanning cannot proceed past the activation. \
                      {UPGRADE_GUIDANCE}",
                     u.branch_id
@@ -2815,7 +2815,7 @@ impl WalletActor {
             } else {
                 warn!(
                     "the upstream reports network upgrade '{name}' (consensus branch \
-                     0x{:08x}) activating at height {height}, which this zecd build does not \
+                     0x{:08x}) activating at height {height}, which this rose build does not \
                      support: syncing will stop there. {UPGRADE_GUIDANCE}",
                     u.branch_id
                 );
@@ -3470,8 +3470,8 @@ impl WalletActor {
     /// `TransactionsInvolvingAddress` discovers transactions that receive or spend funds at
     /// one of the wallet's transparent addresses. librustzcash emits it only to find
     /// *spends* of UTXOs the wallet already holds and to check ephemeral (ZIP-320)
-    /// addresses - ordinary receives, and the spends of receives zecd recorded itself, are
-    /// found by zecd's own block-scan matcher instead (the zebra backend parses each full
+    /// addresses - ordinary receives, and the spends of receives rose recorded itself, are
+    /// found by rose's own block-scan matcher instead (the zebra backend parses each full
     /// block; a versioned-protocol lightwalletd carries the transparent data in the compact
     /// blocks). So this is the librustzcash-driven half of transparent discovery, not the
     /// only path to it. Query the upstream's address index for the requested range,
@@ -3647,7 +3647,7 @@ impl WalletActor {
     /// (`getunconfirmedbalance`/`listunspent minconf=0`), matching the shielded mempool path and
     /// bitcoind. librustzcash never discovers transparent *receives* itself - its
     /// `transaction_data_requests` only ask us to find *spends* of UTXOs we already hold - and
-    /// `decrypt_and_store_transaction` records only shielded outputs, so zecd owns this.
+    /// `decrypt_and_store_transaction` records only shielded outputs, so rose owns this.
     ///
     /// Matching is O(outputs-in-tx) with an O(1) set membership test, independent of how many
     /// addresses the wallet tracks. Sharing [`engine::owned_transparent_output`] with the block
@@ -3912,7 +3912,7 @@ impl WalletActor {
         match decrypt_and_store_transaction(&self.network, &mut self.db_data, &tx, mined_height) {
             Ok(()) => {
                 // `decrypt_and_store_transaction` records only *shielded* outputs, so a transparent
-                // receive needs zecd's own matcher: check this tx's transparent outputs against the
+                // receive needs rose's own matcher: check this tx's transparent outputs against the
                 // wallet's address set and record any that pay us as unmined (0-conf) UTXOs. This is
                 // what makes an incoming transparent payment visible before its first confirmation
                 // (`getunconfirmedbalance`/`listunspent minconf=0`), the same as the shielded path.
@@ -3928,7 +3928,7 @@ impl WalletActor {
                 // If the tx is ours and still unmined, stamp when we first saw it so
                 // `gettransaction`/`listtransactions` can report `time`/`timereceived` (Bitcoin
                 // Core's `nTimeReceived`) while it has no block time. This is held in memory only
-                // - zecd is stateless, so it is never persisted (a restart/restore rebuilds it as
+                // - rose is stateless, so it is never persisted (a restart/restore rebuilds it as
                 // the mempool stream re-observes the tx, or it mines and the block time wins).
                 if mined_height.is_none() && ours {
                     let now = std::time::SystemTime::now()
@@ -4382,7 +4382,7 @@ impl WalletActor {
             return;
         }
         let member = self.shard_pending[0].clone();
-        // The tree state just before the birthday, exactly as `zecd init` and the bootstrap
+        // The tree state just before the birthday, exactly as `rose init` and the bootstrap
         // fetch it. Height 0 has no tree state; clamp to >= 1.
         let prior = u32::from(member.birthday).saturating_sub(1).max(1);
         let treestate = {
@@ -4469,7 +4469,7 @@ impl WalletActor {
     /// path). Best-effort and idempotent: requires the seed to be loaded (so an encrypted wallet
     /// waits for its first `walletpassphrase`), a live upstream, and a known tip; when any is
     /// missing it returns and is retried on the next pass. The birthday's tree state is fetched
-    /// fresh from the upstream (never cached on disk), reusing the exact path `zecd init` takes.
+    /// fresh from the upstream (never cached on disk), reusing the exact path `rose init` takes.
     async fn maybe_bootstrap_account(&mut self) {
         let Some((birthday_height, bootstrap_key)) = self.pending_bootstrap.as_ref() else {
             return;
@@ -4540,7 +4540,7 @@ impl WalletActor {
                     return;
                 }
             };
-        // Same account label and same creation calls `zecd init` makes, so a rebuilt account is
+        // Same account label and same creation calls `rose init` makes, so a rebuilt account is
         // indistinguishable from a freshly initialized one - which is what lets the binding
         // verification below hold it to the same pin.
         let created = match (&self.pending_bootstrap, &seed) {
@@ -4567,9 +4567,9 @@ impl WalletActor {
         }
         match try_select_account(&self.db_data) {
             Ok(Some((id, index, watch_only))) => {
-                // Invariant: a zecd wallet is the first (and only) account of its seed, so
+                // Invariant: a rose wallet is the first (and only) account of its seed, so
                 // `create_account` on the freshly-wiped, account-less DB must derive at ZIP-32
-                // account index 0 - the same index `zecd init` used, so the rebuilt account is
+                // account index 0 - the same index `rose init` used, so the rebuilt account is
                 // the *same* wallet. Anything else would silently rebuild a different account.
                 debug_assert_eq!(
                     index,
@@ -4622,7 +4622,7 @@ impl WalletActor {
                     warn!("bootstrap: update_chain_tip after account creation failed: {e}");
                 }
                 // The scan floor: the lowest height the queue will scan, derived from the now
-                // birthday-anchored scan ranges (a local sqlite read zecd runs every sync - no
+                // birthday-anchored scan ranges (a local sqlite read rose runs every sync - no
                 // upstream call). Its gap below the birthday is the actionable signal for the
                 // "scanning far below birthday" pathology this bootstrap path exists to avoid.
                 let scan_floor = match self.db_data.suggest_scan_ranges() {
@@ -4922,7 +4922,7 @@ impl WalletActor {
                 // acknowledging a pass that will never run.
                 let res = if self.sync_halted {
                     Err(RpcError::misc(
-                        "sync is halted for this wallet; run `zecd rescan` to rebuild it",
+                        "sync is halted for this wallet; run `rose rescan` to rebuild it",
                     ))
                 } else {
                     self.force_sync = true;
@@ -4993,7 +4993,7 @@ impl WalletActor {
         if self.unlock_until.is_some_and(|t| Instant::now() >= t) {
             seed_guard(&self.seed).lock();
             self.unlock_until = None;
-            info!(target: "zecd::audit", "wallet auto-locked (walletpassphrase timeout elapsed)");
+            info!(target: "rose::audit", "wallet auto-locked (walletpassphrase timeout elapsed)");
             self.update_status();
         }
     }
@@ -5198,7 +5198,7 @@ impl WalletActor {
             }
         } else {
             warn!(
-                target: "zecd::audit",
+                target: "rose::audit",
                 "issued transparent address at external index {index}, OUTSIDE the \
                  stateless-restore recovery horizon ({horizon}). Funds received here may be \
                  UNRECOVERABLE from seed unless you raise [pools] transparent_initial_scan \
@@ -5388,7 +5388,7 @@ impl WalletActor {
     ///
     /// ZIP-316 forbids a transparent-only Unified Address, so - exactly as `getnewaddress "" \
     /// "transparent"` does - the derived UA's transparent receiver is extracted and encoded bare;
-    /// zecd never mixes a transparent receiver into a UA it hands out. Deriving at an explicit
+    /// rose never mixes a transparent receiver into a UA it hands out. Deriving at an explicit
     /// index goes through [`Self::expose_transparent_index`], so the recovery-horizon policy
     /// (`transparent_allow_beyond_recovery_window` and its warnings) applies identically, and the
     /// address is *exposed*: the block-scan / mempool matcher will credit a payment to it.
@@ -5466,7 +5466,7 @@ impl WalletActor {
         if self.sync_halted {
             return Err(RpcError::wallet(
                 "sync is halted for this wallet, so a send cannot be built against the current \
-                 chain; run `zecd rescan` to rebuild it",
+                 chain; run `rose rescan` to rebuild it",
             ));
         }
         if self.client.is_none() {
@@ -5615,7 +5615,7 @@ impl WalletActor {
                 // `ANY_ORCHARD`) would silently select from the other - which is precisely the
                 // one-source-per-send guarantee those wildcards exist to make.
                 spend_policy,
-                // No input locking: zecd serializes sends through the single-writer actor, so
+                // No input locking: rose serializes sends through the single-writer actor, so
                 // there is no concurrent proposer to race for inputs.
                 None,
                 // `None` builds at the transaction version implied by the target height.
@@ -5688,7 +5688,7 @@ impl WalletActor {
                 address_index,
             } => (*scope, *address_index),
             // Standalone imported keys/scripts only exist with the `transparent-key-import`
-            // feature, which zecd does not enable.
+            // feature, which rose does not enable.
             #[allow(unreachable_patterns)]
             _ => return Err(RpcError::wallet("Private key not available")),
         };
@@ -5741,7 +5741,7 @@ impl WalletActor {
 
         // Catch up to zebra's real chain tip before building the spend, so the transaction's
         // target height - and therefore its expiry (target + expiry delta) - is computed
-        // against the real tip rather than zecd's last-scanned height, which can lag it under
+        // against the real tip rather than rose's last-scanned height, which can lag it under
         // load and produce an already-expired tx that zebra rejects with -25. This scans up to
         // the tip (not just bumps the pointer) so the spend anchor also lands in a fully-scanned
         // range; normally a no-op because the sync loop keeps the wallet caught up.
@@ -5758,7 +5758,7 @@ impl WalletActor {
         // recipient is a bare transparent address, fund the payment directly from the wallet's
         // received transparent UTXOs and keep the change transparent - never touching a shielded
         // pool. librustzcash's high-level proposal API can't express this (its change accounting
-        // has no persistent transparent-change variant), so zecd builds and signs the transaction
+        // has no persistent transparent-change variant), so rose builds and signs the transaction
         // itself. An explicitly *shielded* source (`z_sendmany` from a UA / shielded address)
         // must mean what it says, so it never takes this branch: its transparent recipients are
         // paid from shielded notes with shielded change, like any other policy's. Any other
@@ -5902,7 +5902,7 @@ impl WalletActor {
                     // for a shielded source, or a transparent-only policy for a transparent
                     // `fromaddress` source (see `spend_policy_for_source`).
                     spend_policy,
-                    // No input locking: zecd serializes sends through the single-writer actor,
+                    // No input locking: rose serializes sends through the single-writer actor,
                     // so there is no concurrent proposer to race for inputs.
                     None,
                     // `None` builds at the transaction version implied by the target height.
@@ -6039,7 +6039,7 @@ impl WalletActor {
 
         // Catch up to zebra's real chain tip before phase A builds the proposal, so the
         // transaction's target/expiry height and spend anchor are computed against the real tip
-        // rather than zecd's last-scanned height (which lags under load, producing an
+        // rather than rose's last-scanned height (which lags under load, producing an
         // already-expired -25). Mirrors the call in `do_send` for the non-pipelined path; a
         // no-op when the sync loop already has the wallet caught up. Runs here (not in
         // `begin_or_queue_send`) so a send queued behind an in-flight proof re-syncs when it
@@ -6318,7 +6318,7 @@ impl WalletActor {
                             target_height,
                             policy,
                             CoinbaseFilter::NonCoinbaseOnly,
-                            // zecd never locks inputs, so lock state can't exclude anything.
+                            // rose never locks inputs, so lock state can't exclude anything.
                             LockFilter::Unfiltered,
                         )
                         .map_err(RpcError::database_internal)?;
@@ -6537,7 +6537,7 @@ impl WalletActor {
                     // here - matching `propose_shielding_coinbase`'s own internal choice.
                     ConfirmationsPolicy::MIN,
                     CoinbaseFilter::CoinbaseOnly,
-                    // zecd never locks inputs, so lock state can't exclude anything.
+                    // rose never locks inputs, so lock state can't exclude anything.
                     LockFilter::Unfiltered,
                 )
                 .map_err(RpcError::database_internal)?;
@@ -6562,7 +6562,7 @@ impl WalletActor {
             to_address,
             memo,
             limit,
-            // zecd does not lock inputs: the single-writer actor already serializes every
+            // rose does not lock inputs: the single-writer actor already serializes every
             // send/shield, so a competing spend of the selected UTXOs can't be built
             // concurrently (an operation racing a later send fails cleanly instead).
             None,
@@ -6695,13 +6695,13 @@ impl WalletActor {
     /// `z_shieldcoinbase` the whole selection is fixed here in the synchronous half and a send
     /// racing the opid fails cleanly at execute.
     ///
-    /// Selection is **smallest-first** (a documented zecd choice; zcashd does not specify an
+    /// Selection is **smallest-first** (a documented rose choice; zcashd does not specify an
     /// order): a merge exists to eliminate outputs, and taking the smallest removes the most
     /// per round under a count limit. Shielded selection is additionally restricted to **one
     /// pool family per call** when a limit binds (Sapling, or Orchard+Ironwood together) so the
     /// hand-computed fee stays a faithful specialization of librustzcash's `propose_send_max`;
     /// repeated calls drain the other family. When no limit binds, the whole proposal is
-    /// delegated to librustzcash's `propose_send_max_transfer` and none of zecd's fee math runs.
+    /// delegated to librustzcash's `propose_send_max_transfer` and none of rose's fee math runs.
     async fn do_propose_merge_to_address(
         &mut self,
         source: MergeSource,
@@ -6791,7 +6791,7 @@ impl WalletActor {
                             // A merge either emits a transparent output (t→t) or is the general
                             // t→z sweep; either way coinbase stays `z_shieldcoinbase`'s alone.
                             CoinbaseFilter::NonCoinbaseOnly,
-                            // zecd never locks inputs, so lock state can't exclude anything.
+                            // rose never locks inputs, so lock state can't exclude anything.
                             LockFilter::Unfiltered,
                         )
                         .map_err(RpcError::database_internal)?,
@@ -7063,7 +7063,7 @@ impl WalletActor {
                         MaxSpendMode::MaxSpendable,
                         policy,
                         &LockedInputPolicy::default(),
-                        // zecd does not lock inputs: the single-writer actor serializes sends.
+                        // rose does not lock inputs: the single-writer actor serializes sends.
                         None,
                     )
                     .map_err(|e| {
@@ -7667,7 +7667,7 @@ impl WalletActor {
         // Seed exposure is audit material, like the auto-unlock and relock events. The
         // passphrase itself never appears anywhere near a log.
         info!(
-            target: "zecd::audit",
+            target: "rose::audit",
             timeout_secs,
             "wallet unlocked via walletpassphrase"
         );
@@ -7704,7 +7704,7 @@ impl WalletActor {
 /// Ensure a freshly-connected upstream `client` is healthy, serves the chain this wallet
 /// is configured for, and the wallet has its note-commitment subtree roots. The
 /// `server_info` call doubles as the liveness probe and the wrong-chain guard (a mainnet
-/// zecd pointed at a testnet upstream would otherwise happily scan the wrong chain). The
+/// rose pointed at a testnet upstream would otherwise happily scan the wrong chain). The
 /// first successful call this process additionally downloads the subtree roots and sets
 /// `roots_synced`; the roots persist in the wallet DB, so they aren't re-streamed on each
 /// reconnect / primary re-probe.
@@ -7797,7 +7797,7 @@ fn sanitize_upstream_msg(msg: &str) -> String {
 /// "txn-already-in-mempool", "txn-already-known", "transaction already in block chain")
 /// where Bitcoin Core's `sendrawtransaction` is idempotent (node/transaction.cpp
 /// `BroadcastTransaction`): already-in-mempool returns the txid as success, already-mined is
-/// `-27` `ALREADY_IN_UTXO_SET`. Matters in practice because zecd's own rebroadcast loop can
+/// `-27` `ALREADY_IN_UTXO_SET`. Matters in practice because rose's own rebroadcast loop can
 /// race a manual `sendrawtransaction` of the same committed tx.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AlreadyKnown {
@@ -7830,7 +7830,7 @@ fn classify_broadcast_outcome(outcome: &BroadcastOutcome) -> Result<(), RpcError
         return Ok(());
     }
     match upstream_already_has_tx(&outcome.error_message) {
-        // Already in the mempool: zecd's own rebroadcast loop can race a manual resubmission
+        // Already in the mempool: rose's own rebroadcast loop can race a manual resubmission
         // of the same committed send, so this is success (as in Bitcoin Core).
         AlreadyKnown::InMempool => Ok(()),
         // Already mined: Bitcoin Core's TransactionError::ALREADY_IN_UTXO_SET maps to
@@ -7944,7 +7944,7 @@ fn request_pays_transparent_output(net: &ZNetwork, request: &TransactionRequest)
 /// Prove (Orchard, plus Sapling outputs if any) and sign the Orchard spends with the account's
 /// key, returning the signed PCZT ready to extract+store. This is the **pure-CPU** half of a PCZT
 /// send (phase B): it touches no DB, so it can run off the single-writer actor (see
-/// `[spend] pipeline_proving`). zecd wallets spend only Orchard notes (no transparent or Sapling
+/// `[spend] pipeline_proving`). rose wallets spend only Orchard notes (no transparent or Sapling
 /// spends), so the only spend authorizations required are the Orchard ones. Pair with
 /// [`store_pczt`] for phase C.
 fn prove_sign_pczt(
@@ -8064,7 +8064,7 @@ fn prove_sign_pczt(
 /// path is only reached for sends with **no Sapling output** - the extractor rejects a Sapling
 /// bundle without one, so `do_send`/`begin_or_queue_send` divert any send to a Sapling-only
 /// recipient to the fused path before reaching here (the guard is `request_pays_sapling_output`).
-/// Note this is about Sapling *outputs*, not spends: zecd never spends Sapling notes on this path,
+/// Note this is about Sapling *outputs*, not spends: rose never spends Sapling notes on this path,
 /// but a send can still *pay* a Sapling recipient. `N` (the note-ref type) is otherwise
 /// unconstrained here - it only appears in the error type - so pin it to our `WalletDb`'s note ref,
 /// as `ProposalError` does for the fused path.
@@ -8073,19 +8073,19 @@ fn prove_sign_pczt(
 /// Ironwood bundles through that one argument, but they use different circuit versions
 /// (`FixedPostNu6_2` vs `PostNu6_3`), so no single key can cover a post-NU6.3 send carrying both -
 /// and passing `None` makes the extractor generate the right verifying key *per bundle* from each
-/// bundle's own version (a `keygen_vk`, cheaper than the proving keygen). zecd used to cache the
+/// bundle's own version (a `keygen_vk`, cheaper than the proving keygen). rose used to cache the
 /// `FixedPostNu6_2` key and pass it for the Ironwood-free case, but NU6.3 is live on both public
 /// networks, so every send now carries an Ironwood bundle and that cache went unread while costing
 /// ~1.2 s of every startup. The one path that still hits the on-the-fly `keygen_vk` for an Orchard
 /// V2 bundle is a pre-NU6.3 chain, i.e. a regtest chain started without
-/// `ZECD_REGTEST_NU63_HEIGHT`.
+/// `ROSE_REGTEST_NU63_HEIGHT`.
 ///
 /// The Ironwood bundle's own outputs are recorded by the extractor as of `zcash_client_backend
 /// 0.24.0-rc.7`. Through rc.6 it built its `SentTransaction` outputs from the Sapling and Orchard
 /// bundles only, so a post-NU6.3 send's payment and change - which ride the Ironwood bundle -
 /// landed with no `sent_notes` row and no memo, and nothing downstream repaired it on the authoring
 /// node (the compact scan materializes the notes but carries no memos, and enhancement skips a tx
-/// whose raw bytes the send pre-stored). zecd covered that by re-decrypting the just-stored
+/// whose raw bytes the send pre-stored). rose covered that by re-decrypting the just-stored
 /// transaction here; the pass is gone with the version that made it unnecessary.
 fn store_pczt(
     db: &mut WriteDb,
@@ -8142,7 +8142,7 @@ fn store_pczt(
 ///
 /// `enabled` is `[spend] trust_own_transactions` (default on), threaded from the caller rather
 /// than read here so the free-function call sites (`store_pczt`,
-/// `build_signed_transparent_tx`) stay actor-state-free. With it off, zecd never writes the
+/// `build_signed_transparent_tx`) stay actor-state-free. With it off, rose never writes the
 /// marker: classification then derives purely from data every from-seed restore re-derives, so
 /// an authoring instance and a restore report identically at every depth - the operator's
 /// full-statelessness opt-out, paid for in self-send payments waiting the untrusted depth.
@@ -8160,7 +8160,7 @@ fn mark_own_tx_trusted(db: &mut WriteDb, txid: TxId, enabled: bool) {
 /// finding. Summed across the proposal's steps.
 #[derive(Clone, Copy, Default)]
 struct SendShape {
-    /// Orchard notes the send spends (zecd spends only Orchard).
+    /// Orchard notes the send spends (rose spends only Orchard).
     inputs: usize,
     /// Orchard actions built across all steps (`sum of max(spends, outputs)`).
     orchard_actions: usize,
@@ -8241,7 +8241,7 @@ fn log_send_latency(
             est_tx_bytes = shape.est_tx_bytes,
             "the built transaction is larger than estimated, so [spend] max_tx_bytes was \
              applied to too small a number; please report this at \
-             forum.zcashcommunity.com with the zecd version"
+             forum.zcashcommunity.com with the rose version"
         );
     }
 }
@@ -8470,7 +8470,7 @@ fn enforce_max_tx_bytes<FeeRuleT, NoteRef>(
     Ok(())
 }
 
-/// Refuse a proposal of more than one step before anything is built from it. zecd broadcasts
+/// Refuse a proposal of more than one step before anything is built from it. rose broadcasts
 /// exactly one transaction per send, but a multi-step proposal (ZIP 320: paying a TEX address
 /// goes through an ephemeral transparent hop) builds one transaction per step, and
 /// `create_proposed_transactions` **stores every step it builds** - inputs marked spent, raw
@@ -8650,7 +8650,7 @@ mod tests {
 
     /// The halt is keyed on the failure *type*, and only the terminal one. A transport failure or
     /// a wallet-apply failure must stay retryable: reconnecting fixes the first, and updating
-    /// zecd fixes the second, so halting on either would strand a wallet that only needed to wait.
+    /// rose fixes the second, so halting on either would strand a wallet that only needed to wait.
     #[test]
     fn only_an_unrecoverable_reorg_halts_sync() {
         use crate::sync::engine::{UnrecoverableReorg, WalletApplyError};
@@ -8667,7 +8667,7 @@ mod tests {
         let apply: anyhow::Error = WalletApplyError("commitment tree conflict".into()).into();
         assert!(
             !super::sync_failure_is_terminal(&apply),
-            "an apply-side failure can clear on its own (e.g. after a zecd update)"
+            "an apply-side failure can clear on its own (e.g. after a rose update)"
         );
         assert!(
             !super::sync_failure_is_terminal(&anyhow::anyhow!("connection reset")),
@@ -9401,9 +9401,9 @@ mod tests {
     /// The sync-failure diagnostics ladder (`sync_failure_hint`): transport failures are never
     /// attributed (reconnecting genuinely fixes those, and telling an operator to rebuild a
     /// wallet over a zebra outage would be harmful); an apply-side failure under an active
-    /// unsupported network upgrade is attributed immediately (the "old zecd after activation"
+    /// unsupported network upgrade is attributed immediately (the "old rose after activation"
     /// loop); and an apply-side failure that keeps repeating with no upgrade in play points at
-    /// the `zecd rescan` database rebuild - each with the operator action (update / rescan /
+    /// the `rose rescan` database rebuild - each with the operator action (update / rescan /
     /// forum report) spelled out in the message.
     #[test]
     fn sync_failure_hint_attributes_only_diagnosable_failures() {
@@ -9431,7 +9431,7 @@ mod tests {
         assert!(hint.contains("NU-Future"), "{hint}");
         assert!(hint.contains("0xdeadbeef"), "{hint}");
         assert!(hint.contains("4100000"), "{hint}");
-        assert!(hint.contains("latest zecd release"), "{hint}");
+        assert!(hint.contains("latest rose release"), "{hint}");
         assert!(hint.contains("forum.zcashcommunity.com"), "{hint}");
 
         // Apply-side, no upgrade: quiet below the persistence threshold (a one-off apply error
@@ -9441,10 +9441,10 @@ mod tests {
             None
         );
         // ...and at the threshold, the wallet database is the prime suspect: point at the
-        // keys-preserving `zecd rescan` rebuild (naming the wallet) and the forum.
+        // keys-preserving `rose rescan` rebuild (naming the wallet) and the forum.
         let hint = sync_failure_hint(true, PERSISTENT_SYNC_ERROR_THRESHOLD, "burner", None)
             .expect("a persistent apply failure escalates to recovery guidance");
-        assert!(hint.contains("zecd rescan --wallet burner"), "{hint}");
+        assert!(hint.contains("rose rescan --wallet burner"), "{hint}");
         assert!(hint.contains("keys.toml is kept"), "{hint}");
         assert!(hint.contains("forum.zcashcommunity.com"), "{hint}");
 
@@ -9471,7 +9471,7 @@ mod tests {
         ensure_dir_writable(&wd).expect("a fresh writable dir is usable");
         assert!(wd.is_dir());
         assert!(
-            !wd.join(".zecd-write-test").exists(),
+            !wd.join(".rose-write-test").exists(),
             "the probe file is removed"
         );
 
@@ -9555,9 +9555,9 @@ mod tests {
         );
     }
 
-    /// The enhancement backlog counts the requests zecd can actually service, which is all three
+    /// The enhancement backlog counts the requests rose can actually service, which is all three
     /// variants: `Enhancement`/`GetStatus` via a full-tx fetch, and the transparent-address
-    /// variant via the address-index query. A variant zecd could not drain would have to be
+    /// variant via the address-index query. A variant rose could not drain would have to be
     /// excluded, or it would pin `pending_enhancements` above zero forever and a wallet would
     /// never report ready.
     #[test]

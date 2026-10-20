@@ -1,7 +1,7 @@
 //! Data-directory layout migration: moving librustzcash's files out of the wallet directory
 //! root and into the per-coin, per-engine subdirectory that now holds them.
 //!
-//! Older zecd put a wallet's databases directly in its directory, beside `keys.toml`:
+//! Older rose put a wallet's databases directly in its directory, beside `keys.toml`:
 //!
 //! ```text
 //! <datadir>/<wallet>/{keys.toml, data.sqlite, blockmeta.sqlite, blocks/}
@@ -26,12 +26,12 @@
 //! Each artifact is **renamed** within the wallet directory, never copied: no free disk space is
 //! needed, nothing is deleted, and a run interrupted part-way simply moves what is left on the
 //! next start. The caller must hold the datadir lock ([`crate::lock::lock_datadir`]) - the
-//! daemon migrates in [`crate::node::PreparedNode::start`], `zecd init` and `zecd rescan` in
+//! daemon migrates in [`crate::node::PreparedNode::start`], `rose init` and `rose rescan` in
 //! their own lock scopes. Nothing here ever deletes anything; the one case it cannot resolve
 //! is an error that leaves both copies on disk for the operator.
 //!
-//! Read-only commands take no lock and so cannot migrate. `zecd export-ufvk` reads an
-//! un-migrated wallet database in place - see [`engine_dir_for_reading`]. `zecd derive-address`
+//! Read-only commands take no lock and so cannot migrate. `rose export-ufvk` reads an
+//! un-migrated wallet database in place - see [`engine_dir_for_reading`]. `rose derive-address`
 //! needs no fallback at all: it reads only `keys.toml`, which this migration never moves.
 
 use std::path::{Path, PathBuf};
@@ -48,7 +48,7 @@ use crate::config::{self, AppConfig, WalletEntry};
 /// The SQLite `-wal`/`-shm` sidecars are listed explicitly and moved with their databases: a
 /// `-wal` holds committed transactions that have not been checkpointed back yet, so moving a
 /// database without it would silently discard the most recent writes. Nothing else in a wallet
-/// directory is librustzcash's - `keys.toml` is zecd's own and stays at the root.
+/// directory is librustzcash's - `keys.toml` is rose's own and stays at the root.
 pub const ENGINE_ARTIFACTS: [&str; 7] = [
     "data.sqlite",
     "data.sqlite-wal",
@@ -94,14 +94,14 @@ pub fn plan(config: &AppConfig) -> anyhow::Result<Vec<WalletMove>> {
                 continue;
             }
             // The same artifact in both places is ambiguous - which database is the real one is
-            // not zecd's call. Refuse and say so, leaving both untouched. Note this compares
+            // not rose's call. Refuse and say so, leaving both untouched. Note this compares
             // artifact by artifact, so a migration interrupted half way (some moved, some not)
             // resumes rather than tripping this.
             if to.join(artifact).exists() {
                 return Err(anyhow!(
-                    "wallet '{name}' has {artifact} both at {} and at {}. zecd will not choose \
+                    "wallet '{name}' has {artifact} both at {} and at {}. rose will not choose \
                      between them: keep the one you want (the current layout is {}), move the \
-                     other out of the wallet directory, and start zecd again",
+                     other out of the wallet directory, and start rose again",
                     from.join(artifact).display(),
                     to.join(artifact).display(),
                     to.display(),
@@ -161,7 +161,7 @@ fn apply(m: &WalletMove) -> anyhow::Result<()> {
         std::fs::rename(&from, &to).with_context(|| {
             format!(
                 "moving {} to {} for wallet '{}'. The data is untouched at {}; if the two paths \
-                 are on different filesystems, move it there yourself and start zecd again",
+                 are on different filesystems, move it there yourself and start rose again",
                 from.display(),
                 to.display(),
                 m.wallet,
@@ -176,7 +176,7 @@ fn apply(m: &WalletMove) -> anyhow::Result<()> {
 /// normally [`WalletEntry::engine_dir`], but the wallet directory itself while the wallet is
 /// still in the pre-`<coin>/<engine>/` layout.
 ///
-/// `zecd export-ufvk` deliberately takes no datadir lock (it must run beside a live daemon), so
+/// `rose export-ufvk` deliberately takes no datadir lock (it must run beside a live daemon), so
 /// it may not move anything - but it should still read a wallet the daemon has not migrated
 /// yet, rather than report it uninitialized. The fallback applies only when the engine
 /// directory holds no wallet database and the wallet root does, so it can never shadow a
@@ -187,8 +187,8 @@ pub fn engine_dir_for_reading(entry: &WalletEntry) -> PathBuf {
         return engine;
     }
     warn!(
-        "reading the wallet database from its pre-{}/{}/ location {}; the next `zecd run` (or \
-         `zecd init`/`zecd rescan`) moves it to {}",
+        "reading the wallet database from its pre-{}/{}/ location {}; the next `rosed` start (or \
+         `rose init`/`rose rescan`) moves it to {}",
         entry.coin.data_dir(),
         entry.coin.engine_dir(),
         entry.dir.display(),
@@ -198,7 +198,7 @@ pub fn engine_dir_for_reading(entry: &WalletEntry) -> PathBuf {
 }
 
 /// Whether `wallet_dir` still holds a wallet database at its root, i.e. predates this layout.
-/// Used by `zecd config check` to report a pending migration without performing one.
+/// Used by `rose config check` to report a pending migration without performing one.
 pub fn awaits_migration(wallet_dir: &Path, coin: Coin) -> bool {
     wallet_dir.join(PRIMARY_ARTIFACT).is_file()
         && !config::engine_dir(wallet_dir, coin)
@@ -211,9 +211,9 @@ mod tests {
     use super::*;
     use crate::config::ConfigOverrides;
 
-    /// Resolve a config against `dir` as the data directory, from an optional `zecd.toml` body.
+    /// Resolve a config against `dir` as the data directory, from an optional `rose.toml` body.
     fn config_with(dir: &Path, toml: &str) -> AppConfig {
-        let conf = dir.join("zecd.toml");
+        let conf = dir.join("rose.toml");
         std::fs::write(&conf, format!("network = \"test\"\n{toml}")).unwrap();
         AppConfig::resolve_overrides(&ConfigOverrides {
             conf: Some(conf),

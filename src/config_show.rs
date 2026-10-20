@@ -1,6 +1,6 @@
-//! `zecd config show` - print the effective configuration in the config file's own syntax.
+//! `rose config show` - print the effective configuration in the config file's own syntax.
 //!
-//! `sshd -T` to `config check`'s `sshd -t`. A zecd config file is only half the configuration:
+//! `sshd -T` to `config check`'s `sshd -t`. A rose config file is only half the configuration:
 //! every key it leaves unset takes this build's default, and those move between versions. This
 //! renders what the binary actually resolved - file, CLI overrides, environment and defaults all
 //! collapsed - as TOML, so it can be diffed across two binaries, captured before an upgrade, or
@@ -36,8 +36,8 @@ use crate::config::{Cli, ConfigShowArgs};
 /// `config check`'s header, so that two versions' stdout differ only where the configuration
 /// differs.
 const HEADER: &str = "\
-# The EFFECTIVE zecd configuration: the config file, CLI flags and environment resolved
-# together, with every unset key filled in by this build's default. Diff two zecd versions'
+# The EFFECTIVE rose configuration: the config file, CLI flags and environment resolved
+# together, with every unset key filled in by this build's default. Diff two rose versions'
 # output to see which defaults moved.
 #
 # Secrets (the RPC password, rpcauth hashes, [zebra] credentials) are shown as commented-out
@@ -645,10 +645,10 @@ fn list_val<S: AsRef<str>>(items: &[S]) -> String {
     .to_string()
 }
 
-/// `zecd config show`.
+/// `rose config show`.
 ///
 /// Same stream contract as `config check`: the configuration goes to stdout, provenance to
-/// stderr, so `zecd config show > effective.toml` captures exactly the config.
+/// stderr, so `rose config show > effective.toml` captures exactly the config.
 ///
 /// Unlike `config check`, a missing config file is **not** an error here. The two commands
 /// answer different questions: `check` validates a file the caller says exists (so a path that
@@ -667,14 +667,14 @@ pub fn run(cli: &Cli, _args: &ConfigShowArgs) -> anyhow::Result<()> {
             conf_path.display()
         )
     };
-    emit_err(&format!("zecd {}\n{source}\n", env!("CARGO_PKG_VERSION")));
+    emit_err(&format!("rose {}\n{source}\n", env!("CARGO_PKG_VERSION")));
 
     let config = AppConfig::resolve(cli)?;
     emit(&render(&config));
     Ok(())
 }
 
-/// Write the configuration to stdout, treating a closed pipe as a clean exit (`zecd config show
+/// Write the configuration to stdout, treating a closed pipe as a clean exit (`rose config show
 /// | head` would otherwise *panic* through `print!`, which panics on EPIPE).
 #[cfg(feature = "cli")]
 fn emit(text: &str) {
@@ -694,16 +694,16 @@ mod tests {
     use clap::Parser;
 
     fn resolve_from(text: &str, dir: &Path) -> AppConfig {
-        let path = dir.join("zecd.toml");
+        let path = dir.join("rose.toml");
         std::fs::write(&path, text).unwrap();
-        let cli = Cli::try_parse_from(["zecd", "--conf", path.to_str().unwrap()]).unwrap();
+        let cli = Cli::try_parse_from(["rose", "--conf", path.to_str().unwrap()]).unwrap();
         AppConfig::resolve(&cli).expect("config resolves")
     }
 
     /// The property that keeps this honest: the rendered config must re-resolve to the same
     /// configuration, and render identically the second time. That pins every emitted key as one
     /// the parser accepts (`deny_unknown_fields` would otherwise let the renderer drift into
-    /// producing a config zecd itself would reject) and every emitted *value* as one that parses
+    /// producing a config rose itself would reject) and every emitted *value* as one that parses
     /// back to what it came from.
     ///
     /// Deliberately a secret-free config: redacted keys are emitted as comments, so a config
@@ -729,12 +729,12 @@ mod tests {
         let second = render(&resolve_from(&first, round_trip.path()));
         assert_eq!(
             first, second,
-            "the effective config must survive being fed back to zecd"
+            "the effective config must survive being fed back to rose"
         );
 
         // ...and it really did carry the settings, rather than round-tripping empty. Note the
         // pool list comes back in `ReceiverSet`'s canonical order, not the order the file wrote -
-        // which is itself worth rendering, since that is the order zecd works in.
+        // which is itself worth rendering, since that is the order rose works in.
         assert!(
             first.contains("privacy_policy = \"FullPrivacy\""),
             "{first}"
@@ -994,7 +994,7 @@ mod tests {
         );
     }
 
-    /// Credentials are named, never printed - `zecd config show` output is the kind of thing
+    /// Credentials are named, never printed - `rose config show` output is the kind of thing
     /// that gets pasted into an issue, and the RPC password is spend authority.
     #[cfg(feature = "zcash")]
     #[test]

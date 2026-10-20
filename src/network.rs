@@ -1,4 +1,4 @@
-//! The consensus network a `zecd` instance operates on: mainnet, testnet, or a local
+//! The consensus network a `rose` instance operates on: mainnet, testnet, or a local
 //! regtest chain.
 //!
 //! librustzcash's own [`zcash_protocol::consensus::Network`] only models main/test, but the
@@ -15,7 +15,7 @@ use zcash_protocol::consensus::{
 #[cfg(feature = "zcash")]
 use zcash_protocol::local_consensus::LocalNetwork;
 
-/// The network `zecd` is configured for. `Copy` so it threads by value through the wallet
+/// The network `rose` is configured for. `Copy` so it threads by value through the wallet
 /// APIs exactly as the upstream `Network` enum did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZNetwork {
@@ -81,7 +81,7 @@ impl Parameters for ZNetwork {
 /// The regtest network environment.
 ///
 /// Its Zcash activation schedule is [`regtest_local`]'s; this constructor calls it eagerly in a
-/// build with the engine so a set-but-unparseable `ZECD_REGTEST_NU63_HEIGHT` still fails here,
+/// build with the engine so a set-but-unparseable `ROSE_REGTEST_NU63_HEIGHT` still fails here,
 /// at config resolution, rather than at the first scan (see the panic that function documents).
 pub fn regtest() -> ZNetwork {
     #[cfg(feature = "zcash")]
@@ -98,7 +98,7 @@ pub fn regtest() -> ZNetwork {
 /// Resolved once per process and cached: [`Parameters::activation_height`] is on the per-block
 /// scan path, and the schedule cannot change under a running daemon (its one input is an
 /// environment variable, which nothing in this tree mutates in-process). A test that needs a
-/// different `ZECD_REGTEST_NU63_HEIGHT` therefore has to run in its own process.
+/// different `ROSE_REGTEST_NU63_HEIGHT` therefore has to run in its own process.
 #[cfg(feature = "zcash")]
 pub fn regtest_local() -> &'static LocalNetwork {
     static REGTEST: std::sync::OnceLock<LocalNetwork> = std::sync::OnceLock::new();
@@ -111,34 +111,34 @@ fn build_regtest_local() -> LocalNetwork {
     // NU6.1/NU6.2 activate a few blocks in, not at genesis: NU6.1's activation block must carry
     // ZIP-271 lockbox disbursements, which require a deferred pool that only accrues once NU6 is
     // live. This must match the regtest chain the harness/zebra run (regtest-harness's
-    // NU6_2_ACTIVATION_HEIGHT) so zecd commits transactions to the right consensus branch id.
+    // NU6_2_ACTIVATION_HEIGHT) so rose commits transactions to the right consensus branch id.
     let nu62 = Some(BlockHeight::from_u32(4));
-    // NU6.3 (ironwood) activation height on the regtest chain, from `ZECD_REGTEST_NU63_HEIGHT`.
+    // NU6.3 (ironwood) activation height on the regtest chain, from `ROSE_REGTEST_NU63_HEIGHT`.
     // Ironwood is always compiled, so the *code* is unconditional; only the regtest activation
     // height is a knob, because regtest has no protocol-assigned height (real networks get theirs
     // from the pinned protocol crate). The regtest harness configures zebra with NU6.3 at height 8
-    // and sets this env var so zecd commits to the matching consensus branch id. The funding
-    // wallet is itself a zecd and reads the same variable out of the inherited environment, so
+    // and sets this env var so rose commits to the matching consensus branch id. The funding
+    // wallet is itself a rose and reads the same variable out of the inherited environment, so
     // all three heights MUST agree (the harness's `NU6_3_ACTIVATION_HEIGHT` is the canonical
     // copy).
     //
     // Unset means no NU6.3 on regtest (a chain built against a zebra without the `"NU6.3"` key).
     // A *set but unparseable* value is fatal rather than silently ignored: falling back to "no
-    // NU6.3" would leave zecd committing transactions to the wrong consensus branch id, which
+    // NU6.3" would leave rose committing transactions to the wrong consensus branch id, which
     // surfaces far away as an opaque zebra rejection at broadcast time.
-    let nu63 = regtest_height_from_env("ZECD_REGTEST_NU63_HEIGHT", "NU6.3");
-    // NU7, from `ZECD_REGTEST_NU7_HEIGHT`, on the same terms as NU6.3 above: compiled
+    let nu63 = regtest_height_from_env("ROSE_REGTEST_NU63_HEIGHT", "NU6.3");
+    // NU7, from `ROSE_REGTEST_NU7_HEIGHT`, on the same terms as NU6.3 above: compiled
     // unconditionally (the protocol crate exposes it without the old `zcash_unstable = "nu7"`
     // flag), activated on regtest only when asked. Unset - the harness default - keeps the
     // regtest chain at NU6.3, which is also all the pinned funder release understands. Upgrades
     // activate in order, so NU7 needs NU6.3 scheduled strictly below it; anything else would
-    // describe a chain no node runs, and zecd would build transactions against it anyway.
-    let nu7 = regtest_height_from_env("ZECD_REGTEST_NU7_HEIGHT", "NU7");
+    // describe a chain no node runs, and rose would build transactions against it anyway.
+    let nu7 = regtest_height_from_env("ROSE_REGTEST_NU7_HEIGHT", "NU7");
     if let Some(nu7) = nu7 {
         match nu63 {
             Some(nu63) if nu63 < nu7 => {}
             _ => panic!(
-                "ZECD_REGTEST_NU7_HEIGHT ({nu7}) needs ZECD_REGTEST_NU63_HEIGHT set to a lower \
+                "ROSE_REGTEST_NU7_HEIGHT ({nu7}) needs ROSE_REGTEST_NU63_HEIGHT set to a lower \
                  height (got {nu63:?}): network upgrades activate in order"
             ),
         }
@@ -194,7 +194,7 @@ mod tests {
 
     /// NU6.3 (ironwood) is live on mainnet and testnet, so the pinned protocol crate must carry an
     /// activation height for both. This is the guard that a dependency bump can't silently drop
-    /// ironwood back to "never activates": zecd derives activation purely from these heights
+    /// ironwood back to "never activates": rose derives activation purely from these heights
     /// (`is_nu_active(Nu6_3, ..)`), and with no height every mainnet send would keep building
     /// legacy Orchard-V2 output - wrong pool, no error.
     #[cfg(feature = "zcash")]
@@ -210,7 +210,7 @@ mod tests {
         }
     }
 
-    /// NU7 is scheduled on testnet and nowhere else. The testnet height is what lets zecd
+    /// NU7 is scheduled on testnet and nowhere else. The testnet height is what lets rose
     /// build transactions past activation there: `BranchId::for_height` picks the NU7 branch id
     /// from it, and a build that lacked it would keep committing to NU6.3 and be rejected by
     /// every upgraded node. Mainnet is unscheduled, and the moment that changes this test is

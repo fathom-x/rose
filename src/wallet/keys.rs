@@ -110,7 +110,7 @@ impl SeedKeeper {
 /// permissions. The file holds the secret key that decrypts the wallet mnemonic, so:
 ///
 /// - **Permissions:** any group/other access bit (`mode & 0o077 != 0`) is rejected, because a
-///   world-/group-readable identity leaks the wallet to other local users. `zecd init` creates
+///   world-/group-readable identity leaks the wallet to other local users. `rose init` creates
 ///   it `0600`, but nothing stops a later `chmod`, so this re-checks on every load, mirroring
 ///   SSH's refusal to use an over-permissive private key.
 /// - **File type:** the load target must resolve to a regular file (not a directory, device,
@@ -119,12 +119,12 @@ impl SeedKeeper {
 /// On the symlink question: we deliberately resolve *through* a symlink
 /// (`std::fs::metadata` follows it) rather than rejecting symlinks outright as OpenSSH does.
 /// A Kubernetes Secret/ConfigMap volume presents each mounted file as a symlink into its
-/// `..data/` directory, and zecd supports mounting the age identity as a Secret
-/// (`ZECD_AGE_IDENTITY`), so a hard "regular file only, no symlinks" rule would break that
+/// `..data/` directory, and rose supports mounting the age identity as a Secret
+/// (`ROSE_AGE_IDENTITY`), so a hard "regular file only, no symlinks" rule would break that
 /// deployment. Validating the *resolved* target's type and mode keeps the Secret mount working
 /// while still enforcing owner-only access on the real file (a group/other-readable target is
 /// rejected whether or not a symlink points at it). Planting a hostile symlink additionally
-/// requires write access to the identity's parent directory, which is already outside zecd's
+/// requires write access to the identity's parent directory, which is already outside rose's
 /// trust boundary, and a foreign identity cannot decrypt the operator's own `keys.toml`.
 ///
 /// Best-effort and a no-op on non-unix targets (no POSIX mode bits to inspect).
@@ -181,7 +181,7 @@ pub fn decrypt_seed_with_identity(
 /// derivation of its own - signing application payloads with a BIP 44 child key, say. They are
 /// path-based rather than taking a `WalletStore` so that type stays internal.
 ///
-/// Deliberately in-process only: zecd exports no key material over RPC, and a
+/// Deliberately in-process only: rose exports no key material over RPC, and a
 /// sign-this-digest RPC would be a spend oracle, since a caller-chosen 32-byte digest can be
 /// the sighash of a transaction spending the wallet's UTXOs. An in-process caller already
 /// holds the datadir and the identity file, so this grants no reach it did not have - it only
@@ -305,7 +305,7 @@ mod tests {
         )
         .unwrap();
 
-        // Write the identity file with owner-only permissions, as `zecd init` does (and as the
+        // Write the identity file with owner-only permissions, as `rose init` does (and as the
         // load-time permission check now requires).
         let id_path = dir.path().join("identity.txt");
         {

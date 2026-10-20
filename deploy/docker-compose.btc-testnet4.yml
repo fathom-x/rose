@@ -1,4 +1,4 @@
-# Development-only Bitcoin Core **testnet4** node, for testing zecd's BDK engine (the
+# Development-only Bitcoin Core **testnet4** node, for testing rose's BDK engine (the
 # off-by-default `bitcoin` cargo feature) with real - valueless - testnet4 coins.
 #
 # The public-testnet sibling of docker-compose.btc-regtest.yml (same image pin, same
@@ -9,10 +9,10 @@
 # the wallet from a testnet4 faucet (e.g. mempool.space/testnet4).
 #
 # The node serves:
-#   - JSON-RPC on 48332 (bitcoind's testnet4 default - exactly where a testnet4 zecd's
+#   - JSON-RPC on 48332 (bitcoind's testnet4 default - exactly where a testnet4 rose's
 #     bare `server = "bitcoind"` token resolves to)
 #   - compact block filters over P2P on 48333 (-blockfilterindex + -peerblockfilters,
-#     what zecd's kyoto/BIP-157 light mode peers with: server = "kyoto://127.0.0.1:48333")
+#     what rose's kyoto/BIP-157 light mode peers with: server = "kyoto://127.0.0.1:48333")
 #   - -txindex, so getrawtransaction answers for any confirmed tx
 #
 # The image is pinned to Bitcoin Core 30.2, in lockstep with the regtest stack and the CI
@@ -25,12 +25,12 @@
 #       bitcoin-cli -testnet4 -rpcuser=btc -rpcpassword=btc'
 #   bcli4 getblockchaininfo     # wait for initialblockdownload: false
 #
-# The stack runs the NODE plus the dev web UI (scripts/zecd-gui). zecd itself is NOT a service
+# The stack runs the NODE plus the dev web UI (scripts/rose-gui). rose itself is NOT a service
 # here: the published image is built without the `bitcoin` cargo feature, so it refuses
-# `coin = "bitcoin"` outright. Run zecd on the host from a `--features bitcoin` build, and see
-# the zecd-gui service below for how the containerised UI reaches it.
+# `coin = "bitcoin"` outright. Run rose on the host from a `--features bitcoin` build, and see
+# the rose-gui service below for how the containerised UI reaches it.
 #
-# deploy/zecd.btc-testnet4.toml is that zecd's config, written out and commented (host-side,
+# deploy/rose.btc-testnet4.toml is that rose's config, written out and commented (host-side,
 # not mounted here); in outline:
 #   network = "test"
 #   btc_testnet = "testnet4"
@@ -40,7 +40,7 @@
 #   rpc_user = "btc"
 #   rpc_password = "btc"
 #
-# zecd keeps its own keys (keys.toml) and does all wallet tracking itself - the node
+# rose keeps its own keys (keys.toml) and does all wallet tracking itself - the node
 # needs no bitcoind wallet. Credentials are fixed dev values: testnet coins are valueless
 # and the RPC port is published on loopback only. Do not reuse this file's shape for
 # mainnet.
@@ -49,7 +49,7 @@
 # keeps this node in its own Compose project so `up -d` on the regtest/testnet3 stacks
 # cannot replace this one's `bitcoind` container.
 
-name: zecd-btc-testnet4
+name: rose-btc-testnet4
 
 services:
   bitcoind:
@@ -104,17 +104,17 @@ services:
     volumes:
       - bitcoind-testnet4-data:/home/bitcoin/.bitcoin
     networks:
-      - zecd-net
+      - rose-net
 
-  # The dev web UI (scripts/zecd-gui), a same-origin proxy in front of zecd's RPC.
+  # The dev web UI (scripts/rose-gui), a same-origin proxy in front of rose's RPC.
   #
-  # It takes its credentials from the mounted zecd config, but NOT the address: that config's
+  # It takes its credentials from the mounted rose config, but NOT the address: that config's
   # `[rpc] bind` is 127.0.0.1, which inside this container is the container's own loopback.
   # --rpc-url overrides just the address. host.docker.internal is the host as seen from a
   # container on Docker Desktop (macOS/Windows); on Linux, the extra_hosts line below maps it
   # to the bridge gateway, which Docker Desktop provides on its own.
   #
-  # For that to resolve, the host zecd must listen past loopback - it is reached on the bridge
+  # For that to resolve, the host rose must listen past loopback - it is reached on the bridge
   # interface, not 127.0.0.1. On a laptop `--rpcbind 0.0.0.0` is the simple answer: it exposes
   # the RPC to the LAN behind the RPC password, acceptable for valueless testnet4 coins. On an
   # INTERNET-FACING host bind the docker bridge gateway alone instead, which is what
@@ -122,49 +122,49 @@ services:
   # `docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'` prints - so the
   # port is reachable from containers and from nowhere else. Do not carry either shape to
   # mainnet; run the UI on the host network there (see docker-compose.btc-mainnet.yml).
-  zecd-gui:
+  rose-gui:
     build:
-      context: ../scripts/zecd-gui
+      context: ../scripts/rose-gui
       dockerfile: Dockerfile
-    container_name: zecd-gui-testnet4
+    container_name: rose-gui-testnet4
     restart: unless-stopped
     environment:
-      # Required: both testnet4 configs ship the CHANGE-ME placeholder, which zecd refuses to
+      # Required: both testnet4 configs ship the CHANGE-ME placeholder, which rose refuses to
       # start on, so the host daemon runs with this variable in its environment and the UI
       # proxy authenticates with the same one. Set it in deploy/.env (gitignored); compose
       # refuses to start the service while it is unset or empty rather than sending a wrong
       # credential on every request.
-      - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:?set ZECD_RPC_PASSWORD in deploy/.env to the password the host zecd runs with}
+      - ROSE_RPC_PASSWORD=${ROSE_RPC_PASSWORD:?set ROSE_RPC_PASSWORD in deploy/.env to the password the host rose runs with}
       # The name the page header shows for this machine: a bridged container's own hostname is
-      # a random id, so set ZECD_GUI_MACHINE (e.g. to `hostname`'s output) in deploy/.env.
-      - ZECD_GUI_MACHINE=${ZECD_GUI_MACHINE:-}
+      # a random id, so set ROSE_GUI_MACHINE (e.g. to `hostname`'s output) in deploy/.env.
+      - ROSE_GUI_MACHINE=${ROSE_GUI_MACHINE:-}
     ports:
       - "127.0.0.1:8080:8080"  # UI on loopback only for dev
     volumes:
       # Both testnet4 configs, so one service covers either backend (see the env vars below).
-      - ./zecd.btc-testnet4.toml:/config/zecd.btc-testnet4.toml:ro
-      - ./zecd.btc-testnet4-kyoto.toml:/config/zecd.btc-testnet4-kyoto.toml:ro
+      - ./rose.btc-testnet4.toml:/config/rose.btc-testnet4.toml:ro
+      - ./rose.btc-testnet4-kyoto.toml:/config/rose.btc-testnet4-kyoto.toml:ro
       # The source, over the image's copy, so an edit is live without a rebuild (index.html
       # on the next page load, serve.py via --reload; see the mainnet file).
-      - ../scripts/zecd-gui:/app:ro
+      - ../scripts/rose-gui:/app:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
-      - zecd-net
+      - rose-net
     command:
       # Defaults serve this stack's own premise: full mode against the bitcoind above. For a
-      # kyoto zecd instead, which needs no bitcoind at all:
-      #   ZECD_GUI_CONF=zecd.btc-testnet4-kyoto.toml ZECD_GUI_RPC_PORT=48242 \
-      #     docker compose -f deploy/docker-compose.btc-testnet4.yml up -d zecd-gui
+      # kyoto rose instead, which needs no bitcoind at all:
+      #   ROSE_GUI_CONF=rose.btc-testnet4-kyoto.toml ROSE_GUI_RPC_PORT=48242 \
+      #     docker compose -f deploy/docker-compose.btc-testnet4.yml up -d rose-gui
       # The port must match the chosen config's [rpc] port - only the host part is overridden.
-      - --conf=/config/${ZECD_GUI_CONF:-zecd.btc-testnet4.toml}
+      - --conf=/config/${ROSE_GUI_CONF:-rose.btc-testnet4.toml}
       - --reload
       - --bind=0.0.0.0
       - --port=8080
-      - --rpc-url=http://host.docker.internal:${ZECD_GUI_RPC_PORT:-48232}
+      - --rpc-url=http://host.docker.internal:${ROSE_GUI_RPC_PORT:-48232}
 
 networks:
-  zecd-net:
+  rose-net:
     driver: bridge
 
 volumes:

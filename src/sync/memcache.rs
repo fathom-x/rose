@@ -1,9 +1,9 @@
 //! The in-memory [`BlockSource`] holding the batch currently being scanned.
 //!
-//! zecd's block cache used to be `FsBlockDb`: one file per compact block under `blocks/`,
+//! rose's block cache used to be `FsBlockDb`: one file per compact block under `blocks/`,
 //! indexed by a `blockmeta.sqlite` metadata table. That layout is built for a cache that
 //! *outlives* a scan - a wallet keeping blocks around so a later rescan need not re-download
-//! them - and zecd never used it that way. `sync_one_batch` downloads a range, scans it, and
+//! them - and rose never used it that way. `sync_one_batch` downloads a range, scans it, and
 //! deletes it before the next range starts, so nothing survived one batch. The files bought
 //! nothing and cost, per 10,000-block batch: 10,000 `create` + `write` syscalls during the
 //! download, 20,000 `open` + `read` during the scan (`scan_cached_blocks` walks the range

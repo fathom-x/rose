@@ -20,18 +20,18 @@
 //! duplicated one.
 //!
 //! Setup mirrors `regtest_funded.rs`/`regtest_sapling.rs`: mine a transparent coinbase to the
-//! funder, mature it, shield it, then have the funder pay zecd. The difference is that zecd is
-//! configured with `[pools] transparent = true` (Orchard-only enabled, as default), zecd hands out
+//! funder, mature it, shield it, then have the funder pay rose. The difference is that rose is
+//! configured with `[pools] transparent = true` (Orchard-only enabled, as default), rose hands out
 //! a `t...` receiving address, and the funder pays *that* - an ordinary shielded→transparent send.
 //!
 //! Skips cleanly unless `ZEBRAD_BIN` is set.
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Rose, RoseConfig,
 };
+use serde_json::json;
 
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
@@ -55,24 +55,24 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     // The funder's own bare t-address, used here as an external transparent counterparty.
     let funder_taddr = funder.transparent_address().to_string();
 
-    // 5. zecd with transparent receiving enabled (Orchard-only otherwise). Readiness runs in
+    // 5. rose with transparent receiving enabled (Orchard-only otherwise). Readiness runs in
     //    "scanned" mode: this wallet accumulates transparent UTXOs, whose recurring spend-search
     //    requests transiently raise `pending_enhancements` on every tip advance - the fleet
     //    report's readiness flap under the default "synced" mode. Step 11 pins the no-flap
     //    contract this mode exists for.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.transparent = true;
     cfg.readiness = Some("scanned".to_string());
-    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    let _rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
-        .expect("attach zecd backend");
-    let zecd = Zecd::start(&cfg)
+        .expect("attach rose backend");
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd with transparent receiving");
+        .expect("start rose with transparent receiving");
 
     // getnewaddress "" "transparent" hands out a BARE transparent address (regtest uses testnet's
     // "tm" P2PKH prefix), not a Unified Address. (Deterministic - no funding needed.)
-    let taddr = zecd
+    let taddr = rose
         .call("getnewaddress", json!(["", "transparent"]))
         .await
         .expect("getnewaddress transparent")
@@ -85,7 +85,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
 
     // validateaddress: a bare transparent address carries exactly the transparent receiver.
-    let v = zecd
+    let v = rose
         .call("validateaddress", json!([taddr]))
         .await
         .expect("validateaddress t-addr");
@@ -97,10 +97,10 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
 
     // getaddressinfo.ismine recognizes the handed-out transparent address as ours, and reports
-    // WHERE it sits in the BIP 44 chain. `getnewaddress` returns a bare string and zecd persists
+    // WHERE it sits in the BIP 44 chain. `getnewaddress` returns a bare string and rose persists
     // no issuance log, so this is the only way a caller learns which index it was handed - and
     // what an exchange reconciles an issued range against.
-    let ai = zecd
+    let ai = rose
         .call("getaddressinfo", json!([taddr]))
         .await
         .expect("getaddressinfo t-addr");
@@ -123,7 +123,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     // z_getaddressforaccount 0 ["p2pkh"] <index> derives the bare transparent address at an
     // explicit BIP 44 external child index. Asking for the index getnewaddress just used must
     // return that same address - the property a caller otherwise had to assume.
-    let derived = zecd
+    let derived = rose
         .call("z_getaddressforaccount", json!([0, ["p2pkh"], taddr_index]))
         .await
         .expect("z_getaddressforaccount p2pkh at an explicit index");
@@ -143,19 +143,19 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         "a transparent derivation reports zcashd's p2pkh receiver type: {derived}"
     );
     // Re-deriving is idempotent (the whole point: an operator can rebuild its issued range).
-    let again = zecd
+    let again = rose
         .call("z_getaddressforaccount", json!([0, ["p2pkh"], taddr_index]))
         .await
         .expect("z_getaddressforaccount is idempotent at a fixed index");
     assert_eq!(again, derived, "re-derivation returns the same object");
     // p2pkh cannot be combined with a shielded receiver (no such address shape exists), and the
     // index must be inside the BIP 44 non-hardened range.
-    let err = zecd
+    let err = rose
         .call("z_getaddressforaccount", json!([0, ["p2pkh", "orchard"]]))
         .await
         .expect_err("p2pkh + orchard has no representable address");
     assert_eq!(err.code(), Some(-8), "p2pkh+orchard -> -8: {err}");
-    let err = zecd
+    let err = rose
         .call("z_getaddressforaccount", json!([0, ["p2pkh"], 1u64 << 31]))
         .await
         .expect_err("a hardened child index is not derivable");
@@ -165,8 +165,8 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     // exercises the real actor key-derivation path (derive the USK from the seed, then the input
     // address's secp256k1 key at its recorded (scope, index)); no funding is needed. (Deterministic
     // - signing is RFC-6979.)
-    let message = "zecd regtest signmessage e2e";
-    let signature = zecd
+    let message = "rose regtest signmessage e2e";
+    let signature = rose
         .call("signmessage", json!([taddr, message]))
         .await
         .expect("signmessage over own t-addr")
@@ -180,14 +180,14 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
     // The signature verifies for (address, message) and fails for a tampered message.
     assert_eq!(
-        zecd.call("verifymessage", json!([taddr, signature, message]))
+        rose.call("verifymessage", json!([taddr, signature, message]))
             .await
             .expect("verifymessage"),
         json!(true),
         "own signature verifies"
     );
     assert_eq!(
-        zecd.call(
+        rose.call(
             "verifymessage",
             json!([taddr, signature, "a different message"])
         )
@@ -198,14 +198,14 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
     // Signing with an address the wallet does not own (a shielded Orchard UA is not even a
     // transparent address) is rejected -5, before the seed is touched.
-    let orchard_ua = zecd
+    let orchard_ua = rose
         .call("getnewaddress", json!(["", "orchard"]))
         .await
         .expect("getnewaddress orchard")
         .as_str()
         .expect("ua string")
         .to_string();
-    let err = zecd
+    let err = rose
         .call("signmessage", json!([orchard_ua, message]))
         .await
         .expect_err("signmessage rejects a non-transparent address");
@@ -216,7 +216,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
     // Signing with a valid transparent address the wallet does NOT own (the funder's own t-addr,
     // derived from a different seed) is rejected -4: the wallet has no key for it.
-    let err = zecd
+    let err = rose
         .call("signmessage", json!([funder_taddr, message]))
         .await
         .expect_err("signmessage rejects an unowned transparent address");
@@ -227,7 +227,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
 
     // getwalletinfo surfaces the transparent observability block (the default gap limit is 20).
-    let wi = zecd
+    let wi = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -245,10 +245,10 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     // address_type "transparent" requires the wallet to enable it - but here it is enabled, so the
     // above succeeded. (A wallet without [pools] transparent would reject it -8.)
 
-    // 6. Wait until zecd is caught up (so the mempool stream is open) before funding.
+    // 6. Wait until rose is caught up (so the mempool stream is open) before funding.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -261,7 +261,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached ready: {peers}"
+            "rose never reached ready: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -276,7 +276,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     funder
         .send(&taddr, FUND_ZATOSHIS)
         .await
-        .expect("send to zecd's transparent address");
+        .expect("send to rose's transparent address");
 
     // 7a. 0-conf: before any block confirms the funding tx, the transparent receive shows in
     //     `listunspent minconf=0` at the t-address with 0 confirmations - and is *not* yet listed at
@@ -284,7 +284,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     //     premature confirmation).
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let lu0 = zecd
+        let lu0 = rose
             .call("listunspent", json!([0]))
             .await
             .expect("listunspent minconf=0");
@@ -294,7 +294,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
                 .any(|u| u["address"] == json!(taddr) && u["confirmations"].as_i64() == Some(0))
         });
         if unconfirmed {
-            let lu_default = zecd
+            let lu_default = rose
                 .call("listunspent", json!([]))
                 .await
                 .expect("listunspent default minconf");
@@ -318,18 +318,18 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         .generate_blocks(12)
         .await
         .expect("confirm transparent receive");
-    // Wait for the *scan* to reach the tip, not just for a balance. zecd already counts this
+    // Wait for the *scan* to reach the tip, not just for a balance. rose already counts this
     // receive from the mempool while it is unmined, so the balance poll below is satisfied the
     // moment the blocks are mined - before the funding block has been scanned - and `listunspent`
     // (minconf 1) would still be empty.
-    zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+    rose.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
         .await
-        .expect("zecd scans the block confirming the transparent receive");
+        .expect("rose scans the block confirming the transparent receive");
 
     // 8. The confirmed transparent receive shows up in the balance/listunspent/history RPCs.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let bal = zecd
+        let bal = rose
             .call("getbalance", json!([]))
             .await
             .ok()
@@ -340,12 +340,12 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd did not reach the 1-ZEC transparent balance within {FUND_TIMEOUT:?} (got {bal})"
+            "rose did not reach the 1-ZEC transparent balance within {FUND_TIMEOUT:?} (got {bal})"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    let getbalance = zecd
+    let getbalance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance");
@@ -360,7 +360,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     // confirmations policy. (A monitoring stack passing `getbalance "*" 1` switches that call
     // alone to a symmetric 1-conf override, which is the documented way the numbers diverge -
     // a field report chased that divergence as a data inconsistency, so pin the agreement.)
-    let wi = zecd
+    let wi = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -369,7 +369,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         getbalance.as_f64(),
         "getwalletinfo.balance equals default-policy getbalance: {wi}"
     );
-    let balances = zecd
+    let balances = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances");
@@ -380,7 +380,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
 
     // listunspent lists the transparent UTXO with a real (txid, vout) outpoint and the t-address.
-    let lu = zecd
+    let lu = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -407,10 +407,10 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
 
     // The received-by aggregations credit the receive under the *bare t-address* the payer
     // actually paid, not the unified address enclosing that receiver. This is the guard for the
-    // address encoding `v_tx_outputs.to_address` reports a transparent receive at: zecd pushes
+    // address encoding `v_tx_outputs.to_address` reports a transparent receive at: rose pushes
     // the single-address filter down into SQL, so a mismatch between the filter encoding and the
     // stored encoding silently reports zero received rather than erroring.
-    let received = zecd
+    let received = rose
         .call("getreceivedbyaddress", json!([taddr]))
         .await
         .expect("getreceivedbyaddress t-addr");
@@ -419,7 +419,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         Some(1.0),
         "getreceivedbyaddress credits the bare t-address: {received}"
     );
-    let lra = zecd
+    let lra = rose
         .call("listreceivedbyaddress", json!([1, false]))
         .await
         .expect("listreceivedbyaddress");
@@ -432,7 +432,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
     // The address_filter parameter, against an address with actual funds behind it: the
     // filtered call (pushed into SQL) returns exactly the one entry with the same total.
-    let lra_f = zecd
+    let lra_f = rose
         .call("listreceivedbyaddress", json!([1, false, false, taddr]))
         .await
         .expect("listreceivedbyaddress address_filter");
@@ -450,12 +450,12 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
 
     // The opt-in gate: this wallet runs under the DEFAULT privacy policy (AllowRevealedRecipients),
     // so a fully-transparent spend is refused. librustzcash's `propose_transfer` funds payments from
-    // shielded notes only and never selects the wallet's transparent UTXOs as inputs, and zecd takes
+    // shielded notes only and never selects the wallet's transparent UTXOs as inputs, and rose takes
     // its own transparent-builder path *only* under the explicit AllowFullyTransparent policy. With
     // 1 ZEC of transparent funds but 0 shielded notes, `sendtoaddress` therefore fails -6 - proving
     // kept-transparent spending never happens by default. (`regtest_transparent_t2t` exercises the
     // AllowFullyTransparent path that *does* spend a received transparent UTXO here.)
-    let err = zecd
+    let err = rose
         .call("sendtoaddress", json!([funder_taddr, 0.5]))
         .await
         .expect_err("a fully-transparent spend is refused under the default policy");
@@ -470,13 +470,13 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     //    path that `transparent_allow_beyond_recovery_window` enables by default) sits OUTSIDE the
     //    pre-exposed gap window. The block-scan / mempool matcher works off an in-memory set of the
     //    wallet's exposed addresses, so a payment to such an address is recognized ONLY if issuing
-    //    the address refreshed that set. zecd marks the set dirty on every transparent issuance for
+    //    the address refreshed that set. rose marks the set dirty on every transparent issuance for
     //    exactly this case (see `actor::new_transparent_address`); without it, the set still holds
     //    just the original window and this receive is silently dropped. Issue well past the default
     //    gap (20), fund the last (beyond-window) address, and assert it is discovered.
     let mut beyond_taddr = String::new();
     for _ in 0..25 {
-        beyond_taddr = zecd
+        beyond_taddr = rose
             .call("getnewaddress", json!(["", "transparent"]))
             .await
             .expect("getnewaddress transparent (beyond the recovery window)")
@@ -498,7 +498,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     // missing from the set - i.e. issuance failed to mark it dirty.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let lu0 = zecd
+        let lu0 = rose
             .call("listunspent", json!([0]))
             .await
             .expect("listunspent minconf=0");
@@ -522,7 +522,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     //     addresses its index range directly would silently miss every payment. Pick an index far
     //     past everything issued so far, so nothing but this call can have exposed it.
     const EXPLICIT_INDEX: u64 = 5_000;
-    let indexed = zecd
+    let indexed = rose
         .call(
             "z_getaddressforaccount",
             json!([0, ["p2pkh"], EXPLICIT_INDEX]),
@@ -539,7 +539,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     );
     // getaddressinfo round-trips the index back, so an operator can resolve an address it sees
     // on-chain to the index it issued.
-    let ai = zecd
+    let ai = rose
         .call("getaddressinfo", json!([indexed_taddr]))
         .await
         .expect("getaddressinfo on the index-derived address");
@@ -560,7 +560,7 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         .expect("fund the index-derived transparent address");
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let lu0 = zecd
+        let lu0 = rose
             .call("listunspent", json!([0]))
             .await
             .expect("listunspent minconf=0");
@@ -590,11 +590,11 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
     //     quadratic spend-search duplication (its request generation joins each queued output to
     //     every received output of the same tx - see `actor::outstanding_requests`), so this also
     //     plants a live tripwire: the raw duplicated set for this tx alone is k^2 = 144 requests,
-    //     and the deduplicated count zecd reports stays far below it.
+    //     and the deduplicated count rose reports stays far below it.
     const FAN_OUT: usize = 12;
     let mut fan_addrs = Vec::with_capacity(FAN_OUT);
     for _ in 0..FAN_OUT {
-        let addr = zecd
+        let addr = rose
             .call("getnewaddress", json!(["", "transparent"]))
             .await
             .expect("getnewaddress transparent (fan-out)")
@@ -611,9 +611,9 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
         .generate_blocks(2)
         .await
         .expect("confirm the fan-out");
-    zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+    rose.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
         .await
-        .expect("zecd scans the fan-out");
+        .expect("rose scans the fan-out");
 
     // Sample /readyz and /status continuously while the tip advances a few more times (each
     // advance regenerates the spend-search set and re-runs the drain). Every /readyz sample must
@@ -652,9 +652,9 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
             .generate_blocks(1)
             .await
             .expect("advance the tip during the readiness window");
-        zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+        rose.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
             .await
-            .expect("zecd follows the tip during the readiness window");
+            .expect("rose follows the tip during the readiness window");
         // Linger caught-up so the sampler sees the post-scan drain, where the backlog is
         // measured (it reads 0 while scanning).
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -683,6 +683,6 @@ async fn regtest_transparent_receive_and_autoshield_spend() {
          request count - the dedup in actor::outstanding_requests has regressed"
     );
 
-    drop(zecd);
+    drop(rose);
     // `zebrad` and `funder` clean up on drop.
 }

@@ -33,7 +33,7 @@
 //! graph and canonicalization retires the orphan on its own. Over kyoto the conflict's
 //! block matches no filter and is never fetched, and BDK keeps a transaction whose anchor
 //! reorged out canonical no matter what evictions it is given - so the
-//! retirement is zecd's: a once-confirmed receive still unconfirmed after the regtest
+//! retirement is rose's: a once-confirmed receive still unconfirmed after the regtest
 //! reorg margin (6 tips) is tombstoned and the wallet reloaded, its loader stripping the
 //! stale anchor. Both legs assert the same end state.
 //!
@@ -45,13 +45,13 @@
 //! re-announced once the light client reorgs, in whatever order the peer asks, and the
 //! node's orphan handling pulls the parent for a child that arrived first.
 //!
-//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
+//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
 use std::time::{Duration, Instant};
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::{json, Value};
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn btc_wallet_follows_a_reorg_over_bitcoind() {
@@ -82,15 +82,15 @@ async fn chained_flow(backend: BtcBackend) {
     let node = BitcoinD::start(&bitcoind, &dir.path().join("btcdata")).await;
     node.mine(101).await;
 
-    let mut zecd = ZecdBtc::prepare(dir.path().join("zecddata"), backend, &node, &["btc"]);
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(101).await;
+    let mut rose = RoseBtc::prepare(dir.path().join("rosedata"), backend, &node, &["btc"]);
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(101).await;
 
     // 1. Fund at 102. The parent send is built at tip 102 (nLockTime 102) and confirms at
     //    103; the child is built at tip 103 (nLockTime 103) spending the parent's confirmed
     //    change - the wallet's only output - and confirms at 104.
-    let addr = zecd
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -101,10 +101,10 @@ async fn chained_flow(backend: BtcBackend) {
         .expect("fund");
     let fund_txid_str = fund_txid.as_str().unwrap().to_string();
     let old_102 = node.mine(1).await.remove(0);
-    zecd.wait_height(102).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
+    rose.wait_height(102).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
     let miner = node.new_address().await;
-    let parent_txid = zecd
+    let parent_txid = rose
         .call(
             "sendtoaddress",
             json!([miner, 0.25, null, null, false, null, null, null, null, 2]),
@@ -113,9 +113,9 @@ async fn chained_flow(backend: BtcBackend) {
         .expect("parent send");
     let parent_txid_str = parent_txid.as_str().unwrap().to_string();
     let old_103 = node.mine(1).await.remove(0);
-    zecd.wait_height(103).await;
-    zecd.wait_wallet_best_hash("btc", &old_103).await;
-    let child_txid = zecd
+    rose.wait_height(103).await;
+    rose.wait_wallet_best_hash("btc", &old_103).await;
+    let child_txid = rose
         .call(
             "sendtoaddress",
             json!([miner, 0.1, null, null, false, null, null, null, null, 2]),
@@ -136,9 +136,9 @@ async fn chained_flow(backend: BtcBackend) {
         "the child spends the parent's change: {child}"
     );
     let old_104 = node.mine(1).await.remove(0);
-    zecd.wait_height(104).await;
-    zecd.wait_wallet_best_hash("btc", &old_104).await;
-    let balance = zecd
+    rose.wait_height(104).await;
+    rose.wait_wallet_best_hash("btc", &old_104).await;
+    let balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance");
@@ -169,7 +169,7 @@ async fn chained_flow(backend: BtcBackend) {
             // goes straight back; the child is not (its locktime is 103), the node answers
             // non-final, and the pass retries it at the next tip - so it must NOT be in the
             // mempool yet, and must be once 103 exists.
-            zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+            rose.wait_wallet_best_hash("btc", &node.best_hash().await)
                 .await;
             node.wait_mempool_contains(&parent_txid_str).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -180,7 +180,7 @@ async fn chained_flow(backend: BtcBackend) {
             );
             let replacement_103 = node.mine_to(&replacement_miner, 1).await.remove(0);
             assert!(node.mempool().await.is_empty(), "the parent was re-mined");
-            zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+            rose.wait_wallet_best_hash("btc", &node.best_hash().await)
                 .await;
             node.wait_mempool_contains(&child_txid_str).await;
             let replacement_104 = node.mine_to(&replacement_miner, 1).await.remove(0);
@@ -193,7 +193,7 @@ async fn chained_flow(backend: BtcBackend) {
             // re-announced on detached tasks in no particular order, and a child the node
             // hears first sits in its orphanage until the parent arrives.
             node.mine_to(&replacement_miner, 3).await;
-            zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+            rose.wait_wallet_best_hash("btc", &node.best_hash().await)
                 .await;
             node.wait_mempool_contains(&parent_txid_str).await;
             node.wait_mempool_contains(&child_txid_str).await;
@@ -206,23 +206,23 @@ async fn chained_flow(backend: BtcBackend) {
 
     // 4. The wallet converges on the node: every transaction re-anchored in its
     //    replacement block, the balance and the UTXO set as before the reorg.
-    zecd.wait_height(tip).await;
-    zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+    rose.wait_height(tip).await;
+    rose.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
-    zecd.wait_wallet_balance("btc", balance).await;
+    rose.wait_wallet_balance("btc", balance).await;
     for (txid, hash, height) in [
         (&fund_txid, &replacement_102, 102u64),
         (&parent_txid, &parent_block, parent_height),
         (&child_txid, &child_block, child_height),
     ] {
-        let tx = zecd
+        let tx = rose
             .call("gettransaction", json!([txid]))
             .await
             .expect("gettransaction after the reorg");
         assert_eq!(tx["blockhash"], json!(hash), "{tx}");
         assert_eq!(tx["confirmations"], json!(tip - height + 1), "{tx}");
     }
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent after the reorg");
@@ -242,13 +242,13 @@ async fn reorg_flow(backend: BtcBackend) {
     let node = BitcoinD::start(&bitcoind, &dir.path().join("btcdata")).await;
     node.mine(101).await;
 
-    let mut zecd = ZecdBtc::prepare(dir.path().join("zecddata"), backend, &node, &["btc"]);
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(101).await;
+    let mut rose = RoseBtc::prepare(dir.path().join("rosedata"), backend, &node, &["btc"]);
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(101).await;
 
     // 1. A receive confirmed at 102 and the wallet's own send confirmed at 103.
-    let addr = zecd
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -258,10 +258,10 @@ async fn reorg_flow(backend: BtcBackend) {
         .await
         .expect("fund");
     let old_102 = node.mine(1).await.remove(0);
-    zecd.wait_height(102).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
+    rose.wait_height(102).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
     let miner = node.new_address().await;
-    let send_txid = zecd
+    let send_txid = rose
         .call(
             "sendtoaddress",
             json!([miner, 0.25, null, null, false, null, null, null, null, 2]),
@@ -269,15 +269,15 @@ async fn reorg_flow(backend: BtcBackend) {
         .await
         .expect("send");
     let old_103 = node.mine(1).await.remove(0);
-    zecd.wait_height(103).await;
-    let balance = zecd
+    rose.wait_height(103).await;
+    let balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance");
     let balance = balance.as_f64().unwrap();
     assert!(balance > 0.74 && balance < 0.75, "{balance}");
     for (txid, hash) in [(&fund_txid, &old_102), (&send_txid, &old_103)] {
-        let tx = zecd
+        let tx = rose
             .call("gettransaction", json!([txid]))
             .await
             .expect("gettransaction");
@@ -326,7 +326,7 @@ async fn reorg_flow(backend: BtcBackend) {
         BtcBackend::Bitcoind => {
             // The emitter mirrors the node's `invalidateblock`: at the replacement 102 the
             // wallet unconfirms the send, and its locktime is final for the next block.
-            zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+            rose.wait_wallet_best_hash("btc", &node.best_hash().await)
                 .await;
             node.wait_mempool_contains(&send_txid_str).await;
             let blocks = node.mine_to(&replacement_miner, 2).await;
@@ -336,7 +336,7 @@ async fn reorg_flow(backend: BtcBackend) {
             // A light client follows work: the replacement chain has to outgrow the old
             // 103-block tail before it reorgs onto it, so the send is resubmitted at 104.
             node.mine_to(&replacement_miner, 2).await;
-            zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+            rose.wait_wallet_best_hash("btc", &node.best_hash().await)
                 .await;
             node.wait_mempool_contains(&send_txid_str).await;
             let blocks = node.mine_to(&replacement_miner, 1).await;
@@ -348,24 +348,24 @@ async fn reorg_flow(backend: BtcBackend) {
 
     //    The wallet walks back to the fork and follows the replacement tail past the old
     //    tip, converging on the node's best block.
-    zecd.wait_height(tip).await;
-    zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+    rose.wait_height(tip).await;
+    rose.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
-    zecd.wait_wallet_balance("btc", balance).await;
+    rose.wait_wallet_balance("btc", balance).await;
     // Both transactions are re-anchored in their replacement blocks.
     let send_confirmations = tip - send_height + 1;
     for (txid, hash, confirmations) in [
         (&fund_txid, &replacement_102, tip - 102 + 1),
         (&send_txid, &send_block, send_confirmations),
     ] {
-        let tx = zecd
+        let tx = rose
             .call("gettransaction", json!([txid]))
             .await
             .expect("gettransaction after the reorg");
         assert_eq!(tx["blockhash"], json!(hash), "{tx}");
         assert_eq!(tx["confirmations"], json!(confirmations), "{tx}");
     }
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent after the reorg");
@@ -381,7 +381,7 @@ async fn reorg_flow(backend: BtcBackend) {
         "{unspent}"
     );
     // And the wallet still serves: a fresh address and a consistent history.
-    let next = zecd
+    let next = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress after the reorg");
@@ -444,8 +444,8 @@ async fn reorg_flow(backend: BtcBackend) {
         .await
         .expect("decode the second receive");
     let old_orphan_block = node.mine(1).await.remove(0);
-    zecd.wait_height(orphan_height).await;
-    zecd.wait_wallet_balance("btc", balance + 0.5).await;
+    rose.wait_height(orphan_height).await;
+    rose.wait_wallet_balance("btc", balance + 0.5).await;
     node.call("invalidateblock", json!([old_orphan_block]))
         .await
         .expect("invalidateblock the orphaned receive's block");
@@ -511,19 +511,19 @@ async fn reorg_flow(backend: BtcBackend) {
         .expect("the conflict is on chain");
     assert_eq!(conflict["blockhash"], json!(replacement[0]), "{conflict}");
 
-    zecd.wait_height(orphan_height + 1).await;
-    zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+    rose.wait_height(orphan_height + 1).await;
+    rose.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
-    zecd.wait_wallet_balance("btc", balance).await;
+    rose.wait_wallet_balance("btc", balance).await;
     if backend == BtcBackend::Kyoto {
         // No verdict on this backend: the retirement is on time. The receive fell out at
         // the reorg (the wallet's tip orphan_height + 1); the actor retires it once the tip
         // is `anchor_reorg_margin` (6 on regtest) past that. One block of slack.
         node.mine_to(&replacement_miner, 7).await;
-        zecd.wait_height(orphan_height + 8).await;
+        rose.wait_height(orphan_height + 8).await;
     }
-    zecd.wait_unconfirmed(0.0).await;
-    let unspent = zecd
+    rose.wait_unconfirmed(0.0).await;
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent after the double-spend");
@@ -537,7 +537,7 @@ async fn reorg_flow(backend: BtcBackend) {
     // as `walletconflicts` is not implemented - see `src/btc/README.md`).
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        match zecd.call("gettransaction", json!([orphan_txid])).await {
+        match rose.call("gettransaction", json!([orphan_txid])).await {
             Err((-5, _)) => break,
             other => assert!(
                 Instant::now() < deadline,

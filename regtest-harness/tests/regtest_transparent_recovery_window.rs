@@ -9,18 +9,18 @@
 //!     handing out distinct sequential t-addresses (warn-only once past the recovery horizon).
 //!
 //! No funding/restore is needed - this exercises the address-generation policy directly, so it
-//! needs only zebrad (for a chain tip) and zecd. Standard tier: it's the guard for the
+//! needs only zebrad (for a chain tip) and rose. Standard tier: it's the guard for the
 //! recovery-window hard-stop and the beyond-gap issuance path.
 //!
 //! Skips cleanly unless `ZEBRAD_BIN` is set.
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    pick_port, resolve_node_bin, RegtestNode, RpcError, Zebrad, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    pick_port, resolve_node_bin, RegtestNode, Rose, RoseConfig, RpcError, Zebrad,
     SEED_MINER_ADDRESS,
 };
+use serde_json::json;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Small gap so the window is reached after only a few addresses (CI speed). The mechanism is
@@ -40,7 +40,7 @@ async fn regtest_transparent_recovery_window_hard_stop_and_allow_beyond() {
         return;
     };
 
-    // A minimal chain so zecd has a tip to sync to and can serve getnewaddress.
+    // A minimal chain so rose has a tip to sync to and can serve getnewaddress.
     let zebrad = Zebrad::start_with_miner(&zebrad_bin, SEED_MINER_ADDRESS)
         .await
         .expect("start zebrad");
@@ -50,13 +50,13 @@ async fn regtest_transparent_recovery_window_hard_stop_and_allow_beyond() {
         .expect("mine a short regtest chain");
 
     // --- Wallet A: fail closed past the recovery window. ---
-    let mut closed_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
+    let mut closed_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
     closed_cfg.transparent = true;
     closed_cfg.transparent_gap_limit = Some(SMALL_GAP);
     closed_cfg.transparent_allow_beyond_recovery_window = Some(false);
-    let closed = Zecd::start(&closed_cfg)
+    let closed = Rose::start(&closed_cfg)
         .await
-        .expect("start the fail-closed zecd");
+        .expect("start the fail-closed rose");
     wait_for_ready(&closed, READY_TIMEOUT).await;
 
     // The account's default address already consumes part of the external window - and its index
@@ -108,13 +108,13 @@ async fn regtest_transparent_recovery_window_hard_stop_and_allow_beyond() {
     drop(closed);
 
     // --- Wallet B: default (allow beyond, warn-only) keeps issuing. ---
-    let mut open_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
+    let mut open_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rpc port"));
     open_cfg.transparent = true;
     open_cfg.transparent_gap_limit = Some(SMALL_GAP);
     // transparent_allow_beyond_recovery_window left at its default (true).
-    let open = Zecd::start(&open_cfg)
+    let open = Rose::start(&open_cfg)
         .await
-        .expect("start the allow-beyond zecd");
+        .expect("start the allow-beyond rose");
     wait_for_ready(&open, READY_TIMEOUT).await;
 
     let mut addrs = Vec::new();
@@ -137,19 +137,19 @@ async fn regtest_transparent_recovery_window_hard_stop_and_allow_beyond() {
 }
 
 /// `getnewaddress "" "transparent"`, returning the bare t-address string.
-async fn new_transparent(zecd: &Zecd) -> Result<String, RpcError> {
-    let v = zecd
+async fn new_transparent(rose: &Rose) -> Result<String, RpcError> {
+    let v = rose
         .call("getnewaddress", json!(["", "transparent"]))
         .await?;
     Ok(v.as_str().expect("address string").to_string())
 }
 
-/// Block until zecd reports its upstream peer `ready` (caught up; a chain tip is known so
+/// Block until rose reports its upstream peer `ready` (caught up; a chain tip is known so
 /// `getnewaddress` can derive within the gap).
-async fn wait_for_ready(zecd: &Zecd, timeout: Duration) {
+async fn wait_for_ready(rose: &Rose, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -162,7 +162,7 @@ async fn wait_for_ready(zecd: &Zecd, timeout: Duration) {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached ready: {peers}"
+            "rose never reached ready: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

@@ -1,7 +1,7 @@
-# zecd on Bitcoin MAINNET over the kyoto (BIP-157) light client, WATCH-ONLY: the shape for a
+# rose on Bitcoin MAINNET over the kyoto (BIP-157) light client, WATCH-ONLY: the shape for a
 # service that issues deposit addresses and watches for payments without holding a key.
 # Built from a spending wallet's exported account xpub
-# (`zecd --conf deploy/zecd.btc-mainnet.toml export-xpub --wallet btc`, or the BIP 84
+# (`rose --conf deploy/rose.btc-mainnet.toml export-xpub --wallet btc`, or the BIP 84
 # first-account xpub of any other wallet) and peered with the project's own mainnet
 # replicas, which serve compact block filters on their public P2P port
 # (-blockfilterindex + -peerblockfilters, deploy/docker-compose.btc-mainnet.yml).
@@ -12,14 +12,14 @@
 # stay valid across it. The RPC password grants VIEW access (balances, every address and
 # transaction) - keep it as private as any credential.
 #
-# Needs a zecd built with the `bitcoin` feature - the release images carry it, a default
+# Needs a rose built with the `bitcoin` feature - the release images carry it, a default
 # `cargo build` does not. Probe:
-#   zecd --conf deploy/zecd.btc-mainnet-view.toml config check
+#   rose --conf deploy/rose.btc-mainnet-view.toml config check
 #
 # Bring-up (offline: kyoto init dials nothing):
-#   zecd --conf deploy/zecd.btc-mainnet-view.toml init --wallet view \
+#   rose --conf deploy/rose.btc-mainnet-view.toml init --wallet view \
 #       --xpub '[fingerprint/84h/0h/0h]xpub...' --birthday 2026-09-01
-#   ZECD_RPC_PASSWORD=... zecd --conf deploy/zecd.btc-mainnet-view.toml
+#   ROSE_RPC_PASSWORD=... rose --conf deploy/rose.btc-mainnet-view.toml
 #
 # `--birthday` is REQUIRED on a mainnet xpub import (the alternative is a scan from SegWit
 # activation). A date or height resolves offline from the shipped per-day table to a
@@ -58,20 +58,20 @@ lookahead = 200
 # ~150-300 MB a day at raw size, no server) - which is why the section is commented out
 # here; `sources = []` turns it off. Add p2p_snapshot = true only once the replicas grant
 # this host the `mempool` permission (-whitelist=mempool@<host>), since Core disconnects a
-# peer that asks without it. See deploy/zecd.btc-mainnet.toml and
-# deploy/zecd.btc-testnet4-kyoto.toml for the full note and the mempool.space alternative.
+# peer that asks without it. See deploy/rose.btc-mainnet.toml and
+# deploy/rose.btc-testnet4-kyoto.toml for the full note and the mempool.space alternative.
 # [mempool]
 # sources = ["p2p"]      # the default; `sources = []` is the off switch
 # p2p_snapshot = true
 
 [rpc]
-# zecd's own Bitcoin-Core-dialect JSON-RPC. Loopback here; a container whose clients are
+# rose's own Bitcoin-Core-dialect JSON-RPC. Loopback here; a container whose clients are
 # sibling services binds the interface they reach it on instead, and nothing wider - the
 # password grants full view access.
 bind = "127.0.0.1"
 port = 8233
 user = "view"
-# Refused as-is on every network: set ZECD_RPC_PASSWORD in the environment.
+# Refused as-is on every network: set ROSE_RPC_PASSWORD in the environment.
 password = "CHANGE-ME"
 
 [sync]

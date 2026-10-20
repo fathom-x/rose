@@ -463,6 +463,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rose-regtest-harness"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -869,17 +880,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
-]
-
-[[package]]
-name = "zecd-regtest-harness"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "reqwest",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

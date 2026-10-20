@@ -89,7 +89,7 @@ pub struct ZebraAuth {
 
 impl ZebraAuth {
     /// Whether any credential source is configured, without reading the cookie file. This is
-    /// what decides whether the cleartext gate applies, so `zecd config check` can reach the
+    /// what decides whether the cleartext gate applies, so `rose config check` can reach the
     /// same verdict as a connect would on a host where zebrad's cookie does not exist yet.
     pub fn is_configured(&self) -> bool {
         self.cookie.is_some() || self.user.is_some() || self.password.is_some()
@@ -134,7 +134,7 @@ impl ZebraAuth {
         }
 
         let mut hasher = Sha256::new();
-        hasher.update(b"zecd zebra auth v1");
+        hasher.update(b"rose zebra auth v1");
         field(&mut hasher, 0, self.user.as_deref().map(str::as_bytes));
         field(
             &mut hasher,
@@ -305,7 +305,7 @@ impl ZebraClient {
             .acquire()
             .await
             .expect("the in-flight semaphore is never closed");
-        let body = json!({ "jsonrpc": "2.0", "id": "zecd", "method": method, "params": params });
+        let body = json!({ "jsonrpc": "2.0", "id": "rose", "method": method, "params": params });
         let mut req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(self.url.clone())
@@ -592,7 +592,7 @@ pub struct ZebraSource {
     client: ZebraClient,
     network: ZNetwork,
     /// zebrad's `getblockchaininfo.chain`, captured at connect, used to fill the protobuf
-    /// `TreeState.network` field (informational; nothing in zecd reads it back).
+    /// `TreeState.network` field (informational; nothing in rose reads it back).
     chain_name: String,
     /// Poll cadence for the synthesized mempool stream; tests shrink this.
     mempool_poll: Duration,
@@ -1381,12 +1381,12 @@ mod tests {
                         .copied()
                 })
                 .flatten();
-            let reply = |v: Value| Json(json!({ "result": v, "error": null, "id": "zecd" }));
+            let reply = |v: Value| Json(json!({ "result": v, "error": null, "id": "rose" }));
             let err = |code: i64, msg: &str| {
                 Json(json!({
                     "result": null,
                     "error": { "code": code, "message": msg },
-                    "id": "zecd"
+                    "id": "rose"
                 }))
             };
             let response = match method.as_str() {
@@ -1445,7 +1445,7 @@ mod tests {
                     (Some(error), _) => Json(json!({
                         "result": null,
                         "error": error.clone(),
-                        "id": "zecd"
+                        "id": "rose"
                     })),
                     (None, Ok(txid)) => reply(json!(txid)),
                     (None, Err((code, msg))) => err(*code, msg),

@@ -1,5 +1,5 @@
 //! Account-to-keys binding: the cryptographic tie between the wallet database's account and
-//! `keys.toml`, zecd's root of trust.
+//! `keys.toml`, rose's root of trust.
 //!
 //! The wallet database (`data.sqlite`) is a rebuildable cache of on-chain data, but one datum
 //! in it is security-critical and has no on-chain check: *which account the daemon serves*.
@@ -11,11 +11,11 @@
 //! The defense is a pin, not a hash: `keys.toml` (0600, operator-controlled, and already the
 //! at-rest home of the mnemonic) records the account's Unified Full Viewing Key at init. The
 //! UFVK is derivable from the seed, so the pin is a cache of seed-derivable data and respects
-//! zecd's statelessness invariant (see the project docs). Four layers use it:
+//! rose's statelessness invariant (see the project docs). Four layers use it:
 //!
-//! 1. `zecd init` refuses a wallet database that already contains an account
+//! 1. `rose init` refuses a wallet database that already contains an account
 //!    (`init::ensure_no_preexisting_account`).
-//! 2. `zecd init` pins the new account's UFVK into `keys.toml` (all three custody models).
+//! 2. `rose init` pins the new account's UFVK into `keys.toml` (all three custody models).
 //! 3. Every startup verifies the DB-selected account against the pin and fails closed on a
 //!    mismatch ([`verify_or_pin_account`]). A pre-pin (legacy) `keys.toml` is upgraded by
 //!    pinning the current account, trust-on-first-use.
@@ -59,7 +59,7 @@ impl std::fmt::Display for BindingMismatch {
 impl std::error::Error for BindingMismatch {}
 
 /// The network-scoped string encoding of the account's Unified Full Viewing Key. This is the
-/// canonical form for pinning and comparison (the same encoding `zecd export-ufvk` prints).
+/// canonical form for pinning and comparison (the same encoding `rose export-ufvk` prints).
 pub fn account_ufvk_encoded(
     network: ZNetwork,
     db: &WriteDb,
@@ -114,14 +114,14 @@ pub fn verify_or_pin_account(
             "wallet '{name}': the account in the wallet database does not match the key pinned \
              in keys.toml (pinned {}, database has {}). The database was replaced or belongs to \
              a different wallet; refusing to serve it. Restore the matching database, or re-run \
-             `zecd init` in a fresh data directory.",
+             `rose init` in a fresh data directory.",
             abbrev(p),
             abbrev(account_ufvk)
         )))),
         None => {
             WalletStore::pin_ufvk(keys_path, account_ufvk)?;
             info!(
-                target: "zecd::audit",
+                target: "rose::audit",
                 "pinned the wallet account's unified full viewing key into keys.toml \
                  (pre-existing wallet upgraded); future startups verify the wallet database \
                  against this pin"

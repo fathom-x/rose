@@ -1,18 +1,18 @@
 //! Multiwallet tests: one spending wallet plus any number of watch-only (UFVK) wallets, served
 //! by a single daemon. Exercises `/wallet/<name>` routing, `listwallets`, the `-18`
-//! unknown-wallet error, and the **single-spending-wallet invariant** (zecd loads at most one
+//! unknown-wallet error, and the **single-spending-wallet invariant** (rose loads at most one
 //! wallet with spending keys; a second one makes the daemon refuse to start) - none of which the
 //! single-wallet suites can reach.
 //!
-//! Extended tier: set `ZECD_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN).
+//! Extended tier: set `ROSE_REGTEST_EXTENDED=1` (plus ZEBRAD_BIN).
 //! Skips cleanly otherwise.
 
 use std::time::Duration;
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    extended_enabled, pick_port, resolve_node_bin, RegtestNode, Zebrad, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    extended_enabled, pick_port, resolve_node_bin, RegtestNode, Rose, RoseConfig, Zebrad,
 };
+use serde_json::json;
 
 const INITIAL_BLOCKS: u32 = 10;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -24,7 +24,7 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 async fn regtest_multiwallet_routing_and_isolation() {
     if !extended_enabled() {
         eprintln!(
-            "SKIP regtest_multiwallet_routing_and_isolation: set ZECD_REGTEST_EXTENDED=1 to run \
+            "SKIP regtest_multiwallet_routing_and_isolation: set ROSE_REGTEST_EXTENDED=1 to run \
              the extended tier."
         );
         return;
@@ -46,17 +46,17 @@ async fn regtest_multiwallet_routing_and_isolation() {
 
     // `default` spends; `w2` and `w3` are watch-only replicas of it (any number are allowed
     // alongside the single spender).
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.extra_watch_only_wallets = vec!["w2".to_string(), "w3".to_string()];
-    let zecd = Zecd::start(&cfg)
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd with one spending + two watch-only wallets");
-    zecd.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
+        .expect("start rose with one spending + two watch-only wallets");
+    rose.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
         .await
-        .expect("zecd scans the chain");
+        .expect("rose scans the chain");
 
     // All three wallets are loaded and reported (sorted, as bitcoind does).
-    let lw = zecd
+    let lw = rose
         .call("listwallets", json!([]))
         .await
         .expect("listwallets");
@@ -68,7 +68,7 @@ async fn regtest_multiwallet_routing_and_isolation() {
 
     // /wallet/<name> routes to the named wallet: getwalletinfo names the wallet that answered,
     // and only the spending wallet reports private_keys_enabled.
-    let wi_default = zecd
+    let wi_default = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo (default)");
@@ -79,7 +79,7 @@ async fn regtest_multiwallet_routing_and_isolation() {
         "the default wallet holds spending keys: {wi_default}"
     );
     for w in ["w2", "w3"] {
-        let wi = zecd
+        let wi = rose
             .call_wallet(w, "getwalletinfo", json!([]))
             .await
             .expect("getwalletinfo (/wallet/<name>)");
@@ -92,7 +92,7 @@ async fn regtest_multiwallet_routing_and_isolation() {
     }
 
     // getnewaddress works on every wallet (the watch-only replicas derive from the viewing key).
-    let addr_default = zecd
+    let addr_default = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress (default)")
@@ -103,7 +103,7 @@ async fn regtest_multiwallet_routing_and_isolation() {
         addr_default.starts_with("uregtest1"),
         "default address: {addr_default}"
     );
-    let addr_w2 = zecd
+    let addr_w2 = rose
         .call_wallet("w2", "getnewaddress", json!([]))
         .await
         .expect("getnewaddress (/wallet/w2)")
@@ -113,19 +113,19 @@ async fn regtest_multiwallet_routing_and_isolation() {
     assert!(addr_w2.starts_with("uregtest1"), "w2 address: {addr_w2}");
 
     // An unknown wallet path is Bitcoin Core's -18 (wallet not found).
-    let err = zecd
+    let err = rose
         .call_wallet("nope", "getbalance", json!([]))
         .await
         .expect_err("an unknown wallet must fail");
     assert_eq!(err.code(), Some(-18), "expected -18, got: {err}");
 
-    // zecd is stateless: there is no off-chain label store, so the label methods are removed
+    // rose is stateless: there is no off-chain label store, so the label methods are removed
     // entirely (method-not-found, -32601) - on every wallet route, default and watch-only alike.
     for w in ["w2", "default"] {
         let err = match w {
-            "default" => zecd.call("setlabel", json!([addr_w2, "x"])).await,
+            "default" => rose.call("setlabel", json!([addr_w2, "x"])).await,
             other => {
-                zecd.call_wallet(other, "setlabel", json!([addr_w2, "x"]))
+                rose.call_wallet(other, "setlabel", json!([addr_w2, "x"]))
                     .await
             }
         }
@@ -140,12 +140,12 @@ async fn regtest_multiwallet_routing_and_isolation() {
     // The watch-only replicas refuse spending and passphrase RPCs with Bitcoin Core's codes
     // (-4 private keys disabled, -15 passphrase RPC unsupported), independently per wallet.
     for w in ["w2", "w3"] {
-        let err = zecd
+        let err = rose
             .call_wallet(w, "sendtoaddress", json!([addr_default, 0.1]))
             .await
             .expect_err("a watch-only wallet must refuse to send");
         assert_eq!(err.code(), Some(-4), "expected -4 on {w}, got: {err}");
-        let err = zecd
+        let err = rose
             .call_wallet(w, "walletpassphrase", json!(["pw", 60]))
             .await
             .expect_err("a watch-only wallet has no passphrase");
@@ -154,12 +154,12 @@ async fn regtest_multiwallet_routing_and_isolation() {
 
     // The lone spending wallet keeps its full spending surface: passphrase RPCs are -15 while
     // it is unencrypted, and a send fails only on funds (-6), not on private-key availability.
-    let err = zecd
+    let err = rose
         .call("walletpassphrase", json!(["x", 60]))
         .await
         .expect_err("the default wallet is unencrypted");
     assert_eq!(err.code(), Some(-15), "expected -15, got: {err}");
-    let err = zecd
+    let err = rose
         .call("sendtoaddress", json!([addr_w2, 0.1]))
         .await
         .expect_err("the default wallet has no funds");
@@ -174,7 +174,7 @@ async fn regtest_multiwallet_routing_and_isolation() {
 async fn regtest_second_spending_wallet_refused_at_init() {
     if !extended_enabled() {
         eprintln!(
-            "SKIP regtest_second_spending_wallet_refused_at_init: set ZECD_REGTEST_EXTENDED=1 to \
+            "SKIP regtest_second_spending_wallet_refused_at_init: set ROSE_REGTEST_EXTENDED=1 to \
              run the extended tier."
         );
         return;
@@ -196,9 +196,9 @@ async fn regtest_second_spending_wallet_refused_at_init() {
 
     // Config lists both `default` and `w2` as spending wallets; init `default`, then attempt to
     // init `w2` - the guard sees the existing spender and refuses.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.extra_wallets = vec!["w2".to_string()];
-    let stderr = Zecd::init_second_spending_expect_refusal(&cfg, "w2")
+    let stderr = Rose::init_second_spending_expect_refusal(&cfg, "w2")
         .await
         .expect("a second spending wallet must be refused at init");
     assert!(

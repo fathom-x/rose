@@ -1,4 +1,4 @@
-//! Transparent offline-window restore, on **whichever backend** `ZECD_REGTEST_BACKEND` selects:
+//! Transparent offline-window restore, on **whichever backend** `ROSE_REGTEST_BACKEND` selects:
 //! a wallet receives on a t-address and spends it, then goes away; a from-seed restore that never
 //! saw either transaction live must recover the **full receive+send pair**.
 //!
@@ -8,8 +8,8 @@
 //! blocks; a versioned-protocol lightwalletd carries transparent data in compact blocks), so the
 //! receive half is covered. Transparent *spends* ride neither: the block-scan matcher only
 //! inspects outputs (`engine::owned_transparent_output`), so a spend is discovered solely when
-//! librustzcash asks zecd to check an address via `TransactionDataRequest::
-//! TransactionsInvolvingAddress`. When zecd records a UTXO itself - which is exactly what the
+//! librustzcash asks rose to check an address via `TransactionDataRequest::
+//! TransactionsInvolvingAddress`. When rose records a UTXO itself - which is exactly what the
 //! block-scan matcher does - librustzcash was observed never to emit that spend-search, so the
 //! spend is never found and the restore shows a receive with no matching send.
 //!
@@ -22,11 +22,11 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+use rose_regtest_harness::{
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Rose, RoseConfig,
+    Zebrad,
 };
+use serde_json::json;
 
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
@@ -56,15 +56,15 @@ async fn regtest_transparent_offline_receive_and_spend_are_restored() {
     // A. The authoring wallet: transparent receiving plus fully-transparent spends, so the t→t
     //    send keeps its change transparent and never touches a shielded pool.
     let pre_fund_height = tip_height(&zebrad).await;
-    let mut author_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
+    let mut author_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
     author_cfg.transparent = true;
     author_cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
     let _author_backend = attach_backend(&mut author_cfg, zebrad.rpc_port)
         .await
         .expect("attach the author's backend");
-    let author = Zecd::start(&author_cfg)
+    let author = Rose::start(&author_cfg)
         .await
-        .expect("start the authoring zecd");
+        .expect("start the authoring rose");
     let mnemonic = author
         .mnemonic
         .clone()
@@ -148,7 +148,7 @@ async fn regtest_transparent_offline_receive_and_spend_are_restored() {
         .await
         .expect("author sees its own spend confirmed");
     // Sanity: the authoring wallet - which watched both transactions live - has the full pair.
-    // If this fails the test is wrong, not zecd.
+    // If this fails the test is wrong, not rose.
     let author_txs = author
         .call("listtransactions", json!(["*", 100]))
         .await
@@ -180,14 +180,14 @@ async fn regtest_transparent_offline_receive_and_spend_are_restored() {
 
     // B. The from-seed restore: same seed, birthday before the funding, its own backend instance.
     //    It never saw either transaction live, so everything must come from the chain.
-    let mut restore_cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
+    let mut restore_cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("rpc port"));
     restore_cfg.transparent = true;
     restore_cfg.restore_mnemonic = Some(mnemonic);
     restore_cfg.birthday = Some(pre_fund_height.saturating_sub(1).max(1));
     let _restore_backend = attach_backend(&mut restore_cfg, zebrad.rpc_port)
         .await
         .expect("attach the restore's backend");
-    let restore = Zecd::start(&restore_cfg)
+    let restore = Rose::start(&restore_cfg)
         .await
         .expect("restore the wallet from seed");
     let tip = tip_height(&zebrad).await;
@@ -247,7 +247,7 @@ async fn regtest_transparent_offline_receive_and_spend_are_restored() {
 /// choreography runs against a lightwalletd, and telling the two apart matters when only one
 /// fails.
 fn backend_label() -> &'static str {
-    if zecd_regtest_harness::zecd_backend_is_lwd() {
+    if rose_regtest_harness::rose_backend_is_lwd() {
         "lightwalletd"
     } else {
         "zebra"

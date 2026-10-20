@@ -25,8 +25,8 @@
 //! `sendrawtransaction` whose bytes reached no node answers `-25` rather than a txid (Core
 //! never returns one without mempool acceptance), while still re-recording the transaction.
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, RoseBtc, RpcProxy};
 use serde_json::json;
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, RpcProxy, ZecdBtc};
 
 /// `sendtoaddress` with Core's positional layout: param 9 is the explicit `fee_rate`
 /// (sat/vB), which keeps every send off the estimator and prices it exactly.
@@ -42,13 +42,13 @@ fn send_params(to: &str, amount: f64, fee_rate: u32) -> serde_json::Value {
 /// sometimes. The refusal comes before coin selection, so it says nothing about what the
 /// test asserts; any other answer is returned for the caller to check.
 async fn call_when_connected(
-    zecd: &ZecdBtc,
+    rose: &RoseBtc,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, (i64, String)> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        match zecd.call(method, params.clone()).await {
+        match rose.call(method, params.clone()).await {
             Err((-4, msg)) if msg.contains("no connection to the upstream") => {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -78,11 +78,11 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
     node.mine(101).await;
     let proxy = RpcProxy::start(node.rpc_port).await;
 
-    let mut zecd = ZecdBtc::prepare_bitcoind_at(dir.path().join("zecddata"), proxy.port, &["btc"]);
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(101).await;
-    let addr = zecd
+    let mut rose = RoseBtc::prepare_bitcoind_at(dir.path().join("rosedata"), proxy.port, &["btc"]);
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(101).await;
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -91,18 +91,18 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
         .await
         .expect("fund");
     node.mine(1).await;
-    zecd.wait_height(102).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
+    rose.wait_height(102).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
     let miner = node.new_address().await;
 
     // 1. Rejected: the node's verdict passes through and the record is withdrawn.
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("sendtoaddress", send_params(&miner, 0.1, 1))
         .await
         .expect_err("a send under the node's relay floor is refused by the node");
     assert_eq!(code, -26, "{msg}");
     assert!(msg.contains("min relay fee"), "{msg}");
-    let balance = zecd
+    let balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance");
@@ -111,7 +111,7 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
         Some(1.0),
         "the rejected send's input is not locked"
     );
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([0]))
         .await
         .expect("listunspent 0");
@@ -120,7 +120,7 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
         Some(1),
         "the funding output is still the one unspent output: {unspent}"
     );
-    let history = zecd
+    let history = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
@@ -137,7 +137,7 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
     // 2. No verdict: the broadcast itself fails, the record stands, the rebroadcast pass
     //    carries it once the path clears.
     proxy.drop_method(Some("sendrawtransaction"));
-    let txid = zecd
+    let txid = rose
         .call("sendtoaddress", send_params(&miner, 0.1, 10))
         .await
         .expect("a send with no verdict is committed and returns its txid");
@@ -146,12 +146,12 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
         !node.mempool().await.contains(&txid),
         "the dropped broadcast never reached the node"
     );
-    let tx = zecd
+    let tx = rose
         .call("gettransaction", json!([txid]))
         .await
         .expect("the unrelayed send is a wallet transaction");
     assert_eq!(tx["confirmations"], json!(0), "{tx}");
-    let (code, msg) = call_when_connected(&zecd, "sendtoaddress", send_params(&miner, 0.95, 10))
+    let (code, msg) = call_when_connected(&rose, "sendtoaddress", send_params(&miner, 0.95, 10))
         .await
         .expect_err("the unrelayed send's input is locked against a retry");
     assert_eq!(code, -6, "{msg}");
@@ -160,13 +160,13 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
     proxy.drop_method(None);
     node.wait_mempool_contains(&txid).await;
     node.mine(1).await;
-    zecd.wait_height(103).await;
-    let tx = zecd
+    rose.wait_height(103).await;
+    let tx = rose
         .call("gettransaction", json!([txid]))
         .await
         .expect("the resubmitted send");
     assert_eq!(tx["confirmations"], json!(1), "{tx}");
-    let after_send = zecd
+    let after_send = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")
@@ -180,27 +180,27 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
     // 3. Abandon an unrelayed send, then resubmit its bytes: the record must come back
     //    before the relay, so the inputs the node now sees spent are spent here too.
     proxy.drop_method(Some("sendrawtransaction"));
-    let txid2 = zecd
+    let txid2 = rose
         .call("sendtoaddress", send_params(&miner, 0.2, 10))
         .await
         .expect("a second unrelayed send");
     let txid2 = txid2.as_str().unwrap().to_string();
-    let hex = zecd
+    let hex = rose
         .call("gettransaction", json!([txid2]))
         .await
         .expect("gettransaction")["hex"]
         .as_str()
         .unwrap()
         .to_string();
-    zecd.call("abandontransaction", json!([txid2]))
+    rose.call("abandontransaction", json!([txid2]))
         .await
         .expect("abandon an unrelayed send");
-    let (code, msg) = zecd
+    let (code, msg) = rose
         .call("gettransaction", json!([txid2]))
         .await
         .expect_err("an abandoned transaction leaves the canonical set");
     assert_eq!(code, -5, "{msg}");
-    let after_abandon = zecd
+    let after_abandon = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")
@@ -210,25 +210,25 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
     // Still no path to the node: sendrawtransaction does not answer a txid for bytes that
     // reached no mempool (Core never does) - it is -25, and the record is re-committed all
     // the same, so the input stays spent here while the rebroadcast pass carries it.
-    let (code, msg) = call_when_connected(&zecd, "sendrawtransaction", json!([hex]))
+    let (code, msg) = call_when_connected(&rose, "sendrawtransaction", json!([hex]))
         .await
         .expect_err("an unrelayed sendrawtransaction is not a success");
     assert_eq!(code, -25, "{msg}");
-    zecd.call("gettransaction", json!([txid2]))
+    rose.call("gettransaction", json!([txid2]))
         .await
         .expect("the unrelayed resubmission is recorded again");
     proxy.drop_method(None);
-    let relayed = call_when_connected(&zecd, "sendrawtransaction", json!([hex]))
+    let relayed = call_when_connected(&rose, "sendrawtransaction", json!([hex]))
         .await
         .expect("resubmit the abandoned send's bytes");
     assert_eq!(relayed, json!(txid2));
     node.wait_mempool_contains(&txid2).await;
-    let tx = zecd
+    let tx = rose
         .call("gettransaction", json!([txid2]))
         .await
         .expect("the resubmitted transaction is canonical again");
     assert_eq!(tx["confirmations"], json!(0), "{tx}");
-    let after_resubmit = zecd
+    let after_resubmit = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")
@@ -239,8 +239,8 @@ async fn btc_send_record_follows_the_relay_outcome_over_bitcoind() {
         "the resubmitted send's input is spent again: {after_resubmit} vs {after_abandon}"
     );
     node.mine(1).await;
-    zecd.wait_height(104).await;
-    let tx = zecd
+    rose.wait_height(104).await;
+    let tx = rose
         .call("gettransaction", json!([txid2]))
         .await
         .expect("the resubmitted send confirmed");

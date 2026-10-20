@@ -1,9 +1,9 @@
 # Zakura Common vs librustzcash - is the switch worth keeping?
 
 **Recommendation: yes, switch permanently.** On the same machine, the same regtest chain and the
-same funder, a zecd built on the Zakura Common forks proves an Orchard/Ironwood send about
+same funder, a rose built on the Zakura Common forks proves an Orchard/Ironwood send about
 **4x faster per action**, builds its proving keys **11x faster**, verifies **2x faster**, and
-trial-decrypts **1.3-1.7x faster** than the same zecd built on upstream librustzcash. End to end,
+trial-decrypts **1.3-1.7x faster** than the same rose built on upstream librustzcash. End to end,
 a one-input `sendtoaddress` went from ~3.5 s to ~0.66 s and a 16-output fan-out from ~15 s to
 ~3.2 s. Nothing about the wallet, its database, addresses, keys or the RPC surface changed, every
 regtest leg passes, and the forks keep librustzcash's API so the switch is a Cargo-level rename.
@@ -16,7 +16,7 @@ upstream orchard's own criterion benches run unmodified against both crates.
 
 ## Method
 
-Two `zecd` release binaries from the same source tree, differing only in the Zcash stack:
+Two `rose` release binaries from the same source tree, differing only in the Zcash stack:
 
 | label | tree | stack |
 | --- | --- | --- |
@@ -25,9 +25,9 @@ Two `zecd` release binaries from the same source tree, differing only in the Zca
 | `zakura-orbits` | + `orbits` feature and `ProvingKey::prepare_proving()` at startup | same |
 | `zakura-shared` | + share the fork's process-wide key cache, pass a cached verifying key to the extractor (what shipped) | same |
 
-The end-to-end benchmark (`ZECD_BENCH_BINS=... cargo test --test regtest_bench_stack`) brings up
+The end-to-end benchmark (`ROSE_BENCH_BINS=... cargo test --test regtest_bench_stack`) brings up
 one regtest zebrad (6.3.0, extracted from the CI-pinned image) and one funder (the CI-pinned
-zecd 0.7.0 release), then runs every binary through the same workload on that one chain,
+rose 0.7.0 release), then runs every binary through the same workload on that one chain,
 **alternating binaries across rounds** so drift is shared: fund the wallet with 14 notes of
 0.5 ZEC, five `sendtoaddress` calls with growing input counts (1, 1, 2, 3, 4 notes), a
 `z_sendmany` fan-out to 16 of the wallet's own addresses (18 Orchard actions), and a from-seed
@@ -81,7 +81,7 @@ Reading the table:
 - **The `store` phase collapsed twice.** On librustzcash it was ~1.5 s, almost all of it the PCZT
   extractor regenerating an Orchard verifying key per send (`VerifyingKey::build`, 1.5 s
   upstream). The fork builds keys from embedded parameters, so that fell to ~150 ms; handing the
-  extractor the verifying key zecd already holds (`zakura-shared`) removes it entirely (12-16 ms
+  extractor the verifying key rose already holds (`zakura-shared`) removes it entirely (12-16 ms
   is the SQLite write).
 - **`orbits` is worth ~13% on proving** (219 -> 191 ms per action in run 2, where plain and armed
   Zakura builds ran side by side) for ~1.2 s of one-time background startup work and some tens of
@@ -121,22 +121,22 @@ circuit size alone; the fork ships them as an embedded 131 KB artifact
 (`orchard_k11_params.bin`) and both `ProvingKey::build` and `VerifyingKey::build` read it. The
 fork does that upstream of zecd, plus a faster `keygen_pk` on top.
 
-## What the proving-key work in zecd looks like after the switch
+## What the proving-key work in rose looks like after the switch
 
 - **The fused path no longer rebuilds a key per transaction.** The fork's `zcash_primitives`
   caches built keys process-wide (`builder::cached_orchard_proving_key`, one `OnceLock` per
-  circuit version) and `Builder::build` reads from there. So the reason zecd's PCZT path exists -
+  circuit version) and `Builder::build` reads from there. So the reason rose's PCZT path exists -
   avoiding a per-send keygen in `create_proposed_transactions` - is gone. The PCZT path is kept
   because `pipeline_proving` (proving off the actor) rides on its prove/store seam, and because
   it is what gives the per-phase timing above.
-- **zecd no longer builds a second key set.** `ProvingKeyCache` now holds `&'static` references
+- **rose no longer builds a second key set.** `ProvingKeyCache` now holds `&'static` references
   into the fork's cells, so the PCZT path and every fused-path caller (Sapling spends,
   transparent-source sends, `z_shieldcoinbase`, `z_mergetoaddress`, `cache_proving_key = false`)
   prove with one key set, warmed in the background at startup.
 - **Prepared commitment tables are armed** (`ProvingKey::prepare_proving`, the fork's opt-in
   `orbits` feature) on those shared keys, so the fused path benefits too.
 - **The extract step gets a cached verifying key** cloned from the proving key (no keygen).
-- No send path in zecd bypasses the fork: Sapling proving (`LocalTxProver`) and the
+- No send path in rose bypasses the fork: Sapling proving (`LocalTxProver`) and the
   transparent-only builder already go through the forked crates.
 
 ## Caveats
@@ -155,12 +155,12 @@ fork does that upstream of zecd, plus a faster `keygen_pk` on top.
 
 ```sh
 # node + funder as CI pins them (no Docker daemon needed - pull_bin.py walks the image layers)
-export ZEBRAD_BIN=/path/to/zebrad ZECD_FUNDER_BIN=/path/to/zecd-0.7.0
-export ZECD_REGTEST_NU63_HEIGHT=8 ZECD_STDERR=1 RUST_LOG=zecd=info
-export ZECD_BENCH_BINS="lrz=/path/to/zecd-main,zakura=/path/to/zecd-branch"
+export ZEBRAD_BIN=/path/to/zebrad ROSE_FUNDER_BIN=/path/to/rose-0.7.0
+export ROSE_REGTEST_NU63_HEIGHT=8 ROSE_STDERR=1 RUST_LOG=rosed=info
+export ROSE_BENCH_BINS="lrz=/path/to/rose-main,zakura=/path/to/rose-branch"
 cargo test --manifest-path regtest-harness/Cargo.toml --test regtest_bench_stack -- --nocapture
 ```
 
 The test prints `BENCH ...` lines plus a `BENCH_RESULTS` JSON summary; the daemon log lines
-(`send complete ... prove_ms=`) carry the phase profile. It skips unless `ZECD_BENCH_BINS` is
+(`send complete ... prove_ms=`) carry the phase profile. It skips unless `ROSE_BENCH_BINS` is
 set, so it is inert in CI and can be deleted once the question is settled.

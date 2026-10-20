@@ -1,21 +1,21 @@
-# Example zecd configuration. Copy to <datadir>/zecd.toml (or pass --conf) and edit.
+# Example rose configuration. Copy to <datadir>/rose.toml (or pass --conf) and edit.
 # CLI flags (e.g. --rpcuser, --rpcport, --testnet, --datadir, --server) override these.
 #
 # Validate an edited config against the binary you are about to run, without starting it:
-#   zecd config check --conf <file>
-# It exits non-zero if that build would refuse the file (zecd rejects unknown keys, so a
+#   rose config check --conf <file>
+# It exits non-zero if that build would refuse the file (rose rejects unknown keys, so a
 # config can be valid for one version and not another), and prints the settings it resolves
 # to - including every value left to a built-in default.
 #
 # For 12-factor / Kubernetes deployments, several secret inputs can come from the environment
 # or a mounted Secret file instead of this (ConfigMap-bound) TOML:
-#   ZECD_AGE_IDENTITY - path to the age identity (also --age-identity / [keys] age_identity)
-#   ZECD_KEYS_FILE - path to the default wallet's keys.toml (also --keys-file / keys_file)
-#   ZECD_RPC_PASSWORD - the RPC password (also --rpcpassword / [rpc] password_file)
-#   ZECD_DATADIR - the data directory (also --datadir / datadir)
-# And for non-interactive `zecd init --restore`:
-#   ZECD_MNEMONIC - the seed phrase (also --mnemonic-file); else read from stdin
-#   ZECD_WALLET_PASSPHRASE - the at-rest passphrase for `init --encrypt`; else prompted
+#   ROSE_AGE_IDENTITY - path to the age identity (also --age-identity / [keys] age_identity)
+#   ROSE_KEYS_FILE - path to the default wallet's keys.toml (also --keys-file / keys_file)
+#   ROSE_RPC_PASSWORD - the RPC password (also --rpcpassword / [rpc] password_file)
+#   ROSE_DATADIR - the data directory (also --datadir / datadir)
+# And for non-interactive `rose init --restore`:
+#   ROSE_MNEMONIC - the seed phrase (also --mnemonic-file); else read from stdin
+#   ROSE_WALLET_PASSPHRASE - the at-rest passphrase for `init --encrypt`; else prompted
 
 # Network: "main" or "test".
 network = "test"
@@ -32,13 +32,13 @@ default_wallet = "default"
 
 # One section per wallet. The directory holds keys.toml plus one subdirectory per coin, so a
 # Zcash wallet's databases live at <dir>/zec/lrz/ (zec = the coin, lrz = librustzcash, the
-# library that owns them). zecd is stateless: it keeps no off-chain data the seed can't
+# library that owns them). rose is stateless: it keeps no off-chain data the seed can't
 # rebuild, so there is no label store on disk.
 [wallets.default]
 dir = "./data/default"
 # Optional: put this wallet's keys.toml somewhere other than <dir>/keys.toml - e.g. a
 # Kubernetes Secret mounted read-only, separate from the (disposable, cache-only) data dir.
-# The global [keys] keys_file below sets this for the default wallet; ZECD_KEYS_FILE /
+# The global [keys] keys_file below sets this for the default wallet; ROSE_KEYS_FILE /
 # --keys-file override it. The databases still live under <dir>/zec/lrz/.
 # keys_file = "/secrets/keys.toml"
 # This wallet's own upstream, overriding [backend] below. Every [backend] endpoint key
@@ -79,7 +79,7 @@ dir = "./data/default"
 #   server = "zebra"               # local zebrad: "zebra://127.0.0.1:8234" mainnet /
 #                                  # ":18234" testnet (zebrad ships with RPC disabled, so set
 #                                  # its `rpc.listen_addr` to that port; the zcashd-convention
-#                                  # ports 8232/18232 belong to zecd's own RPC). See [zebra]
+#                                  # ports 8232/18232 belong to rose's own RPC). See [zebra]
 #                                  # below for credentials.
 #   server = "zebra://host:port"   # a zebrad on another host/port.
 #   server = "zecrocks"            # the zec.rocks public lightwalletd (zec.rocks:443 mainnet,
@@ -93,7 +93,7 @@ dir = "./data/default"
 #
 # Light-mode notes: a lightwalletd upstream must be 0.5.0 or later for a transparent-enabled
 # wallet (that is the first release serving transparent and Ironwood data inside compact blocks;
-# zecd probes this at connect and refuses an older server rather than silently missing
+# rose probes this at connect and refuses an older server rather than silently missing
 # transparent receives). Shielded-only wallets work against any server. Prefer running your own
 # zebra when the wallet tracks many funded transparent addresses - spend detection costs one
 # upstream query per funded address.
@@ -102,16 +102,16 @@ server = "zebra"
 connect_timeout_secs = 10
 # Route EVERY outbound connection through a SOCKS5 proxy - most usefully Tor. Off by default.
 # It covers both upstream kinds (the zebra:// JSON-RPC client and the lightwalletd gRPC
-# channel), so nothing zecd dials bypasses it.
+# channel), so nothing rose dials bypasses it.
 #
-# The proxy resolves the destination, not zecd, so no DNS leaves this host and a .onion
+# The proxy resolves the destination, not rose, so no DNS leaves this host and a .onion
 # upstream works. lightwalletd TLS is layered over the proxied connection unchanged, with
 # certificate verification still pinned to the destination hostname - the proxy carries
 # ciphertext it cannot read. SOCKS username/password authentication is not supported; use a
 # proxy that restricts access by source address (a loopback listener is the usual answer).
 #
 # Note that with a proxy set, a loopback `server` names the PROXY's loopback rather than this
-# machine's - `zecd config check` warns about that combination.
+# machine's - `rose config check` warns about that combination.
 # proxy = "socks5://127.0.0.1:9050"
 # Reconnect backoff (seconds): start at base, double up to max, with full jitter.
 reconnect_base_secs = 1
@@ -126,12 +126,12 @@ reconnect_max_secs = 60
 # kernel's autotuned window.
 # p2p_receive_window_bytes = 1448
 # Which hosts count as local for a plaintext connection. The zebra:// connection is plain HTTP,
-# so zecd sends its RPC credentials only to a local host, and an http:// lightwalletd (which
+# so rose sends its RPC credentials only to a local host, and an http:// lightwalletd (which
 # would expose the addresses and txids this wallet asks about) is only dialled toward one.
 # Loopback and `localhost` always count. With this on (the default) so do private and
 # non-routable ranges - 10/8, 172.16/12, 192.168/16, link-local, 100.64/10, fc00::/7, fe80::/10
 # - the usual Docker/LAN setup. Set false for loopback only. Any other hostname never counts
-# (zecd does no DNS lookup here), so name a LAN upstream by IP address.
+# (rose does no DNS lookup here), so name a LAN upstream by IP address.
 # rfc1918_is_local = true
 # Allow those plaintext connections to ANY host, public ones included. Only for a hop secured
 # out of band (SSH or WireGuard tunnel, private overlay). An unauthenticated zebra connection
@@ -148,7 +148,7 @@ reconnect_max_secs = 60
 # certificate is then validated normally - chain, hostname and expiry all checked - so this is
 # the best option for a lightwalletd behind your own CA. An unreadable or malformed file fails
 # startup rather than quietly falling back to the public roots.
-# tls_ca_file = "/etc/zecd/lwd-ca.pem"
+# tls_ca_file = "/etc/rose/lwd-ca.pem"
 #
 # Pin lightwalletd's TLS certificate to one or more SHA-256 fingerprints. Get one with:
 #   openssl s_client -connect host:443 </dev/null 2>/dev/null \
@@ -170,7 +170,7 @@ reconnect_max_secs = 60
 # tls_insecure_skip_verify = false
 #
 # Assert that the upstream lightwalletd serves transparent (and ironwood) data inside compact
-# blocks. zecd normally decides this from GetLightdInfo.lightwalletProtocolVersion, and refuses
+# blocks. rose normally decides this from GetLightdInfo.lightwalletProtocolVersion, and refuses
 # to run a transparent-enabled wallet against a server that does not serve the data - otherwise
 # transparent receives would simply never appear. But no released lightwalletd populates that
 # field yet, so even a 0.5.x server that does serve the data reports "incapable" and is refused.
@@ -193,18 +193,18 @@ bind = "127.0.0.1"
 port = 18232
 # If user/password are omitted, a bitcoind-style cookie file is generated at <datadir>/.cookie.
 user = "zec"
-# Placeholder: zecd refuses to start while the password is `change-me`, on every network.
+# Placeholder: rose refuses to start while the password is `change-me`, on every network.
 password = "change-me"
 # The RPC password is spend-equivalent for clients, so in a ConfigMap+Secret split keep it
 # OUT of this (ConfigMap-bound) file. Source it from a mounted Secret file or the environment
-# instead; precedence is --rpcpassword / ZECD_RPC_PASSWORD > password_file > inline `password`.
+# instead; precedence is --rpcpassword / ROSE_RPC_PASSWORD > password_file > inline `password`.
 # password_file = "/secrets/rpc.password"
 # Additional bitcoind-style rpcauth credentials (salted - no plaintext in the config).
-# Generate entries with the built-in tool: `zecd rpcauth <user> [password]`
+# Generate entries with the built-in tool: `rose rpcauth <user> [password]`
 # (omit the password to have a strong random one generated and printed once).
 # auth = ["alice:<salt>$<hmac-sha256 hex>"]
 #
-# Cookie auth: with no user/password pair set, zecd mints a random secret at startup and
+# Cookie auth: with no user/password pair set, rose mints a random secret at startup and
 # writes __cookie__:<random> to this file (mode 0600). Any local process that can read the
 # file authenticates with it - no shared secret to configure, regenerated each startup
 # (how bitcoin-cli auths to a local node by default).
@@ -297,16 +297,16 @@ age_identity = "./data/identity.txt"
 auto_unlock = true
 # Optional: location of the DEFAULT wallet's keys.toml (the age-encrypted seed), independent
 # of the datadir, so it can be mounted as a Secret while the datadir stays a disposable cache.
-# Equivalent to [wallets.default] keys_file; ZECD_KEYS_FILE / --keys-file override it.
+# Equivalent to [wallets.default] keys_file; ROSE_KEYS_FILE / --keys-file override it.
 # keys_file = "/secrets/keys.toml"
 # Rebuild data.sqlite from keys.toml when the data directory is empty (default true): the
 # account is recreated from the seed - immediately for an identity/auto_unlock wallet, at the
 # first walletpassphrase for an encrypted one - then the wallet rescans from its birthday. This
 # is what lets the data directory be a disposable cache (mount keys.toml as a Secret, start with
 # an empty PVC). Set false to instead fail fast on an empty datadir. (Watch-only wallets have no
-# seed and aren't covered - recreate them with `zecd init --ufvk`.)
+# seed and aren't covered - recreate them with `rose init --ufvk`.)
 bootstrap_from_keys = true
-# How many blocks below the chain tip `zecd init` anchors a freshly generated wallet's
+# How many blocks below the chain tip `rose init` anchors a freshly generated wallet's
 # birthday. Unset (the default), each wallet uses its coin's built-in margin - 100 for
 # Zcash, 6 for Bitcoin, roughly the same wall-clock cover at each chain's block spacing.
 # Setting this applies ONE global number to every wallet; any [wallets.<name>] section can
@@ -316,25 +316,25 @@ bootstrap_from_keys = true
 # explicit `--birthday` are unaffected.
 # fresh_wallet_birthday_margin = 100
 #
-# Permit more than one loaded wallet to hold spending keys. LIBRARY CONSUMERS ONLY: the zecd
-# daemon REFUSES TO START with this set, and `zecd config check` reports it as an error.
+# Permit more than one loaded wallet to hold spending keys. LIBRARY CONSUMERS ONLY: the rose
+# daemon REFUSES TO START with this set, and `rose config check` reports it as an error.
 #
 # It is a custody line, not a technical limit. Over RPC a credential is spend authority for
 # whichever wallet the request routes to, so with two spenders loaded there is no single answer
 # to "which key can this credential spend?", and one leaked credential reaches every seed in the
-# data directory. An application embedding zecd as a library has no RPC credentials - it is
+# data directory. An application embedding rose as a library has no RPC credentials - it is
 # itself the authorization boundary, and names the wallet on every call - so it can opt in here
-# instead of running one node per writable wallet. Under the daemon, run one zecd per wallet
+# instead of running one node per writable wallet. Under the daemon, run one rose per wallet
 # (separate datadirs and ports) as before.
 # allow_multiple_spending_wallets = false
 
 [pools]
-# Shielded RECEIVERS this wallet's addresses may carry. zecd is shielded-only; the receivers are
+# Shielded RECEIVERS this wallet's addresses may carry. rose is shielded-only; the receivers are
 # "sapling" and "orchard". These are the GLOBAL defaults; any [wallets.<name>] section can
 # override `pools`/`default_receivers` independently, and likewise each `transparent*` key below.
 #
 # Both keys below name receivers, not value pools, which is why this list is shorter than the set
-# of pools zecd reports funds in. The section is called [pools] because a receiver and the pool
+# of pools rose reports funds in. The section is called [pools] because a receiver and the pool
 # funds arriving at it land in are usually one and the same; ironwood is the exception that makes
 # the difference worth stating.
 #
@@ -357,7 +357,7 @@ bootstrap_from_keys = true
 #                       (naming a receiver that is not enabled is a startup error). Defaults to
 #                       `enabled`.
 #
-# The default (this section omitted) is the Orchard receiver only, preserving zecd's historical
+# The default (this section omitted) is the Orchard receiver only, preserving rose's historical
 # behaviour; post-NU6.3 such a wallet holds ironwood notes at that receiver.
 # To enable Sapling receiving as well:
 #   enabled = ["sapling", "orchard"]
@@ -378,7 +378,7 @@ bootstrap_from_keys = true
 enabled = ["orchard"]
 default_receivers = ["orchard"]
 #
-# Transparent (t-address) receiving. OFF by default - zecd stays shielded-only. When enabled,
+# Transparent (t-address) receiving. OFF by default - rose stays shielded-only. When enabled,
 # `getnewaddress "" "transparent"` hands out a bare transparent address (t1.../tm...), funds
 # received there are discovered by the block scan (and at 0-conf via the mempool), and they are
 # spent explicitly through z_sendmany's fromaddress: a t-address (or ANY_TADDR) as the source
@@ -406,7 +406,7 @@ default_receivers = ["orchard"]
 #
 # NOTE the two anchors, because they are not the same and the difference is what decides whether
 # funds survive a restore. RESTORE recovery is funded-anchored, BIP-44 style: from a bare seed
-# zecd rediscovers indices 0..transparent_initial_scan + transparent_gap_limit, then extends
+# rose rediscovers indices 0..transparent_initial_scan + transparent_gap_limit, then extends
 # transparent_gap_limit past each FUNDED index it finds - merely handing an address out does not
 # extend it, because issuance leaves no trace on chain. The RUNNING wallet's lookahead is
 # exposure-anchored: it also slides past addresses you have merely handed out, so a live wallet
@@ -508,7 +508,7 @@ rebroadcast_secs = 60
 # proposals; getbalance's explicit minconf argument overrides it per call. Lowering these
 # trades reorg/double-spend safety for latency.
 # Confirmations before the wallet's *own* outputs are spendable: change, and every output of
-# a transaction this wallet authored (zecd marks its own sends trusted at store time, so a
+# a transaction this wallet authored (rose marks its own sends trusted at store time, so a
 # self-send's payment output waits this depth, not the untrusted one - Bitcoin Core's
 # own-transaction trust model).
 trusted_confirmations = 3
@@ -516,7 +516,7 @@ trusted_confirmations = 3
 untrusted_confirmations = 10
 # Mark transactions this wallet authors as trusted at store time (what makes a self-send's
 # payment output wait trusted_confirmations above rather than untrusted_confirmations). Set
-# false to keep zecd from persisting the trust marker at all: classification then derives only
+# false to keep rose from persisting the trust marker at all: classification then derives only
 # from data a from-seed restore re-derives, so an authoring instance and a restore of the same
 # seed report identical balances at every confirmation depth (the strictest statelessness
 # posture) - at the cost of the wallet's own self-send payments waiting the untrusted depth.
@@ -540,7 +540,7 @@ trust_own_transactions = true
 #       inputs, a transparent recipient, and kept-transparent change (never touching a shielded
 #       pool) - the most revealing send possible.
 # z_sendmany's per-call privacyPolicy accepts these plus zcashd's AllowLinkingAccountAddresses
-# (maps onto AllowRevealedSenders - zecd is single-account, so there is nothing extra to link)
+# (maps onto AllowRevealedSenders - rose is single-account, so there is nothing extra to link)
 # and NoPrivacy (maps onto AllowFullyTransparent).
 privacy_policy = "AllowRevealedRecipients"
 # Cap on the number of Orchard actions (max of Orchard inputs vs. Orchard outputs) a single
@@ -569,7 +569,7 @@ orchard_action_limit = 50
 # this, while a post-NU6.3 send carrying both an Orchard and an Ironwood bundle pays for two
 # proofs and reaches the ceiling sooner than its action count suggests. Raise it only if every
 # node between this wallet and a miner raises its own policy to match: relay is hop by hop, so
-# a larger transaction gets into one mempool and no further. `zecd config check` warns when
+# a larger transaction gets into one mempool and no further. `rose config check` warns when
 # these two settings disagree about which will bind first.
 max_tx_bytes = 250000
 # Change splitting. A send divides its change into up to target_note_count notes, so that the
@@ -643,7 +643,7 @@ port = 9233
 #       sends. Clamp any history consumer to `enhanced_through` when using this mode.
 #   "connected" - ready as soon as the backend is connected and its chain tip is past this
 #       wallet's birthday height (a sanity check that we're on the right, live network). It does
-#       NOT wait for the wallet to finish scanning, so RPC clients can reach zecd while it catches
+#       NOT wait for the wallet to finish scanning, so RPC clients can reach rose while it catches
 #       up, and readiness doesn't flap during a long sync. Reads may lag the tip until the wallet
 #       is caught up - the per-wallet `scan_lag` in /readyz and /status shows by how much. Choose
 #       this only when reachability matters more than balance freshness.
@@ -653,7 +653,7 @@ max_scan_lag = 4
 
 [log]
 # Default tracing filter: a level ("error", "warn", "info", "debug", "trace") or a
-# comma-separated directive list such as "info,zecd::sync=debug". RUST_LOG overrides it.
+# comma-separated directive list such as "info,rose::sync=debug". RUST_LOG overrides it.
 # Logs go to stderr.
 level = "info"
 # "text" for people, "json" for log aggregation (one object per line). Anything else is
@@ -670,7 +670,7 @@ format = "text"
 #
 # What it does: a view wallet normally costs a full stack of its own (a database, an
 # actor, a scan pass, note-commitment trees). At tens or thousands of wallets that
-# duplication is what stops zecd scaling. A fleet puts many viewing keys behind ONE
+# duplication is what stops rose scaling. A fleet puts many viewing keys behind ONE
 # scan domain - a "shard" - so a block is fetched once and trial-decrypted once
 # against every key in the shard. Spending is untouched: one conventional wallet, its
 # own database, its own actor.
@@ -690,7 +690,7 @@ format = "text"
 #     keeps scanning its key. Removing it means deleting and rebuilding the shard.
 #
 # Backup note: with a fleet enabled, `manifest_dir` below holds viewing keys that
-# exist NOWHERE ELSE in zecd, and it is written at runtime by `createwallet`. It is
+# exist NOWHERE ELSE in rose, and it is written at runtime by `createwallet`. It is
 # key material, not a cache, and the "the whole data directory is disposable" rule in
 # docs/OPERATIONS.md does NOT cover it. Back it up like keys.toml.
 #
@@ -699,7 +699,7 @@ format = "text"
 # one currency where the mnemonic in keys.toml serves every one) and which shard a
 # wallet lands in is decided by its birthday - a height on one chain. NB this makes
 # `fleet` a reserved wallet name: a
-# [wallets.fleet] entry would resolve to <datadir>/fleet, and zecd refuses to start
+# [wallets.fleet] entry would resolve to <datadir>/fleet, and rose refuses to start
 # rather than let a wallet and the fleet share a directory tree.
 #
 # [fleet]

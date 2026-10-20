@@ -36,13 +36,13 @@
 //! new chain, the balance unchanged, and - over kyoto - `getwalletinfo.birthday.anchor`
 //! naming the new block at 150.
 //!
-//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a zecd built without the
+//! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
 use std::time::{Duration, Instant};
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::json;
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 /// The shape of one run: the wallet's birthday, the height the node invalidates (below the
 /// birthday, so the anchor's block is orphaned), and the orphaned receive's locktime (above
@@ -126,15 +126,15 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
     .expect("enable node logging");
     node.mine(201).await;
 
-    let mut zecd = ZecdBtc::prepare(dir.path().join("zecddata"), backend, &node, &["btc"]);
-    zecd.init_ok("btc", &["--birthday", &birthday.to_string()]);
-    zecd.start().await;
-    zecd.wait_height(201).await;
+    let mut rose = RoseBtc::prepare(dir.path().join("rosedata"), backend, &node, &["btc"]);
+    rose.init_ok("btc", &["--birthday", &birthday.to_string()]);
+    rose.start().await;
+    rose.wait_height(201).await;
 
     // 1. A receive confirmed at 202, built raw from an old coinbase (height 1, mature on
     //    either side of the fork) with the locktime that keeps it out of the replacement
     //    chain's first blocks.
-    let addr = zecd
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -172,9 +172,9 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
         .expect("broadcast the receive");
     let old_202 = node.mine(1).await.remove(0);
     node.mine(old_tip - 202).await;
-    zecd.wait_height(old_tip).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
-    let tx = zecd
+    rose.wait_height(old_tip).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
+    let tx = rose
         .call("gettransaction", json!([receive_txid]))
         .await
         .expect("gettransaction");
@@ -185,7 +185,7 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
     if backend == BtcBackend::Kyoto {
         // The birthday resolved to an anchor on the original chain (the resolution waits
         // for the tip to be the reorg margin past the anchor).
-        zecd.wait_wallet(
+        rose.wait_wallet(
             "btc",
             "getwalletinfo",
             json!([]),
@@ -196,9 +196,9 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
     }
     // Restart at the old tip: over kyoto the light client comes back with a `Sync` header
     // tree from seven blocks below it, which fixes where the fork lands relative to the tree.
-    zecd.restart().await;
-    zecd.wait_height(old_tip).await;
-    zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+    rose.restart().await;
+    rose.wait_height(old_tip).await;
+    rose.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
 
     // 2. The reorg: invalidate the fork height, below the birthday, and outgrow the old
@@ -229,7 +229,7 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
     //    the light client reorging by itself.
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
-        let wi = zecd
+        let wi = rose
             .call("getwalletinfo", json!([]))
             .await
             .expect("getwalletinfo");
@@ -285,7 +285,7 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
             let verdict = node
                 .call("testmempoolaccept", json!([[signed["hex"]]]))
                 .await;
-            let wi = zecd.call("getwalletinfo", json!([])).await;
+            let wi = rose.call("getwalletinfo", json!([])).await;
             let txid = receive_txid.as_str().unwrap();
             let node_log = std::fs::read_to_string(dir.path().join("btcdata/regtest/debug.log"))
                 .unwrap_or_default();
@@ -321,11 +321,11 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
         header["height"].as_u64() >= Some(birthday),
         "the receive must confirm above the birthday: {header}"
     );
-    zecd.wait_height(node.height().await).await;
-    zecd.wait_wallet_best_hash("btc", &node.best_hash().await)
+    rose.wait_height(node.height().await).await;
+    rose.wait_wallet_best_hash("btc", &node.best_hash().await)
         .await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
-    zecd.wait_wallet(
+    rose.wait_wallet_balance("btc", 1.0).await;
+    rose.wait_wallet(
         "btc",
         "gettransaction",
         json!([receive_txid]),
@@ -333,7 +333,7 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
         |tx| tx["blockhash"] == json!(confirmed_block) && tx["confirmations"].as_u64() >= Some(1),
     )
     .await;
-    let unspent = zecd
+    let unspent = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -341,7 +341,7 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
     assert_eq!(unspent[0]["txid"], receive_txid, "{unspent}");
     // The wallet holds the whole transaction, witness included - what the resubmission
     // above depended on (bip157 serves witness-stripped blocks unless asked otherwise).
-    let tx = zecd
+    let tx = rose
         .call("gettransaction", json!([receive_txid]))
         .await
         .expect("gettransaction");
@@ -359,7 +359,7 @@ async fn deep_reorg_flow(backend: BtcBackend, shape: Fork) {
 
     // 5. Over kyoto the anchor was cleared and re-resolved against the new chain.
     if backend == BtcBackend::Kyoto {
-        zecd.wait_wallet(
+        rose.wait_wallet(
             "btc",
             "getwalletinfo",
             json!([]),

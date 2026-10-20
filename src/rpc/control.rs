@@ -16,7 +16,7 @@ pub(crate) fn stop(state: &AppState) -> Result<Value, RpcError> {
         return Err(RpcError::method_not_found("stop"));
     }
     state.trigger_shutdown();
-    Ok(Value::String("zecd stopping".to_string()))
+    Ok(Value::String("rose stopping".to_string()))
 }
 
 /// `uptime` - seconds since the daemon started.
@@ -24,11 +24,11 @@ pub(crate) fn uptime(state: &AppState) -> Result<Value, RpcError> {
     Ok(json!(state.started_at.elapsed().as_secs()))
 }
 
-/// `help` - a short orientation string (zecd has no per-method help pages; the README's
+/// `help` - a short orientation string (rose has no per-method help pages; the README's
 /// method table is the reference).
 pub(crate) fn help() -> Result<Value, RpcError> {
     Ok(Value::String(
-        "zecd: a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash. \
+        "rose: a Bitcoin-Core-style JSON-RPC server for shielded-first Zcash. \
          Supported methods include getblockchaininfo, getnetworkinfo, getwalletinfo, \
          getnewaddress, z_getaddressforaccount, getbalance, sendtoaddress, sendmany, \
          listtransactions, gettransaction, validateaddress. See the README for the full list \
@@ -62,20 +62,20 @@ pub(crate) fn listwallets(state: &AppState) -> Result<Value, RpcError> {
 
 /// `listwalletdir` - the wallets available on disk, whether or not they are loaded.
 ///
-/// Bitcoin Core's shape (`{"wallets": [{"name": ...}, ...]}`). For zecd this is the fleet's
+/// Bitcoin Core's shape (`{"wallets": [{"name": ...}, ...]}`). For rose this is the fleet's
 /// manifest directory: the wallets an operator has provisioned, which is what they reconcile
 /// against when a name is missing from `listwallets`. Configured `[wallets.<name>]` entries are
 /// listed too - they are equally "on disk available", and omitting them would make the two RPCs
 /// disagree for reasons that have nothing to do with the fleet.
 ///
-/// zecd extension: a `warnings` array naming any manifest that could not be read. Those wallets
+/// rose extension: a `warnings` array naming any manifest that could not be read. Those wallets
 /// are skipped at startup rather than taking the daemon down, so this is where an operator sees
 /// that a file they wrote is not being served - without it, a skipped wallet is indistinguishable
 /// from one that was never provisioned. Absent when there are none, so the Core-shaped response
 /// is unchanged for a healthy fleet.
 ///
 /// Beside `listwallets` for the same reason it is: the configured-wallet half reads the
-/// config and touches no wallet, so every build serves it - a bitcoin-only zecd answered
+/// config and touches no wallet, so every build serves it - a bitcoin-only rose answered
 /// method-not-found here after the engine gate landed, which `conformance.py`'s shared
 /// "wallets" section (both coins) trips on. Only the fleet half, which is Zcash's, is gated.
 pub(crate) fn listwalletdir(state: &AppState) -> Result<Value, RpcError> {
@@ -118,10 +118,10 @@ pub(crate) fn listwalletdir(state: &AppState) -> Result<Value, RpcError> {
 /// load_on_startup external_signer )` - onboard a **view wallet** into the fleet, without
 /// restarting the daemon.
 ///
-/// zecd's divergence from Bitcoin Core is forced by what a Zcash wallet is: Core creates a wallet
+/// rose's divergence from Bitcoin Core is forced by what a Zcash wallet is: Core creates a wallet
 /// that generates its own keys, while a monitored Zcash wallet is defined by a viewing key it is
 /// given. So this RPC requires `ufvk` and `birthday` (in the options object, param 8), and every
-/// Core flag that would ask for a *spending* wallet is refused rather than ignored - zecd loads at
+/// Core flag that would ask for a *spending* wallet is refused rather than ignored - rose loads at
 /// most one wallet with spending keys, and it is not created over the network. `disable_private_keys`
 /// is accepted only as `true`, which is what a fleet wallet is.
 ///
@@ -147,9 +147,9 @@ pub(crate) async fn createwallet(state: &AppState, params: &[Value]) -> Result<V
     if let Some(v) = params.get(1) {
         if v.as_bool() == Some(false) {
             return Err(RpcError::invalid_parameter(
-                "createwallet on zecd creates a watch-only wallet from a viewing key, so \
-                 disable_private_keys must be true (or omitted). zecd loads at most one wallet \
-                 with spending keys, created offline with `zecd init`.",
+                "createwallet on rose creates a watch-only wallet from a viewing key, so \
+                 disable_private_keys must be true (or omitted). rose loads at most one wallet \
+                 with spending keys, created offline with `rose init`.",
             ));
         }
     }
@@ -299,9 +299,9 @@ pub(crate) fn unloadwallet_target<'a>(
     }
 }
 
-/// Accept `unloadwallet`'s `load_on_startup` only where zecd can honor it.
+/// Accept `unloadwallet`'s `load_on_startup` only where rose can honor it.
 ///
-/// The fleet manifest **is** zecd's startup list, and `unloadwallet` deliberately leaves it in
+/// The fleet manifest **is** rose's startup list, and `unloadwallet` deliberately leaves it in
 /// place (that is what lets `loadwallet` restore the wallet). So `true` ("keep loading this wallet
 /// at startup") is already the truth and costs nothing to accept, while `false` ("stop loading it
 /// at startup") is a promise this RPC cannot keep - and silently ignoring it would have the wallet
@@ -313,7 +313,7 @@ pub(crate) fn reject_unsupported_load_on_startup(value: Option<&Value>) -> Resul
         None | Some(Value::Null) | Some(Value::Bool(true)) => Ok(()),
         Some(Value::Bool(false)) => Err(RpcError::invalid_parameter(
             "unloadwallet does not support load_on_startup = false: a fleet wallet's manifest is \
-             zecd's startup list, and unloading leaves it in place so loadwallet can restore the \
+             rose's startup list, and unloading leaves it in place so loadwallet can restore the \
              wallet. Delete the wallet's manifest from the fleet manifest directory to keep it \
              unloaded across restarts (its account stays in its shard either way)",
         )),

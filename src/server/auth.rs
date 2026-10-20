@@ -49,7 +49,7 @@ pub fn generate_rpcauth(username: &str, password: Option<&str>) -> (String, Opti
     (line, generated)
 }
 
-/// `zecd rpcauth <user> [password]`: print a salted credential line for `[rpc] auth`, plus the
+/// `rose rpcauth <user> [password]`: print a salted credential line for `[rpc] auth`, plus the
 /// password to keep when one is generated. No daemon, config, or external script needed.
 #[cfg(feature = "cli")]
 pub fn run_rpcauth(args: &crate::config::RpcauthArgs) -> anyhow::Result<()> {
@@ -67,7 +67,7 @@ pub fn run_rpcauth(args: &crate::config::RpcauthArgs) -> anyhow::Result<()> {
     let (line, generated) =
         generate_rpcauth(&args.username, args.password.as_ref().map(Password::expose));
 
-    println!("Add this line to your zecd config under [rpc]:");
+    println!("Add this line to your rose config under [rpc]:");
     println!();
     println!("auth = [\"{line}\"]");
     println!();
@@ -171,21 +171,21 @@ fn reject_empty_passwords(
     if rpc.password.as_ref().is_some_and(|p| p.expose().is_empty()) {
         return Err(anyhow!(
             "the RPC password is empty (check [rpc] password_file, [rpc] password, \
-             --rpcpassword and ZECD_RPC_PASSWORD); an empty password would let anyone log in \
+             --rpcpassword and ROSE_RPC_PASSWORD); an empty password would let anyone log in \
              as the RPC user"
         ));
     }
     if let Some((user, _)) = entries.iter().find(|(_, hash)| hash.check_ct("").into()) {
         return Err(anyhow!(
             "the [rpc] auth entry for user {user} accepts an empty password; regenerate it \
-             with `zecd rpcauth {user}`"
+             with `rose rpcauth {user}`"
         ));
     }
     Ok(())
 }
 
 /// Reach [`Authenticator::from_config`]'s verdict *without* its side effect of minting and
-/// writing a cookie file. For `zecd config check`, which must never touch the datadir of a
+/// writing a cookie file. For `rose config check`, which must never touch the datadir of a
 /// deployment it is only inspecting - a fresh cookie there would invalidate the credential a
 /// running daemon handed out.
 pub fn check_config(rpc: &RpcConfig) -> anyhow::Result<()> {

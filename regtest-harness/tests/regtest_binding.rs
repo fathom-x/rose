@@ -1,25 +1,25 @@
-//! End-to-end test of the account-to-keys binding (`wallet::binding`): `zecd init` pins the
+//! End-to-end test of the account-to-keys binding (`wallet::binding`): `rose init` pins the
 //! account's UFVK into `keys.toml`, startup verifies the wallet database against the pin
 //! (backfilling it on a pre-pin `keys.toml`), and a swapped `data.sqlite` refuses to serve,
-//! both at daemon startup and at `zecd init` time.
+//! both at daemon startup and at `rose init` time.
 //!
 //! Skips cleanly when the node binary isn't provisioned (so plain `cargo test` and the
 //! build-only CI path still validate that the harness compiles). Provide `ZEBRAD_BIN` to run
 //! the full flow. Runs in the default (non-extended) tier: it needs only one
-//! zebra and two short-lived zecd instances.
+//! zebra and two short-lived rose instances.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    pick_port, resolve_node_bin, zecd_bin, RegtestNode, Zebrad, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    pick_port, resolve_node_bin, rose_bin, RegtestNode, Rose, RoseConfig, Zebrad,
 };
+use serde_json::json;
 
-/// Blocks mined before launching zecd. Regtest mining is cheap (PoW disabled).
+/// Blocks mined before launching rose. Regtest mining is cheap (PoW disabled).
 const INITIAL_BLOCKS: u32 = 10;
-/// Generous: zecd scan over a fresh regtest chain.
+/// Generous: rose scan over a fresh regtest chain.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read the pinned `ufvk` value out of a wallet's `keys.toml`, if present.
@@ -32,7 +32,7 @@ fn pinned_ufvk(keys_toml: &Path) -> Option<String> {
     })
 }
 
-/// Rewrite `keys.toml` without its `ufvk` line, simulating a file written by a zecd from
+/// Rewrite `keys.toml` without its `ufvk` line, simulating a file written by a rose from
 /// before the pin existed (the upgrade path the daemon must backfill).
 fn strip_pin(keys_toml: &Path) {
     let text = std::fs::read_to_string(keys_toml).expect("read keys.toml");
@@ -65,19 +65,19 @@ async fn regtest_account_binding() {
 
     // ---- 1. init pins the account UFVK into keys.toml, and it matches export-ufvk ----
 
-    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
-    let mut zecd = Zecd::start(&cfg).await.expect("start zecd");
-    zecd.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
+    let cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
+    let mut rose = Rose::start(&cfg).await.expect("start rose");
+    rose.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
         .await
-        .expect("zecd scans to the regtest tip");
+        .expect("rose scans to the regtest tip");
 
-    let keys_toml = zecd.wallet_dir("default").join("keys.toml");
-    let pin = pinned_ufvk(&keys_toml).expect("zecd init must pin the account UFVK");
+    let keys_toml = rose.wallet_dir("default").join("keys.toml");
+    let pin = pinned_ufvk(&keys_toml).expect("rose init must pin the account UFVK");
     assert!(
         pin.starts_with("uviewregtest1"),
         "the pin is a regtest-encoded UFVK, got {pin}"
     );
-    let exported = zecd.export_ufvk("default").expect("export-ufvk");
+    let exported = rose.export_ufvk("default").expect("export-ufvk");
     assert_eq!(
         pin, exported,
         "the pinned UFVK is exactly the account's (export-ufvk) key"
@@ -85,11 +85,11 @@ async fn regtest_account_binding() {
 
     // ---- 2. a pre-pin keys.toml starts normally and gets the pin backfilled ----
 
-    zecd.stop_keeping_datadir().await.expect("stop zecd");
+    rose.stop_keeping_datadir().await.expect("stop rose");
     strip_pin(&keys_toml);
     assert_eq!(pinned_ufvk(&keys_toml), None, "pin stripped for the test");
-    zecd.respawn().await.expect("a legacy keys.toml must start");
-    let addr = zecd
+    rose.respawn().await.expect("a legacy keys.toml must start");
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("the upgraded wallet serves RPCs");
@@ -103,22 +103,22 @@ async fn regtest_account_binding() {
     // ---- 3. a swapped data.sqlite refuses to serve (fail closed) ----
 
     // A second, unrelated wallet supplies the foreign database (its own fresh mnemonic).
-    let cfg_b = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick second rpc port"));
-    let mut foreign = Zecd::start(&cfg_b).await.expect("start the foreign zecd");
+    let cfg_b = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick second rpc port"));
+    let mut foreign = Rose::start(&cfg_b).await.expect("start the foreign rose");
     foreign
         .stop_keeping_datadir()
         .await
-        .expect("stop the foreign zecd");
+        .expect("stop the foreign rose");
     let foreign_db = foreign.engine_dir("default").join("data.sqlite");
 
-    zecd.stop_keeping_datadir().await.expect("stop zecd again");
-    let engine_dir = zecd.engine_dir("default");
+    rose.stop_keeping_datadir().await.expect("stop rose again");
+    let engine_dir = rose.engine_dir("default");
     for suffix in ["-wal", "-shm"] {
         let _ = std::fs::remove_file(engine_dir.join(format!("data.sqlite{suffix}")));
     }
     std::fs::copy(&foreign_db, engine_dir.join("data.sqlite")).expect("swap in the foreign db");
 
-    let stderr = zecd
+    let stderr = rose
         .respawn_expect_startup_failure()
         .await
         .expect("a swapped database must refuse startup");
@@ -127,14 +127,14 @@ async fn regtest_account_binding() {
         "the refusal names the binding mismatch; stderr:\n{stderr}"
     );
 
-    // ---- 4. `zecd init` refuses a database that already contains an account ----
+    // ---- 4. `rose init` refuses a database that already contains an account ----
 
     // The foreign wallet's datadir, with keys.toml removed: exactly the audit's scenario of a
     // pre-existing account-bearing database in a directory about to be initialized. The guard
     // runs before any interactive or network I/O, so the refusal is immediate.
     std::fs::remove_file(foreign.wallet_dir("default").join("keys.toml"))
         .expect("remove the foreign wallet's keys.toml");
-    let out = Command::new(zecd_bin())
+    let out = Command::new(rose_bin())
         .args([
             "--datadir",
             foreign.datadir().to_str().unwrap(),
@@ -144,7 +144,7 @@ async fn regtest_account_binding() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("run zecd init on the account-bearing datadir");
+        .expect("run rose init on the account-bearing datadir");
     assert!(
         !out.status.success(),
         "init into an account-bearing database must refuse"

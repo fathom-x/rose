@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Regenerate THIRD-PARTY-LICENSES.txt - the bundled license texts of every crate
-# compiled into the zecd binary. Committed to the repo (not generated at build time)
+# compiled into the rose binary. Committed to the repo (not generated at build time)
 # so the reproducible StageX (amd64) / Alpine (arm64) Docker builds stay tooling-free; the packaging
 # (build-deb.sh, the release tarball, the Docker runtime image) just ships this file.
 #
@@ -35,13 +35,14 @@ if ! command -v cargo-about >/dev/null 2>&1; then
     exit 1
 fi
 
-# The shipped tree: the default features (`server` + `cli`) plus the `mimalloc-secure`
-# allocator and the `bitcoin` wallet engine the static musl release images build with
-# (both Dockerfiles), on the release targets named in about.toml. `--all-features` would
-# pull optional deps the artifacts don't carry.
+# The shipped tree: the default features (`server` + `cli` + `bitcoin`) plus the
+# `mimalloc-secure` allocator and the opt-in `zcash` wallet engine the static musl release
+# images build with (both Dockerfiles), on the release targets named in about.toml.
+# `--all-features` would pull optional deps the artifacts don't carry. The `rose` command
+# line (rose-cli/) adds no crate the daemon does not already carry.
 cargo about generate about.hbs \
     --locked \
-    --features mimalloc-secure,bitcoin \
+    --features mimalloc-secure,bitcoin,zcash \
     --output-file "$OUTPUT"
 
 echo "Wrote $OUTPUT"

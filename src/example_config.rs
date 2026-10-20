@@ -1,8 +1,8 @@
-//! `zecd example-config` - emit the annotated example configuration file.
+//! `rose example-config` - emit the annotated example configuration file.
 //!
 //! The analog of `zebrad generate -o` / `zallet example-config -o`: a way to get a valid,
 //! documented starting config out of the binary itself, so an operator never has to hunt for
-//! `zecd.example.toml` in a source tree they may not have (release tarball, `.deb`, container).
+//! `rose.example.toml` in a source tree they may not have (release tarball, `.deb`, container).
 
 #[cfg(feature = "cli")]
 use std::io::Write;
@@ -12,7 +12,7 @@ use std::path::Path;
 #[cfg(feature = "cli")]
 use crate::config::ExampleConfigArgs;
 
-/// The shipped `zecd.example.toml`, embedded at compile time.
+/// The shipped `rose.example.toml`, embedded at compile time.
 ///
 /// Embedding the real file - rather than serializing a `ConfigFile::default()` - is deliberate:
 /// a serde round-trip silently drops every comment, and the comments *are* the value here (the
@@ -20,8 +20,8 @@ use crate::config::ExampleConfigArgs;
 /// to the file shipped alongside it in the `.deb`/tarball by construction, so the two can never
 /// drift. `config::tests::shipped_configs_parse` asserts this exact text deserializes into
 /// `ConfigFile`, so `deny_unknown_fields` turns any schema drift into a failing test rather
-/// than a config zecd would emit but refuse to load.
-pub const EXAMPLE_CONFIG: &str = include_str!("../zecd.example.toml");
+/// than a config rose would emit but refuse to load.
+pub const EXAMPLE_CONFIG: &str = include_str!("../rose.example.toml");
 
 /// Print the example config to stdout, or write it to `--output-file`.
 #[cfg(feature = "cli")]
@@ -32,7 +32,7 @@ pub fn run(args: &ExampleConfigArgs) -> anyhow::Result<()> {
 
     write_file(path, args.force, EXAMPLE_CONFIG)?;
     // The confirmation goes to stderr so stdout carries only config text in every mode -
-    // `zecd example-config -o - > zecd.toml` and `... -o zecd.toml` produce the same file.
+    // `rose example-config -o - > rose.toml` and `... -o rose.toml` produce the same file.
     eprintln!("wrote example config to {}", path.display());
     Ok(())
 }
@@ -51,8 +51,8 @@ fn output_path(args: &ExampleConfigArgs) -> Option<&Path> {
 
 /// Write `text` to stdout via the locked handle.
 ///
-/// Not `print!`: the payload is ~12 KiB (and ~290 KiB for `zecd licenses`, which shares this),
-/// so `zecd example-config | head` closes the pipe mid-write, and the `println!`/`print!`
+/// Not `print!`: the payload is ~12 KiB (and ~290 KiB for `rose licenses`, which shares this),
+/// so `rose example-config | head` closes the pipe mid-write, and the `println!`/`print!`
 /// macros *panic* on `EPIPE` rather than returning it. A broken pipe here means the reader
 /// stopped caring, which is a clean exit, not an error. Shared with `crate::licenses` so that
 /// gotcha has one implementation rather than a copy that can rot.
@@ -67,7 +67,7 @@ pub(crate) fn write_stdout(text: &str) -> anyhow::Result<()> {
 
 /// Write the config to `path`, refusing to clobber an existing file unless `force`.
 ///
-/// The refusal is the point: this command's natural target is `<datadir>/zecd.toml`, where a
+/// The refusal is the point: this command's natural target is `<datadir>/rose.toml`, where a
 /// silent overwrite would discard a live deployment's settings (credentials included).
 #[cfg(feature = "cli")]
 fn write_file(path: &Path, force: bool, text: &str) -> anyhow::Result<()> {
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn emitted_config_is_the_annotated_example() {
         assert!(
-            EXAMPLE_CONFIG.starts_with("# Example zecd configuration"),
+            EXAMPLE_CONFIG.starts_with("# Example rose configuration"),
             "example config keeps its explanatory header"
         );
         assert!(
@@ -131,7 +131,7 @@ mod tests {
         run(&args(Some(fresh.to_str().unwrap()), false)).unwrap();
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), EXAMPLE_CONFIG);
 
-        let path = dir.path().join("zecd.toml");
+        let path = dir.path().join("rose.toml");
         std::fs::write(&path, "network = \"main\"\n").unwrap();
 
         let err = run(&args(Some(path.to_str().unwrap()), false)).unwrap_err();
@@ -155,8 +155,8 @@ mod tests {
         assert_eq!(output_path(&args(None, false)), None);
         assert_eq!(output_path(&args(Some("-"), false)), None);
         assert_eq!(
-            output_path(&args(Some("./zecd.toml"), false)),
-            Some(Path::new("./zecd.toml"))
+            output_path(&args(Some("./rose.toml"), false)),
+            Some(Path::new("./rose.toml"))
         );
     }
 }

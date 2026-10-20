@@ -5,8 +5,8 @@
 //! `regtest_transparent.rs` (which only receives): here we assert the change stays transparent
 //! (zero shielded balance appears) and that the change UTXO is itself spendable by a second send.
 //!
-//! Flow: bring up the funder (mine + mature + shield) as in `regtest_transparent.rs`, fund zecd's
-//! t-address, then have zecd pay the funder's t-address for less than it holds (forcing change).
+//! Flow: bring up the funder (mine + mature + shield) as in `regtest_transparent.rs`, fund rose's
+//! t-address, then have rose pay the funder's t-address for less than it holds (forcing change).
 //! After the send mines, the wallet's remaining balance is the transparent change at an own
 //! `t`-address (not a shielded note). The change is routed to the wallet's INTERNAL change chain,
 //! so `gettransaction` hides it (one send, no phantom self-payment); a second send then consumes
@@ -26,11 +26,11 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Rose, RoseConfig,
     SEED_MINER_ADDRESS,
 };
+use serde_json::json;
 
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
@@ -57,18 +57,18 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     // The funder's own bare t-address, used here as an external transparent counterparty.
     let funder_taddr = funder.transparent_address().to_string();
 
-    // 5. zecd with transparent receiving AND the fully-transparent spend policy.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    // 5. rose with transparent receiving AND the fully-transparent spend policy.
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.transparent = true;
     cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
-    let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    let _rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
-        .expect("attach zecd backend");
-    let zecd = Zecd::start(&cfg)
+        .expect("attach rose backend");
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd with fully-transparent spending");
+        .expect("start rose with fully-transparent spending");
 
-    let taddr = zecd
+    let taddr = rose
         .call("getnewaddress", json!(["", "transparent"]))
         .await
         .expect("getnewaddress transparent")
@@ -77,13 +77,13 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         .to_string();
     assert!(
         taddr.starts_with("tm"),
-        "zecd hands out a bare t-addr (tm...), got {taddr}"
+        "rose hands out a bare t-addr (tm...), got {taddr}"
     );
 
-    // 6. Wait until zecd is caught up before funding.
+    // 6. Wait until rose is caught up before funding.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -96,17 +96,17 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached ready: {peers}"
+            "rose never reached ready: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 7. Fund zecd's transparent address and confirm it (transparent receives are found once mined).
+    // 7. Fund rose's transparent address and confirm it (transparent receives are found once mined).
     funder
         .send(&taddr, FUND_ZATOSHIS)
         .await
-        .expect("send to zecd's transparent address");
+        .expect("send to rose's transparent address");
     zebrad
         .generate_blocks(12)
         .await
@@ -115,7 +115,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     // 8. Wait for the 1-ZEC transparent balance.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let bal = zecd
+        let bal = rose
             .call("getbalance", json!([]))
             .await
             .ok()
@@ -126,7 +126,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd did not reach the 1-ZEC transparent balance within {FUND_TIMEOUT:?} (got {bal})"
+            "rose did not reach the 1-ZEC transparent balance within {FUND_TIMEOUT:?} (got {bal})"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -143,10 +143,10 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd scans to the chain tip before spending");
-        match zecd.call("sendtoaddress", json!([funder_taddr, 0.5])).await {
+            .expect("rose scans to the chain tip before spending");
+        match rose.call("sendtoaddress", json!([funder_taddr, 0.5])).await {
             Ok(v) => break v.as_str().expect("txid string").to_string(),
             Err(e) if e.code() == Some(-6) => {
                 assert!(
@@ -163,7 +163,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     };
     assert_eq!(txid.len(), 64, "sendtoaddress returns a txid: {txid}");
 
-    // 10. Confirm the spend and let zecd rediscover the change.
+    // 10. Confirm the spend and let rose rediscover the change.
     zebrad.generate_blocks(3).await.expect("confirm the spend");
     let deadline = Instant::now() + SPEND_TIMEOUT;
     loop {
@@ -173,10 +173,10 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd syncs the spend");
-        let txn = zecd
+            .expect("rose syncs the spend");
+        let txn = rose
             .call("gettransaction", json!([txid]))
             .await
             .ok()
@@ -193,7 +193,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     //     funds, so any remaining balance that is reported with a bare `t`-address (not an empty /
     //     shielded note) proves the change did NOT auto-shield. Every unspent output must be
     //     transparent (a `tm...` address); `getbalance` reflects ~0.5 ZEC minus the fee.
-    let lu = zecd
+    let lu = rose
         .call("listunspent", json!([0]))
         .await
         .expect("listunspent");
@@ -210,7 +210,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
              {lu}"
         );
     }
-    let change_balance = zecd
+    let change_balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance")
@@ -226,7 +226,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     //      payment to the funder - with no phantom self-payment for the change. (A from-seed
     //      re-sync recovers the change via the internal gap chain and likewise recognizes it as
     //      change, so this stays true after restore.)
-    let gt = zecd
+    let gt = rose
         .call("gettransaction", json!([txid]))
         .await
         .expect("gettransaction for the send");
@@ -268,13 +268,13 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd scans before the second spend");
+            .expect("rose scans before the second spend");
         let mut recipients = serde_json::Map::new();
         recipients.insert(funder_taddr.clone(), json!(0.1));
         recipients.insert(second_taddr.to_string(), json!(0.05));
-        match zecd.call("sendmany", json!(["", recipients])).await {
+        match rose.call("sendmany", json!(["", recipients])).await {
             Ok(v) => break v.as_str().expect("txid string").to_string(),
             Err(e) if e.code() == Some(-6) => {
                 assert!(
@@ -308,10 +308,10 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         .expect("zebra getblockcount")
         .as_u64()
         .expect("tip height");
-    zecd.wait_until_synced(tip, Duration::from_secs(60))
+    rose.wait_until_synced(tip, Duration::from_secs(60))
         .await
-        .expect("zecd scans the sendmany's confirmation");
-    let gt2 = zecd
+        .expect("rose scans the sendmany's confirmation");
+    let gt2 = rose
         .call("gettransaction", json!([txid2]))
         .await
         .expect("gettransaction for the sendmany");
@@ -340,7 +340,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
             .any(|d| d["address"].as_str() == Some(second_taddr)),
         "the other send is the 0.05 ZEC payment to the second recipient: {gt2}"
     );
-    let lu2 = zecd
+    let lu2 = rose
         .call("listunspent", json!([0]))
         .await
         .expect("listunspent after the sendmany");
@@ -356,7 +356,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     //     address is a deliberate payment, not change, so it must surface in history as a
     //     send+receive pair - proving the internal-change hiding does not swallow legitimate
     //     self-payments. (The change of *this* tx is on the internal chain and stays hidden.)
-    let own_addr = zecd
+    let own_addr = rose
         .call("getnewaddress", json!(["", "transparent"]))
         .await
         .expect("getnewaddress for the self-send")
@@ -371,10 +371,10 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd scans before the self-send");
-        match zecd.call("sendtoaddress", json!([own_addr, 0.05])).await {
+            .expect("rose scans before the self-send");
+        match rose.call("sendtoaddress", json!([own_addr, 0.05])).await {
             Ok(v) => break v.as_str().expect("txid string").to_string(),
             Err(e) if e.code() == Some(-6) => {
                 assert!(
@@ -401,10 +401,10 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd syncs the self-send");
-        if zecd
+            .expect("rose syncs the self-send");
+        if rose
             .call("gettransaction", json!([self_txid]))
             .await
             .ok()
@@ -417,7 +417,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         assert!(Instant::now() < deadline, "the self-send never confirmed");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let gt_self = zecd
+    let gt_self = rose
         .call("gettransaction", json!([self_txid]))
         .await
         .expect("gettransaction for the self-send");
@@ -445,7 +445,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
     //     down both directions: internal change must NOT be credited as received (a change
     //     address leaking in here would misreport wallet income), and the deliberate external
     //     self-payment MUST be. Spending the funding UTXO must not reduce what `taddr` received.
-    let recv_taddr = zecd
+    let recv_taddr = rose
         .call("getreceivedbyaddress", json!([taddr]))
         .await
         .expect("getreceivedbyaddress on the funded t-addr")
@@ -455,7 +455,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         (recv_taddr - 1.0).abs() < 1e-8,
         "the funded t-addr still shows the full 1 ZEC received after spending it: {recv_taddr}"
     );
-    let recv_own = zecd
+    let recv_own = rose
         .call("getreceivedbyaddress", json!([own_addr]))
         .await
         .expect("getreceivedbyaddress on the self-send address")
@@ -465,7 +465,7 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         (recv_own - 0.05).abs() < 1e-8,
         "the self-payment is credited to the own external address: {recv_own}"
     );
-    let lra = zecd
+    let lra = rose
         .call("listreceivedbyaddress", json!([1, false]))
         .await
         .expect("listreceivedbyaddress");
@@ -483,6 +483,6 @@ async fn regtest_fully_transparent_spend_keeps_change_transparent() {
         "exactly the two external receive addresses are listed - no change address, no foreign \
          recipient: {lra}"
     );
-    drop(zecd);
+    drop(rose);
     // `zebrad` and `funder` clean up on drop.
 }

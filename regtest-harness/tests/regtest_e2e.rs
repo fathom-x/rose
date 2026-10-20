@@ -1,9 +1,9 @@
-//! End-to-end regtest test: zebra (Regtest) + the real `zecd` daemon.
+//! End-to-end regtest test: zebra (Regtest) + the real `rose` daemon.
 //!
 //! The **unfunded** surface, and deliberately only that: a daemon comes up against a real chain,
 //! follows it, and answers correctly with an empty wallet. Every funded flow belongs to
 //! `regtest_funded.rs` and its siblings, so nothing that needs a funder should be added here -
-//! this binary is cheap (one zebrad, one zecd, no funder, no proving) and that is its value.
+//! this binary is cheap (one zebrad, one rose, no funder, no proving) and that is its value.
 //!
 //! Skips cleanly when the node binary isn't provisioned (so plain `cargo test` and the
 //! build-only CI path still validate that the harness compiles). Provide `ZEBRAD_BIN` to run
@@ -11,12 +11,12 @@
 
 use std::time::Duration;
 
+use rose_regtest_harness::{pick_port, resolve_node_bin, RegtestNode, Rose, RoseConfig, Zebrad};
 use serde_json::json;
-use zecd_regtest_harness::{pick_port, resolve_node_bin, RegtestNode, Zebrad, Zecd, ZecdConfig};
 
-/// Blocks mined before launching zecd. Regtest mining is cheap (PoW disabled).
+/// Blocks mined before launching rose. Regtest mining is cheap (PoW disabled).
 const INITIAL_BLOCKS: u32 = 10;
-/// Generous: zecd scan over a fresh regtest chain.
+/// Generous: rose scan over a fresh regtest chain.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]
@@ -40,21 +40,31 @@ async fn regtest_end_to_end() {
         .await
         .expect("mine initial regtest blocks");
 
-    // 2. zecd against zebra's JSON-RPC.
-    let cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
-    let zecd = Zecd::start(&cfg)
+    // 2. rose against zebra's JSON-RPC.
+    let cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd against regtest zebra");
-    zecd.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
+        .expect("start rose against regtest zebra");
+    rose.wait_until_synced(INITIAL_BLOCKS as u64, SYNC_TIMEOUT)
         .await
-        .expect("zecd scans to the regtest tip");
+        .expect("rose scans to the regtest tip");
 
-    // ---- zecd RPC assertions ----
+    // The `rose` command line's RPC client reaches this daemon through the same `rose.toml`
+    // (its `[rpc]` user, password and port) and answers with what the HTTP client sees: the
+    // chain is at rest between the two readings (synced, nothing mined), so they must agree.
+    let cli_height = rose.cli(&["getblockcount"]).expect("rose getblockcount");
+    assert_eq!(
+        cli_height.trim(),
+        rose.block_count().await.expect("getblockcount").to_string(),
+        "`rose getblockcount` disagrees with the HTTP client"
+    );
+
+    // ---- rose RPC assertions ----
 
     // Chain identity. Capture the synced height rather than assuming an absolute value (how the
     // regtest genesis maps to a tip height is an implementation detail); `blocks` is the
     // fully-scanned height.
-    let info = zecd
+    let info = rose
         .call("getblockchaininfo", json!([]))
         .await
         .expect("getblockchaininfo");
@@ -62,11 +72,11 @@ async fn regtest_end_to_end() {
     let height0 = info["blocks"].as_u64().expect("blocks is a number");
     assert!(
         height0 >= INITIAL_BLOCKS as u64,
-        "zecd should have scanned at least the {INITIAL_BLOCKS} mined blocks (got {height0})"
+        "rose should have scanned at least the {INITIAL_BLOCKS} mined blocks (got {height0})"
     );
 
     // Orchard-only receive address: unified, regtest-encoded.
-    let addr = zecd
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -76,7 +86,7 @@ async fn regtest_end_to_end() {
         "expected a uregtest1 unified address, got {addr}"
     );
 
-    let validated = zecd
+    let validated = rose
         .call("validateaddress", json!([addr]))
         .await
         .expect("validateaddress");
@@ -86,7 +96,7 @@ async fn regtest_end_to_end() {
     );
 
     // Empty wallet: zero balance, no history, no notes.
-    let balance = zecd
+    let balance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance");
@@ -95,7 +105,7 @@ async fn regtest_end_to_end() {
         Some(0.0),
         "fresh wallet balance should be 0"
     );
-    let txs = zecd
+    let txs = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
@@ -106,7 +116,7 @@ async fn regtest_end_to_end() {
     );
 
     // Spending with no funds → Bitcoin Core's insufficient-funds code (-6).
-    let err = zecd
+    let err = rose
         .call("sendtoaddress", json!([addr, 1.0]))
         .await
         .expect_err("sendtoaddress with an empty wallet must fail");
@@ -118,24 +128,24 @@ async fn regtest_end_to_end() {
 
     // The wallet is unencrypted (age-identity model): the passphrase RPCs reject with -15,
     // exactly like bitcoind running with an unencrypted wallet.
-    let err = zecd
+    let err = rose
         .call("walletlock", json!([]))
         .await
         .expect_err("walletlock on an unencrypted wallet must fail");
     assert_eq!(err.code(), Some(-15), "expected -15, got: {err}");
-    let err = zecd
+    let err = rose
         .call("walletpassphrase", json!(["x", 60]))
         .await
         .expect_err("walletpassphrase on an unencrypted wallet must fail");
     assert_eq!(err.code(), Some(-15), "expected -15, got: {err}");
 
-    // Mining more blocks advances zecd's view by exactly that many.
+    // Mining more blocks advances rose's view by exactly that many.
     zebrad.generate_blocks(5).await.expect("mine 5 more");
-    zecd.wait_until_synced(height0 + 5, SYNC_TIMEOUT)
+    rose.wait_until_synced(height0 + 5, SYNC_TIMEOUT)
         .await
-        .expect("zecd follows the new blocks");
+        .expect("rose follows the new blocks");
     assert_eq!(
-        zecd.block_count().await.expect("getblockcount"),
+        rose.block_count().await.expect("getblockcount"),
         height0 + 5
     );
 

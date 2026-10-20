@@ -1,8 +1,8 @@
-//! Embedding zecd in another process: build a running node (wallet actors, registry,
+//! Embedding rose in another process: build a running node (wallet actors, registry,
 //! async-operation registry, proving keys) without the HTTP RPC or health servers, and
 //! dispatch RPCs in-process with wire-identical semantics.
 //!
-//! The `zecd` binary is this facade plus the HTTP layers: [`crate::daemon::run`] is
+//! The `rose` binary is this facade plus the HTTP layers: [`crate::daemon::run`] is
 //! `NodeBuilder::prepare` + the HTTP `Authenticator` + `PreparedNode::start` + the health and
 //! RPC servers + signal handling. An embedder that wants only the node stops at
 //! [`NodeBuilder::start`] and talks to it through [`Node::call`].
@@ -44,7 +44,7 @@ use crate::wallet::binding;
 use crate::wallet::store::WalletStore;
 use crate::wallet::{CoinWallet, WalletRegistry};
 
-/// Builder for an embedded zecd node. `new(config).start().await` is the normal entry point;
+/// Builder for an embedded rose node. `new(config).start().await` is the normal entry point;
 /// the two-phase `prepare()` / [`PreparedNode::start`] split exists so the binary can run its
 /// HTTP-only startup work (building the RPC `Authenticator`, logging the auth mode) between
 /// the fail-fast checks and the wallet spawns, preserving the daemon's exact startup order.
@@ -58,7 +58,7 @@ impl NodeBuilder {
     }
 
     /// Phase 1 - everything that must fail before any wallet is touched: take the exclusive
-    /// datadir lock (a second zecd on the same datadir would corrupt the wallet DB), refuse a
+    /// datadir lock (a second rose on the same datadir would corrupt the wallet DB), refuse a
     /// placeholder RPC password, and install the (idempotent) panic hook.
     pub fn prepare(self) -> anyhow::Result<PreparedNode> {
         // Single-instance guard: take the exclusive datadir lock before opening any wallet, and
@@ -66,7 +66,7 @@ impl NodeBuilder {
         let datadir_lock = crate::lock::lock_datadir(&self.config.datadir)?;
         // The example/deploy configs ship with a placeholder RPC password, which is spend
         // authority printed in a public repo, so refuse to start until it has been changed - on
-        // every network. Shared with `zecd config check`, which reports the same refusal
+        // every network. Shared with `rose config check`, which reports the same refusal
         // without starting anything.
         config::reject_placeholder_password(&self.config)?;
         #[cfg(feature = "zcash")]
@@ -124,7 +124,7 @@ impl PreparedNode {
     /// not be able to reacquire the lock over a straggler. (The binary never noticed - a fatal
     /// startup error exits the process - but the facade outlives its errors.)
     pub async fn start(self) -> anyhow::Result<Node> {
-        let prog = "zecd";
+        let prog = "rose";
         let config = self.config;
 
         // Move any librustzcash file still sitting at a wallet directory's root into that
@@ -177,7 +177,7 @@ impl PreparedNode {
             // NU6.3, so post-NU6.3 sends prove the Ironwood bundle from the cache instead of
             // rebuilding a key per send. NU6.3 is live on mainnet (3_428_143) and testnet
             // (4_134_000), so both build it; only a regtest chain without
-            // `ZECD_REGTEST_NU63_HEIGHT` skips a keygen no send there could use.
+            // `ROSE_REGTEST_NU63_HEIGHT` skips a keygen no send there could use.
             let build_ironwood = config
                 .network
                 .activation_height(NetworkUpgrade::Nu6_3)
@@ -237,7 +237,7 @@ impl PreparedNode {
             }
         };
 
-        // zecd permits at most one wallet with spending keys per coin; watch-only (UFVK)
+        // rose permits at most one wallet with spending keys per coin; watch-only (UFVK)
         // wallets may be loaded without limit. Record each opened wallet's coin and watch-only
         // flag so the invariant can be enforced once every wallet has been spawned (the flag
         // is only known after the actor reads the account from the wallet DB).
@@ -402,7 +402,7 @@ impl PreparedNode {
                     }
                     // A failed account-to-keys binding check is evidence the wallet database (or
                     // keys.toml) was replaced, so it is fatal for the whole node, like the
-                    // single-spending-wallet invariant: zecd won't quietly keep serving the other
+                    // single-spending-wallet invariant: rose won't quietly keep serving the other
                     // wallets while one of them shows signs of tampering. Any other per-wallet
                     // startup failure (unreadable database, missing files) skips just that wallet.
                     Err(e) if e.downcast_ref::<binding::BindingMismatch>().is_some() => {
@@ -465,7 +465,7 @@ impl PreparedNode {
         }
 
         // Enforce the single-spending-wallet invariant before serving anything. A second spending
-        // wallet is a misconfiguration the operator must resolve (zecd won't silently pick which
+        // wallet is a misconfiguration the operator must resolve (rose won't silently pick which
         // one is "the" spender), so this is fatal - the actors spawned above are stopped and
         // awaited before the error releases the datadir lock.
         if let Err(e) = crate::daemon::ensure_single_spending_wallet(
@@ -689,7 +689,7 @@ async fn spawn_fleet(
 /// Whether any configured wallet could ever sign a transaction - i.e. whether this daemon has
 /// any use for the Orchard proving keys.
 ///
-/// Reads `keys.toml`, not the wallet database. A `zecd init --ufvk` wallet is seedless by
+/// Reads `keys.toml`, not the wallet database. A `rose init --ufvk` wallet is seedless by
 /// construction (`WalletStore::init_view_only`), and `keys.toml` is written before the database
 /// exists, so this is answerable at startup - before any actor has spawned and reported the
 /// `watch_only` flag the single-spender invariant later uses. An *encrypted* wallet still holds
@@ -793,8 +793,8 @@ fn spawn_bitcoin_wallet(
         ),
         None if store.has_seed() => None,
         None => anyhow::bail!(
-            "wallet '{}' has neither a seed nor an imported xpub in {} (not a wallet zecd \
-             created); re-run `zecd init` for it",
+            "wallet '{}' has neither a seed nor an imported xpub in {} (not a wallet rose \
+             created); re-run `rose init` for it",
             name,
             keys_path.display()
         ),
@@ -867,7 +867,7 @@ pub struct WalletLocation {
     pub scope: crate::wallet::read::AccountScope,
 }
 
-/// A running embedded zecd node: the wallet actors, registry, and async-operation registry,
+/// A running embedded rose node: the wallet actors, registry, and async-operation registry,
 /// behind the same dispatch table the HTTP server uses. Owns the datadir lock for its
 /// lifetime; call [`Node::shutdown`] to stop the actors and release it cleanly.
 pub struct Node {
@@ -919,8 +919,8 @@ impl Node {
         let _active = self.state.active.begin(&req.method);
         // Same `rpc` span the HTTP transport enters, so an embedded call's downstream events
         // are attributable exactly as an HTTP one's are - and so an embedder's own span
-        // wrapping this call nests zecd's events underneath it (the correlation id they can
-        // attach, which zecd deliberately has no field for).
+        // wrapping this call nests rose's events underneath it (the correlation id they can
+        // attach, which rose deliberately has no field for).
         use tracing::Instrument as _;
         let span = tracing::info_span!(
             "rpc",
@@ -937,10 +937,10 @@ impl Node {
     /// surface (see the crate root).
     ///
     /// [`Node::call`] can reach every send RPC, but only through their zcashd/Bitcoin-dialect
-    /// argument shapes: a JSON array of `{address, amount, memo}` objects that zecd parses back
+    /// argument shapes: a JSON array of `{address, amount, memo}` objects that rose parses back
     /// into exactly this type. A consumer that already holds a [`TransactionRequest`] - anything
     /// building payments programmatically, memo-carrying protocols above all - would otherwise
-    /// have to render one to JSON for zecd to re-parse. Everything below this method is the RPC
+    /// have to render one to JSON for rose to re-parse. Everything below this method is the RPC
     /// path unchanged: the same single-writer actor, so sends still serialize and cannot
     /// double-spend; the same privacy ladder; the same `SendSource` one-source-per-send rule.
     ///
@@ -1413,6 +1413,6 @@ mod tests {
         let uptime = node.call(None, "uptime", vec![]).await.unwrap();
         assert!(uptime.is_u64());
         let help = node.call(None, "help", vec![]).await.unwrap();
-        assert!(help.as_str().unwrap().contains("zecd"));
+        assert!(help.as_str().unwrap().contains("rose"));
     }
 }

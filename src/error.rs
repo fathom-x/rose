@@ -13,7 +13,7 @@ use std::fmt;
 pub mod codes {
     // JSON-RPC 2.0 transport-level errors. NB: `RPC_INVALID_PARAMS` (-32602) is a framing-level
     // code that Bitcoin Core never emits from a method handler - a missing argument raises the
-    // help text (`RPC_MISC_ERROR`, -1) and a wrong-typed one raises `RPC_TYPE_ERROR` (-3). zecd
+    // help text (`RPC_MISC_ERROR`, -1) and a wrong-typed one raises `RPC_TYPE_ERROR` (-3). rose
     // follows suit: handlers use [`RpcError::missing_param`]/[`RpcError::type_error`], never this.
     pub const RPC_INVALID_REQUEST: i32 = -32600;
     pub const RPC_METHOD_NOT_FOUND: i32 = -32601;
@@ -21,8 +21,8 @@ pub mod codes {
     pub const RPC_PARSE_ERROR: i32 = -32700;
 
     // General application errors. (Bitcoin Core's `protocol.h` defines more - including a P2P
-    // client block - but zecd has no occasion to emit them, so this is Core's taxonomy narrowed
-    // to what zecd returns rather than a copy of the whole header. Clients still match on the
+    // client block - but rose has no occasion to emit them, so this is Core's taxonomy narrowed
+    // to what rose returns rather than a copy of the whole header. Clients still match on the
     // numeric values.)
     pub const RPC_MISC_ERROR: i32 = -1;
     pub const RPC_TYPE_ERROR: i32 = -3;
@@ -34,8 +34,8 @@ pub mod codes {
     pub const RPC_VERIFY_ALREADY_IN_UTXO_SET: i32 = -27;
     pub const RPC_METHOD_DEPRECATED: i32 = -32;
 
-    // The one code zecd takes from Core's P2P client block: Core returns it while the node is
-    // still downloading initial blocks, and zecd returns it from a send while the wallet is
+    // The one code rose takes from Core's P2P client block: Core returns it while the node is
+    // still downloading initial blocks, and rose returns it from a send while the wallet is
     // still scanning further behind the tip than `[spend] max_send_catchup_blocks` allows.
     pub const RPC_CLIENT_IN_INITIAL_DOWNLOAD: i32 = -10;
 
@@ -43,7 +43,7 @@ pub mod codes {
     // and `-18` (wallet not found) differ in *meaning* from zcashd's `protocol.h` (where they are
     // "accounts unsupported" / "backup required"). The collision is harmless - those codes belong
     // to the label/multiwallet methods zcashd lacks - so don't "reconcile" the numbers: the
-    // Bitcoin Core values are the conformance target. `-11` is the one code here zecd no longer
+    // Bitcoin Core values are the conformance target. `-11` is the one code here rose no longer
     // emits at all: the label methods it belonged to were removed with the address-label feature
     // (see the statelessness invariant). It is kept so the wallet block stays Core's, and so
     // re-adding a label-shaped method cannot invent a different number.
@@ -141,7 +141,7 @@ impl RpcError {
     }
 
     /// A required parameter was omitted. Bitcoin Core answers a missing argument with the
-    /// method's help text under `RPC_MISC_ERROR` (-1); zecd carries a short description instead
+    /// method's help text under `RPC_MISC_ERROR` (-1); rose carries a short description instead
     /// of a full help page. Never `RPC_INVALID_PARAMS` (-32602), which Core reserves for framing.
     pub fn missing_param(message: impl Into<String>) -> Self {
         Self::new(codes::RPC_MISC_ERROR, message)

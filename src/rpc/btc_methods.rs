@@ -1,7 +1,7 @@
 //! The RPC methods served for Bitcoin wallets - the handler half of the second sanctioned
 //! engine seam (the registry being the first; see the shared-layer boundary in the project docs).
 //!
-//! [`dispatch`] is a sub-table consulted by `dispatch_zecd` when the addressed wallet is a
+//! [`dispatch`] is a sub-table consulted by `dispatch_rose` when the addressed wallet is a
 //! Bitcoin one: `Some` for the methods the BDK engine serves (which must be exactly the
 //! methods `METHOD_COINS` lists for [`crate::coin::Coin::Bitcoin`] - the
 //! `bitcoin_slice_matches_method_coins` test pins the two together), `None` to fall through
@@ -280,7 +280,7 @@ async fn getnewaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Val
     // Same statelessness rule as the Zcash handler: no labels, ever.
     if opt_str(req, 0).is_some_and(|s| !s.is_empty()) {
         return Err(RpcError::invalid_parameter(
-            "labels are not supported (zecd is stateless); call getnewaddress without a label",
+            "labels are not supported (rose is stateless); call getnewaddress without a label",
         ));
     }
     // The engine derives BIP 84 native segwit; that is the only address type it can issue.
@@ -375,13 +375,13 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
             "hash": status.synced_hash,
             "height": status.synced_height,
         },
-        // zecd extension: whether the wallet's chain source is connected right now. The
+        // rose extension: whether the wallet's chain source is connected right now. The
         // Zcash side answers this through `getpeerinfo`, which Bitcoin wallets do not
         // serve (nothing here has peers in Core's sense); this is the one signal that a
         // hung or unreachable upstream has been noticed - it flips false when the actor
         // drops the connection and back once a reconnect succeeds.
         "upstream_connected": status.conn_state != BtcConnState::Down,
-        // zecd extension: the wallet birthday and how it resolved - the same object the Zcash
+        // rose extension: the wallet birthday and how it resolved - the same object the Zcash
         // handler reports. `height` is the recorded birthday (`keys.toml`), where a rebuild
         // scans from; `time` the birthday block's own time once the chain source has
         // answered (bitcoind at connect, kyoto once its headers cover it), else the offline
@@ -400,7 +400,7 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
                 .as_ref()
                 .map(|(height, hash)| json!({ "height": height, "hash": hash })),
         },
-        // zecd extension: the opt-in mempool feed (`[mempool]`, kyoto only) - the one source
+        // rose extension: the opt-in mempool feed (`[mempool]`, kyoto only) - the one source
         // of 0-conf sightings on that backend, so a merchant integration can tell "no
         // payment detected" from "nothing could have been detected". `state` is `disabled`
         // (no feed configured for this wallet: the default, and always over bitcoind, which
@@ -429,7 +429,7 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
                 obj
             }
         },
-        // zecd extension: what a from-seed restore under this wallet's configuration would
+        // rose extension: what a from-seed restore under this wallet's configuration would
         // recover, the Bitcoin counterpart of the Zcash handler's `transparent` block (see
         // `src/btc/README.md`, "Restores and the address lookahead"). `horizon` is the
         // highest external index such a restore re-derives without further funding
@@ -445,7 +445,7 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
             "issued_through": recovery.issued_through,
             "restorable": recovery.restorable,
         },
-        // zecd extension: which engine serves this wallet. The Zcash handler reports its own
+        // rose extension: which engine serves this wallet. The Zcash handler reports its own
         // extensions (pools, transparent) here; `coin` is the field a mixed-coin deployment
         // tells wallets apart by.
         "coin": "bitcoin",
@@ -658,7 +658,7 @@ async fn listtransactions(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<
     if let Some(label) = opt_str(req, 0) {
         if !label.is_empty() && label != "*" {
             return Err(RpcError::invalid_parameter(
-                "labels are not supported (zecd is stateless); pass \"*\" or omit the label",
+                "labels are not supported (rose is stateless); pass \"*\" or omit the label",
             ));
         }
     }
@@ -724,7 +724,7 @@ async fn gettransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Va
 /// `include_immature_coinbase` is accepted and ignored (an address this wallet hands out is
 /// never a coinbase destination). `include_empty` unions every address the wallet has ever
 /// revealed, which makes `listreceivedbyaddress 0 true` the enumeration of the issued set -
-/// Core has no `listaddresses` either. Each entry carries zecd's `address_index` extension,
+/// Core has no `listaddresses` either. Each entry carries rose's `address_index` extension,
 /// the external-keychain derivation index `getaddressinfo` reports as `address_index`, so a
 /// caller reconciling an issued range never needs one `getaddressinfo` per address.
 /// Entries ascend by index. A filter naming an address that is not the wallet's answers `[]`.
@@ -788,7 +788,7 @@ async fn listreceivedbyaddress(
 
 /// `listdescriptors [private]` - Bitcoin Core's shape: the wallet's two public descriptors
 /// (receiving `/0/*`, change `/1/*`), each with its next unused index and the range the
-/// wallet watches. This is where the account xpub is read over RPC (`zecd export-xpub` is
+/// wallet watches. This is where the account xpub is read over RPC (`rose export-xpub` is
 /// the offline route). `private = true` is refused with `-4`: the database holds public
 /// descriptors only and the seed never leaves the process, so there is no private
 /// descriptor to return - Core answers a private-keys-disabled wallet the same way.
@@ -834,7 +834,7 @@ async fn sendtoaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Val
         }
         Some(v) => value_to_zats(v)?,
     };
-    // Params 2/3 (comment, comment_to) are metadata and safe to ignore (zecd is stateless).
+    // Params 2/3 (comment, comment_to) are metadata and safe to ignore (rose is stateless).
     // Param 4 (subtractfeefromamount): the fee comes out of the amount sent - the recipient
     // receives amount minus fee and the sender is debited exactly the amount.
     let subtract = match req.param(4) {
@@ -875,7 +875,7 @@ async fn sendtoaddress(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Val
     Ok(send_result(sent, verbose))
 }
 
-/// Parse zecd's `fee_split` extension (position 12 on `sendtoaddress`, 10 on `sendmany`):
+/// Parse rose's `fee_split` extension (position 12 on `sendtoaddress`, 10 on `sendmany`):
 /// how the recipients named to pay the fee share it. `"equal"` (or absent) is Core's
 /// `subtractfeefrom`: the whole fee, divided equally. `"output"` charges each paying
 /// recipient only its own output's block space at the send's rate, and the sender's change
@@ -1185,7 +1185,7 @@ async fn getaddressinfo(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Va
             "m/84'/{coin_type}'/0'/{}/{index}",
             if change { 1 } else { 0 }
         ));
-        // The same zecd extension the Zcash handler exposes for transparent addresses: the
+        // The same rose extension the Zcash handler exposes for transparent addresses: the
         // child index, so an operator can reconcile issued ranges without parsing the path.
         obj["address_index"] = json!(index);
     }
@@ -1277,7 +1277,7 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join("zecd.toml");
+        let conf = dir.path().join("rose.toml");
         std::fs::write(
             &conf,
             format!(
@@ -1287,7 +1287,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let cli = crate::config::Cli::parse_from(["zecd", "--conf", conf.to_str().unwrap()]);
+        let cli = crate::config::Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let config = crate::config::AppConfig::resolve(&cli).unwrap();
         let entry = &config.wallets["btc"];
         let (handle, _task) = crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
@@ -1337,7 +1337,7 @@ mod tests {
         let address = address.as_str().unwrap().to_string();
         assert!(address.starts_with("tb1"), "{address}");
 
-        // Amounts are bare 8-decimal JSON numbers, like every zecd balance.
+        // Amounts are bare 8-decimal JSON numbers, like every rose balance.
         let balance = call("getbalance", vec![]).await.unwrap();
         assert_eq!(balance.to_string(), "0.00000000");
         let balances = call("getbalances", vec![]).await.unwrap();

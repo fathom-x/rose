@@ -3,7 +3,7 @@
 //! reports those funds correctly across every balance/history RPC - then spends via the turnstile.
 //!
 //! Setup mirrors `regtest_funded.rs`: mine a transparent coinbase to the funder, mature it, shield
-//! it, then send shielded funds to zecd. The difference is that zecd is configured with
+//! it, then send shielded funds to rose. The difference is that rose is configured with
 //! `[pools] enabled = ["sapling", "orchard"]`, and we fund **two** receivers - a Sapling-only one
 //! (1 ZEC) and an Orchard-only one (2 ZEC) - so the wallet ends up holding one Sapling note and one
 //! Orchard note. That lets us assert that getbalance / getbalances / getwalletinfo / listunspent /
@@ -11,7 +11,7 @@
 //!
 //! The funder spends its Orchard notes; sending to a Sapling-only receiver is an
 //! ordinary cross-pool transfer (its `propose_transfer` takes no privacy policy - the same
-//! call zecd uses when it sends Orchard->transparent in `regtest_funded`), so the value simply
+//! call rose uses when it sends Orchard->transparent in `regtest_funded`), so the value simply
 //! lands as a Sapling note.
 //!
 //! NB: past the `dw/ironwood-scan-model` "select shielded inputs from a single pool group" change,
@@ -31,10 +31,10 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Rose, RoseConfig,
 };
+use serde_json::json;
 
 const FUND_ZATOSHIS: u64 = 100_000_000; // 1 ZEC per receiver
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
@@ -60,25 +60,25 @@ async fn regtest_sapling_and_orchard_balances() {
     // The funder's own bare t-address, used here as an external transparent counterparty.
     let funder_taddr = funder.transparent_address().to_string();
 
-    // 5. zecd with BOTH shielded pools enabled.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    // 5. rose with BOTH shielded pools enabled.
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.pools = Some((
         vec!["sapling".into(), "orchard".into()],
         vec!["sapling".into(), "orchard".into()],
     ));
-    let zecd = Zecd::start(&cfg)
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd with sapling+orchard");
+        .expect("start rose with sapling+orchard");
 
     // Address generation honours the configuration: the default UA carries both receivers, and the
     // per-call overrides yield single-pool UAs. (Deterministic - no funding needed.)
     let addr_str = |v: serde_json::Value| v.as_str().expect("address string").to_string();
     let default_ua = addr_str(
-        zecd.call("getnewaddress", json!([]))
+        rose.call("getnewaddress", json!([]))
             .await
             .expect("getnewaddress"),
     );
-    let dv = zecd
+    let dv = rose
         .call("validateaddress", json!([default_ua]))
         .await
         .expect("validateaddress default UA");
@@ -92,22 +92,22 @@ async fn regtest_sapling_and_orchard_balances() {
     assert!(has_recv(&dv, "sapling"), "default UA has Sapling: {dv}");
 
     let sapling_ua = addr_str(
-        zecd.call("getnewaddress", json!(["", "sapling"]))
+        rose.call("getnewaddress", json!(["", "sapling"]))
             .await
             .expect("getnewaddress sapling"),
     );
     let orchard_ua = addr_str(
-        zecd.call("getnewaddress", json!(["", "orchard"]))
+        rose.call("getnewaddress", json!(["", "orchard"]))
             .await
             .expect("getnewaddress orchard"),
     );
-    let sv = zecd
+    let sv = rose
         .call("validateaddress", json!([sapling_ua]))
         .await
         .expect("validateaddress sapling UA");
     assert!(has_recv(&sv, "sapling"), "sapling UA has Sapling: {sv}");
     assert!(!has_recv(&sv, "orchard"), "sapling-only UA: {sv}");
-    let ov = zecd
+    let ov = rose
         .call("validateaddress", json!([orchard_ua]))
         .await
         .expect("validateaddress orchard UA");
@@ -115,7 +115,7 @@ async fn regtest_sapling_and_orchard_balances() {
     assert!(!has_recv(&ov, "sapling"), "orchard-only UA: {ov}");
 
     // An unknown address type is a -5 (both pools are enabled, so this is the syntax path).
-    let err = zecd
+    let err = rose
         .call("getnewaddress", json!(["", "boguspool"]))
         .await
         .expect_err("unknown address type must fail");
@@ -124,7 +124,7 @@ async fn regtest_sapling_and_orchard_balances() {
     // z_getaddressforaccount (zcashd syntax) on a sapling+orchard wallet: the default and the
     // explicit single-/dual-pool receiver sets all derive shielded-only UAs, and re-deriving at
     // a fixed diversifier index is idempotent. (Deterministic - no funding needed.)
-    let a = zecd
+    let a = rose
         .call("z_getaddressforaccount", json!([0]))
         .await
         .expect("z_getaddressforaccount");
@@ -134,20 +134,20 @@ async fn regtest_sapling_and_orchard_balances() {
         a_recv.iter().any(|x| x == "sapling") && a_recv.iter().any(|x| x == "orchard"),
         "default UA receiver_types are sapling+orchard: {a}"
     );
-    let av = zecd
+    let av = rose
         .call("validateaddress", json!([a["address"].as_str().unwrap()]))
         .await
         .expect("validateaddress");
     assert!(has_recv(&av, "sapling") && has_recv(&av, "orchard"), "{av}");
     // Idempotent re-derivation at the chosen diversifier index returns the identical object.
     let j = a["diversifier_index"].clone();
-    let a_again = zecd
+    let a_again = rose
         .call("z_getaddressforaccount", json!([0, [], j]))
         .await
         .expect("z_getaddressforaccount idempotent");
     assert_eq!(a_again, a, "re-derivation at a fixed index is idempotent");
     // Explicit single-pool receiver sets.
-    let s = zecd
+    let s = rose
         .call("z_getaddressforaccount", json!([0, ["sapling"]]))
         .await
         .expect("z_getaddressforaccount sapling");
@@ -157,7 +157,7 @@ async fn regtest_sapling_and_orchard_balances() {
     // seed-dependent - and librustzcash rejects a second UA with different receivers at an
     // already-used index (DiversifierIndexReuse -> -4). A large index can't collide with that
     // low-index default, and Orchard diversifiers are valid at every index.
-    let o = zecd
+    let o = rose
         .call("z_getaddressforaccount", json!([0, ["orchard"], 1_000_000]))
         .await
         .expect("z_getaddressforaccount orchard at a fixed index");
@@ -170,16 +170,16 @@ async fn regtest_sapling_and_orchard_balances() {
     // p2pkh derives a bare transparent address, but only on a wallet that enables transparent
     // receiving. This one has two shielded pools and no [pools] transparent, so it is -8.
     // (The enabled case is covered by regtest_transparent.)
-    let err = zecd
+    let err = rose
         .call("z_getaddressforaccount", json!([0, ["p2pkh"]]))
         .await
         .expect_err("p2pkh must be rejected on a wallet without [pools] transparent");
     assert_eq!(err.code(), Some(-8), "p2pkh -> -8: {err}");
 
-    // 6. Wait until zecd is caught up (so the mempool stream is open) before funding.
+    // 6. Wait until rose is caught up (so the mempool stream is open) before funding.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -192,7 +192,7 @@ async fn regtest_sapling_and_orchard_balances() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached ready: {peers}"
+            "rose never reached ready: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -209,7 +209,7 @@ async fn regtest_sapling_and_orchard_balances() {
     funder
         .send(&orchard_ua, 2 * FUND_ZATOSHIS)
         .await
-        .expect("send to zecd's Orchard receiver");
+        .expect("send to rose's Orchard receiver");
     zebrad
         .generate_blocks(12)
         .await
@@ -224,11 +224,11 @@ async fn regtest_sapling_and_orchard_balances() {
     funder
         .send(&sapling_ua, FUND_ZATOSHIS)
         .await
-        .expect("send to zecd's Sapling receiver");
+        .expect("send to rose's Sapling receiver");
     {
         let deadline = Instant::now() + FUND_TIMEOUT;
         loop {
-            let pending = zecd
+            let pending = rose
                 .call("getunconfirmedbalance", json!([]))
                 .await
                 .expect("getunconfirmedbalance")
@@ -253,15 +253,15 @@ async fn regtest_sapling_and_orchard_balances() {
     // exactly how this test failed in CI (`getbalance sums both pools: left Some(0.0), right
     // Some(3.0)`, with the engine logging `Scanning Historic(161..162)` at the moment of the
     // assertion). `wait_until_synced_to_node` asks the daemon the question directly.
-    zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+    rose.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
         .await
-        .expect("zecd scans to the chain tip before the balance assertions");
+        .expect("rose scans to the chain tip before the balance assertions");
 
     // 7. Both notes confirmed: the wallet holds 3 ZEC across two pools (2 Orchard + 1 Sapling).
     //    Assert EVERY balance RPC aggregates across Sapling + Orchard.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let bal = zecd
+        let bal = rose
             .call("getbalance", json!([]))
             .await
             .ok()
@@ -272,13 +272,13 @@ async fn regtest_sapling_and_orchard_balances() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd did not reach the combined 3-ZEC balance within {FUND_TIMEOUT:?} (got {bal})"
+            "rose did not reach the combined 3-ZEC balance within {FUND_TIMEOUT:?} (got {bal})"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     // getbalance: combined spendable across both pools.
-    let getbalance = zecd
+    let getbalance = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance");
@@ -289,7 +289,7 @@ async fn regtest_sapling_and_orchard_balances() {
     );
 
     // getbalances: the modern triple, trusted == combined spendable, no pending.
-    let getbalances = zecd
+    let getbalances = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances");
@@ -305,7 +305,7 @@ async fn regtest_sapling_and_orchard_balances() {
     );
 
     // getwalletinfo: balance / unconfirmed_balance / immature_balance.
-    let wi = zecd
+    let wi = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -321,7 +321,7 @@ async fn regtest_sapling_and_orchard_balances() {
     );
 
     // getunconfirmedbalance: zero once both notes are confirmed.
-    let unconf = zecd
+    let unconf = rose
         .call("getunconfirmedbalance", json!([]))
         .await
         .expect("getunconfirmedbalance");
@@ -333,7 +333,7 @@ async fn regtest_sapling_and_orchard_balances() {
 
     // listunspent: two notes (one per pool - a 2-ZEC Orchard note and a 1-ZEC Sapling note),
     // summing to 3 ZEC.
-    let lu = zecd
+    let lu = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent");
@@ -350,7 +350,7 @@ async fn regtest_sapling_and_orchard_balances() {
     );
 
     // getreceivedbyaddress: each receiver credited exactly its 1 ZEC.
-    let recv_sapling = zecd
+    let recv_sapling = rose
         .call("getreceivedbyaddress", json!([sapling_ua]))
         .await
         .expect("getreceivedbyaddress sapling");
@@ -359,7 +359,7 @@ async fn regtest_sapling_and_orchard_balances() {
         Some(1.0),
         "Sapling UA credited 1 ZEC: {recv_sapling}"
     );
-    let recv_orchard = zecd
+    let recv_orchard = rose
         .call("getreceivedbyaddress", json!([orchard_ua]))
         .await
         .expect("getreceivedbyaddress orchard");
@@ -370,7 +370,7 @@ async fn regtest_sapling_and_orchard_balances() {
     );
 
     // History carries both receives.
-    let txs = zecd
+    let txs = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
@@ -399,9 +399,9 @@ async fn regtest_sapling_and_orchard_balances() {
         .expect("zebra getblockcount")
         .as_u64()
         .expect("tip height");
-    zecd.wait_until_synced(chain_tip, FUND_TIMEOUT)
+    rose.wait_until_synced(chain_tip, FUND_TIMEOUT)
         .await
-        .expect("zecd scans to the chain tip before spending");
+        .expect("rose scans to the chain tip before spending");
 
     // 8a. FullPrivacy rejects a turnstile send. Paying 1.5 ZEC to a Sapling-only recipient can't be
     //     funded from the Sapling group (only 1 ZEC), so selection falls to the 2-ZEC Orchard group,
@@ -409,7 +409,7 @@ async fn regtest_sapling_and_orchard_balances() {
     //     FullPrivacy forbids. This rejection happens on the *built proposal* inside the async send,
     //     so it surfaces via the operation's error (code -8), not synchronously. The default policy
     //     permits it (8b).
-    let fp_opid = zecd
+    let fp_opid = rose
         .call(
             "z_sendmany",
             json!([default_ua, [{ "address": sapling_ua, "amount": 1.5 }], null, null, "FullPrivacy"]),
@@ -421,7 +421,7 @@ async fn regtest_sapling_and_orchard_balances() {
         .to_string();
     let mut saw_full_privacy_reject = false;
     for _ in 0..120 {
-        let st = zecd
+        let st = rose
             .call("z_getoperationstatus", json!([[fp_opid]]))
             .await
             .expect("z_getoperationstatus");
@@ -461,14 +461,14 @@ async fn regtest_sapling_and_orchard_balances() {
     //      draw only on the 1-ZEC Sapling note and must fail with insufficient funds - not quietly
     //      fall back to the 2-ZEC Orchard note, as it did while any own shielded address named
     //      the whole account.
-    let opid = zecd
+    let opid = rose
         .call(
             "z_sendmany",
             json!([sapling_ua, [{ "address": funder.unified_address().to_string(), "amount": 1.5 }]]),
         )
         .await
         .expect("z_sendmany from the Sapling-only UA returns an opid");
-    let waited = zecd
+    let waited = rose
         .call("z_waitforoperation", json!([opid, 120]))
         .await
         .expect("z_waitforoperation on the Sapling-sourced send");
@@ -489,7 +489,7 @@ async fn regtest_sapling_and_orchard_balances() {
     //     would also permit the turnstile 8a rejected; that permission is covered by the funded
     //     e2e's transparent-recipient sends.)
     let funder_ua = funder.unified_address().to_string();
-    let txid = zecd
+    let txid = rose
         .call("sendtoaddress", json!([funder_ua, 1.5]))
         .await
         .expect("orchard-funded spend");
@@ -497,7 +497,7 @@ async fn regtest_sapling_and_orchard_balances() {
     assert_eq!(txid.len(), 64, "sendtoaddress returns a txid: {txid}");
 
     zebrad.generate_blocks(3).await.expect("confirm the spend");
-    wait_until_confirmed(&zecd, &txid).await;
+    wait_until_confirmed(&rose, &txid).await;
 
     // 9. TRI-POOL mixed-recipient sendmany - the flagship: a single v5 transaction that carries a
     //    transparent output AND a Sapling output AND an Orchard output at once, funded from the
@@ -505,17 +505,17 @@ async fn regtest_sapling_and_orchard_balances() {
     //    Orchard spends (+ Sapling outputs when a recipient is Sapling) in one shot", with change
     //    routed back to Orchard. We pay three recipients in one `sendmany` under the default policy:
     //      - the funder's bare t-address          -> forces a TRANSPARENT output
-    //      - zecd's own Sapling-only UA           -> forces a SAPLING output (self-receive)
-    //      - zecd's own Orchard-only UA           -> forces an ORCHARD output (self-receive)
+    //      - rose's own Sapling-only UA           -> forces a SAPLING output (self-receive)
+    //      - rose's own Orchard-only UA           -> forces an ORCHARD output (self-receive)
     //    The two shielded legs are self-sends so the harness can *verify each pool actually
     //    received* via `getreceivedbyaddress` (the only verifiable shielded receivers in the harness
-    //    are zecd's own addresses; zebra's verbose getrawtransaction doesn't decode the shielded
+    //    are rose's own addresses; zebra's verbose getrawtransaction doesn't decode the shielded
     //    bundles into JSON, so this behavioral check stands in for a structural one).
     const TRI_AMOUNT: f64 = 0.05;
     // Cumulative-received baselines for the two self-receivers (received totals never decrease on
     // spend, so the earlier 1-ZEC fundings sit here); we assert each grows by exactly TRI_AMOUNT.
-    let sapling_before = received_by(&zecd, &sapling_ua).await;
-    let orchard_before = received_by(&zecd, &orchard_ua).await;
+    let sapling_before = received_by(&rose, &sapling_ua).await;
+    let orchard_before = received_by(&rose, &orchard_ua).await;
 
     // The Orchard change must be scanned-to-tip and spendable; retry on -6 while aging it.
     let tri_deadline = Instant::now() + FUND_TIMEOUT;
@@ -526,14 +526,14 @@ async fn regtest_sapling_and_orchard_balances() {
             .expect("zebra getblockcount")
             .as_u64()
             .expect("tip height");
-        zecd.wait_until_synced(tip, Duration::from_secs(30))
+        rose.wait_until_synced(tip, Duration::from_secs(30))
             .await
-            .expect("zecd scans to the tip before the tri-pool send");
+            .expect("rose scans to the tip before the tri-pool send");
         let mut recipients = serde_json::Map::new();
         recipients.insert(funder_taddr.clone(), json!(TRI_AMOUNT));
         recipients.insert(sapling_ua.clone(), json!(TRI_AMOUNT));
         recipients.insert(orchard_ua.clone(), json!(TRI_AMOUNT));
-        match zecd.call("sendmany", json!(["", recipients])).await {
+        match rose.call("sendmany", json!(["", recipients])).await {
             Ok(v) => break v.as_str().expect("txid string").to_string(),
             Err(e) if e.code() == Some(-6) => {
                 assert!(
@@ -557,13 +557,13 @@ async fn regtest_sapling_and_orchard_balances() {
         .generate_blocks(3)
         .await
         .expect("confirm the tri-pool send");
-    wait_until_confirmed(&zecd, &tri_txid).await;
+    wait_until_confirmed(&rose, &tri_txid).await;
 
     // 9a. gettransaction lists exactly three sends - one per recipient - each reduced to the single
     //     receiver actually paid in its pool (display_address per-pool reduction). The transparent
     //     leg stays a bare t-addr (reduces to itself); the Sapling leg reduces to a bare Sapling
     //     receiver; the Orchard leg reduces to a single-receiver UA (Orchard has no bare encoding).
-    let tri = zecd
+    let tri = rose
         .call("gettransaction", json!([tri_txid]))
         .await
         .expect("gettransaction for the tri-pool send");
@@ -596,7 +596,7 @@ async fn regtest_sapling_and_orchard_balances() {
         if addr == funder_taddr {
             continue;
         }
-        let v = zecd
+        let v = rose
             .call("validateaddress", json!([addr]))
             .await
             .expect("validateaddress on a reduced send receiver");
@@ -621,8 +621,8 @@ async fn regtest_sapling_and_orchard_balances() {
     //     transaction really carried a Sapling output and an Orchard output (not just a transparent
     //     one with shielded change) - change lands as Orchard and is excluded from these per-address
     //     totals.
-    let sapling_after = received_by(&zecd, &sapling_ua).await;
-    let orchard_after = received_by(&zecd, &orchard_ua).await;
+    let sapling_after = received_by(&rose, &sapling_ua).await;
+    let orchard_after = received_by(&rose, &orchard_ua).await;
     assert!(
         (sapling_after - sapling_before - TRI_AMOUNT).abs() < 1e-8,
         "the Sapling-only receiver gained exactly {TRI_AMOUNT} (a Sapling output landed): \
@@ -640,7 +640,7 @@ async fn regtest_sapling_and_orchard_balances() {
     //     selection group are therefore live in this wallet, which is what the aggregation and
     //     turnstile assertions above are really exercising post-NU6.3. Held here (rather than as a
     //     separate binary) because the balance/history checks are pool-blind by construction.
-    let lu = zecd
+    let lu = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent after the tri-pool send");
@@ -653,13 +653,13 @@ async fn regtest_sapling_and_orchard_balances() {
         lu.iter().any(|u| u["pool"] == "sapling"),
         "the Sapling-receiver output landed as a sapling note: {lu:?}"
     );
-    drop(zecd);
+    drop(rose);
     // `zebrad` and `funder` clean up on drop.
 }
 
 /// The cumulative ZEC `getreceivedbyaddress` reports for `addr`.
-async fn received_by(zecd: &Zecd, addr: &str) -> f64 {
-    zecd.call("getreceivedbyaddress", json!([addr]))
+async fn received_by(rose: &Rose, addr: &str) -> f64 {
+    rose.call("getreceivedbyaddress", json!([addr]))
         .await
         .expect("getreceivedbyaddress")
         .as_f64()
@@ -667,10 +667,10 @@ async fn received_by(zecd: &Zecd, addr: &str) -> f64 {
 }
 
 /// Wait until `gettransaction` reports the spend at >= 1 confirmation.
-async fn wait_until_confirmed(zecd: &Zecd, txid: &str) {
+async fn wait_until_confirmed(rose: &Rose, txid: &str) {
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let tx = zecd
+        let tx = rose
             .call("gettransaction", json!([txid]))
             .await
             .expect("gettransaction");

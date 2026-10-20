@@ -1,21 +1,21 @@
-//! End-to-end regtest harness for `zecd`.
+//! End-to-end regtest harness for `rose`.
 //!
-//! Orchestrates a `zebrad` (Regtest, PoW disabled) node and drives the real `zecd` daemon over
-//! its Bitcoin-Core-style JSON-RPC - `zecd` talks straight to zebrad. There is intentionally
+//! Orchestrates a `zebrad` (Regtest, PoW disabled) node and drives the real `rose` daemon over
+//! its Bitcoin-Core-style JSON-RPC - `rose` talks straight to zebrad. There is intentionally
 //! **no `zingo-infra`/`zcash_local_net` dependency**, and no compile-time zebra dependency
 //! either: blocks are mined with zebrad's own Regtest-only `generate` RPC (zebra ≥ 2.0.0),
 //! which runs the template→assemble→submit flow server-side against the node's own network
 //! parameters. The harness is a pure black-box JSON-RPC driver, so it works unmodified against
 //! any zebrad release.
 //!
-//! The funded tests bring up a second `zecd` as the [funding wallet](Funder). It talks straight
+//! The funded tests bring up a second `rose` as the [funding wallet](Funder). It talks straight
 //! to the same zebrad, so funding needs no lightwalletd; `lightwalletd` is spawned only when the
-//! `zecd` **under test** runs in light mode (`ZECD_REGTEST_BACKEND=lwd`, see [`attach_backend`]).
+//! `rose` **under test** runs in light mode (`ROSE_REGTEST_BACKEND=lwd`, see [`attach_backend`]).
 //!
 //! Binaries are supplied by the caller via `$ZEBRAD_BIN` / `$LIGHTWALLETD_BIN` (see
 //! [`resolve_bin`]); in CI zebrad is extracted from the official `zfnd/zebra` image and
-//! lightwalletd is built from a release tag. `zecd` itself is the built release binary; the
-//! funder's `zecd` comes from `$ZECD_FUNDER_BIN` (see [`funder_bin`]).
+//! lightwalletd is built from a release tag. `rose` itself is the built release binary; the
+//! funder's `rose` comes from `$ROSE_FUNDER_BIN` (see [`funder_bin`]).
 
 pub mod btc;
 
@@ -28,14 +28,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 /// The default loopback port window probed by [`pick_port`]: 20000..32000, entirely below the
-/// 32768 ephemeral floor. Narrowed per process by `ZECD_REGTEST_PORT_LO`/`_SPAN` - see
+/// 32768 ephemeral floor. Narrowed per process by `ROSE_REGTEST_PORT_LO`/`_SPAN` - see
 /// [`port_window`].
 const DEFAULT_PORT_LO: u16 = 20000;
 const DEFAULT_PORT_SPAN: u16 = 12000;
 
 /// The loopback port window this process probes, as `(lo, span)`.
 ///
-/// Defaults to the whole non-ephemeral range. `ZECD_REGTEST_PORT_LO` and `ZECD_REGTEST_PORT_SPAN`
+/// Defaults to the whole non-ephemeral range. `ROSE_REGTEST_PORT_LO` and `ROSE_REGTEST_PORT_SPAN`
 /// narrow it to a slice, which is how several harness test binaries run **concurrently**: the CI
 /// driver (`run-tests.sh`) hands each one a disjoint slice, so two processes can never probe the
 /// same port. Without that, [`pick_port`]'s probe-then-release-then-bind-later pattern leaves a
@@ -51,8 +51,8 @@ fn port_window() -> (u16, u16) {
             .ok()
             .filter(|v| *v > 0)
     }
-    let lo = from_env("ZECD_REGTEST_PORT_LO").unwrap_or(DEFAULT_PORT_LO);
-    let span = from_env("ZECD_REGTEST_PORT_SPAN").unwrap_or(DEFAULT_PORT_SPAN);
+    let lo = from_env("ROSE_REGTEST_PORT_LO").unwrap_or(DEFAULT_PORT_LO);
+    let span = from_env("ROSE_REGTEST_PORT_SPAN").unwrap_or(DEFAULT_PORT_SPAN);
     // Never let a bad slice push the window into (or past) the ephemeral range.
     let span = span.min(32768u16.saturating_sub(lo));
     (lo, span)
@@ -61,9 +61,9 @@ fn port_window() -> (u16, u16) {
 /// Pick an unused loopback TCP port for a daemon to bind later.
 ///
 /// Deliberately NOT `bind(":0")`-and-release: `:0` hands out ports from the kernel's *ephemeral*
-/// range (32768-60999 on Linux), where any concurrent outbound connection - zebra↔zecd RPC,
+/// range (32768-60999 on Linux), where any concurrent outbound connection - zebra↔rose RPC,
 /// reqwest clients, the mempool poller - can grab the released port before its real owner binds
-/// it. That race cost a CI run (zecd's health server lost its pre-picked port to a client socket
+/// it. That race cost a CI run (rose's health server lost its pre-picked port to a client socket
 /// and the run continued without health endpoints). Instead, probe sequentially from a
 /// PID-seeded offset in a range *below* the ephemeral floor, which client sockets never touch;
 /// the cursor never re-probes a handed-out port within a process, so back-to-back picks can't
@@ -105,11 +105,11 @@ pub fn resolve_bin(env_var: &str) -> Option<PathBuf> {
         .filter(|p| p.is_file())
 }
 
-/// Which zebrad-dialect node the live tier drives, selected by the `ZECD_REGTEST_NODE`
+/// Which zebrad-dialect node the live tier drives, selected by the `ROSE_REGTEST_NODE`
 /// environment variable. Both nodes speak the same Bitcoin-Core-style JSON-RPC dialect, accept
 /// the same regtest config, and mine via the same Regtest-only `generate` RPC, so the harness
 /// code path is *identical* - only the binary (and the env var pointing at it) differs. This is
-/// what makes the harness a true black-box driver: `zecd` can't tell the two apart.
+/// what makes the harness a true black-box driver: `rose` can't tell the two apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegtestNode {
     /// The Zcash Foundation's `zebrad` (the default). Binary from `$ZEBRAD_BIN`.
@@ -120,17 +120,17 @@ pub enum RegtestNode {
 }
 
 impl RegtestNode {
-    /// Resolve the node from `ZECD_REGTEST_NODE` (case-insensitive; default [`RegtestNode::Zebra`]).
+    /// Resolve the node from `ROSE_REGTEST_NODE` (case-insensitive; default [`RegtestNode::Zebra`]).
     /// An unrecognised value falls back to zebra with a warning so a typo can't silently pick the
     /// wrong backend.
     pub fn from_env() -> RegtestNode {
-        match std::env::var("ZECD_REGTEST_NODE") {
+        match std::env::var("ROSE_REGTEST_NODE") {
             Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
                 "" | "zebra" | "zebrad" => RegtestNode::Zebra,
                 "zakura" | "zakurad" => RegtestNode::Zakura,
                 other => {
                     eprintln!(
-                        "WARN ZECD_REGTEST_NODE={other:?} is not recognised; \
+                        "WARN ROSE_REGTEST_NODE={other:?} is not recognised; \
                          defaulting to zebra (valid: zebra, zakura)"
                     );
                     RegtestNode::Zebra
@@ -160,7 +160,7 @@ impl RegtestNode {
 /// Resolve the [selected node](RegtestNode::from_env)'s binary (`$ZEBRAD_BIN` or `$ZAKURAD_BIN`),
 /// returning `None` if unset or missing so callers can skip the live test cleanly. This is the
 /// backend-agnostic replacement for `resolve_bin("ZEBRAD_BIN")`: the default is zebra, and setting
-/// `ZECD_REGTEST_NODE=zakura` points the whole suite at `zakurad` instead.
+/// `ROSE_REGTEST_NODE=zakura` points the whole suite at `zakurad` instead.
 pub fn resolve_node_bin() -> Option<PathBuf> {
     resolve_bin(RegtestNode::from_env().bin_env())
 }
@@ -170,13 +170,14 @@ pub fn resolve_node_bin() -> Option<PathBuf> {
 /// Height at which NU6.1 and NU6.2 activate on our regtest chain. NU5/NU6 are active from genesis;
 /// NU6.1's activation block requires ZIP-271 lockbox disbursements out of the deferred pool, which
 /// only accrues once NU6 is live - so NU6.1/NU6.2 activate a few blocks in, after a pool exists.
-/// Must match `zecd`'s `network::regtest`.
+/// Must match `rose`'s `network::regtest`.
 const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
 /// Height at which NU6.3 (ironwood) activates on the regtest chain. NU6.3 is active on mainnet and
 /// testnet, so the harness chain activates it too - every regtest flow runs on the pool real users
 /// are on. This value is the canonical reference for the cross-component schedule: it MUST equal
-/// `zecd`'s `network::regtest()` `nu6_3` height, which both the wallet under test and the
-/// [`Funder`] pick up from `ZECD_REGTEST_NU63_HEIGHT` - a mismatch diverges the NU6.3 consensus
+/// `rose`'s `network::regtest()` `nu6_3` height, which the wallet under test picks up from
+/// `ROSE_REGTEST_NU63_HEIGHT` and the [`Funder`] from the same value via [`funder_command`] - a
+/// mismatch diverges the NU6.3 consensus
 /// branch id and zebra rejects the tx (loud failure, not silent). Needs zebrad >= 6.2.2, which
 /// accepts the `"NU6.3"` activation-height key.
 pub const NU6_3_ACTIVATION_HEIGHT: u32 = 8;
@@ -200,7 +201,7 @@ pub const ALT_MINER_ADDRESS: &str = "tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86";
 /// take the same regtest config and mine via the same Regtest-only `generate` RPC.
 pub struct Zebrad {
     child: Child,
-    /// JSON-RPC port (cookie auth disabled so zecd can connect).
+    /// JSON-RPC port (cookie auth disabled so rose can connect).
     pub rpc_port: u16,
     net_port: u16,
     bin: PathBuf,
@@ -523,7 +524,7 @@ disable_pow = true
 # deferred (lockbox) pool only accrues once NU6 is active - so we let NU6 run for a few blocks to
 # build a pool, then disburse a token amount at the NU6.1/NU6.2 activation block. zebra's
 # getblocktemplate emits the disbursement output automatically from the config below.
-# zecd's regtest network must match these heights (network::regtest).
+# rose's regtest network must match these heights (network::regtest).
 [network.testnet_parameters.activation_heights]
 NU5 = 1
 NU6 = 1
@@ -571,12 +572,12 @@ enable_cookie_auth = false
 /// no counterpart in zebra, which has no such key at all. A 200-input Orchard merge, which is
 /// exactly what `regtest_mergetoaddress_default_shielded_limit` builds to pin zcashd's default
 /// `shielded_limit`, serializes to ~634 KB, so on the zakura leg the node refused a transaction
-/// zecd had built correctly and the test read it as a wallet failure (every extended run since
+/// rose had built correctly and the test read it as a wallet failure (every extended run since
 /// the zakura leg was promoted to the full test list).
 ///
 /// Raising the policy to the consensus block limit lets the regtest node relay anything the
 /// wallet can legally build, which is what the suite is here to exercise - the same reason it
-/// disables proof-of-work. It hides nothing an operator would meet by default: zecd's own
+/// disables proof-of-work. It hides nothing an operator would meet by default: rose's own
 /// `[spend] orchard_action_limit` (default 50) binds long before 250 KB, and only a config that
 /// lifts that cap - as the merge e2e deliberately does - can build a transaction a stock zakura
 /// node would decline to relay.
@@ -616,7 +617,7 @@ impl Lightwalletd {
     }
 
     /// Launch on a *fixed* gRPC port. Used by the fault tests to bring lightwalletd back on
-    /// the same address a running zecd is configured for (a fresh data dir re-ingests the
+    /// the same address a running rose is configured for (a fresh data dir re-ingests the
     /// chain from zebra, which takes seconds on a regtest chain).
     pub async fn start_on(
         bin: &Path,
@@ -632,7 +633,7 @@ impl Lightwalletd {
         let zcash_conf = dir.path().join("zcash.conf");
         std::fs::write(
             &zcash_conf,
-            format!("rpcuser=zecdtest\nrpcpassword=zecdtest\nrpcbind=127.0.0.1\nrpcport={zebrad_rpc_port}\n"),
+            format!("rpcuser=rosetest\nrpcpassword=rosetest\nrpcbind=127.0.0.1\nrpcport={zebrad_rpc_port}\n"),
         )
         .context("write zcash.conf")?;
 
@@ -712,30 +713,30 @@ impl Drop for Lightwalletd {
     }
 }
 
-/// Whether the zecd under test should use a lightwalletd upstream ("light mode") instead of
-/// zebrad - the `ZECD_REGTEST_BACKEND=lwd` convention, used by the CI lwd matrix leg to rerun
+/// Whether the rose under test should use a lightwalletd upstream ("light mode") instead of
+/// zebrad - the `ROSE_REGTEST_BACKEND=lwd` convention, used by the CI lwd matrix leg to rerun
 /// the opted-in suites against the light backend.
-pub fn zecd_backend_is_lwd() -> bool {
-    std::env::var("ZECD_REGTEST_BACKEND")
+pub fn rose_backend_is_lwd() -> bool {
+    std::env::var("ROSE_REGTEST_BACKEND")
         .is_ok_and(|v| v.eq_ignore_ascii_case("lwd") || v.eq_ignore_ascii_case("lightwalletd"))
 }
 
-/// Point `cfg` at the backend selected by `ZECD_REGTEST_BACKEND`: in lwd mode, spawn a
-/// **dedicated** lightwalletd for the zecd under test (separate from the funder's instance, so
-/// fault-injection against zecd's upstream never stalls the funder) and wire its gRPC port
+/// Point `cfg` at the backend selected by `ROSE_REGTEST_BACKEND`: in lwd mode, spawn a
+/// **dedicated** lightwalletd for the rose under test (separate from the funder's instance, so
+/// fault-injection against rose's upstream never stalls the funder) and wire its gRPC port
 /// into the config; in zebra mode (the default), leave the config pointing at zebrad. The
 /// returned supervisor must be kept alive for the daemon's lifetime; killing/pausing it is the
 /// light-mode analog of pausing zebrad.
 pub async fn attach_backend(
-    cfg: &mut ZecdConfig,
+    cfg: &mut RoseConfig,
     zebrad_rpc_port: u16,
 ) -> Result<Option<Lightwalletd>> {
-    if !zecd_backend_is_lwd() {
+    if !rose_backend_is_lwd() {
         return Ok(None);
     }
     let bin = resolve_bin("LIGHTWALLETD_BIN").ok_or_else(|| {
         anyhow::anyhow!(
-            "ZECD_REGTEST_BACKEND=lwd needs $LIGHTWALLETD_BIN (the lightwalletd binary)"
+            "ROSE_REGTEST_BACKEND=lwd needs $LIGHTWALLETD_BIN (the lightwalletd binary)"
         )
     })?;
     let lwd = Lightwalletd::start(&bin, zebrad_rpc_port).await?;
@@ -743,7 +744,7 @@ pub async fn attach_backend(
     Ok(Some(lwd))
 }
 
-// =============================== funder (a released zecd) ===============================
+// =============================== funder (a released rose) ===============================
 
 /// A valid 24-word BIP-39 test mnemonic (the canonical all-zero-entropy vector). Regtest only - it
 /// controls throwaway coinbase funds, never anything of value.
@@ -751,15 +752,15 @@ const FUNDER_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon a
 abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon abandon art";
 
-/// The funder wallet's birthday. Height 2 is the lowest usable value: `zecd init --restore`
+/// The funder wallet's birthday. Height 2 is the lowest usable value: `rose init --restore`
 /// anchors the wallet on the tree state at `birthday - 1`, and genesis has none.
 const FUNDER_BIRTHDAY: u32 = 2;
 
-/// Derive the funder's transparent address at an explicit external `index` **offline** (`zecd
+/// Derive the funder's transparent address at an explicit external `index` **offline** (`rose
 /// derive-address`): no chain, no wallet database, no daemon - which is what lets zebra mine to
 /// the funder from genesis, with no seed blocks and no miner-swap restart.
 ///
-/// Runs the **built** zecd (`zecd_bin`), not [`funder_bin`]: derivation is deterministic BIP-44
+/// Runs the **built** rose (`rose_bin`), not [`funder_bin`]: derivation is deterministic BIP-44
 /// math, identical across versions, and the pinned release playing the funder may predate the
 /// subcommand. [`start_funded_chain`] asserts the funder daemon agrees with this derivation once
 /// its wallet exists.
@@ -779,7 +780,7 @@ pub fn derive_funder_transparent_address(index: u32) -> Result<String> {
 }
 
 /// Derive a wallet address **offline** from `mnemonic` - no chain, no wallet database, no daemon -
-/// via `zecd derive-address`. `address_type` takes `getnewaddress`'s `address_type` syntax
+/// via `rose derive-address`. `address_type` takes `getnewaddress`'s `address_type` syntax
 /// (`transparent`, `orchard`, `sapling,orchard`, ...) and `index` is the diversifier index (a
 /// BIP-44 external child index for `transparent`).
 ///
@@ -790,8 +791,8 @@ pub fn derive_funder_transparent_address(index: u32) -> Result<String> {
 /// asynchronously, so the restart drops the very blocks the daemon just scanned, and a young
 /// wallet cannot rewind below its own birthday checkpoint.
 pub fn derive_address_offline(mnemonic: &str, address_type: &str, index: u32) -> Result<String> {
-    let out = Command::new(zecd_bin())
-        // `--conf /dev/null` bypasses any zecd.toml a default datadir might hold: this derivation
+    let out = Command::new(rose_bin())
+        // `--conf /dev/null` bypasses any rose.toml a default datadir might hold: this derivation
         // has no deployment context, so nothing but the network flag may influence it.
         .args([
             "--conf",
@@ -804,13 +805,13 @@ pub fn derive_address_offline(mnemonic: &str, address_type: &str, index: u32) ->
             "--index",
             &index.to_string(),
         ])
-        .env("ZECD_MNEMONIC", mnemonic)
+        .env("ROSE_MNEMONIC", mnemonic)
         .stdin(Stdio::null())
         .output()
-        .context("spawn zecd derive-address")?;
+        .context("spawn rose derive-address")?;
     if !out.status.success() {
         bail!(
-            "zecd derive-address failed ({}):\n{}",
+            "rose derive-address failed ({}):\n{}",
             out.status,
             tail(&String::from_utf8_lossy(&out.stderr), 30)
         );
@@ -823,7 +824,7 @@ pub fn derive_address_offline(mnemonic: &str, address_type: &str, index: u32) ->
 ///
 /// This is the fleet's real deployment shape - the spending wallets live somewhere else (a cold
 /// signer, another daemon) and the monitor only ever holds viewing keys - so the harness mints
-/// them the same way: a throwaway zecd wallet the fleet daemon never sees, of which only the UFVK
+/// them the same way: a throwaway rose wallet the fleet daemon never sees, of which only the UFVK
 /// crosses over.
 #[derive(Clone, Debug)]
 pub struct ViewWallet {
@@ -836,7 +837,7 @@ pub struct ViewWallet {
 
 /// Mint `count` independent view wallets, concurrently.
 ///
-/// Each is a real `zecd init` in its own throwaway datadir (zecd allows one spending wallet per
+/// Each is a real `rose init` in its own throwaway datadir (rose allows one spending wallet per
 /// datadir, so they cannot share one), from which only the mnemonic is kept; the UFVK and a
 /// receiving address are then derived **offline** with `derive-address --json`, which is the same
 /// path an operator provisioning a fleet from a cold seed would take.
@@ -862,12 +863,12 @@ pub async fn provision_view_wallets(
     Ok(wallets)
 }
 
-/// Mint one view wallet: `zecd init` in a throwaway datadir for the mnemonic, then offline
+/// Mint one view wallet: `rose init` in a throwaway datadir for the mnemonic, then offline
 /// derivation for the viewing key and an address.
 fn mint_view_wallet(zebra_rpc_port: u16, index: usize, birthday: u32) -> Result<ViewWallet> {
     let dir = tempfile::tempdir().context("create provisioning datadir")?;
     std::fs::write(
-        dir.path().join("zecd.toml"),
+        dir.path().join("rose.toml"),
         format!(
             "network = \"regtest\"\ndatadir = \"{datadir}\"\ndefault_wallet = \"default\"\n\n\
              [wallets.default]\ndir = \"{datadir}/default\"\n\n\
@@ -875,9 +876,9 @@ fn mint_view_wallet(zebra_rpc_port: u16, index: usize, birthday: u32) -> Result<
             datadir = dir.path().display()
         ),
     )
-    .context("write provisioning zecd.toml")?;
+    .context("write provisioning rose.toml")?;
 
-    let out = Command::new(zecd_bin())
+    let out = Command::new(rose_bin())
         .args([
             "--datadir",
             dir.path().to_str().unwrap(),
@@ -890,18 +891,18 @@ fn mint_view_wallet(zebra_rpc_port: u16, index: usize, birthday: u32) -> Result<
         ])
         .stdin(Stdio::null())
         .output()
-        .context("spawn zecd init for a view wallet")?;
+        .context("spawn rose init for a view wallet")?;
     if !out.status.success() {
         bail!(
-            "zecd init for view wallet {index} failed ({}):\n{}",
+            "rose init for view wallet {index} failed ({}):\n{}",
             out.status,
             tail(&String::from_utf8_lossy(&out.stderr), 30)
         );
     }
-    // `zecd init` prints the generated mnemonic - and nothing else - on stdout.
+    // `rose init` prints the generated mnemonic - and nothing else - on stdout.
     let mnemonic = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if mnemonic.is_empty() {
-        bail!("zecd init printed no mnemonic for view wallet {index}");
+        bail!("rose init printed no mnemonic for view wallet {index}");
     }
 
     // Offline from here: the UFVK and an address, straight out of `derive-address --json`.
@@ -922,13 +923,13 @@ fn mint_view_wallet(zebra_rpc_port: u16, index: usize, birthday: u32) -> Result<
     })
 }
 
-/// `zecd derive-address --mnemonic --json` for an Orchard receiver at index 0, offline.
+/// `rose derive-address --mnemonic --json` for an Orchard receiver at index 0, offline.
 ///
 /// Orchard on purpose: every diversifier index has a valid Orchard receiver, while a UA that also
 /// requires Sapling does not - index 0 simply has no address for about half of all seeds (the
 /// default-address gotcha), which would make provisioning fail at random.
 fn derive_json_offline(mnemonic: &str) -> Result<Value> {
-    let out = Command::new(zecd_bin())
+    let out = Command::new(rose_bin())
         .args([
             "--conf",
             "/dev/null",
@@ -941,13 +942,13 @@ fn derive_json_offline(mnemonic: &str) -> Result<Value> {
             "0",
             "--json",
         ])
-        .env("ZECD_MNEMONIC", mnemonic)
+        .env("ROSE_MNEMONIC", mnemonic)
         .stdin(Stdio::null())
         .output()
-        .context("spawn zecd derive-address --json")?;
+        .context("spawn rose derive-address --json")?;
     if !out.status.success() {
         bail!(
-            "zecd derive-address --json failed ({}):\n{}",
+            "rose derive-address --json failed ({}):\n{}",
             out.status,
             tail(&String::from_utf8_lossy(&out.stderr), 30)
         );
@@ -978,27 +979,47 @@ const SHIELD_UTXO_LIMIT: u32 = 10;
 /// Upper bound on the blocks [`Funder::wait_until_mined`] will mine waiting for a transaction.
 const MINE_UNTIL_CONFIRMED_BLOCKS: u32 = 20;
 
-/// Locate the `zecd` binary that plays the **funder**: `$ZECD_FUNDER_BIN` when set (CI extracts it
-/// from a digest-pinned `ghcr.io/zecrocks/zecd` release image), else the built binary.
+/// The binaries that play the **funder**: `$ROSE_FUNDER_BIN` when set (CI extracts it from a
+/// digest-pinned `ghcr.io/zecrocks/zecd` release image, a release from before the `zecd` ->
+/// `rose` rename, whose one binary serves and administers alike), else the built pair - the
+/// `rosed` daemon and the `rose` command line.
 ///
-/// Running a *released* zecd as the funder keeps the two sides of every funded test independent: a
+/// Running a *released* daemon as the funder keeps the two sides of every funded test independent: a
 /// regression on this branch cannot mask itself by being present in both the wallet under test and
 /// the wallet paying it. It also makes the funded tier cross-version coverage - the last release
 /// funds HEAD - which is the shape a real deployment upgrades through. Falling back to the built
-/// binary keeps a bare `cargo test` working with no extra setup.
-pub fn funder_bin() -> PathBuf {
-    resolve_bin("ZECD_FUNDER_BIN").unwrap_or_else(zecd_bin)
+/// binaries keeps a bare `cargo test` working with no extra setup.
+#[derive(Debug, Clone)]
+pub struct FunderBins {
+    /// Runs the funder's daemon (spawned with no subcommand: a pre-rename release serves
+    /// that way too).
+    pub daemon: PathBuf,
+    /// Runs `init` and `config check` for it.
+    pub cli: PathBuf,
 }
 
-/// A funding wallet: a second `zecd` daemon that owns the regtest chain's coinbase.
+pub fn funder_bin() -> FunderBins {
+    match resolve_bin("ROSE_FUNDER_BIN") {
+        Some(pinned) => FunderBins {
+            daemon: pinned.clone(),
+            cli: pinned,
+        },
+        None => FunderBins {
+            daemon: rosed_bin(),
+            cli: rose_bin(),
+        },
+    }
+}
+
+/// A funding wallet: a second `rose` daemon that owns the regtest chain's coinbase.
 ///
 /// Regtest can't mine a coinbase straight into a shielded note the wallet under test would see, so
 /// this is how funds get in: zebra mines transparent coinbase to the funder's t-address, it matures
 /// (100 blocks), the funder sweeps it into a shielded note with `z_shieldcoinbase`, and then pays
 /// the wallet under test. The funder talks straight to zebrad's JSON-RPC, so **funding needs no
-/// lightwalletd** - the only reason the suite still builds one is the zecd-under-test's light mode.
+/// lightwalletd** - the only reason the suite still builds one is the rose-under-test's light mode.
 ///
-/// Bring-up: the funder's t-address is derived **offline** (`zecd derive-address`, see
+/// Bring-up: the funder's t-address is derived **offline** (`rose derive-address`, see
 /// [`derive_funder_transparent_address`]), so zebra mines to the funder from its very first
 /// block and the wallet is created afterwards, against the already-grown chain:
 ///
@@ -1024,7 +1045,7 @@ pub struct Funder {
     /// `z_shieldcoinbase` destination, so the funder's own funds stay in one pool.
     source_ua: String,
     /// A **multi-receiver** (Sapling + Orchard) unified address, which is what tests pay. Handing
-    /// out more than one receiver keeps the outgoing-history reduction under test: zecd records the
+    /// out more than one receiver keeps the outgoing-history reduction under test: rose records the
     /// single receiver it actually paid, so a payee whose address carries only one receiver would
     /// make that reduction a no-op and the assertion vacuous.
     pay_to_ua: String,
@@ -1042,12 +1063,14 @@ impl Funder {
     /// anchors the account on that tree state).
     pub async fn init(zebra_rpc_port: u16) -> Result<Funder> {
         let bin = funder_bin();
-        if !bin.exists() {
-            bail!(
-                "funder zecd binary not found at {} - build it first \
-                 (cargo build --release --bin zecd) or set $ZECD_FUNDER_BIN",
-                bin.display()
-            );
+        for path in [&bin.daemon, &bin.cli] {
+            if !path.exists() {
+                bail!(
+                    "funder binary not found at {} - build it first (cargo build --release \
+                     --bin rosed && cargo build --release -p rose-cli) or set $ROSE_FUNDER_BIN",
+                    path.display()
+                );
+            }
         }
         let dir = tempfile::tempdir().context("create funder dir")?;
         let cfg = FunderConfig {
@@ -1065,24 +1088,19 @@ impl Funder {
         // `config check` exists for. Ask the funder's own binary whether it accepts the file,
         // which turns a violation into a named unknown key instead of the opaque daemon startup
         // timeout every funded test would otherwise report.
-        assert_funder_config_check_passes(&bin, dir.path())?;
-        funder_init_with_retry(&bin, dir.path(), &cfg).await?;
+        assert_funder_config_check_passes(&bin.cli, dir.path())?;
+        funder_init_with_retry(&bin.cli, dir.path(), &cfg).await?;
 
-        // Discard the daemon's logs unless ZECD_STDERR asks for them, exactly like `Zecd::start`
+        // Discard the daemon's logs unless ROSE_STDERR asks for them, exactly like `Rose::start`
         // (both then interleave into the test output under `--nocapture`, each line tagged with
         // its instance so concurrent daemons stay distinguishable).
-        let (out, err) = zecd_daemon_stdio();
-        let mut child = Command::new(&bin)
-            .args([
-                "--datadir",
-                dir.path().to_str().unwrap(),
-                "--regtest",
-                "run",
-            ])
+        let (out, err) = rose_daemon_stdio();
+        let mut child = funder_command(&bin.daemon)
+            .args(["--datadir", dir.path().to_str().unwrap(), "--regtest"])
             .stdout(out)
             .stderr(err)
             .spawn()
-            .context("spawn funder zecd daemon")?;
+            .context("spawn funder rose daemon")?;
         forward_daemon_logs(&format!("funder:{}", cfg.rpc_port), &mut child);
 
         let mut funder = Funder {
@@ -1140,12 +1158,14 @@ impl Funder {
         taddr: String,
     ) -> Result<Funder> {
         let bin = funder_bin();
-        if !bin.exists() {
-            bail!(
-                "funder zecd binary not found at {} - build it first \
-                 (cargo build --release --bin zecd) or set $ZECD_FUNDER_BIN",
-                bin.display()
-            );
+        for path in [&bin.daemon, &bin.cli] {
+            if !path.exists() {
+                bail!(
+                    "funder binary not found at {} - build it first (cargo build --release \
+                     --bin rosed && cargo build --release -p rose-cli) or set $ROSE_FUNDER_BIN",
+                    path.display()
+                );
+            }
         }
         let dir = tempfile::tempdir().context("create funder dir")?;
         copy_dir_all(datadir_src, dir.path())
@@ -1159,20 +1179,15 @@ impl Funder {
         };
         // Overwrite the snapshot's config: its ports belong to the stack that built it.
         write_funder_toml(dir.path(), &cfg)?;
-        assert_funder_config_check_passes(&bin, dir.path())?;
+        assert_funder_config_check_passes(&bin.cli, dir.path())?;
 
-        let (out, err) = zecd_daemon_stdio();
-        let mut child = Command::new(&bin)
-            .args([
-                "--datadir",
-                dir.path().to_str().unwrap(),
-                "--regtest",
-                "run",
-            ])
+        let (out, err) = rose_daemon_stdio();
+        let mut child = funder_command(&bin.daemon)
+            .args(["--datadir", dir.path().to_str().unwrap(), "--regtest"])
             .stdout(out)
             .stderr(err)
             .spawn()
-            .context("spawn funder zecd daemon")?;
+            .context("spawn funder rose daemon")?;
         forward_daemon_logs(&format!("funder:{}", cfg.rpc_port), &mut child);
 
         let mut funder = Funder {
@@ -1235,7 +1250,7 @@ impl Funder {
     }
 
     /// Wait until the funder has scanned up to `zebrad`'s current tip, so a balance or a send
-    /// reflects everything mined so far. (zecd syncs continuously in the background, so unlike a
+    /// reflects everything mined so far. (rose syncs continuously in the background, so unlike a
     /// CLI wallet there is nothing to drive here - only to wait for.)
     ///
     /// This polls `getblockchaininfo` rather than calling `waitforblockheight`: the funder is a
@@ -1383,7 +1398,7 @@ impl Funder {
     /// never spent building the fixture (its selection can't cannibalize the fragments the way
     /// self-send rounds do). Callers batching multiple rounds must confirm the funder's change
     /// between rounds (mine + [`Funder::sync`]), and must stay under the funder's per-send
-    /// Orchard action cap (a released zecd's default is 50, so at most ~45 shielded outputs
+    /// Orchard action cap (a released rose's default is 50, so at most ~45 shielded outputs
     /// per call once change splits are counted).
     pub async fn send_many(&self, outputs: &[(String, u64)]) -> Result<()> {
         let amounts: Vec<Value> = outputs
@@ -1409,7 +1424,7 @@ impl Funder {
     /// is always terminal.
     ///
     /// A poll loop rather than `z_waitforoperation`, deliberately: the funder is a pinned released
-    /// binary and that RPC postdates every release it may be. The zecd *under test* is HEAD, so
+    /// binary and that RPC postdates every release it may be. The rose *under test* is HEAD, so
     /// tests waiting on their own daemon's operations should use `z_waitforoperation` instead.
     async fn await_opid(&self, opid: &str, timeout: Duration) -> Result<Value> {
         let deadline = Instant::now() + timeout;
@@ -1432,7 +1447,7 @@ impl Funder {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        zecd_rpc_call(
+        rose_rpc_call(
             &self.http,
             self.base_url.clone(),
             &self.user,
@@ -1449,15 +1464,15 @@ impl Funder {
         loop {
             if let Ok(Some(status)) = self.child.try_wait() {
                 bail!(
-                    "funder zecd exited during startup ({status}); \
-                     set ZECD_STDERR=1 to capture its logs"
+                    "funder rose exited during startup ({status}); \
+                     set ROSE_STDERR=1 to capture its logs"
                 );
             }
             if self.call("uptime", json!([])).await.is_ok() {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                bail!("funder zecd RPC did not come up within 60s");
+                bail!("funder rose RPC did not come up within 60s");
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
@@ -1490,8 +1505,9 @@ pub async fn start_funded_chain_live(node_bin: &Path) -> Result<(Zebrad, Funder)
 /// With a height past the bring-up (which ends near block 140), the funder's shielded coinbase is
 /// a **legacy Orchard** note rather than an ironwood one, and so is anything it pays before the
 /// chain reaches that height: the only way to hold Orchard-pool value when NU6.3 activates, which
-/// every wallet funded before mainnet's activation does. zecd and the funder must be given the
-/// same height through `ZECD_REGTEST_NU63_HEIGHT`, or their consensus diverges from the node's.
+/// every wallet funded before mainnet's activation does. rose and the funder must be given the
+/// same height through `ROSE_REGTEST_NU63_HEIGHT` (the harness relays it to the funder), or
+/// their consensus diverges from the node's.
 /// Always a live bring-up: the chain snapshot is built at the standard height.
 pub async fn start_funded_chain_live_at(
     node_bin: &Path,
@@ -1562,10 +1578,10 @@ pub async fn start_funded_chain_live_at(
 /// snapshot. Its own rate limit is `MIN_DURATION_BETWEEN_BACKUP_UPDATES` (5s); this adds margin.
 const NON_FINALIZED_BACKUP_GRACE: Duration = Duration::from_secs(9);
 
-/// Path to a prebuilt chain snapshot, from `ZECD_REGTEST_CHAIN_SNAPSHOT`. Unset (the default, and
+/// Path to a prebuilt chain snapshot, from `ROSE_REGTEST_CHAIN_SNAPSHOT`. Unset (the default, and
 /// what a local `cargo test` sees) means every funded binary builds its own chain, exactly as
 /// before.
-const CHAIN_SNAPSHOT_ENV: &str = "ZECD_REGTEST_CHAIN_SNAPSHOT";
+const CHAIN_SNAPSHOT_ENV: &str = "ROSE_REGTEST_CHAIN_SNAPSHOT";
 
 fn chain_snapshot_path() -> Option<PathBuf> {
     std::env::var(CHAIN_SNAPSHOT_ENV)
@@ -1581,7 +1597,7 @@ fn chain_snapshot_path() -> Option<PathBuf> {
 /// consensus, so it cannot be shortened), start the funder, shield its coinbase (a proof), and
 /// age the note. Measured at ~89s per binary, paid by 12 of them on the zebra leg.
 ///
-/// So if `ZECD_REGTEST_CHAIN_SNAPSHOT` names a snapshot built by the `build-chain-snapshot`
+/// So if `ROSE_REGTEST_CHAIN_SNAPSHOT` names a snapshot built by the `build-chain-snapshot`
 /// binary, restore from it instead. **Failure to restore is never fatal**: a stale, truncated or
 /// wrong-version snapshot logs a warning and falls back to the live bring-up, so the worst a bad
 /// snapshot costs is the time it was meant to save. That matters more than it looks - a snapshot
@@ -1767,10 +1783,12 @@ struct FunderConfig {
     password: &'static str,
 }
 
-/// Write the funder's `zecd.toml`.
+/// Write the funder's config: `rose.toml`, plus a copy under [`FUNDER_LEGACY_CONF_FILE`] for a
+/// pinned funder release from before the rename. The built binary reads the former, the pinned
+/// one the latter; writing both keeps the local fallback and CI's pin on one code path.
 ///
-/// Deliberately **not** [`write_zecd_toml`]: that writer tracks the config surface of the branch
-/// under test, and zecd rejects unknown config keys - so a knob added on this branch would break a
+/// Deliberately **not** [`write_rose_toml`]: that writer tracks the config surface of the branch
+/// under test, and rose rejects unknown config keys - so a knob added on this branch would break a
 /// funder running a pinned older release. Only long-stable keys belong here.
 ///
 /// The `[spend]` confirmation depths are load-bearing: `z_shieldcoinbase` produces a *single*
@@ -1829,11 +1847,35 @@ untrusted_confirmations = 1
         password = cfg.password,
         health_port = cfg.health_port,
     );
-    std::fs::write(dir.join("zecd.toml"), toml)?;
+    std::fs::write(dir.join("rose.toml"), &toml)?;
+    std::fs::write(dir.join(FUNDER_LEGACY_CONF_FILE), &toml)?;
     Ok(())
 }
 
-/// `zecd init --restore` the funder's wallet, retried while the upstream settles (the chain is
+/// The config file name a funder release from before the `zecd` -> `rose` rename looks up in
+/// its datadir, and the environment variable it reads the regtest NU6.3 height from. CI's
+/// pinned funder (see [`funder_bin`]) is such a release, so [`write_funder_toml`] also writes
+/// the old name and [`funder_command`] maps the harness's own `ROSE_REGTEST_NU63_HEIGHT` onto
+/// the old variable, so the two sides keep agreeing by construction. Both go away once
+/// `ROSE_FUNDER_IMAGE` is bumped to a `rose` release.
+const FUNDER_LEGACY_CONF_FILE: &str = "zecd.toml";
+const FUNDER_LEGACY_NU63_HEIGHT_ENV: &str = "ZECD_REGTEST_NU63_HEIGHT";
+
+/// A `Command` for a funder binary, with the regtest NU6.3 height mirrored onto the variable
+/// a pre-rename release reads (see [`FUNDER_LEGACY_NU63_HEIGHT_ENV`]); a `rosed` funder reads
+/// `ROSE_REGTEST_NU63_HEIGHT` from the inherited environment as before. Every funder spawn goes
+/// through here (the daemon with no subcommand, which a pre-rename release serves on too): a
+/// funder that misses the height commits to the pre-NU6.3 branch id and the node rejects
+/// everything it sends.
+fn funder_command(bin: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    if let Some(height) = std::env::var_os("ROSE_REGTEST_NU63_HEIGHT") {
+        cmd.env(FUNDER_LEGACY_NU63_HEIGHT_ENV, height);
+    }
+    cmd
+}
+
+/// `rose init --restore` the funder's wallet, retried while the upstream settles (the chain is
 /// only a couple of blocks old and several stacks may be starting at once). The datadir is reset
 /// between attempts so a partial init can't wedge the next one; the mnemonic goes in on stdin,
 /// never on the command line.
@@ -1844,7 +1886,7 @@ async fn funder_init_with_retry(bin: &Path, dir: &Path, cfg: &FunderConfig) -> R
             Ok(()) => return Ok(()),
             Err(e) => {
                 if Instant::now() >= deadline {
-                    return Err(e.context("funder zecd init failed after retries"));
+                    return Err(e.context("funder rose init failed after retries"));
                 }
                 for entry in std::fs::read_dir(dir).context("read funder datadir for reset")? {
                     let path = entry?.path();
@@ -1862,7 +1904,7 @@ async fn funder_init_with_retry(bin: &Path, dir: &Path, cfg: &FunderConfig) -> R
 }
 
 fn run_funder_init(bin: &Path, dir: &Path) -> Result<()> {
-    let mut child = Command::new(bin)
+    let mut child = funder_command(bin)
         .args([
             "--datadir",
             dir.to_str().unwrap(),
@@ -1876,7 +1918,7 @@ fn run_funder_init(bin: &Path, dir: &Path) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("spawn funder zecd init")?;
+        .context("spawn funder rose init")?;
     {
         use std::io::Write as _;
         // Dropping the handle closes the pipe, so init sees EOF after the phrase.
@@ -1885,14 +1927,14 @@ fn run_funder_init(bin: &Path, dir: &Path) -> Result<()> {
             .take()
             .context("funder init stdin not piped")?
             .write_all(format!("{FUNDER_MNEMONIC}\n").as_bytes())
-            .context("write the mnemonic to funder zecd init")?;
+            .context("write the mnemonic to funder rose init")?;
     }
     let out = child
         .wait_with_output()
-        .context("wait for funder zecd init")?;
+        .context("wait for funder rose init")?;
     if !out.status.success() {
         bail!(
-            "funder zecd init failed ({}):\n{}",
+            "funder rose init failed ({}):\n{}",
             out.status,
             tail(&String::from_utf8_lossy(&out.stderr), 30)
         );
@@ -1900,26 +1942,60 @@ fn run_funder_init(bin: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-// =============================== zecd (the system under test) ===============================
+// =============================== rose (the system under test) ===============================
 
-/// Locate the built `zecd` binary: `$ZECD_BIN` if set, else the parent crate's release build.
-pub fn zecd_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("ZECD_BIN") {
+/// Locate the built `rosed` daemon: `$ROSED_BIN` if set, else the parent crate's release
+/// build. Every daemon the harness starts is this binary; the subcommands are [`rose_bin`]'s.
+pub fn rosed_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("ROSED_BIN") {
         return PathBuf::from(p);
     }
+    built_bin("rosed")
+}
+
+/// Locate the built `rose` command line (rose-cli): `$ROSE_BIN` if set, else the workspace's
+/// release build. `init`, `config check`, `derive-address`, `export-ufvk` and the RPC client
+/// are its; the daemon is [`rosed_bin`].
+pub fn rose_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("ROSE_BIN") {
+        return PathBuf::from(p);
+    }
+    built_bin("rose")
+}
+
+/// `target/release/<name>` of the workspace this harness sits in.
+fn built_bin(name: &str) -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
-        .map(|p| p.join("target/release/zecd"))
-        .unwrap_or_else(|| PathBuf::from("zecd"))
+        .map(|p| p.join("target/release").join(name))
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
-/// The stdout/stderr wiring for a zecd daemon spawn: piped when `ZECD_STDERR` asks for the
+/// Both binaries a stack needs, or a message naming the one that is missing and how to build
+/// it: `rosed` runs the daemon, `rose` initialises its wallets and checks its configuration.
+fn require_rose_binaries() -> Result<()> {
+    for (bin, name, build) in [
+        (rosed_bin(), "rosed", "cargo build --release --bin rosed"),
+        (rose_bin(), "rose", "cargo build --release -p rose-cli"),
+    ] {
+        if !bin.exists() {
+            bail!(
+                "{name} binary not found at {} - build it first ({build}) or set ${}_BIN",
+                bin.display(),
+                name.to_uppercase()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The stdout/stderr wiring for a rose daemon spawn: piped when `ROSE_STDERR` asks for the
 /// daemon's logs (hand the spawned child to [`forward_daemon_logs`] to stream them), discarded
 /// otherwise. Split from the forwarding half because `Command` needs the `Stdio`s before spawn
 /// and the forwarder needs the child after.
-fn zecd_daemon_stdio() -> (Stdio, Stdio) {
-    if std::env::var_os("ZECD_STDERR").is_some() {
+fn rose_daemon_stdio() -> (Stdio, Stdio) {
+    if std::env::var_os("ROSE_STDERR").is_some() {
         (Stdio::piped(), Stdio::piped())
     } else {
         (Stdio::null(), Stdio::null())
@@ -1929,12 +2005,12 @@ fn zecd_daemon_stdio() -> (Stdio, Stdio) {
 /// Stream a just-spawned daemon's piped stdout/stderr into the test output, prefixing every line
 /// with `[tag]` so the interleaved logs of concurrently running daemons stay attributable to one
 /// instance. Without the prefix the logs are unusable for diagnosis: the CI driver runs several
-/// test binaries at once, each with multiple zecd instances, and **every daemon logs under the
+/// test binaries at once, each with multiple rose instances, and **every daemon logs under the
 /// same `[default]` wallet name** - a naive extraction of one wallet's lines yields an
 /// impossible interleaving (e.g. a "frontier" that appears to retreat). The RPC port is the tag
 /// of choice: unique per instance (see `pick_port`) and printed by the harness's own messages.
 ///
-/// A no-op when the child's streams were not piped (`ZECD_STDERR` unset - logs discarded).
+/// A no-op when the child's streams were not piped (`ROSE_STDERR` unset - logs discarded).
 fn forward_daemon_logs(tag: &str, child: &mut Child) {
     let streams: [Option<Box<dyn std::io::Read + Send>>; 2] = [
         child.stdout.take().map(|s| Box::new(s) as _),
@@ -1956,68 +2032,68 @@ fn forward_daemon_logs(tag: &str, child: &mut Child) {
     }
 }
 
-/// Whether the extended ("big run") regtest tier is enabled: set `ZECD_REGTEST_EXTENDED=1`.
+/// Whether the extended ("big run") regtest tier is enabled: set `ROSE_REGTEST_EXTENDED=1`.
 /// PR runs skip these tests (each spins a full zebra+lightwalletd stack); the scheduled and
 /// manually dispatched workflow runs set the variable.
 pub fn extended_enabled() -> bool {
-    std::env::var("ZECD_REGTEST_EXTENDED").is_ok_and(|v| !v.is_empty() && v != "0")
+    std::env::var("ROSE_REGTEST_EXTENDED").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Whether the **stress** regtest tier is enabled: set `ZECD_REGTEST_STRESS=1`. Distinct from
+/// Whether the **stress** regtest tier is enabled: set `ROSE_REGTEST_STRESS=1`. Distinct from
 /// (and heavier than) the extended tier - building thousands of notes and timing multi-minute
 /// sends would blow up even the weekly extended run - so it is gated separately and driven only
 /// by an explicit workflow dispatch and a rare (monthly) schedule, never on push/PR.
 pub fn stress_enabled() -> bool {
-    std::env::var("ZECD_REGTEST_STRESS").is_ok_and(|v| !v.is_empty() && v != "0")
+    std::env::var("ROSE_REGTEST_STRESS").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// How many notes the stress test should build before measuring a send, from
-/// `ZECD_STRESS_NOTE_COUNT` (default 256). The dispatch can dial this from a quick smoke (a few
+/// `ROSE_STRESS_NOTE_COUNT` (default 256). The dispatch can dial this from a quick smoke (a few
 /// hundred) to a heavy soak (thousands) without code changes.
 pub fn stress_note_count() -> usize {
-    std::env::var("ZECD_STRESS_NOTE_COUNT")
+    std::env::var("ROSE_STRESS_NOTE_COUNT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(256)
 }
 
-/// A running `zecd` daemon plus the HTTP client and credentials to drive it.
-pub struct Zecd {
+/// A running `rose` daemon plus the HTTP client and credentials to drive it.
+pub struct Rose {
     child: Child,
     /// The instance's RPC port - also its log tag (see [`forward_daemon_logs`]), so a
     /// respawn on the same datadir keeps the same discriminator.
     rpc_port: u16,
-    /// The `[health]` port this instance was configured with, so [`Zecd::health_get`] can
+    /// The `[health]` port this instance was configured with, so [`Rose::health_get`] can
     /// reach `/healthz`, `/readyz` and `/status` without the caller rebuilding the URL.
     health_port: u16,
     base_url: String,
     user: String,
     password: String,
     http: reqwest::Client,
-    /// The default wallet's generated mnemonic, captured from `zecd init`'s stdout. `None`
-    /// when the wallet was restored ([`ZecdConfig::restore_mnemonic`]) - a restore prints none.
+    /// The default wallet's generated mnemonic, captured from `rose init`'s stdout. `None`
+    /// when the wallet was restored ([`RoseConfig::restore_mnemonic`]) - a restore prints none.
     pub mnemonic: Option<String>,
     _datadir: tempfile::TempDir,
 }
 
-/// How `zecd` should reach the regtest chain (a local zebrad's JSON-RPC, or a lightwalletd in
+/// How `rose` should reach the regtest chain (a local zebrad's JSON-RPC, or a lightwalletd in
 /// front of it) and what RPC port/creds to expose.
-pub struct ZecdConfig {
-    /// zebrad JSON-RPC port zecd connects to (`zebra://127.0.0.1:<port>`) when
+pub struct RoseConfig {
+    /// zebrad JSON-RPC port rose connects to (`zebra://127.0.0.1:<port>`) when
     /// `lightwalletd_grpc_port` is unset.
     pub zebra_rpc_port: u16,
-    /// When set, zecd connects to this local lightwalletd gRPC port instead of zebrad
+    /// When set, rose connects to this local lightwalletd gRPC port instead of zebrad
     /// (`server = "http://127.0.0.1:<port>"` - light mode over the harness's plaintext
-    /// lightwalletd). See [`attach_backend`] for the `ZECD_REGTEST_BACKEND` convention.
+    /// lightwalletd). See [`attach_backend`] for the `ROSE_REGTEST_BACKEND` convention.
     pub lightwalletd_grpc_port: Option<u16>,
     pub rpc_port: u16,
-    /// The `[health]` port zecd is configured with. Picked via [`pick_port`] in
-    /// [`ZecdConfig::new`] - NOT derived as `rpc_port + 1`: a derived port never advances the
+    /// The `[health]` port rose is configured with. Picked via [`pick_port`] in
+    /// [`RoseConfig::new`] - NOT derived as `rpc_port + 1`: a derived port never advances the
     /// pick cursor, so the very next [`pick_port`] call (e.g. [`attach_backend`]'s dedicated
-    /// lightwalletd, which runs before zecd binds anything) would probe it, find it unbound,
+    /// lightwalletd, which runs before rose binds anything) would probe it, find it unbound,
     /// and hand the same port to another component. That exact collision put the funded
-    /// test's lightwalletd on zecd's health port: zecd came up "without health endpoints",
+    /// test's lightwalletd on rose's health port: rose came up "without health endpoints",
     /// and the outage phase's health poll then waited forever on a listener that never
     /// existed - a multi-hour CI hang.
     pub health_port: u16,
@@ -2026,47 +2102,47 @@ pub struct ZecdConfig {
     /// `[sync] rebroadcast_secs` - tight by default so outage tests don't idle a minute.
     pub rebroadcast_secs: u64,
     /// `[sync] fetch_memos`: `Some(false)` disables memo retrieval (the memo-backfill half of
-    /// the enhancement drain), `None` omits the key (zecd defaults to `true`). The funded e2e's
+    /// the enhancement drain), `None` omits the key (rose defaults to `true`). The funded e2e's
     /// memo-less twin phase runs a watch-only restore with it off, then flips it back on over
     /// the same data directory to prove the skipped memos backfill without a rescan.
     pub fetch_memos: Option<bool>,
     /// Additional **spending** `[wallets.<name>]` entries beyond `default` (each gets its own
-    /// `zecd init --wallet <name>` before the daemon starts). NB: zecd permits only ONE
+    /// `rose init --wallet <name>` before the daemon starts). NB: rose permits only ONE
     /// spending wallet, so configuring any of these alongside the spending `default` makes the
-    /// daemon refuse to start - that refusal is what [`Zecd::start_expect_refusal`] asserts.
+    /// daemon refuse to start - that refusal is what [`Rose::start_expect_refusal`] asserts.
     pub extra_wallets: Vec<String>,
     /// Additional **watch-only** `[wallets.<name>]` entries, each created `--ufvk` from the
     /// `default` wallet's exported UFVK (a watch-only replica of the single spending wallet).
     /// Any number are allowed alongside the spending `default`.
     pub extra_watch_only_wallets: Vec<String>,
-    /// Restore the default wallet from this mnemonic (`zecd init --restore`, phrase on stdin)
+    /// Restore the default wallet from this mnemonic (`rose init --restore`, phrase on stdin)
     /// instead of generating a fresh one.
     pub restore_mnemonic: Option<String>,
     /// Create the default wallet watch-only from this Unified Full Viewing Key
-    /// (`zecd init --ufvk`) instead of a mnemonic.
+    /// (`rose init --ufvk`) instead of a mnemonic.
     pub ufvk: Option<String>,
     /// `--birthday` for the restore/watch-only paths (a fresh init defaults near the tip on
     /// its own).
     pub birthday: Option<u32>,
     /// `[spend] cache_proving_key`: `Some(true/false)` writes the knob explicitly, `None`
-    /// omits it (zecd defaults to `true`). No test sets it today - both routes prove from one
+    /// omits it (rose defaults to `true`). No test sets it today - both routes prove from one
     /// shared key set since the Zakura forks, so the binary that flipped it was removed - but
     /// the knob is still real, and this is how a test would pin the fused route deliberately.
     pub cache_proving_key: Option<bool>,
     /// `[spend] privacy_policy`: `Some("AllowFullyTransparent")` etc. writes the knob explicitly,
-    /// `None` omits it (zecd defaults to `AllowRevealedRecipients`). The fully-transparent spend
+    /// `None` omits it (rose defaults to `AllowRevealedRecipients`). The fully-transparent spend
     /// e2e sets it to `AllowFullyTransparent`.
     pub privacy_policy: Option<String>,
     /// `[spend] pipeline_proving`: `Some(true/false)` writes the knob explicitly, `None` omits it
-    /// (zecd defaults to `false`). The stress test runs with it on to exercise the off-actor
+    /// (rose defaults to `false`). The stress test runs with it on to exercise the off-actor
     /// proving pipeline (sync stays live during a send).
     pub pipeline_proving: Option<bool>,
     /// `[spend] orchard_action_limit`: `Some(n)` writes the cap (`0` disables it), `None` omits it
-    /// (zecd defaults to 50). The stress test lifts the cap so its big fan-out/sweep sends aren't
+    /// (rose defaults to 50). The stress test lifts the cap so its big fan-out/sweep sends aren't
     /// rejected.
     pub orchard_action_limit: Option<usize>,
     /// `[spend] max_tx_bytes`: `Some(n)` writes the transaction-size ceiling (`0` disables it),
-    /// `None` omits it (zecd defaults to 250000, matching zakura's relay policy). The merge e2e
+    /// `None` omits it (rose defaults to 250000, matching zakura's relay policy). The merge e2e
     /// disables it for the same reason it disables the action cap: it is measuring a third
     /// limit, `shielded_limit`, and a 200-note merge is larger than any node relays.
     pub max_tx_bytes: Option<usize>,
@@ -2078,7 +2154,7 @@ pub struct ZecdConfig {
     /// even when `pools` is `None` (keeping the Orchard-only enabled default).
     pub transparent: bool,
     /// `[pools] transparent_gap_limit` - the external transparent gap limit, i.e. the
-    /// stateless-restore scan depth. `None` omits it (zecd defaults to 20). Only meaningful with
+    /// stateless-restore scan depth. `None` omits it (rose defaults to 20). Only meaningful with
     /// `transparent = true`. The transparent-gap restore e2e sets it small (a beyond-gap receive
     /// is missed) vs large (the same receive is recovered).
     pub transparent_gap_limit: Option<u32>,
@@ -2089,13 +2165,13 @@ pub struct ZecdConfig {
     pub transparent_initial_scan: Option<u32>,
     /// `[pools] transparent_allow_beyond_recovery_window` - when `Some(false)`, `getnewaddress`
     /// fails closed once the recovery window is exhausted instead of issuing (warn-only) beyond it.
-    /// `None` omits it (zecd defaults to `true`). Only meaningful with `transparent = true`.
+    /// `None` omits it (rose defaults to `true`). Only meaningful with `transparent = true`.
     pub transparent_allow_beyond_recovery_window: Option<bool>,
     /// `[pools] transparent_gap_warn_threshold` - warn when fewer than this many in-window slots
-    /// remain. `None` omits it (zecd defaults to 5). Only meaningful with `transparent = true`.
+    /// remain. `None` omits it (rose defaults to 5). Only meaningful with `transparent = true`.
     pub transparent_gap_warn_threshold: Option<u32>,
     /// `[health] readiness` - `Some("scanned")` etc. writes the mode explicitly, `None` omits it
-    /// (zecd defaults to `"synced"`). The transparent e2e runs under `"scanned"` to pin the
+    /// (rose defaults to `"synced"`). The transparent e2e runs under `"scanned"` to pin the
     /// no-flap contract: `/readyz` must stay 200 through a send while the recurring transparent
     /// spend-search backlog transiently rises.
     pub readiness: Option<String>,
@@ -2104,12 +2180,12 @@ pub struct ZecdConfig {
     /// all of their accounts. Empty (the default) writes no manifests and no `[fleet]` section,
     /// so the daemon behaves exactly as it always has.
     pub fleet: Vec<ViewWallet>,
-    /// `[fleet] shard_size` - view wallets per shard database. `None` omits it (zecd defaults to
+    /// `[fleet] shard_size` - view wallets per shard database. `None` omits it (rose defaults to
     /// 128). The fleet e2e sets it small so a handful of wallets still spans several shards,
     /// which is what exercises the placement and per-shard scanning rather than one big database.
     pub fleet_shard_size: Option<usize>,
     /// When `Some`, the spending `default` wallet is created passphrase-encrypted
-    /// (`zecd init --encrypt`, passphrase supplied via `ZECD_WALLET_PASSPHRASE`): it starts
+    /// (`rose init --encrypt`, passphrase supplied via `ROSE_WALLET_PASSPHRASE`): it starts
     /// locked and needs `walletpassphrase` before sending. `None` = unencrypted (identity model).
     pub encrypt_passphrase: Option<String>,
     /// Per-wallet `[wallets.<name>] server` overrides, for stacks where one daemon serves
@@ -2118,15 +2194,15 @@ pub struct ZecdConfig {
     pub wallet_servers: Vec<(String, String)>,
 }
 
-impl ZecdConfig {
-    /// Test-friendly defaults: zecd points at the given zebrad JSON-RPC port, `user`/`pass`
-    /// credentials, 2s rebroadcast, fast reconnect backoff (written by [`write_zecd_toml`]).
-    pub fn new(zebra_rpc_port: u16, rpc_port: u16) -> ZecdConfig {
-        ZecdConfig {
+impl RoseConfig {
+    /// Test-friendly defaults: rose points at the given zebrad JSON-RPC port, `user`/`pass`
+    /// credentials, 2s rebroadcast, fast reconnect backoff (written by [`write_rose_toml`]).
+    pub fn new(zebra_rpc_port: u16, rpc_port: u16) -> RoseConfig {
+        RoseConfig {
             zebra_rpc_port,
             lightwalletd_grpc_port: None,
             rpc_port,
-            health_port: pick_port().expect("pick zecd health port"),
+            health_port: pick_port().expect("pick rose health port"),
             rpc_user: "user".to_string(),
             rpc_password: "pass".to_string(),
             rebroadcast_secs: 2,
@@ -2163,34 +2239,29 @@ impl ZecdConfig {
     }
 }
 
-impl Zecd {
-    /// Write a regtest `zecd.toml`, run `zecd init` (retried while lightwalletd catches up to the
+impl Rose {
+    /// Write a regtest `rose.toml`, run `rose init` (retried while lightwalletd catches up to the
     /// chain tip), then spawn the daemon. Returns once the RPC is up; call
-    /// [`Zecd::wait_until_synced`] to wait for the scan to reach the tip.
-    pub async fn start(cfg: &ZecdConfig) -> Result<Zecd> {
+    /// [`Rose::wait_until_synced`] to wait for the scan to reach the tip.
+    pub async fn start(cfg: &RoseConfig) -> Result<Rose> {
         let (datadir, mnemonic) = Self::prepare_datadir(cfg).await?;
 
-        // Set ZECD_STDERR (to any value) to stream the daemon's logs into the test output
+        // Set ROSE_STDERR (to any value) to stream the daemon's logs into the test output
         // (use with `--nocapture`); otherwise discard them. The daemon inherits RUST_LOG from
-        // the environment, so `RUST_LOG=zecd=debug,info ZECD_STDERR=1` gives a full sync/rewind
+        // the environment, so `RUST_LOG=rose=debug,info ROSE_STDERR=1` gives a full sync/rewind
         // trace in CI. Mirrors the ZEBRAD_STDERR hook above. Every line is prefixed with this
         // instance's RPC port so concurrent daemons stay distinguishable (see
         // [`forward_daemon_logs`]).
-        let (out, err) = zecd_daemon_stdio();
-        let mut child = Command::new(zecd_bin())
-            .args([
-                "--datadir",
-                datadir.path().to_str().unwrap(),
-                "--regtest",
-                "run",
-            ])
+        let (out, err) = rose_daemon_stdio();
+        let mut child = Command::new(rosed_bin())
+            .args(["--datadir", datadir.path().to_str().unwrap(), "--regtest"])
             .stdout(out)
             .stderr(err)
             .spawn()
-            .context("spawn zecd daemon")?;
-        forward_daemon_logs(&format!("zecd:{}", cfg.rpc_port), &mut child);
+            .context("spawn rose daemon")?;
+        forward_daemon_logs(&format!("rose:{}", cfg.rpc_port), &mut child);
 
-        let zecd = Zecd {
+        let rose = Rose {
             child,
             rpc_port: cfg.rpc_port,
             health_port: cfg.health_port,
@@ -2202,29 +2273,24 @@ impl Zecd {
             _datadir: datadir,
         };
 
-        zecd.wait_until_rpc_up().await?;
-        Ok(zecd)
+        rose.wait_until_rpc_up().await?;
+        Ok(rose)
     }
 
-    /// Set up a datadir with the spending `default` wallet, then attempt `zecd init --wallet
-    /// <name>` for a **second spending** wallet, expecting zecd's init-time guard to refuse it
-    /// (zecd allows only one spending wallet). `cfg.extra_wallets` must list `name` so the
+    /// Set up a datadir with the spending `default` wallet, then attempt `rose init --wallet
+    /// <name>` for a **second spending** wallet, expecting rose's init-time guard to refuse it
+    /// (rose allows only one spending wallet). `cfg.extra_wallets` must list `name` so the
     /// config the guard scans contains both wallets. Returns the refusal's stderr; errors if
     /// the second init unexpectedly succeeded.
     pub async fn init_second_spending_expect_refusal(
-        cfg: &ZecdConfig,
+        cfg: &RoseConfig,
         name: &str,
     ) -> Result<String> {
-        let datadir = tempfile::tempdir().context("create zecd datadir")?;
-        let bin = zecd_bin();
-        if !bin.exists() {
-            bail!(
-                "zecd binary not found at {} - build it first (cargo build --release --bin zecd) \
-                 or set $ZECD_BIN",
-                bin.display()
-            );
-        }
-        write_zecd_toml(datadir.path(), cfg).context("write zecd.toml")?;
+        let datadir = tempfile::tempdir().context("create rose datadir")?;
+        require_rose_binaries()?;
+        // The command line, for `init` and `config check`; the daemon spawn is `rosed`.
+        let bin = rose_bin();
+        write_rose_toml(datadir.path(), cfg).context("write rose.toml")?;
         init_default_with_retry(&bin, datadir.path(), cfg).await?;
 
         // The guard runs before any network I/O, so this fails fast offline.
@@ -2240,31 +2306,26 @@ impl Zecd {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .context("spawn second zecd init")?;
+            .context("spawn second rose init")?;
         anyhow::ensure!(
             !out.status.success(),
-            "zecd init of a second spending wallet was expected to fail but succeeded"
+            "rose init of a second spending wallet was expected to fail but succeeded"
         );
         Ok(String::from_utf8_lossy(&out.stderr).into_owned())
     }
 
-    /// Prepare a datadir: write `zecd.toml`, init the `default` wallet (retried while
+    /// Prepare a datadir: write `rose.toml`, init the `default` wallet (retried while
     /// lightwalletd warms up), then init any watch-only replicas. (Only one spending wallet is
     /// permitted, so extra *spending* wallets are never initialised here.)
-    async fn prepare_datadir(cfg: &ZecdConfig) -> Result<(tempfile::TempDir, Option<String>)> {
-        let datadir = tempfile::tempdir().context("create zecd datadir")?;
-        let bin = zecd_bin();
-        if !bin.exists() {
-            bail!(
-                "zecd binary not found at {} - build it first (cargo build --release --bin zecd) \
-                 or set $ZECD_BIN",
-                bin.display()
-            );
-        }
+    async fn prepare_datadir(cfg: &RoseConfig) -> Result<(tempfile::TempDir, Option<String>)> {
+        let datadir = tempfile::tempdir().context("create rose datadir")?;
+        require_rose_binaries()?;
+        // The command line, for `init` and `config check`; the daemon spawn is `rosed`.
+        let bin = rose_bin();
 
-        write_zecd_toml(datadir.path(), cfg).context("write zecd.toml")?;
-        // Every regtest is a free assertion that the `zecd config` commands agree with the
-        // daemon: this exact file is about to be handed to a zecd that must start on it, so a
+        write_rose_toml(datadir.path(), cfg).context("write rose.toml")?;
+        // Every regtest is a free assertion that the `rose config` commands agree with the
+        // daemon: this exact file is about to be handed to a rose that must start on it, so a
         // check that rejects it (or a daemon that refuses a file the check passed) is a real
         // disagreement between the two - on a production-shaped config rather than a fixture,
         // across both backends and every tier. Same for what `config show` renders from it.
@@ -2299,7 +2360,7 @@ impl Zecd {
                 .context("export default UFVK for watch-only replicas")?;
             let birthday = cfg.birthday.unwrap_or(2);
             for name in &cfg.extra_watch_only_wallets {
-                run_zecd_init_watch_only(&bin, datadir.path(), name, &ufvk, Some(birthday))
+                run_rose_init_watch_only(&bin, datadir.path(), name, &ufvk, Some(birthday))
                     .with_context(|| format!("init watch-only wallet '{name}'"))?;
             }
         }
@@ -2307,7 +2368,7 @@ impl Zecd {
         Ok((datadir, mnemonic))
     }
 
-    /// Run `zecd export-ufvk` against this daemon's datadir and return the printed Unified
+    /// Run `rose export-ufvk` against this daemon's datadir and return the printed Unified
     /// Full Viewing Key (the last stdout line). Safe while the daemon runs: the command only
     /// reads the wallet DB.
     pub fn export_ufvk(&self, wallet: &str) -> Result<String> {
@@ -2322,14 +2383,14 @@ impl Zecd {
     }
 
     /// Wallet `name`'s directory: `<datadir>/<name>`, holding `keys.toml` and one subdirectory
-    /// per coin. Ask for it here rather than joining the name onto [`Zecd::datadir`].
+    /// per coin. Ask for it here rather than joining the name onto [`Rose::datadir`].
     pub fn wallet_dir(&self, name: &str) -> PathBuf {
         self._datadir.path().join(name)
     }
 
     /// Wallet `name`'s Zcash **engine** directory: `<datadir>/<name>/zec/lrz`, holding
-    /// everything librustzcash owns - `data.sqlite` (and, from an older zecd, the on-disk block
-    /// cache's `blockmeta.sqlite` and `blocks/`). This, not [`Zecd::wallet_dir`], is where a
+    /// everything librustzcash owns - `data.sqlite` (and, from an older rose, the on-disk block
+    /// cache's `blockmeta.sqlite` and `blocks/`). This, not [`Rose::wallet_dir`], is where a
     /// test tampering with the wallet database looks.
     pub fn engine_dir(&self, name: &str) -> PathBuf {
         self.wallet_dir(name).join("zec").join("lrz")
@@ -2337,7 +2398,7 @@ impl Zecd {
 
     /// Gracefully stop the daemon (the `stop` RPC, falling back to kill), keeping the data
     /// directory intact so a test can modify on-disk state and relaunch against it with
-    /// [`Zecd::respawn`] or [`Zecd::respawn_expect_startup_failure`].
+    /// [`Rose::respawn`] or [`Rose::respawn_expect_startup_failure`].
     pub async fn stop_keeping_datadir(&mut self) -> Result<()> {
         let _ = self.call("stop", json!([])).await;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -2356,22 +2417,21 @@ impl Zecd {
         }
     }
 
-    /// Relaunch the daemon on the kept data directory (after [`Zecd::stop_keeping_datadir`])
+    /// Relaunch the daemon on the kept data directory (after [`Rose::stop_keeping_datadir`])
     /// with the same config, and wait for the RPC to come back up.
     pub async fn respawn(&mut self) -> Result<()> {
-        let (out, err) = zecd_daemon_stdio();
-        self.child = Command::new(zecd_bin())
+        let (out, err) = rose_daemon_stdio();
+        self.child = Command::new(rosed_bin())
             .args([
                 "--datadir",
                 self._datadir.path().to_str().unwrap(),
                 "--regtest",
-                "run",
             ])
             .stdout(out)
             .stderr(err)
             .spawn()
-            .context("respawn zecd")?;
-        forward_daemon_logs(&format!("zecd:{}", self.rpc_port), &mut self.child);
+            .context("respawn rose")?;
+        forward_daemon_logs(&format!("rose:{}", self.rpc_port), &mut self.child);
         self.wait_until_rpc_up().await?;
         Ok(())
     }
@@ -2381,17 +2441,16 @@ impl Zecd {
     /// message). Errors if the daemon comes up or exits cleanly. Used by the binding e2e:
     /// a swapped `data.sqlite` must refuse to serve.
     pub async fn respawn_expect_startup_failure(&mut self) -> Result<String> {
-        let mut child = Command::new(zecd_bin())
+        let mut child = Command::new(rosed_bin())
             .args([
                 "--datadir",
                 self._datadir.path().to_str().unwrap(),
                 "--regtest",
-                "run",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .context("respawn zecd expecting a startup failure")?;
+            .context("respawn rose expecting a startup failure")?;
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             match child.try_wait() {
@@ -2403,7 +2462,7 @@ impl Zecd {
                     }
                     anyhow::ensure!(
                         !status.success(),
-                        "zecd was expected to refuse startup but exited cleanly; stderr:\n\
+                        "rose was expected to refuse startup but exited cleanly; stderr:\n\
                          {stderr}"
                     );
                     return Ok(stderr);
@@ -2414,9 +2473,9 @@ impl Zecd {
                 Ok(None) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    bail!("zecd was expected to refuse startup but is still running after 60s");
+                    bail!("rose was expected to refuse startup but is still running after 60s");
                 }
-                Err(e) => return Err(anyhow!("waiting for zecd to exit: {e}")),
+                Err(e) => return Err(anyhow!("waiting for rose to exit: {e}")),
             }
         }
     }
@@ -2424,7 +2483,7 @@ impl Zecd {
     /// Stop the daemon, delete every wallet's `data.sqlite` (and the compact-block cache), and
     /// restart against the *same* data directory - simulating a disposable/empty data directory
     /// next to a preserved `keys.toml`. Exercises the Phase-1 bootstrap rebuild path on a real
-    /// chain. `keys.toml`, the age identity, and `zecd.toml` are left untouched, so the daemon
+    /// chain. `keys.toml`, the age identity, and `rose.toml` are left untouched, so the daemon
     /// rebuilds the account from `keys.toml` (immediately for an auto-unlock wallet, at the first
     /// `walletpassphrase` for an encrypted one). The RPC port/credentials are unchanged.
     pub async fn restart_wiping_data_db(&mut self) -> Result<()> {
@@ -2445,25 +2504,24 @@ impl Zecd {
             }
         }
 
-        let (out, err) = zecd_daemon_stdio();
-        let mut child = Command::new(zecd_bin())
+        let (out, err) = rose_daemon_stdio();
+        let mut child = Command::new(rosed_bin())
             .args([
                 "--datadir",
                 self._datadir.path().to_str().unwrap(),
                 "--regtest",
-                "run",
             ])
             .stdout(out)
             .stderr(err)
             .spawn()
-            .context("respawn zecd on the wiped data directory")?;
-        forward_daemon_logs(&format!("zecd:{}", self.rpc_port), &mut child);
+            .context("respawn rose on the wiped data directory")?;
+        forward_daemon_logs(&format!("rose:{}", self.rpc_port), &mut child);
         self.child = child;
         self.wait_until_rpc_up().await?;
         Ok(())
     }
 
-    /// Graceful shutdown via the `stop` RPC: asserts bitcoind's reply shape ("zecd stopping"),
+    /// Graceful shutdown via the `stop` RPC: asserts bitcoind's reply shape ("rose stopping"),
     /// then waits for the process to exit cleanly (status 0).
     pub async fn shutdown(mut self) -> Result<()> {
         let reply = self
@@ -2471,24 +2529,24 @@ impl Zecd {
             .await
             .map_err(|e| anyhow!("stop RPC failed: {e}"))?;
         anyhow::ensure!(
-            reply == json!("zecd stopping"),
+            reply == json!("rose stopping"),
             "unexpected stop reply: {reply}"
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
-                    anyhow::ensure!(status.success(), "zecd exited with {status} after stop");
+                    anyhow::ensure!(status.success(), "rose exited with {status} after stop");
                     return Ok(());
                 }
                 Ok(None) => {
                     anyhow::ensure!(
                         Instant::now() < deadline,
-                        "zecd did not exit within 30s of the stop RPC"
+                        "rose did not exit within 30s of the stop RPC"
                     );
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                Err(e) => return Err(anyhow!("waiting for zecd to exit: {e}")),
+                Err(e) => return Err(anyhow!("waiting for rose to exit: {e}")),
             }
         }
     }
@@ -2498,7 +2556,7 @@ impl Zecd {
     /// `[sync] fetch_memos`. The wallet DB, keys, and funds persist across the restart;
     /// `cfg` must keep the same RPC port so this handle's `base_url` stays valid. Used by the
     /// funded e2e's memo-less phase to re-open one funded wallet under a changed knob.
-    pub async fn restart(&mut self, cfg: &ZecdConfig) -> Result<()> {
+    pub async fn restart(&mut self, cfg: &RoseConfig) -> Result<()> {
         let _ = self.call("stop", json!([])).await;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -2514,18 +2572,17 @@ impl Zecd {
                 }
             }
         }
-        write_zecd_toml(self._datadir.path(), cfg).context("rewrite zecd.toml for restart")?;
-        self.child = Command::new(zecd_bin())
+        write_rose_toml(self._datadir.path(), cfg).context("rewrite rose.toml for restart")?;
+        self.child = Command::new(rosed_bin())
             .args([
                 "--datadir",
                 self._datadir.path().to_str().unwrap(),
                 "--regtest",
-                "run",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .context("respawn zecd")?;
+            .context("respawn rose")?;
         self.base_url = format!("http://127.0.0.1:{}/", cfg.rpc_port);
         self.user = cfg.rpc_user.clone();
         self.password = cfg.rpc_password.clone();
@@ -2533,8 +2590,8 @@ impl Zecd {
         Ok(())
     }
 
-    /// Send `SIGHUP` to the daemon, which makes it re-read its `zecd.toml` and apply the
-    /// settings that can change under a running wallet. Pairs with [`Zecd::edit_config`].
+    /// Send `SIGHUP` to the daemon, which makes it re-read its `rose.toml` and apply the
+    /// settings that can change under a running wallet. Pairs with [`Rose::edit_config`].
     ///
     /// Unix-only, like the signal; the daemon is spawned as a child process, so this needs no
     /// privileges beyond owning it.
@@ -2550,10 +2607,10 @@ impl Zecd {
         Ok(())
     }
 
-    /// Rewrite the daemon's `zecd.toml`, applying `edit` to its current text. For testing a
-    /// configuration reload: change the file, then [`Zecd::reload_config`].
+    /// Rewrite the daemon's `rose.toml`, applying `edit` to its current text. For testing a
+    /// configuration reload: change the file, then [`Rose::reload_config`].
     pub fn edit_config(&self, edit: impl FnOnce(String) -> String) -> Result<()> {
-        let path = self._datadir.path().join("zecd.toml");
+        let path = self._datadir.path().join("rose.toml");
         let text =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         std::fs::write(&path, edit(text)).with_context(|| format!("write {}", path.display()))?;
@@ -2585,6 +2642,33 @@ impl Zecd {
         Ok((status, json))
     }
 
+    /// Run the `rose` command line against this daemon's datadir - `rose --datadir <dir>
+    /// --regtest <args...>` - and return its stdout. For an RPC method that is the client
+    /// half of `rose` reaching this daemon through the same `rose.toml` the daemon reads
+    /// (`[rpc]` user, password and port), so a test can hold the two surfaces to one answer.
+    /// `Err` carries stderr, with the exit code, for a refusal.
+    pub fn cli(&self, args: &[&str]) -> Result<String> {
+        let out = Command::new(rose_bin())
+            .args([
+                "--datadir",
+                self._datadir.path().to_str().unwrap(),
+                "--regtest",
+            ])
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .context("spawn rose")?;
+        if !out.status.success() {
+            bail!(
+                "rose {} failed ({}):\n{}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Issue a JSON-RPC call, returning the `result` on success or an error carrying the
     /// Bitcoin Core error `code` (so tests can assert e.g. `-6` for insufficient funds).
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
@@ -2592,7 +2676,7 @@ impl Zecd {
     }
 
     /// Issue a JSON-RPC call against a named wallet's `/wallet/<name>` endpoint (multiwallet
-    /// routing; the bare [`Zecd::call`] serves the default wallet).
+    /// routing; the bare [`Rose::call`] serves the default wallet).
     pub async fn call_wallet(
         &self,
         wallet: &str,
@@ -2604,10 +2688,10 @@ impl Zecd {
     }
 
     async fn call_at(&self, url: String, method: &str, params: Value) -> Result<Value, RpcError> {
-        zecd_rpc_call(&self.http, url, &self.user, &self.password, method, params).await
+        rose_rpc_call(&self.http, url, &self.user, &self.password, method, params).await
     }
 
-    /// The current best-block height as seen by zecd (`getblockcount`).
+    /// The current best-block height as seen by rose (`getblockcount`).
     pub async fn block_count(&self) -> Result<u64> {
         self.call("getblockcount", json!([]))
             .await
@@ -2616,7 +2700,7 @@ impl Zecd {
             .ok_or_else(|| anyhow!("getblockcount did not return a number"))
     }
 
-    /// Block until zecd has **scanned** up to the node's current tip.
+    /// Block until rose has **scanned** up to the node's current tip.
     ///
     /// Reach for this before asserting on confirmed state after mining. Polling a balance instead
     /// is not equivalent: a transparent receive is visible in `getbalance` from the mempool while
@@ -2631,7 +2715,7 @@ impl Zecd {
         self.wait_until_synced(target, timeout).await
     }
 
-    /// Block until zecd has *scanned* to `target` - `getblockchaininfo.blocks`, the height at
+    /// Block until rose has *scanned* to `target` - `getblockchaininfo.blocks`, the height at
     /// which balances and history are accurate.
     ///
     /// This asks the daemon the question directly (`waitforblockheight`) instead of polling a
@@ -2646,7 +2730,7 @@ impl Zecd {
         self.wait_until_synced_inner(None, target, timeout).await
     }
 
-    /// [`Zecd::wait_until_synced`] for a named wallet (`/wallet/<name>`). Each wallet scans on
+    /// [`Rose::wait_until_synced`] for a named wallet (`/wallet/<name>`). Each wallet scans on
     /// its own actor - and, when it overrides `[backend] server`, over its own upstream - so a
     /// multi-wallet stack has to wait for each one it is about to read.
     pub async fn wait_until_wallet_synced(
@@ -2671,7 +2755,7 @@ impl Zecd {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 let which = wallet.unwrap_or("default");
-                bail!("zecd wallet '{which}' did not sync to height {target} within {timeout:?}");
+                bail!("rose wallet '{which}' did not sync to height {target} within {timeout:?}");
             }
             // Never 0: that is `waitforblockheight`'s "wait indefinitely".
             let wait_ms = remaining.min(MAX_SERVER_WAIT).as_millis().max(1) as u64;
@@ -2700,14 +2784,14 @@ impl Zecd {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                bail!("zecd RPC did not come up within 30s");
+                bail!("rose RPC did not come up within 30s");
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }
 }
 
-impl Drop for Zecd {
+impl Drop for Rose {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -2745,9 +2829,9 @@ impl std::fmt::Display for RpcError {
 
 // =============================== helpers ===============================
 
-/// JSON-RPC 1.0 call to a `zecd` (bitcoind's envelope, HTTP Basic auth), shared by the daemon
-/// under test ([`Zecd::call`]) and the [`Funder`]'s own daemon.
-async fn zecd_rpc_call(
+/// JSON-RPC 1.0 call to a `rose` (bitcoind's envelope, HTTP Basic auth), shared by the daemon
+/// under test ([`Rose::call`]) and the [`Funder`]'s own daemon.
+async fn rose_rpc_call(
     http: &reqwest::Client,
     url: String,
     user: &str,
@@ -2779,7 +2863,7 @@ async fn zecd_rpc_call(
     Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
 }
 
-/// Format zatoshis as an 8-dp ZEC decimal string, the amount shape zecd's send RPCs take.
+/// Format zatoshis as an 8-dp ZEC decimal string, the amount shape rose's send RPCs take.
 pub fn zec_str(zat: u64) -> String {
     format!("{}.{:08}", zat / 100_000_000, zat % 100_000_000)
 }
@@ -2827,7 +2911,7 @@ fn signal_process(pid: u32, sig: &str) -> Result<()> {
     Ok(())
 }
 
-fn reset_datadir(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
+fn reset_datadir(datadir: &Path, cfg: &RoseConfig) -> Result<()> {
     for entry in std::fs::read_dir(datadir).context("read datadir for reset")? {
         let path = entry?.path();
         if path.is_dir() {
@@ -2836,18 +2920,18 @@ fn reset_datadir(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
             let _ = std::fs::remove_file(&path);
         }
     }
-    write_zecd_toml(datadir, cfg)
+    write_rose_toml(datadir, cfg)
 }
 
-/// Run `zecd init` for one wallet, returning the generated mnemonic (printed on stdout by a
+/// Run `rose init` for one wallet, returning the generated mnemonic (printed on stdout by a
 /// fresh init; `None` on the restore path, which prints none). The restore path applies to
-/// the default wallet only: the phrase from [`ZecdConfig::restore_mnemonic`] is fed on stdin
+/// the default wallet only: the phrase from [`RoseConfig::restore_mnemonic`] is fed on stdin
 /// and `--birthday` is passed when set.
-fn run_zecd_init(
+fn run_rose_init(
     bin: &Path,
     datadir: &Path,
     wallet: &str,
-    cfg: &ZecdConfig,
+    cfg: &RoseConfig,
 ) -> Result<Option<String>> {
     let mut args: Vec<String> = vec![
         "--datadir".into(),
@@ -2875,7 +2959,7 @@ fn run_zecd_init(
         }
     }
     // The spending `default` wallet may be created passphrase-encrypted; the passphrase is
-    // passed out-of-band via `ZECD_WALLET_PASSPHRASE` (never on the command line). `--encrypt`
+    // passed out-of-band via `ROSE_WALLET_PASSPHRASE` (never on the command line). `--encrypt`
     // is incompatible with `--ufvk`, so it only applies to the seed-bearing default wallet.
     let encrypt = (wallet == "default" && ufvk.is_none())
         .then(|| cfg.encrypt_passphrase.clone())
@@ -2894,9 +2978,9 @@ fn run_zecd_init(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(pass) = &encrypt {
-        command.env("ZECD_WALLET_PASSPHRASE", pass);
+        command.env("ROSE_WALLET_PASSPHRASE", pass);
     }
-    let mut child = command.spawn().context("spawn zecd init")?;
+    let mut child = command.spawn().context("spawn rose init")?;
     if let Some(phrase) = &restore {
         use std::io::Write as _;
         child
@@ -2904,12 +2988,12 @@ fn run_zecd_init(
             .take()
             .expect("piped stdin")
             .write_all(format!("{phrase}\n").as_bytes())
-            .context("write the mnemonic to zecd init")?;
+            .context("write the mnemonic to rose init")?;
     }
-    let out = child.wait_with_output().context("wait for zecd init")?;
+    let out = child.wait_with_output().context("wait for rose init")?;
     if !out.status.success() {
         bail!(
-            "zecd init --wallet {wallet} failed ({}):\n{}",
+            "rose init --wallet {wallet} failed ({}):\n{}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
@@ -2919,21 +3003,21 @@ fn run_zecd_init(
 }
 
 /// Init the `default` wallet, retried while lightwalletd catches up to the chain tip. Just
-/// after launch lightwalletd may still be ingesting from zebrad, so `zecd init` (which contacts
+/// after launch lightwalletd may still be ingesting from zebrad, so `rose init` (which contacts
 /// it for `get_latest_block` + `get_tree_state`) is retried, resetting the datadir between
 /// attempts so a partial init can't wedge the next one. Returns the generated mnemonic.
 async fn init_default_with_retry(
     bin: &Path,
     datadir: &Path,
-    cfg: &ZecdConfig,
+    cfg: &RoseConfig,
 ) -> Result<Option<String>> {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        match run_zecd_init(bin, datadir, "default", cfg) {
+        match run_rose_init(bin, datadir, "default", cfg) {
             Ok(mnemonic) => return Ok(mnemonic),
             Err(e) => {
                 if Instant::now() >= deadline {
-                    return Err(e.context("zecd init failed after retries"));
+                    return Err(e.context("rose init failed after retries"));
                 }
                 reset_datadir(datadir, cfg)?;
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2942,10 +3026,10 @@ async fn init_default_with_retry(
     }
 }
 
-/// Run `zecd init --wallet <wallet> --ufvk <ufvk>` to create a watch-only wallet (no spending
+/// Run `rose init --wallet <wallet> --ufvk <ufvk>` to create a watch-only wallet (no spending
 /// material). `birthday` sets the scan start (`init --ufvk` fetches GetTreeState(birthday-1),
 /// so genesis/height-1 are rejected - pass ≥ 2).
-fn run_zecd_init_watch_only(
+fn run_rose_init_watch_only(
     bin: &Path,
     datadir: &Path,
     wallet: &str,
@@ -2971,12 +3055,12 @@ fn run_zecd_init_watch_only(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("spawn zecd init --ufvk")?
+        .context("spawn rose init --ufvk")?
         .wait_with_output()
-        .context("wait for zecd init --ufvk")?;
+        .context("wait for rose init --ufvk")?;
     if !out.status.success() {
         bail!(
-            "zecd init --wallet {wallet} --ufvk failed ({}):\n{}",
+            "rose init --wallet {wallet} --ufvk failed ({}):\n{}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
@@ -2984,7 +3068,7 @@ fn run_zecd_init_watch_only(
     Ok(())
 }
 
-/// Run the `zecd config` commands against a datadir's freshly written `zecd.toml` and require
+/// Run the `rose config` commands against a datadir's freshly written `rose.toml` and require
 /// them to agree with the daemon that is about to start on that same file: `config check` must
 /// pass it, and what `config show` renders from it must itself be a config `config check`
 /// accepts. Offline and read-only (no datadir lock, nothing written to the datadir), so it
@@ -2992,7 +3076,7 @@ fn run_zecd_init_watch_only(
 ///
 /// The second half is the renderer's schema contract - `config show` prints every resolved
 /// setting by its real key, so a renderer that drifts from what the parser accepts emits
-/// something that looks authoritative and that zecd would refuse. Offline fixtures pin that
+/// something that looks authoritative and that rose would refuse. Offline fixtures pin that
 /// property already; running it here puts it on the widest configs in the tree, and on the
 /// shapes only the harness builds - light mode, transparent pools, multiwallet, the `[spend]`
 /// knobs.
@@ -3001,32 +3085,32 @@ fn run_zecd_init_watch_only(
 /// initialised yet, which the command reports as exactly that. `--strict` would turn that
 /// normal state into a failure.
 fn assert_config_commands_agree(bin: &Path, datadir: &Path) -> Result<()> {
-    let conf = datadir.join("zecd.toml");
+    let conf = datadir.join("rose.toml");
     run_config_check(bin, &conf)
-        .context("zecd config check rejected the config this test is about to run zecd on")?;
+        .context("rose config check rejected the config this test is about to run rose on")?;
 
     let out = Command::new(bin)
         .args(["config", "show", "--conf", conf.to_str().unwrap()])
         .output()
-        .context("spawn zecd config show")?;
+        .context("spawn rose config show")?;
     if !out.status.success() {
         bail!(
-            "zecd config show failed on the config this test is about to run zecd on ({}):\n{}",
+            "rose config show failed on the config this test is about to run rose on ({}):\n{}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    // Rendered outside the datadir: the daemon reads only `zecd.toml`, but a test that asserts
+    // Rendered outside the datadir: the daemon reads only `rose.toml`, but a test that asserts
     // on datadir contents should not have to know about this check.
     let rendered_dir = tempfile::tempdir().context("temp dir for the rendered config")?;
     let rendered = rendered_dir.path().join("effective.toml");
     std::fs::write(&rendered, &out.stdout).context("write the rendered config")?;
     run_config_check(bin, &rendered)
-        .context("zecd config check rejected the config zecd config show rendered")?;
+        .context("rose config check rejected the config rose config show rendered")?;
     Ok(())
 }
 
-/// Run `zecd config check` on the funder's `zecd.toml` **with the funder's own binary**, which
+/// Run `rose config check` on the funder's `rose.toml` **with the funder's own binary**, which
 /// is the whole point: that binary is a pinned older release, so this is the "a config valid for
 /// one build is refused by another" case, checked offline before the daemon starts.
 ///
@@ -3040,9 +3124,9 @@ fn assert_config_commands_agree(bin: &Path, datadir: &Path) -> Result<()> {
 /// [`write_funder_toml`] when the real cause is the pin. So probe for the subcommand first and
 /// name that cause instead.
 ///
-/// A missing subcommand is a hard failure, not a skip. `ZECD_FUNDER_IMAGE` is pinned by this
+/// A missing subcommand is a hard failure, not a skip. `ROSE_FUNDER_IMAGE` is pinned by this
 /// repo, so a funder that cannot answer is a pin someone edited rather than an environment we
-/// happen to run in (the distinction from `ZECD_REGTEST_REQUIRE_SHIELDED_COINBASE`, which keys
+/// happen to run in (the distinction from `ROSE_REGTEST_REQUIRE_SHIELDED_COINBASE`, which keys
 /// on whichever zebrad image is present and so defaults the other way) - and a silent skip
 /// inside a green run is exactly how this assertion sat inert for its whole life.
 /// [`allow_funder_without_config_check`] is the deliberate escape hatch.
@@ -3050,47 +3134,47 @@ fn assert_funder_config_check_passes(bin: &Path, dir: &Path) -> Result<()> {
     let probe = Command::new(bin)
         .args(["config", "check", "--help"])
         .output()
-        .context("spawn zecd config check --help")?;
+        .context("spawn rose config check --help")?;
     if !probe.status.success() {
         if !allow_funder_without_config_check() {
             bail!(
-                "the pinned funder zecd has no `config check` (exit {}): ZECD_FUNDER_IMAGE points \
+                "the pinned funder rose has no `config check` (exit {}): ROSE_FUNDER_IMAGE points \
                  at a release older than 0.6.0. Advance the pin, or set \
-                 ZECD_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK=1 to skip this assertion - which \
+                 ROSE_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK=1 to skip this assertion - which \
                  is what a bisect walking the pin backwards wants.",
                 probe.status
             );
         }
         eprintln!(
             "WARN skipping the funder config assertion by request \
-             (ZECD_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK): the pinned funder zecd has no \
+             (ROSE_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK): the pinned funder rose has no \
              `config check` (exit {})",
             probe.status
         );
         return Ok(());
     }
-    run_config_check(bin, &dir.join("zecd.toml")).context(
+    run_config_check(bin, &dir.join("rose.toml")).context(
         "the pinned funder release rejects the config the harness wrote for it - \
          write_funder_toml must use only keys that release knows",
     )
 }
 
 /// Whether a funder binary without `config check` is tolerated:
-/// `ZECD_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK=1`. Every release from 0.6.0 on carries the
-/// command, so the only thing this is for is walking `ZECD_FUNDER_IMAGE` *backwards* - a bisect
+/// `ROSE_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK=1`. Every release from 0.6.0 on carries the
+/// command, so the only thing this is for is walking `ROSE_FUNDER_IMAGE` *backwards* - a bisect
 /// chasing some unrelated symptom, which should not have every funded stack die at funder init.
 fn allow_funder_without_config_check() -> bool {
-    std::env::var("ZECD_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK")
+    std::env::var("ROSE_REGTEST_ALLOW_FUNDER_WITHOUT_CONFIG_CHECK")
         .is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
-/// One `zecd config check --conf <file>` run; `Err` carries the command's own output, which is
+/// One `rose config check --conf <file>` run; `Err` carries the command's own output, which is
 /// the part worth reading when it fails.
 fn run_config_check(bin: &Path, conf: &Path) -> Result<()> {
     let out = Command::new(bin)
         .args(["config", "check", "--conf", conf.to_str().unwrap()])
         .output()
-        .context("spawn zecd config check")?;
+        .context("spawn rose config check")?;
     if !out.status.success() {
         bail!(
             "({}):\n{}{}",
@@ -3102,11 +3186,11 @@ fn run_config_check(bin: &Path, conf: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run `zecd export-ufvk --wallet <wallet>` against a datadir (reads the wallet DB directly; no
+/// Run `rose export-ufvk --wallet <wallet>` against a datadir (reads the wallet DB directly; no
 /// running daemon required) and return the printed Unified Full Viewing Key (the last non-empty
 /// stdout line).
 fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
-    let out = Command::new(zecd_bin())
+    let out = Command::new(rose_bin())
         .args([
             "--datadir",
             datadir.to_str().unwrap(),
@@ -3116,10 +3200,10 @@ fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
             wallet,
         ])
         .output()
-        .context("spawn zecd export-ufvk")?;
+        .context("spawn rose export-ufvk")?;
     if !out.status.success() {
         bail!(
-            "zecd export-ufvk failed ({}):\n{}",
+            "rose export-ufvk failed ({}):\n{}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
@@ -3134,7 +3218,7 @@ fn export_ufvk_from_datadir(datadir: &Path, wallet: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("export-ufvk printed nothing on stdout"))
 }
 
-fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
+fn write_rose_toml(datadir: &Path, cfg: &RoseConfig) -> Result<()> {
     // The single upstream: a local zebrad JSON-RPC endpoint (full mode), or - when
     // `lightwalletd_grpc_port` is set - a local plaintext lightwalletd (light mode).
     let server = match cfg.lightwalletd_grpc_port {
@@ -3143,7 +3227,7 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
     };
     // In light mode, assert the upstream's transparent-in-compact-blocks capability. The
     // harness builds lightwalletd from a 0.5.x release, which serves that data - but no
-    // released lightwalletd populates `GetLightdInfo.lightwalletProtocolVersion`, so zecd's
+    // released lightwalletd populates `GetLightdInfo.lightwalletProtocolVersion`, so rose's
     // connect-time probe cannot see the capability and would refuse every transparent wallet.
     let backend_capability = match cfg.lightwalletd_grpc_port {
         Some(_) => "assume_transparent_in_compact_blocks = true\n",
@@ -3177,10 +3261,10 @@ fn write_zecd_toml(datadir: &Path, cfg: &ZecdConfig) -> Result<()> {
         }
     };
     // The default wallet plus any extra `[wallets.<name>]` entries (multiwallet tests). No
-    // explicit `dir`: the wallets land wherever zecd puts them by default (`<datadir>/<name>`,
+    // explicit `dir`: the wallets land wherever rose puts them by default (`<datadir>/<name>`,
     // with the databases under `<name>/zec/lrz/`), so the harness exercises the same path
-    // resolution an operator gets. Tests that need a path ask [`Zecd::wallet_dir`] or
-    // [`Zecd::engine_dir`] rather than assuming one.
+    // resolution an operator gets. Tests that need a path ask [`Rose::wallet_dir`] or
+    // [`Rose::engine_dir`] rather than assuming one.
     //
     // A per-wallet `server` override, when this stack gives the wallet its own upstream.
     let wallet_server =
@@ -3294,7 +3378,7 @@ port = {health_port}
             .unwrap_or_default(),
         spend_section = spend_section,
     );
-    std::fs::write(datadir.join("zecd.toml"), toml)?;
+    std::fs::write(datadir.join("rose.toml"), toml)?;
     Ok(())
 }
 

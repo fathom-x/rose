@@ -1,6 +1,6 @@
 # cargo-about configuration for generating THIRD-PARTY-LICENSES.txt.
 #
-# zecd is a statically linked binary, so every dependency's license text travels
+# rose is a statically linked binary, so every dependency's license text travels
 # in the shipped artifact. `scripts/generate-licenses.sh` runs `cargo about generate`
 # against this config + about.hbs to produce the committed THIRD-PARTY-LICENSES.txt
 # (CI verifies it is current). Keep the `accepted` set in lockstep with deny.toml's
@@ -18,7 +18,10 @@ targets = [
     "aarch64-unknown-linux-gnu",
 ]
 
-# Workspace-internal crates carry no third-party text.
+# Workspace-internal crates carry no third-party text. This only skips *unpublished*
+# members, and both crates publish, so about.hbs also leaves `rosed` and `rose-cli` out of
+# the "Used by" lists (the file is the third-party notices; rose's own license is
+# LICENSE-MIT / LICENSE-APACHE).
 private = { ignore = true }
 
 # cargo-about's defaults cover build- and dev-dependencies as well as the ones linked into

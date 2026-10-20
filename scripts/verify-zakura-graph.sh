@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Prove that zecd's resolved dependency graph rides the Zakura Common stack alone.
+# Prove that rose's resolved dependency graph rides the Zakura Common stack alone.
 #
-# zecd consumes the librustzcash crypto and wallet crates as their Zakura Common forks
+# rose consumes the librustzcash crypto and wallet crates as their Zakura Common forks
 # (`zakura-orchard`, `zakura-client-backend`, ...; see the Zcash block in Cargo.toml). The
 # forks keep the upstream *library* names (`orchard`, `zcash_client_backend`), so a stray
 # crates.io original compiles fine right up until two identical-looking types meet at a
@@ -26,9 +26,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-cargo metadata --format-version 1 --locked --all-features > "${TMPDIR:-/tmp}/zecd-graph-metadata.json"
+cargo metadata --format-version 1 --locked --all-features > "${TMPDIR:-/tmp}/rose-graph-metadata.json"
 
-python3 - "${TMPDIR:-/tmp}/zecd-graph-metadata.json" <<'PY'
+python3 - "${TMPDIR:-/tmp}/rose-graph-metadata.json" <<'PY'
 import json
 import sys
 from collections import defaultdict

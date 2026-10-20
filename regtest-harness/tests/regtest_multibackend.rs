@@ -10,16 +10,16 @@
 //! that per-wallet resolution actually reaches the actor rather than silently falling back to
 //! the global endpoint.
 //!
-//! Extended tier: set `ZECD_REGTEST_EXTENDED=1`, plus `ZEBRAD_BIN` and `LIGHTWALLETD_BIN`
-//! (lightwalletd is provisioned on the `zecd-lwd` CI leg, which is where this runs). Skips
+//! Extended tier: set `ROSE_REGTEST_EXTENDED=1`, plus `ZEBRAD_BIN` and `LIGHTWALLETD_BIN`
+//! (lightwalletd is provisioned on the `rose-lwd` CI leg, which is where this runs). Skips
 //! cleanly otherwise.
 
 use std::time::Duration;
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    extended_enabled, pick_port, resolve_bin, start_funded_chain, Lightwalletd, Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    extended_enabled, pick_port, resolve_bin, start_funded_chain, Lightwalletd, Rose, RoseConfig,
 };
+use serde_json::json;
 
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
@@ -29,7 +29,7 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(240);
 async fn regtest_multibackend_wallets_share_one_daemon() {
     if !extended_enabled() {
         eprintln!(
-            "SKIP regtest_multibackend_wallets_share_one_daemon: set ZECD_REGTEST_EXTENDED=1 to \
+            "SKIP regtest_multibackend_wallets_share_one_daemon: set ROSE_REGTEST_EXTENDED=1 to \
              run the extended tier."
         );
         return;
@@ -54,22 +54,22 @@ async fn regtest_multibackend_wallets_share_one_daemon() {
 
     // 2. One daemon, two upstreams: `default` inherits the global zebra:// endpoint, `replica`
     //    (a watch-only UFVK import of it) overrides `server` to the lightwalletd.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.extra_watch_only_wallets = vec!["replica".to_string()];
     cfg.wallet_servers = vec![(
         "replica".to_string(),
         format!("http://127.0.0.1:{}", lwd.grpc_port),
     )];
-    let zecd = Zecd::start(&cfg)
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd with a zebra-backed and a lightwalletd-backed wallet");
+        .expect("start rose with a zebra-backed and a lightwalletd-backed wallet");
 
-    zecd.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
+    rose.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
         .await
         .expect("the zebra-backed wallet scans the chain");
 
     // Both wallets are loaded and served by the one daemon.
-    let wallets = zecd
+    let wallets = rose
         .call("listwallets", json!([]))
         .await
         .expect("listwallets");
@@ -77,7 +77,7 @@ async fn regtest_multibackend_wallets_share_one_daemon() {
 
     // 3. Fund the shared account and confirm it past the untrusted depth. The replica watches
     //    the same keys, so the payment must land on both sides.
-    let addr = zecd
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress")
@@ -97,26 +97,26 @@ async fn regtest_multibackend_wallets_share_one_daemon() {
         .await
         .expect("confirm the funding");
 
-    zecd.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
+    rose.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
         .await
         .expect("the zebra-backed wallet scans the funding block");
-    let tip = zecd
+    let tip = rose
         .call("getblockcount", json!([]))
         .await
         .expect("getblockcount")
         .as_u64()
         .expect("a height");
-    zecd.wait_until_wallet_synced("replica", tip, SYNC_TIMEOUT)
+    rose.wait_until_wallet_synced("replica", tip, SYNC_TIMEOUT)
         .await
         .expect("the lightwalletd-backed wallet scans the funding block");
 
     // 4. The two backends derive the same chain view and the same balance. Same seed, same
     //    chain, different routes to it.
     let (hash_zebra, hash_lwd) = (
-        zecd.call("getbestblockhash", json!([]))
+        rose.call("getbestblockhash", json!([]))
             .await
             .expect("getbestblockhash (zebra-backed)"),
-        zecd.call_wallet("replica", "getbestblockhash", json!([]))
+        rose.call_wallet("replica", "getbestblockhash", json!([]))
             .await
             .expect("getbestblockhash (lightwalletd-backed)"),
     );
@@ -126,10 +126,10 @@ async fn regtest_multibackend_wallets_share_one_daemon() {
     );
 
     let (balance_zebra, balance_lwd) = (
-        zecd.call("getbalance", json!([]))
+        rose.call("getbalance", json!([]))
             .await
             .expect("getbalance (zebra-backed)"),
-        zecd.call_wallet("replica", "getbalance", json!([]))
+        rose.call_wallet("replica", "getbalance", json!([]))
             .await
             .expect("getbalance (lightwalletd-backed)"),
     );
@@ -144,11 +144,11 @@ async fn regtest_multibackend_wallets_share_one_daemon() {
     );
 
     // 5. And the history agrees too - the replica recovered the receive from compact blocks.
-    let txs_zebra = zecd
+    let txs_zebra = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions (zebra-backed)");
-    let txs_lwd = zecd
+    let txs_lwd = rose
         .call_wallet("replica", "listtransactions", json!([]))
         .await
         .expect("listtransactions (lightwalletd-backed)");

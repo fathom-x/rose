@@ -1,23 +1,23 @@
-# zecd configuration for the Bitcoin **testnet4** dev stack
+# rose configuration for the Bitcoin **testnet4** dev stack
 # (deploy/docker-compose.btc-testnet4.yml), for exercising the BDK engine against real -
-# valueless - testnet4 coins. See deploy/zecd.btc-testnet3.toml for the testnet3 twin; the
+# valueless - testnet4 coins. See deploy/rose.btc-testnet3.toml for the testnet3 twin; the
 # two differ only in `btc_testnet`, the ports, and the datadir, so both can run side by side.
 #
-# Needs a zecd built with the `bitcoin` feature. A default build carries no BDK engine and
+# Needs a rose built with the `bitcoin` feature. A default build carries no BDK engine and
 # refuses this file three times over: `[bitcoind]` is gated out of the config schema (so it
 # trips deny_unknown_fields at parse time, which is the error you actually see), and
 # `coin = "bitcoin"` and `btc_testnet` are both refused in resolve behind it. So running
-# `zecd config check --conf <this file>` is the probe for whether a binary has the engine.
+# `rose config check --conf <this file>` is the probe for whether a binary has the engine.
 #
-# Unlike deploy/zecd.toml this file is NOT mounted into a container: the compose stack runs
-# only bitcoind, publishing its RPC on loopback, and zecd runs on the host. Relative paths
-# below therefore resolve against zecd's working directory - the repository root, if you run
+# Unlike deploy/rose.toml this file is NOT mounted into a container: the compose stack runs
+# only bitcoind, publishing its RPC on loopback, and rose runs on the host. Relative paths
+# below therefore resolve against rose's working directory - the repository root, if you run
 # the commands as written:
 #
 #   docker compose -f deploy/docker-compose.btc-testnet4.yml up -d
-#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4.toml \
+#   cargo run --release --features bitcoin -- --conf deploy/rose.btc-testnet4.toml \
 #       init --wallet btc --birthday 2026-08-01
-#   cargo run --release --features bitcoin -- --conf deploy/zecd.btc-testnet4.toml
+#   cargo run --release --features bitcoin -- --conf deploy/rose.btc-testnet4.toml
 #
 # `--wallet btc` above is optional: every subcommand's `--wallet` (init, export-xpub, rescan,
 # `run --restore-if-empty`) defaults to `default_wallet` below, which names this file's
@@ -38,7 +38,7 @@
 #
 # Then fund the wallet from a testnet4 faucet (e.g. mempool.space/testnet4). The coins are
 # valueless, which is why the bitcoind credentials below are fixed dev values published in
-# the repo (zecd's own [rpc] password is a CHANGE-ME placeholder - see the note on it). Do
+# the repo (rose's own [rpc] password is a CHANGE-ME placeholder - see the note on it). Do
 # not reuse this file's shape for mainnet.
 
 network = "test"
@@ -71,28 +71,28 @@ coin = "bitcoin"
 
 [bitcoind]
 # Matches -rpcuser/-rpcpassword in the compose file. A cookie file (`rpc_cookie`) wins over
-# user/password when both are set. These credentials ride plaintext HTTP, so zecd's
+# user/password when both are set. These credentials ride plaintext HTTP, so rose's
 # cleartext-credential gate applies: loopback and the private ranges are allowed, a
 # globally-routable host is refused at connect.
 rpc_user = "btc"
 rpc_password = "btc"
 
 [rpc]
-# zecd's own Bitcoin-Core-dialect JSON-RPC, for the client under test. Loopback-only: unlike
-# deploy/zecd.toml there is no container boundary to cross, so nothing needs 0.0.0.0.
+# rose's own Bitcoin-Core-dialect JSON-RPC, for the client under test. Loopback-only: unlike
+# deploy/rose.toml there is no container boundary to cross, so nothing needs 0.0.0.0.
 bind = "127.0.0.1"
 port = 48232
 user = "btc"
-# zecd's OWN RPC password - unlike the [bitcoind] credentials above it has no counterpart to
-# match, and it is the one value in this file you MUST change: zecd refuses to start while it
+# rose's OWN RPC password - unlike the [bitcoind] credentials above it has no counterpart to
+# match, and it is the one value in this file you MUST change: rose refuses to start while it
 # is the `CHANGE-ME` placeholder, on every network, testnet included. Either edit this line or
-# leave it and supply ZECD_RPC_PASSWORD in the daemon's environment (it wins over the file) -
-# the latter is what the zecd-gui compose service expects, since the UI proxy reads the same
-# variable to authenticate. Same rule and same variable for deploy/zecd.btc-testnet4-kyoto.toml.
+# leave it and supply ROSE_RPC_PASSWORD in the daemon's environment (it wins over the file) -
+# the latter is what the rose-gui compose service expects, since the UI proxy reads the same
+# variable to authenticate. Same rule and same variable for deploy/rose.btc-testnet4-kyoto.toml.
 password = "CHANGE-ME"
 
 [keys]
-# age identity written by `zecd init`; used to decrypt the seed for unattended sending. A
+# age identity written by `rose init`; used to decrypt the seed for unattended sending. A
 # bitcoin send derives its signers from that seed per send (no spending material is stored
 # in the BDK database), and there is no `walletpassphrase` for a bitcoin wallet - so a
 # passphrase-encrypted one cannot send at all, and this is the only unattended custody model.

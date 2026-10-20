@@ -14,15 +14,15 @@
 //!    `peer_median`, and the node holds the transaction at about 1 sat/vB.
 //!
 //! Kyoto only: over bitcoind the fee is `estimatesmartfee`'s. Skips cleanly without a
-//! bitcoind or a zecd built without the `bitcoin` feature.
+//! bitcoind or a rose built without the `bitcoin` feature.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
-use zecd_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, ZecdBtc};
 
 /// A BTC amount as satoshis.
 fn sats(v: &Value) -> u64 {
@@ -83,20 +83,20 @@ async fn btc_kyoto_fee_chain_checks_oracles_and_gates_on_fullness() {
         "[fees]\nmempool_space_url = \"http://127.0.0.1:{oracle_port}/mempool\"\n\
          esplora_url = \"http://127.0.0.1:{oracle_port}/esplora\"\n"
     );
-    let mut zecd = ZecdBtc::prepare_full(
-        dir.path().join("zecddata"),
+    let mut rose = RoseBtc::prepare_full(
+        dir.path().join("rosedata"),
         BtcBackend::Kyoto,
         &node,
         &["btc"],
         "",
         &fees,
     );
-    zecd.init_ok("btc", &["--birthday", "0"]);
-    zecd.start().await;
-    zecd.wait_height(101).await;
+    rose.init_ok("btc", &["--birthday", "0"]);
+    rose.start().await;
+    rose.wait_height(101).await;
 
     // Fund the wallet, then five blocks that each carry a 100 sat/vB payment.
-    let addr = zecd
+    let addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
@@ -115,8 +115,8 @@ async fn btc_kyoto_fee_chain_checks_oracles_and_gates_on_fullness() {
         .expect("a 100 sat/vB payment");
         node.mine(1).await;
     }
-    zecd.wait_height(107).await;
-    zecd.wait_wallet_balance("btc", 1.0).await;
+    rose.wait_height(107).await;
+    rose.wait_wallet_balance("btc", 1.0).await;
     // The precondition step 2 rests on: the tip block's average rate - what the peer tier
     // samples - is far above the floor, and the block is nowhere near full.
     let tip = node
@@ -141,7 +141,7 @@ async fn btc_kyoto_fee_chain_checks_oracles_and_gates_on_fullness() {
 
     // 1. mempool.space's 1000 sat/vB is far above anything recent blocks paid: Esplora's
     //    3 sat/vB answers.
-    let estimate = zecd
+    let estimate = rose
         .call("estimatesmartfee", json!([6]))
         .await
         .expect("estimatesmartfee");
@@ -152,7 +152,7 @@ async fn btc_kyoto_fee_chain_checks_oracles_and_gates_on_fullness() {
     //    block was full - whatever the target.
     esplora_up.store(false, Ordering::SeqCst);
     for target in [1, 6, 144] {
-        let estimate = zecd
+        let estimate = rose
             .call("estimatesmartfee", json!([target]))
             .await
             .expect("estimatesmartfee");
@@ -165,7 +165,7 @@ async fn btc_kyoto_fee_chain_checks_oracles_and_gates_on_fullness() {
     }
 
     // 3. A send takes the same answer.
-    let sent = zecd
+    let sent = rose
         .call(
             "sendtoaddress",
             json!([miner, 0.1, null, null, false, null, null, null, null, null, true]),

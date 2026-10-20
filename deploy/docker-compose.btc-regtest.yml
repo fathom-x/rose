@@ -1,9 +1,9 @@
-# Development-only Bitcoin Core regtest stack, for exercising zecd's BDK engine
+# Development-only Bitcoin Core regtest stack, for exercising rose's BDK engine
 # (the off-by-default `bitcoin` cargo feature).
 #
 # This is NOT part of the self-hosted deployment example (docker-compose.yml) and is not
 # used by the regtest harness (regtest_btc.rs spawns its own bitcoind from BITCOIND_BIN).
-# It is the manual-testing upstream for a `--features bitcoin` zecd: point a bitcoin
+# It is the manual-testing upstream for a `--features bitcoin` rose: point a bitcoin
 # wallet's default `server = "bitcoind"` (regtest resolves to 127.0.0.1:18443) at it with
 # `[bitcoind] rpc_user = "btc"` / `rpc_password = "btc"`. The node serves:
 #   - JSON-RPC on 18443 (the bitcoind full-mode backend, and your bitcoin-cli)
@@ -33,7 +33,7 @@
 # distinct project name per network keeps the regtest/testnet3/testnet4 nodes independent,
 # so they can run side by side and never clobber each other.
 
-name: zecd-btc-regtest
+name: rose-btc-regtest
 
 services:
   bitcoind:

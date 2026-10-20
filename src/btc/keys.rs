@@ -7,7 +7,7 @@
 //! internal (change) keychains.
 //!
 //! The wallet database is created from **public** descriptors ([`Bip84Public`]): the account
-//! xpub plus the master fingerprint, never the xprv. That preserves zecd's custody model - the
+//! xpub plus the master fingerprint, never the xprv. That preserves rose's custody model - the
 //! only spending material on disk is the age-encrypted mnemonic in `keys.toml` - and it is
 //! what the spend path will build on too (derive signers from the seed at signing time, as the
 //! Zcash actor derives its USK per send, rather than persisting keys).
@@ -102,7 +102,7 @@ impl AccountKeys {
         let DescriptorPublicKey::XPub(xkey) = key else {
             anyhow::bail!(
                 "invalid account xpub: expected an extended public key of the form \
-                 [fingerprint/84'/coin'/0']xpub... (as `zecd export-xpub` prints) or a \
+                 [fingerprint/84'/coin'/0']xpub... (as `rose export-xpub` prints) or a \
                  bare xpub..."
             );
         };

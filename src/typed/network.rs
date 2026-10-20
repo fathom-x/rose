@@ -11,9 +11,9 @@ use crate::amount::Amount;
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct NetworkInfo {
-    /// zecd's version in Bitcoin Core's numeric encoding (major*10000 + minor*100 + patch).
+    /// rose's version in Bitcoin Core's numeric encoding (major*10000 + minor*100 + patch).
     pub version: u64,
-    /// `/zecd:<version>/`.
+    /// `/rose:<version>/`.
     pub subversion: String,
     pub protocolversion: u64,
     pub localservices: String,
@@ -31,7 +31,7 @@ pub struct NetworkInfo {
     pub warnings: String,
 }
 
-/// One entry of `getpeerinfo` - zecd's single "peer" is the active upstream
+/// One entry of `getpeerinfo` - rose's single "peer" is the active upstream
 /// (`rpc/network.rs::getpeerinfo`; the list is empty while disconnected).
 #[non_exhaustive]
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -39,9 +39,9 @@ pub struct PeerInfo {
     pub id: u64,
     pub addr: String,
     pub inbound: bool,
-    /// zecd extension: the upstream connection state (`down`/`syncing`/`ready`).
+    /// rose extension: the upstream connection state (`down`/`syncing`/`ready`).
     pub conn_state: String,
-    /// zecd extension: true while scanning or draining the enhancement backlog.
+    /// rose extension: true while scanning or draining the enhancement backlog.
     pub syncing: bool,
 }
 
@@ -78,7 +78,7 @@ mod tests {
     fn network_info_decodes() {
         let v = serde_json::json!({
             "version": 100,
-            "subversion": "/zecd:0.1.0/",
+            "subversion": "/rose:0.1.0/",
             "protocolversion": 170100,
             "localservices": "0000000000000000",
             "localservicesnames": [],
@@ -97,7 +97,7 @@ mod tests {
         let info: NetworkInfo = serde_json::from_value(v).unwrap();
         assert_eq!(info.relayfee.zatoshis(), 1000);
         assert_eq!(info.connections, 1);
-        assert!(info.subversion.contains("zecd"));
+        assert!(info.subversion.contains("rose"));
     }
 
     /// Fixture from a connected wallet's `getpeerinfo`.

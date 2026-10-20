@@ -1,37 +1,37 @@
 //! Stress regtest: large, note-fragmented wallet - the scaling tier.
 //!
-//! This reproduces (a scaled version of) the measured finding that a `zecd` send's latency grows
+//! This reproduces (a scaled version of) the measured finding that a `rose` send's latency grows
 //! with the wallet's note count, and that - with `[spend] pipeline_proving` on - the proof runs
 //! **off** the single-writer actor so background sync is no longer frozen for the whole send.
 //!
-//! It is gated **separately** from the extended tier (`ZECD_REGTEST_STRESS=1`, not
-//! `ZECD_REGTEST_EXTENDED`): building thousands of notes and timing multi-minute sends is far too
+//! It is gated **separately** from the extended tier (`ROSE_REGTEST_STRESS=1`, not
+//! `ROSE_REGTEST_EXTENDED`): building thousands of notes and timing multi-minute sends is far too
 //! heavy for even the weekly extended run, so the CI workflow drives it only via an explicit
 //! dispatch and a rare (monthly) schedule, never on push/PR. The note target is tunable with
-//! `ZECD_STRESS_NOTE_COUNT` (default 256) so the same test scales from a quick dispatch smoke to a
+//! `ROSE_STRESS_NOTE_COUNT` (default 256) so the same test scales from a quick dispatch smoke to a
 //! heavy soak.
 //!
 //! What it asserts:
 //!   1. **Liveness during a send (the Layer-1 fix):** while a large send's proof runs, new blocks
-//!      mined on the chain are still *scanned by zecd* before the send returns - i.e. the actor is
+//!      mined on the chain are still *scanned by rose* before the send returns - i.e. the actor is
 //!      not frozen by the proof. With `pipeline_proving` off this would hang (the actor blocks on
 //!      `block_in_place` for the whole proof), so this is the discriminating regression guard.
 //!   2. **Correctness:** the send still completes and moves funds (it is committed and broadcast).
 //!
 //! The per-send phase-timing log lines (`send complete (pipelined): N inputs, M orchard actions;
 //! select+build ... prove+sign ... store ... broadcast ...`) are the Layer-0 profiling artifact - set
-//! `ZECD_STDERR=1` to stream them into the CI log.
+//! `ROSE_STDERR=1` to stream them into the CI log.
 //!
 //! Skips cleanly unless `ZEBRAD_BIN` is set *and*
-//! `ZECD_REGTEST_STRESS=1`.
+//! `ROSE_REGTEST_STRESS=1`.
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use zecd_regtest_harness::{
+use rose_regtest_harness::{
     pick_port, resolve_node_bin, start_funded_chain, stress_enabled, stress_note_count,
-    RegtestNode, Zebrad, Zecd, ZecdConfig,
+    RegtestNode, Rose, RoseConfig, Zebrad,
 };
+use serde_json::json;
 
 /// Value of each note the wallet is fragmented into (0.001 ZEC - comfortably above dust and the
 /// ZIP-317 marginal fee, so notes don't decay as the build loop recycles them).
@@ -49,7 +49,7 @@ const MINE_DURING_SEND: u32 = 3;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(240);
 /// Per build-round send (a `BUILD_CHUNK`-output proof; seconds with the cached key).
 const BUILD_OP_TIMEOUT: Duration = Duration::from_secs(600);
-/// How long zecd has to scan the blocks mined during the measured send. Generous, but far shorter
+/// How long rose has to scan the blocks mined during the measured send. Generous, but far shorter
 /// than a large send's proof - so reaching it proves concurrency, not just eventual sync.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -57,7 +57,7 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(180);
 async fn regtest_stress_many_notes() {
     if !stress_enabled() {
         eprintln!(
-            "SKIP regtest_stress_many_notes: set ZECD_REGTEST_STRESS=1 to run the stress tier. The \
+            "SKIP regtest_stress_many_notes: set ROSE_REGTEST_STRESS=1 to run the stress tier. The \
              harness still compiled and linked."
         );
         return;
@@ -83,20 +83,20 @@ async fn regtest_stress_many_notes() {
     // The funder's own bare t-address, used here as an external transparent counterparty.
     let funder_taddr = funder.transparent_address().to_string();
 
-    // --- zecd with the pipeline on, and both send bounds lifted so the big fan-out/sweep sends
+    // --- rose with the pipeline on, and both send bounds lifted so the big fan-out/sweep sends
     //     aren't rejected: `orchard_action_limit` bounds the action count and `max_tx_bytes`
     //     the serialized size, and a deliberately many-input sweep exceeds both. A long proof
     //     is the point here - it is what the actor must stay live through - so this test wants
     //     the transaction the defaults exist to prevent. cache_proving_key stays default-on:
     //     the pipeline only engages on that cached-Orchard PCZT path. ---
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.pipeline_proving = Some(true);
     cfg.orchard_action_limit = Some(0);
     cfg.max_tx_bytes = Some(0);
-    let zecd = Zecd::start(&cfg)
+    let rose = Rose::start(&cfg)
         .await
-        .expect("start zecd against regtest zebra");
-    let zecd_ua = zecd
+        .expect("start rose against regtest zebra");
+    let rose_ua = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress")
@@ -104,25 +104,25 @@ async fn regtest_stress_many_notes() {
         .expect("address string")
         .to_string();
 
-    // Wait for zecd to be caught up so its mempool stream is open (the build sends appear at
+    // Wait for rose to be caught up so its mempool stream is open (the build sends appear at
     // 0-conf and the measured send's concurrent sync works off that "new block" signal).
     let tip = zebrad_tip(&zebrad).await;
-    zecd.wait_until_synced(tip, SYNC_TIMEOUT)
+    rose.wait_until_synced(tip, SYNC_TIMEOUT)
         .await
-        .expect("zecd initial sync");
+        .expect("rose initial sync");
 
-    // --- Fund zecd with one large note, sized to split into `note_target` notes plus fee/slack. ---
+    // --- Fund rose with one large note, sized to split into `note_target` notes plus fee/slack. ---
     let headroom = (note_target as u64) * 20_000 + 50_000_000;
     let fund_zat = (note_target as u64) * PER_NOTE_ZAT + headroom;
     funder
-        .send(&zecd_ua, fund_zat)
+        .send(&rose_ua, fund_zat)
         .await
-        .expect("fund zecd with the seed note");
+        .expect("fund rose with the seed note");
     zebrad.generate_blocks(6).await.expect("confirm the fund");
     let tip = zebrad_tip(&zebrad).await;
-    zecd.wait_until_synced(tip, SYNC_TIMEOUT)
+    rose.wait_until_synced(tip, SYNC_TIMEOUT)
         .await
-        .expect("zecd sync (funded)");
+        .expect("rose sync (funded)");
 
     // --- Fan-out destinations: `BUILD_CHUNK` *distinct* wallet addresses, issued once and reused
     //     every round. Distinct is a hard requirement, not a stylistic choice - `z_sendmany`
@@ -133,7 +133,7 @@ async fn regtest_stress_many_notes() {
     let mut fan_out_dests = Vec::with_capacity(BUILD_CHUNK);
     for _ in 0..BUILD_CHUNK {
         fan_out_dests.push(
-            zecd.call("getnewaddress", json!([]))
+            rose.call("getnewaddress", json!([]))
                 .await
                 .expect("getnewaddress (fan-out dest)")
                 .as_str()
@@ -145,7 +145,7 @@ async fn regtest_stress_many_notes() {
     // --- Build the fragmented note set: fan out `BUILD_CHUNK` notes per round until we reach the
     //     target. Each round spends the (single, large) change note and creates many small ones. ---
     let build_start = Instant::now();
-    let mut notes = confirmed_note_count(&zecd).await;
+    let mut notes = confirmed_note_count(&rose).await;
     let max_rounds = note_target / BUILD_CHUNK + 20;
     let mut round = 0;
     while notes < note_target {
@@ -161,24 +161,24 @@ async fn regtest_stress_many_notes() {
             .map(|dest| json!({ "address": dest, "amount": amount }))
             .collect();
         // minconf=1 so a change note confirmed this round is immediately spendable next round.
-        let opid = zecd
-            .call("z_sendmany", json!([zecd_ua, outputs, 1]))
+        let opid = rose
+            .call("z_sendmany", json!([rose_ua, outputs, 1]))
             .await
             .expect("z_sendmany fan-out")
             .as_str()
             .expect("opid string")
             .to_string();
-        await_opid(&zecd, &opid, BUILD_OP_TIMEOUT).await;
+        await_opid(&rose, &opid, BUILD_OP_TIMEOUT).await;
 
         zebrad
             .generate_blocks(MINE_PER_ROUND)
             .await
             .expect("confirm fan-out");
         let tip = zebrad_tip(&zebrad).await;
-        zecd.wait_until_synced(tip, SYNC_TIMEOUT)
+        rose.wait_until_synced(tip, SYNC_TIMEOUT)
             .await
-            .expect("zecd sync (build round)");
-        notes = confirmed_note_count(&zecd).await;
+            .expect("rose sync (build round)");
+        notes = confirmed_note_count(&rose).await;
         eprintln!("stress: build round {round}: {notes}/{note_target} notes");
     }
     eprintln!(
@@ -188,13 +188,13 @@ async fn regtest_stress_many_notes() {
 
     // --- The measured send: sweep a large fraction of the balance back to the funder. A big
     //     fraction forces the greedy selector to pull in many of the small notes → a large Orchard
-    //     bundle → a long proof. While that proof runs off the actor, mine blocks and require zecd
+    //     bundle → a long proof. While that proof runs off the actor, mine blocks and require rose
     //     to scan them: that is only possible if the actor is NOT frozen by the proof. ---
-    let balance = getbalance_zats(&zecd).await;
-    // Take the fraction in **zatoshis**, not in ZEC. zecd parses an amount with Bitcoin Core's
+    let balance = getbalance_zats(&rose).await;
+    // Take the fraction in **zatoshis**, not in ZEC. rose parses an amount with Bitcoin Core's
     // `ParseFixedPoint`, which accepts at most 8 decimal places, and an f64 product routinely has
     // more: a 0.78225 ZEC wallet gives `balance * 0.7 == 0.5475749999999999`, which serde_json
-    // serializes in full and zecd rejects with -3 "Invalid amount" - the failure this replaced,
+    // serializes in full and rose rejects with -3 "Invalid amount" - the failure this replaced,
     // and one that depends on the balance the build loop happens to land on. Integer zatoshis
     // through `zec_str` can only ever render 8 places.
     let sweep_zats = balance * 7 / 10;
@@ -205,20 +205,20 @@ async fn regtest_stress_many_notes() {
     let sweep = zec_str(sweep_zats);
     eprintln!("stress: measured send sweeps {sweep} ZEC ({notes}-note wallet)");
 
-    let before = zecd.block_count().await.expect("block_count before send");
-    let send = zecd.call("sendtoaddress", json!([funder_taddr, sweep]));
+    let before = rose.block_count().await.expect("block_count before send");
+    let send = rose.call("sendtoaddress", json!([funder_taddr, sweep]));
     let observe = async {
-        // Mine while the proof is in flight; require zecd to scan to the new tip before the send
+        // Mine while the proof is in flight; require rose to scan to the new tip before the send
         // returns. (With pipeline_proving off, the actor would be frozen and this would time out.)
         zebrad
             .generate_blocks(MINE_DURING_SEND)
             .await
             .expect("mine during the measured send");
         let target = before + MINE_DURING_SEND as u64;
-        zecd.wait_until_synced(target, OBSERVE_TIMEOUT)
+        rose.wait_until_synced(target, OBSERVE_TIMEOUT)
             .await
             .expect(
-                "zecd must keep scanning new blocks while a send's proof runs - the actor is \
+                "rose must keep scanning new blocks while a send's proof runs - the actor is \
                  frozen by the proof (pipeline_proving regressed?)",
             );
         target
@@ -231,19 +231,19 @@ async fn regtest_stress_many_notes() {
     // --- Correctness: the swept funds confirm and the balance drops. ---
     zebrad.generate_blocks(6).await.expect("confirm sweep");
     let tip = zebrad_tip(&zebrad).await;
-    zecd.wait_until_synced(tip, SYNC_TIMEOUT)
+    rose.wait_until_synced(tip, SYNC_TIMEOUT)
         .await
-        .expect("zecd sync (post-sweep)");
-    let after = getbalance_zats(&zecd).await;
+        .expect("rose sync (post-sweep)");
+    let after = getbalance_zats(&rose).await;
     assert!(
         after < balance,
         "sweep did not move funds: balance {balance} -> {after} zatoshis"
     );
 
-    let _ = zecd.call("stop", json!([])).await;
+    let _ = rose.call("stop", json!([])).await;
 }
 
-/// zebra's current best-block height (the node's own `getblockcount`, independent of zecd's scan).
+/// zebra's current best-block height (the node's own `getblockcount`, independent of rose's scan).
 async fn zebrad_tip(zebrad: &Zebrad) -> u64 {
     zebrad
         .rpc("getblockcount", json!([]))
@@ -253,9 +253,9 @@ async fn zebrad_tip(zebrad: &Zebrad) -> u64 {
         .expect("zebra getblockcount number")
 }
 
-/// Count zecd's confirmed (minconf=1) notes via `listunspent`.
-async fn confirmed_note_count(zecd: &Zecd) -> usize {
-    zecd.call("listunspent", json!([1]))
+/// Count rose's confirmed (minconf=1) notes via `listunspent`.
+async fn confirmed_note_count(rose: &Rose) -> usize {
+    rose.call("listunspent", json!([1]))
         .await
         .expect("listunspent")
         .as_array()
@@ -263,15 +263,15 @@ async fn confirmed_note_count(zecd: &Zecd) -> usize {
         .unwrap_or(0)
 }
 
-/// zecd's spendable balance in zatoshis.
+/// rose's spendable balance in zatoshis.
 ///
 /// `getbalance` answers with a bare 8-decimal JSON number, and the harness's `serde_json` has no
 /// `arbitrary_precision`, so it arrives as an `f64` and is converted back to an exact integer
 /// here. That conversion is lossless at any balance a regtest chain can hold (a whole number of
 /// zatoshis is far inside f64's 2^53 exactly-representable range), and reading the balance as an
 /// integer is what lets every amount this test derives from it stay an exact 8-dp decimal.
-async fn getbalance_zats(zecd: &Zecd) -> u64 {
-    let v = zecd
+async fn getbalance_zats(rose: &Rose) -> u64 {
+    let v = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance");
@@ -287,7 +287,7 @@ async fn getbalance_zats(zecd: &Zecd) -> u64 {
 /// stress test's proving runs are multi-minute, a blocking call holds a work-queue permit, and
 /// re-issuing keeps the harness's own deadline the authority. Timing out server-side is not an
 /// error - `finished: false` just means "still running", per the RPC's contract.
-async fn await_opid(zecd: &Zecd, opid: &str, timeout: Duration) {
+async fn await_opid(rose: &Rose, opid: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -296,7 +296,7 @@ async fn await_opid(zecd: &Zecd, opid: &str, timeout: Duration) {
             "operation {opid} did not finish within {timeout:?}"
         );
         let wait_secs = remaining.as_secs().clamp(1, 30);
-        let st = zecd
+        let st = rose
             .call("z_waitforoperation", json!([opid, wait_secs]))
             .await
             .expect("z_waitforoperation");

@@ -1,4 +1,4 @@
-//! The currency a `zecd` wallet serves, and the chain it serves it on.
+//! The currency a `rose` wallet serves, and the chain it serves it on.
 //!
 //! [`Coin`] is what the shared layer - config, the wallet registry, dispatch, the address
 //! codec - names when it needs to say *which* currency a wallet deals in, so those modules
@@ -30,7 +30,7 @@ pub enum Coin {
 }
 
 impl Coin {
-    /// Every coin zecd serves, in the order error messages list them.
+    /// Every coin rose serves, in the order error messages list them.
     pub const SUPPORTED: &'static [Coin] = &[
         #[cfg(feature = "zcash")]
         Coin::Zcash,
@@ -72,7 +72,7 @@ impl Coin {
     /// ([`crate::config::coin_dir`]).
     ///
     /// It sits inside the wallet rather than above it because `keys.toml` - the one file in a
-    /// wallet directory that is zecd's own - is derived from a BIP-39 seed that serves every
+    /// wallet directory that is rose's own - is derived from a BIP-39 seed that serves every
     /// coin at once. One wallet, one seed, one directory per coin underneath it.
     ///
     /// The token is short and coin-specific rather than [`Coin::name`], because it is a path
@@ -95,7 +95,7 @@ impl Coin {
     /// level of its own so that everything a *particular* library owns is separable from the
     /// coin's own state: replacing librustzcash - or running a migration between two of its
     /// incompatible schema generations - is then a sibling directory and a rescan, not an
-    /// archaeology exercise over a shared one. Nothing zecd owns goes in here; `keys.toml`,
+    /// archaeology exercise over a shared one. Nothing rose owns goes in here; `keys.toml`,
     /// which the seed and the chain cannot rebuild, stays at the wallet root where no engine
     /// swap can reach it.
     ///
@@ -109,7 +109,7 @@ impl Coin {
         }
     }
 
-    /// Parse a token produced by [`Coin::name`]. `None` for anything zecd does not serve.
+    /// Parse a token produced by [`Coin::name`]. `None` for anything rose does not serve.
     pub fn parse(s: &str) -> Option<Coin> {
         Coin::SUPPORTED.iter().copied().find(|c| c.name() == s)
     }
@@ -189,7 +189,7 @@ impl CoinNetwork {
 /// The Bitcoin chain a wallet serves, derived from the daemon's network environment like
 /// every [`CoinNetwork`].
 ///
-/// A zecd-owned enum, not `bdk_wallet::bitcoin::Network`: [`CoinNetwork`] is a shared-layer
+/// A rose-owned enum, not `bdk_wallet::bitcoin::Network`: [`CoinNetwork`] is a shared-layer
 /// type, and the engine-boundary rule keeps engine types out of cross-coin enums. The BDK
 /// engine maps this onto its own network type at its edge (`crate::btc`), the same way
 /// [`ZNetwork`] stays the Zcash engine's internal `Parameters` value.

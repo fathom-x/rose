@@ -2,7 +2,7 @@
 //!
 //! The alternative to the mempool.space websocket ([`super::mempool_feed`] holds the shared
 //! shape and the actor-facing events). Where that feed asks a third party for JSON, this one
-//! is a minimal Bitcoin P2P client of zecd's own - version handshake, `inv`/`getdata`/`tx`,
+//! is a minimal Bitcoin P2P client of rose's own - version handshake, `inv`/`getdata`/`tx`,
 //! `ping`/`pong`, and optionally BIP 35 `mempool` - peering with one node, by default the
 //! wallet's own `kyoto://<ip>:<port>` trusted peer. Our `version` announces `relay = true`,
 //! so the node announces every transaction entering its mempool with an `inv`; the client
@@ -15,7 +15,7 @@
 //! Why a client of our own: the `bip157` crate kyoto rides on sends `relay: false`, drops
 //! transaction inventory, and its maintainer has closed the request to expose relay
 //! (2140-dev/kyoto#220: "a side-car application may still be possible"). This is that
-//! side-car, built in zecd; kyoto keeps doing headers, filters and blocks untouched, over its
+//! side-car, built in rose; kyoto keeps doing headers, filters and blocks untouched, over its
 //! own connection.
 //!
 //! ## Bandwidth and the snapshot
@@ -64,7 +64,7 @@ use super::mempool_feed::{FeedDelta, FeedEvent, FeedSnapshot, FeedTx};
 use crate::coin::BitcoinNetwork;
 
 /// What the node sees us as. Bitcoin Core logs it; nothing else reads it.
-pub const USER_AGENT: &str = concat!("/zecd:", env!("CARGO_PKG_VERSION"), "/");
+pub const USER_AGENT: &str = concat!("/rose:", env!("CARGO_PKG_VERSION"), "/");
 
 /// The protocol version announced: the last one before BIP 339 wtxid relay (70016). A node
 /// negotiates wtxid relay only with a peer that announces 70016 *and* sends `wtxidrelay`;
@@ -806,7 +806,7 @@ pub(crate) mod tests {
         let raw = RawNetworkMessage::new(
             Magic::REGTEST,
             NetworkMessage::Unknown {
-                command: "zecdfuture".parse().unwrap(),
+                command: "rosefuture".parse().unwrap(),
                 payload: Vec::new(),
             },
         );
@@ -823,6 +823,6 @@ pub(crate) mod tests {
         assert!(v.relay);
         assert_eq!(v.version, 70015);
         assert_eq!(v.services, ServiceFlags::NONE);
-        assert!(v.user_agent.starts_with("/zecd:"));
+        assert!(v.user_agent.starts_with("/rose:"));
     }
 }

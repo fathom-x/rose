@@ -23,17 +23,17 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use serde_json::json;
-use zecd_regtest_harness::{
-    pick_port, provision_view_wallets, resolve_node_bin, start_funded_chain, RegtestNode, RpcError,
-    Zecd, ZecdConfig,
+use rose_regtest_harness::{
+    pick_port, provision_view_wallets, resolve_node_bin, start_funded_chain, RegtestNode, Rose,
+    RoseConfig, RpcError,
 };
+use serde_json::json;
 
 /// How many view wallets the fleet holds.
 ///
 /// Sized to be honest about the mechanism rather than to be a load test: enough wallets to span
 /// several shards and to make a per-wallet cost visible, few enough that provisioning them (a real
-/// `zecd init` apiece) stays a fraction of the suite's runtime. The offline test in the main crate
+/// `rose init` apiece) stays a fraction of the suite's runtime. The offline test in the main crate
 /// carries a larger set, and the production bound is `[fleet] shard_size`, not this.
 const FLEET_SIZE: usize = 12;
 
@@ -75,18 +75,18 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         .expect("provision the view wallets");
     assert_eq!(wallets.len(), FLEET_SIZE);
 
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.fleet = wallets.clone();
     cfg.fleet_shard_size = Some(SHARD_SIZE);
     cfg.birthday = Some(2);
-    let zecd = Zecd::start(&cfg).await.expect("start zecd with a fleet");
-    zecd.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
+    let rose = Rose::start(&cfg).await.expect("start rose with a fleet");
+    rose.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
         .await
-        .expect("zecd catches up");
+        .expect("rose catches up");
 
     // Every fleet wallet is served, alongside the daemon's own spending wallet. `listwallets` is
     // the operator's view of the fleet, so it must name all of them.
-    let listed: BTreeSet<String> = zecd
+    let listed: BTreeSet<String> = rose
         .call("listwallets", json!([]))
         .await
         .expect("listwallets")
@@ -106,7 +106,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
 
     // Every fleet wallet is watch-only - the fleet monitors, it does not spend.
     for wallet in &wallets {
-        let info = zecd
+        let info = rose
             .call_wallet(&wallet.name, "getwalletinfo", json!([]))
             .await
             .expect("getwalletinfo");
@@ -125,7 +125,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // key at once; crediting the wrong wallet, or crediting one twice, shows up below as a wrong
     // balance rather than as a crash.
     //
-    // Chunked because the funder is a released zecd with a default 50-action cap per send, and
+    // Chunked because the funder is a released rose with a default 50-action cap per send, and
     // its change must confirm between rounds before it can fund the next.
     for chunk in wallets.chunks(6) {
         let outputs: Vec<(String, u64)> = chunk
@@ -146,7 +146,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         funder.sync(&zebrad).await.expect("funder follows the tip");
     }
     // Past the untrusted-note confirmation depth. These payments come from *outside* the wallet,
-    // so ZIP-315's untrusted policy (10 confirmations, zecd's default) governs when they count as
+    // so ZIP-315's untrusted policy (10 confirmations, rose's default) governs when they count as
     // spendable - and `getbalance` reports spendable value. Mining only a couple of blocks would
     // read as a balance of zero and say nothing about whether the scan worked.
     zebrad
@@ -157,7 +157,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // own actor, so the spending wallet reaching the tip says nothing about the shards - waiting
     // only on it would make every assertion below a race.
     let tip = node_height(&zebrad).await;
-    wait_for_fleet(&zecd, &wallets, tip).await;
+    wait_for_fleet(&rose, &wallets, tip).await;
 
     // --- Property 1: isolation ------------------------------------------------------------
     //
@@ -167,7 +167,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     for (index, wallet) in wallets.iter().enumerate() {
         let expected = payment_for(index);
 
-        let balance = zecd
+        let balance = rose
             .call_wallet(&wallet.name, "getbalance", json!([]))
             .await
             .expect("getbalance");
@@ -180,7 +180,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
 
         // One unspent note, at this wallet's own address: the payment, and nothing belonging to
         // a shard-mate.
-        let unspent = zecd
+        let unspent = rose
             .call_wallet(&wallet.name, "listunspent", json!([0]))
             .await
             .expect("listunspent");
@@ -199,7 +199,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         );
 
         // History likewise: one receive, of this wallet's amount.
-        let txs = zecd
+        let txs = rose
             .call_wallet(&wallet.name, "listtransactions", json!([]))
             .await
             .expect("listtransactions");
@@ -224,7 +224,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // observable form of that.
     let mut issued = BTreeSet::new();
     for wallet in &wallets {
-        let address = zecd
+        let address = rose
             .call_wallet(&wallet.name, "getnewaddress", json!([]))
             .await
             .expect("getnewaddress")
@@ -237,7 +237,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
             wallet.name
         );
         // And it belongs to the wallet that asked for it.
-        let info = zecd
+        let info = rose
             .call_wallet(&wallet.name, "getaddressinfo", json!([address.clone()]))
             .await
             .expect("getaddressinfo");
@@ -250,7 +250,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         // A shard-mate must not claim it. Picking the *other* wallets keeps this meaningful
         // whichever shard the pair landed in.
         for other in wallets.iter().filter(|w| w.name != wallet.name) {
-            let info = zecd
+            let info = rose
                 .call_wallet(&other.name, "getaddressinfo", json!([address.clone()]))
                 .await
                 .expect("getaddressinfo");
@@ -272,11 +272,11 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // a shard does not have.
     {
         let wallet = &wallets[0];
-        let addr = zecd
+        let addr = rose
             .call_wallet(&wallet.name, "getnewaddress", json!([]))
             .await
             .expect("a watch-only wallet still derives addresses");
-        let err = zecd
+        let err = rose
             .call_wallet(
                 &wallet.name,
                 "sendtoaddress",
@@ -302,7 +302,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // therefore scaled with shards, not with wallets - which is the whole point of the design.
     // `<datadir>/fleet/zec/shards`, not `<datadir>/fleet`: the fleet root holds one coin
     // directory, and the shard databases sit inside it.
-    let shard_dirs = std::fs::read_dir(zecd.datadir().join("fleet").join("zec").join("shards"))
+    let shard_dirs = std::fs::read_dir(rose.datadir().join("fleet").join("zec").join("shards"))
         .expect("the fleet shard directory exists")
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
@@ -316,7 +316,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // And each wallet's own view agrees the chain is scanned - a shard that silently stopped
     // would show here as a wallet stuck below the tip.
     for wallet in &wallets {
-        let count = zecd
+        let count = rose
             .call_wallet(&wallet.name, "getblockcount", json!([]))
             .await
             .expect("getblockcount")
@@ -339,7 +339,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         .expect("provision a late arrival")
         .pop()
         .expect("one wallet");
-    let created = zecd
+    let created = rose
         .call(
             "createwallet",
             json!([
@@ -359,7 +359,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     assert_eq!(created["name"], json!("late-arrival"));
 
     // It is served straight away, before it has scanned anything.
-    let info = zecd
+    let info = rose
         .call_wallet("late-arrival", "getwalletinfo", json!([]))
         .await
         .expect("the new wallet answers immediately");
@@ -379,7 +379,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // whether or not the import has landed by the time this runs, because its own payment comes
     // later - what it pins is that the answer is its own, either way.
     let balance_before_funding = zec_to_zats(
-        &zecd
+        &rose
             .call_wallet("late-arrival", "getbalance", json!([]))
             .await
             .expect("getbalance on a freshly onboarded wallet"),
@@ -388,7 +388,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
         balance_before_funding, 0,
         "an unfunded new member must read its own (empty) account, never its shard's"
     );
-    let history = zecd
+    let history = rose
         .call_wallet("late-arrival", "listtransactions", json!([]))
         .await
         .expect("listtransactions on a freshly onboarded wallet");
@@ -401,7 +401,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // `waitforsync` reports the import as its own field, so a caller can tell "not imported yet"
     // from "imported and empty" - two states that read identically in every balance and history
     // RPC. A zero timeout makes this a read of the current state rather than a wait.
-    let state = zecd
+    let state = rose
         .call_wallet("late-arrival", "waitforsync", json!([1]))
         .await
         .expect("waitforsync answers for a freshly onboarded wallet");
@@ -420,7 +420,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
 
     // Onboarding is idempotent-proof: the same name twice is refused rather than served by two
     // accounts, which would leave one of them silently unreachable.
-    let again = zecd
+    let again = rose
         .call(
             "createwallet",
             json!(["late-arrival", true, null, null, null, null, null, null,
@@ -453,14 +453,14 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // rewind a shard and lose funds, the balance is still wrong once every wallet reports the tip.
     // This mirrors what the restart section further down already does.
     let mut whole_fleet = wallets.clone();
-    whole_fleet.push(zecd_regtest_harness::ViewWallet {
+    whole_fleet.push(rose_regtest_harness::ViewWallet {
         name: "late-arrival".to_string(),
         ..newcomer.clone()
     });
-    wait_for_fleet(&zecd, &whole_fleet, tip).await;
+    wait_for_fleet(&rose, &whole_fleet, tip).await;
     // Now that it has caught up, both halves must be true: the account exists, and the wallet is
     // synced. `imported` is what `synced` folds in, so a caught-up member asserts them together.
-    let state = zecd
+    let state = rose
         .call_wallet("late-arrival", "waitforsync", json!([60_000]))
         .await
         .expect("waitforsync on a caught-up member");
@@ -472,7 +472,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     assert_eq!(state["synced"], json!(true), "{state:?}");
     assert_eq!(
         zec_to_zats(
-            &zecd
+            &rose
                 .call_wallet("late-arrival", "getbalance", json!([]))
                 .await
                 .expect("getbalance")
@@ -485,7 +485,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     for (index, wallet) in wallets.iter().enumerate() {
         assert_eq!(
             zec_to_zats(
-                &zecd
+                &rose
                     .call_wallet(&wallet.name, "getbalance", json!([]))
                     .await
                     .expect("getbalance")
@@ -498,7 +498,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
 
     // `listwalletdir` reports what is provisioned on disk, which is now the whole fleet plus the
     // newcomer - the answer an operator needs when a name is missing from `listwallets`.
-    let on_disk: BTreeSet<String> = zecd
+    let on_disk: BTreeSet<String> = rose
         .call("listwalletdir", json!([]))
         .await
         .expect("listwalletdir")["wallets"]
@@ -518,21 +518,21 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
 
     // Unload stops serving it without deleting anything, and load brings it back - with its
     // balance, since its account never left its shard.
-    zecd.call("unloadwallet", json!(["late-arrival"]))
+    rose.call("unloadwallet", json!(["late-arrival"]))
         .await
         .expect("unloadwallet");
     assert!(
-        zecd.call_wallet("late-arrival", "getwalletinfo", json!([]))
+        rose.call_wallet("late-arrival", "getwalletinfo", json!([]))
             .await
             .is_err(),
         "an unloaded wallet must not be served"
     );
-    zecd.call("loadwallet", json!(["late-arrival"]))
+    rose.call("loadwallet", json!(["late-arrival"]))
         .await
         .expect("loadwallet");
     assert_eq!(
         zec_to_zats(
-            &zecd
+            &rose
                 .call_wallet("late-arrival", "getbalance", json!([]))
                 .await
                 .expect("getbalance after reload")
@@ -543,19 +543,19 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
 
     // A restart must adopt every account from its shard database rather than re-import it: the
     // manifest is idempotent, and re-importing would rewind the shard and rescan the fleet.
-    let mut zecd = zecd;
-    zecd.stop_keeping_datadir()
+    let mut rose = rose;
+    rose.stop_keeping_datadir()
         .await
         .expect("stop the daemon cleanly");
-    zecd.respawn().await.expect("restart the daemon");
+    rose.respawn().await.expect("restart the daemon");
     let mut after_restart = wallets.clone();
-    after_restart.push(zecd_regtest_harness::ViewWallet {
+    after_restart.push(rose_regtest_harness::ViewWallet {
         name: "late-arrival".to_string(),
         ..newcomer.clone()
     });
-    wait_for_fleet(&zecd, &after_restart, node_height(&zebrad).await).await;
+    wait_for_fleet(&rose, &after_restart, node_height(&zebrad).await).await;
     for (index, wallet) in wallets.iter().enumerate() {
-        let balance = zecd
+        let balance = rose
             .call_wallet(&wallet.name, "getbalance", json!([]))
             .await
             .expect("getbalance after restart");
@@ -570,7 +570,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
     // it from disk like any other - and adopt its existing account rather than re-import it.
     assert_eq!(
         zec_to_zats(
-            &zecd
+            &rose
                 .call_wallet("late-arrival", "getbalance", json!([]))
                 .await
                 .expect("the runtime-onboarded wallet survives a restart")
@@ -581,7 +581,7 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
 }
 
 /// The node's current tip height.
-async fn node_height(zebrad: &zecd_regtest_harness::Zebrad) -> u64 {
+async fn node_height(zebrad: &rose_regtest_harness::Zebrad) -> u64 {
     zebrad
         .rpc("getblockcount", json!([]))
         .await
@@ -596,9 +596,9 @@ async fn node_height(zebrad: &zecd_regtest_harness::Zebrad) -> u64 {
 /// up?" - and, routed at `/wallet/<name>`, it is answered by that wallet's shard actor rather than
 /// by the daemon as a whole. A timeout is not an error on that RPC (it returns the current tip),
 /// so the height it reports is asserted here.
-async fn wait_for_fleet(zecd: &Zecd, wallets: &[zecd_regtest_harness::ViewWallet], height: u64) {
+async fn wait_for_fleet(rose: &Rose, wallets: &[rose_regtest_harness::ViewWallet], height: u64) {
     for wallet in wallets {
-        let reached = zecd
+        let reached = rose
             .call_wallet(
                 &wallet.name,
                 "waitforblockheight",
@@ -615,7 +615,7 @@ async fn wait_for_fleet(zecd: &Zecd, wallets: &[zecd_regtest_harness::ViewWallet
     }
 }
 
-/// A decimal ZEC amount (as zecd emits it, an exact JSON number) in zatoshis.
+/// A decimal ZEC amount (as rose emits it, an exact JSON number) in zatoshis.
 fn zec_to_zats(value: &serde_json::Value) -> u64 {
     let text = value.to_string();
     let text = text.trim_matches('"');

@@ -1,15 +1,15 @@
-# Example self-hosted Zcash stack:  zebra (full node) -> zecd.
+# Example self-hosted Zcash stack:  zebra (full node) -> rose.
 #
-# zecd talks straight to zebra's JSON-RPC (the only backend).
+# rose talks straight to zebra's JSON-RPC (the only backend).
 #
 # Testnet by default. For mainnet, add `-f docker-compose.mainnet.yml` to each command below (it
 # swaps in the *.mainnet.* config files). The image tags are EXAMPLES - pin them to releases you
 # have verified; the zebra flags can vary between versions.
 #
-# First run (zebra must sync enough before zecd can init):
+# First run (zebra must sync enough before rose can init):
 #   docker compose up -d zebra                     # let it sync
-#   docker compose run --rm zecd init --wallet default
-#   docker compose up -d                           # start zecd (and the rest)
+#   docker compose run --rm --entrypoint rose rose init --wallet default
+#   docker compose up -d                           # start rose (and the rest)
 #
 # Probes:   curl localhost:9233/healthz ; curl localhost:9233/readyz
 # RPC:      curl --user zec:CHANGE-ME --data-binary '{"method":"getblockchaininfo","id":1}' localhost:18232/
@@ -25,25 +25,25 @@ services:
       - ./zebrad.toml:/etc/zebra/zebrad.toml:ro
       - zebra-state:/var/cache/zebra
     expose:
-      - "18234"   # JSON-RPC, reached by zecd over the compose network
+      - "18234"   # JSON-RPC, reached by rose over the compose network
 
-  zecd:
+  rose:
     build:
       context: ..
       dockerfile: Dockerfile   # StageX build is amd64-only; on ARM hosts use Dockerfile.arm64
     restart: unless-stopped
     depends_on:
       - zebra
-    command: ["--datadir=/var/lib/zecd", "--conf=/etc/zecd/zecd.toml"]
+    command: ["--datadir=/var/lib/rose", "--conf=/etc/rose/rose.toml"]
     environment:
       - RUST_LOG=info
-      # Required: zecd.toml ships the CHANGE-ME placeholder, which zecd refuses to start on
+      # Required: rose.toml ships the CHANGE-ME placeholder, which rose refuses to start on
       # (every network). Set the real one in deploy/.env (gitignored); it wins over the file.
       # Compose refuses to start the service while it is unset or empty.
-      - ZECD_RPC_PASSWORD=${ZECD_RPC_PASSWORD:?set ZECD_RPC_PASSWORD in deploy/.env - zecd refuses the config's CHANGE-ME placeholder}
+      - ROSE_RPC_PASSWORD=${ROSE_RPC_PASSWORD:?set ROSE_RPC_PASSWORD in deploy/.env - rose refuses the config's CHANGE-ME placeholder}
     volumes:
-      - ./zecd.toml:/etc/zecd/zecd.toml:ro
-      - zecd-data:/var/lib/zecd
+      - ./rose.toml:/etc/rose/rose.toml:ro
+      - rose-data:/var/lib/rose
     # Published on loopback only: RPC credentials are spend authority and travel as plaintext
     # HTTP Basic auth, so the port must not be reachable from untrusted networks. To serve other
     # hosts, front it with TLS/a reverse proxy - or, understanding the exposure, change the
@@ -54,4 +54,4 @@ services:
 
 volumes:
   zebra-state:
-  zecd-data:
+  rose-data:

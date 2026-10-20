@@ -1,10 +1,10 @@
-//! Funded regtest end-to-end: get real Orchard funds into `zecd` and verify it sees them.
+//! Funded regtest end-to-end: get real Orchard funds into `rose` and verify it sees them.
 //!
-//! Regtest can't mine a coinbase directly into an Orchard note that `zecd` (Orchard-only receive)
+//! Regtest can't mine a coinbase directly into an Orchard note that `rose` (Orchard-only receive)
 //! would scan, so we fund it the way the protocol allows: mine a **transparent** coinbase to a
-//! [funding wallet](zecd_regtest_harness::Funder) - a second `zecd`, run from a pinned release -
+//! [funding wallet](rose_regtest_harness::Funder) - a second `rose`, run from a pinned release -
 //! let it mature (100 blocks), **shield** it into Orchard with `z_shieldcoinbase`, then **send**
-//! Orchard funds to the `zecd` under test.
+//! Orchard funds to the `rose` under test.
 //!
 //! Everything runs on a **single chain**: zebra seeds a couple of blocks to a throwaway address so
 //! the funder has a chain to `init` against, then restarts mining to the funder's own t-address. The
@@ -13,12 +13,12 @@
 //! proofs would be invalid).
 //!
 //! Skips cleanly unless `ZEBRAD_BIN` is set. `LIGHTWALLETD_BIN` is needed only on
-//! the light-mode leg (`ZECD_REGTEST_BACKEND=lwd`), where the *zecd under test* is the light
+//! the light-mode leg (`ROSE_REGTEST_BACKEND=lwd`), where the *rose under test* is the light
 //! client - the funder always talks straight to zebra.
 //!
-//! Phase 1: funded receive (funder → zecd) - first observed at **0 conf via the mempool
+//! Phase 1: funded receive (funder → rose) - first observed at **0 conf via the mempool
 //! stream** (`getunconfirmedbalance`/`listtransactions`/`listunspent minconf=0`), then
-//! confirmed (balance + history). Phase 2: zecd *spends* - the walletlock/-13/walletpassphrase
+//! confirmed (balance + history). Phase 2: rose *spends* - the walletlock/-13/walletpassphrase
 //! gate, a real `sendtoaddress` back to the funder with `gettransaction` shape checks through
 //! confirmation, and the payment-poller methods (`listsinceblock` cursor loop,
 //! `getreceivedbyaddress`/`listreceivedbyaddress`). Phase 3: a send during an upstream outage
@@ -29,7 +29,7 @@
 //! `sendmany` (shielded + transparent recipient). Phase 7: `sendrawtransaction`'s
 //! accept/idempotency contract. Phase 8: a **self-send** (pay our own address) carrying a
 //! memo - surfaced as a send+receive pair in `gettransaction`/`listtransactions`/
-//! `z_listtransactions` (librustzcash flags self-payments `is_change`, so zecd must key off the
+//! `z_listtransactions` (librustzcash flags self-payments `is_change`, so rose must key off the
 //! external recipient scope, not `is_change`, to keep them - and their memos - visible).
 //! Finally `scripts/conformance.py` runs against the live funded daemon, putting its full
 //! Bitcoin-Core wire-format suite under CI.
@@ -40,11 +40,11 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
-use zecd_regtest_harness::{
-    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Zebrad, Zecd,
-    ZecdConfig,
+use rose_regtest_harness::{
+    attach_backend, pick_port, resolve_node_bin, start_funded_chain, RegtestNode, Rose, RoseConfig,
+    Zebrad,
 };
+use serde_json::{json, Value};
 
 /// How long a health endpoint may take to answer while the wallet is busy. These handlers read
 /// a cached status snapshot and do no I/O, so a healthy daemon answers in milliseconds; the
@@ -54,10 +54,10 @@ const HEALTH_PROBE_BOUND: Duration = Duration::from_secs(3);
 
 /// 1 ZEC, in zatoshis.
 const FUND_ZATOSHIS: u64 = 100_000_000;
-/// ZIP-302 text memo the funder attaches to the funding send, so zecd's receive-memo path is
+/// ZIP-302 text memo the funder attaches to the funding send, so rose's receive-memo path is
 /// exercised. Decoded text is asserted against `memoStr`; hex against `memo`.
 const RECEIVE_MEMO: &str = "hello from the funder";
-/// Generous: lightwalletd ingestion + zecd scan + Orchard proving.
+/// Generous: lightwalletd ingestion + rose scan + Orchard proving.
 const FUND_TIMEOUT: Duration = Duration::from_secs(240);
 /// Passphrase the funded wallet is created with (`init --encrypt`). Drives the locked-send
 /// gate before Phase 2 and conformance.py's lock/unlock state machine at the end. ≥12 chars
@@ -87,10 +87,10 @@ async fn regtest_funded_orchard_receive() {
     let funder_ua = funder.unified_address().to_string();
     let funder_taddr = funder.transparent_address().to_string();
 
-    // 5. zecd against zebra's JSON-RPC; get its Orchard unified address. The wallet is
+    // 5. rose against zebra's JSON-RPC; get its Orchard unified address. The wallet is
     // created passphrase-encrypted (`init --encrypt`), so it starts locked - Phase 1 receiving
     // still works (scanning needs only viewing keys), and Phase 2 exercises the unlock gate.
-    let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
+    let mut cfg = RoseConfig::new(zebrad.rpc_port, pick_port().expect("pick rose rpc port"));
     cfg.encrypt_passphrase = Some(ENCRYPT_PASSPHRASE.to_string());
     // Run this comprehensive send suite through the off-actor proving pipeline (`[spend]
     // pipeline_proving`): this wallet is Orchard-only with the cached proving key, so the pipeline
@@ -102,31 +102,31 @@ async fn regtest_funded_orchard_receive() {
     // regtest_sapling/regtest_shielding/regtest_mergetoaddress, so all three send paths are
     // exercised across the funded tier without a binary dedicated to any of them.
     cfg.pipeline_proving = Some(true);
-    // `ZECD_REGTEST_BACKEND=lwd` reruns this whole suite with zecd on a dedicated lightwalletd
+    // `ROSE_REGTEST_BACKEND=lwd` reruns this whole suite with rose on a dedicated lightwalletd
     // (light mode) instead of zebra's JSON-RPC. The funder is unaffected either way - it always
     // talks straight to zebra - so pausing this lightwalletd in Phase 3 cannot stall it.
-    let zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
+    let rose_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
-        .expect("attach zecd backend");
-    let mut zecd = Zecd::start(&cfg)
+        .expect("attach rose backend");
+    let mut rose = Rose::start(&cfg)
         .await
-        .expect("start zecd against the regtest upstream");
-    let zecd_ua = zecd
+        .expect("start rose against the regtest upstream");
+    let rose_ua = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress");
-    let zecd_ua = zecd_ua.as_str().expect("address string").to_string();
+    let rose_ua = rose_ua.as_str().expect("address string").to_string();
     assert!(
-        zecd_ua.starts_with("uregtest1"),
-        "expected a uregtest1 address, got {zecd_ua}"
+        rose_ua.starts_with("uregtest1"),
+        "expected a uregtest1 address, got {rose_ua}"
     );
 
-    // 6. Fund zecd: send Orchard funds from the funder to zecd's UA. First wait for zecd to
+    // 6. Fund rose: send Orchard funds from the funder to rose's UA. First wait for rose to
     //    be fully caught up (conn_state "ready"): only a caught-up actor subscribes to
     //    lightwalletd's mempool stream, which the 0-conf check below exercises.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -139,26 +139,26 @@ async fn regtest_funded_orchard_receive() {
         }
         assert!(
             Instant::now() < deadline,
-            "zecd never reached conn_state ready before funding: {peers}"
+            "rose never reached conn_state ready before funding: {peers}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     // One sync interval of slack so the caught-up pass has opened the mempool stream.
     tokio::time::sleep(Duration::from_secs(3)).await;
     // The funding send carries a ZIP-302 text memo so the *receive*-memo path is exercised
-    // end to end: zecd must surface this memo on the received output (`memoStr`). This is the
-    // complement to the send-memo coverage in Phase 2 (zecd → funder).
+    // end to end: rose must surface this memo on the received output (`memoStr`). This is the
+    // complement to the send-memo coverage in Phase 2 (rose → funder).
     funder
-        .send_with_memo(&zecd_ua, FUND_ZATOSHIS, Some(RECEIVE_MEMO))
+        .send_with_memo(&rose_ua, FUND_ZATOSHIS, Some(RECEIVE_MEMO))
         .await
-        .expect("send Orchard funds (with a memo) to zecd");
+        .expect("send Orchard funds (with a memo) to rose");
 
     // 0-conf visibility via the mempool stream: before any block confirms the funding tx,
-    // zecd trial-decrypts it out of the mempool and reports it bitcoind-style in
+    // rose trial-decrypts it out of the mempool and reports it bitcoind-style in
     // getunconfirmedbalance, listtransactions, and listunspent minconf=0.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let pending = zecd
+        let pending = rose
             .call("getunconfirmedbalance", json!([]))
             .await
             .expect("getunconfirmedbalance")
@@ -173,7 +173,7 @@ async fn regtest_funded_orchard_receive() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let txs = zecd
+    let txs = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
@@ -189,13 +189,13 @@ async fn regtest_funded_orchard_receive() {
     // This foreign receive has no block time and no librustzcash `created` time, so a non-zero
     // `time`/`timereceived` can only come from the actor's transient in-memory first-seen stamp
     // (set when the mempool stream stored the tx). Proves first-seen survives the move off the
-    // removed labels.sqlite into the in-memory map (zecd stays stateless: it's never persisted).
+    // removed labels.sqlite into the in-memory map (rose stays stateless: it's never persisted).
     let rcv = unconfirmed_receive.unwrap();
     assert!(
         rcv["time"].as_i64().is_some_and(|t| t > 0) && rcv["time"] == rcv["timereceived"],
         "the 0-conf receive carries an in-memory first-seen time: {rcv}"
     );
-    let lu = zecd
+    let lu = rose
         .call("listunspent", json!([0]))
         .await
         .expect("listunspent minconf=0");
@@ -207,7 +207,7 @@ async fn regtest_funded_orchard_receive() {
         "listunspent minconf=0 lists the unconfirmed note: {lu}"
     );
 
-    // Confirm the funding send. zecd's getbalance uses the default confirmations policy,
+    // Confirm the funding send. rose's getbalance uses the default confirmations policy,
     // under which an externally-received (untrusted) note needs 10 confirmations before it
     // counts; mine a couple extra for the tip skew.
     zebrad
@@ -215,17 +215,17 @@ async fn regtest_funded_orchard_receive() {
         .await
         .expect("confirm funding send");
     // Wait for the *scan* to reach the tip before anything asserts on confirmed state. The balance
-    // poll below is not a substitute: zecd already counts this receive from the mempool, unmined,
+    // poll below is not a substitute: rose already counts this receive from the mempool, unmined,
     // so it is satisfied the moment the blocks are mined - while the blocks confirming the note are
     // still being scanned, leaving `listunspent` empty.
-    zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+    rose.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
         .await
-        .expect("zecd scans the blocks confirming the funding send");
+        .expect("rose scans the blocks confirming the funding send");
 
-    // 7. zecd scans the note and reports the balance.
+    // 7. rose scans the note and reports the balance.
     let deadline = Instant::now() + FUND_TIMEOUT;
     let balance = loop {
-        let bal = zecd
+        let bal = rose
             .call("getbalance", json!([]))
             .await
             .ok()
@@ -235,24 +235,24 @@ async fn regtest_funded_orchard_receive() {
             break bal;
         }
         if Instant::now() >= deadline {
-            panic!("zecd did not see the funded Orchard note within {FUND_TIMEOUT:?}");
+            panic!("rose did not see the funded Orchard note within {FUND_TIMEOUT:?}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
     assert!(
         balance > 0.0,
-        "zecd should have a positive shielded balance, got {balance}"
+        "rose should have a positive shielded balance, got {balance}"
     );
 
     // The confirmed note is an IRONWOOD note. NU6.3 is active on this chain (as on mainnet and
-    // testnet), so the funder's payment to zecd's Orchard receiver is an Orchard-V3 (ironwood) note,
+    // testnet), so the funder's payment to rose's Orchard receiver is an Orchard-V3 (ironwood) note,
     // not an Orchard-V2 one - and every send below therefore spends ironwood. Pin it here so this
     // whole e2e is known to exercise the pool real users are on: without this the entire file stays
     // green if the receive silently lands in the legacy Orchard pool. NB the *mined* note is checked,
     // not the 0-conf one from the mempool path above, which can still read `orchard` until the block
     // scan relabels it.
-    let lu = zecd
+    let lu = rose
         .call("listunspent", json!([]))
         .await
         .expect("listunspent after confirmation");
@@ -263,19 +263,19 @@ async fn regtest_funded_orchard_receive() {
     );
 
     // The receive shows up in history as a `receive` transaction.
-    let txs = zecd
+    let txs = rose
         .call("listtransactions", json!([]))
         .await
         .expect("listtransactions");
     let txs = txs.as_array().expect("listtransactions is an array");
     assert!(
         !txs.is_empty(),
-        "expected at least one transaction in zecd history"
+        "expected at least one transaction in rose history"
     );
     let receive = txs
         .iter()
         .find(|t| t.get("category").and_then(|c| c.as_str()) == Some("receive"))
-        .unwrap_or_else(|| panic!("expected a receive in zecd history: {txs:?}"));
+        .unwrap_or_else(|| panic!("expected a receive in rose history: {txs:?}"));
     // Receiving a memo: the funder attached RECEIVE_MEMO, so the received output carries it
     // (decoded text in memoStr, raw ZIP-302 bytes in memo) - zcashd's z_viewtransaction names.
     assert_eq!(
@@ -294,7 +294,7 @@ async fn regtest_funded_orchard_receive() {
         .expect("the receive carries a txid")
         .to_string();
     // gettransaction on the receive surfaces the same memo on its receive detail.
-    let gt_recv = zecd
+    let gt_recv = rose
         .call("gettransaction", json!([recv_txid]))
         .await
         .expect("gettransaction on the funded receive");
@@ -313,7 +313,7 @@ async fn regtest_funded_orchard_receive() {
     // A pure receive reports `amount` == exactly what arrived (fee-exclusive) and carries no
     // top-level `fee` - like bitcoind, where `fee` appears only on txs the wallet sent.
     // librustzcash records a fee for every fully-shielded tx (derived from the public value
-    // balance, even for a tx the wallet never paid for); this asserts zecd does not fold that
+    // balance, even for a tx the wallet never paid for); this asserts rose does not fold that
     // phantom fee into the deposit amount or expose it.
     assert_eq!(
         gt_recv["amount"].as_f64(),
@@ -325,12 +325,12 @@ async fn regtest_funded_orchard_receive() {
         "a pure receive carries no top-level fee field: {gt_recv}"
     );
 
-    // ---- Phase 2: zecd spends ----
+    // ---- Phase 2: rose spends ----
 
     // The poller methods credit the funded receive. getreceivedbyaddress: exactly the 1 ZEC
     // sent to our UA; listreceivedbyaddress lists the UA with the contributing txid.
-    let recv = zecd
-        .call("getreceivedbyaddress", json!([zecd_ua]))
+    let recv = rose
+        .call("getreceivedbyaddress", json!([rose_ua]))
         .await
         .expect("getreceivedbyaddress");
     assert_eq!(
@@ -338,20 +338,20 @@ async fn regtest_funded_orchard_receive() {
         Some(1.0),
         "the 1-ZEC funding receive is credited to the UA, got {recv}"
     );
-    let lra = zecd
+    let lra = rose
         .call("listreceivedbyaddress", json!([1, false]))
         .await
         .expect("listreceivedbyaddress");
     assert!(
         lra.as_array().expect("array").iter().any(|e| {
-            e["address"] == json!(zecd_ua.as_str())
+            e["address"] == json!(rose_ua.as_str())
                 && e["txids"].as_array().is_some_and(|t| !t.is_empty())
         }),
         "listreceivedbyaddress lists the funded UA with its txid: {lra}"
     );
 
     // Capture the listsinceblock cursor before the send, exactly as a payment poller would.
-    let lsb = zecd
+    let lsb = rose
         .call("listsinceblock", json!([]))
         .await
         .expect("listsinceblock");
@@ -365,12 +365,12 @@ async fn regtest_funded_orchard_receive() {
     // refused (-13; the seed check precedes input selection, so the funds don't matter), a wrong
     // passphrase is rejected (-14), and the configured passphrase unlocks it with a timeout long
     // enough to cover the remaining phases.
-    let err = zecd
+    let err = rose
         .call("sendtoaddress", json!([funder_ua, 0.4]))
         .await
         .expect_err("a locked wallet must refuse to send");
     assert_eq!(err.code(), Some(-13), "expected unlock-needed (-13): {err}");
-    let err = zecd
+    let err = rose
         .call("walletpassphrase", json!(["wrong-pass", 600]))
         .await
         .expect_err("a wrong passphrase must be rejected");
@@ -379,10 +379,10 @@ async fn regtest_funded_orchard_receive() {
         Some(-14),
         "expected passphrase-incorrect (-14): {err}"
     );
-    zecd.call("walletpassphrase", json!([ENCRYPT_PASSPHRASE, 3600]))
+    rose.call("walletpassphrase", json!([ENCRYPT_PASSPHRASE, 3600]))
         .await
         .expect("the real passphrase unlocks");
-    let wi = zecd
+    let wi = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo");
@@ -405,9 +405,9 @@ async fn regtest_funded_orchard_receive() {
         .expect("zebra getblockcount")
         .as_u64()
         .expect("tip height");
-    zecd.wait_until_synced(chain_tip, FUND_TIMEOUT)
+    rose.wait_until_synced(chain_tip, FUND_TIMEOUT)
         .await
-        .expect("zecd scans to the tip before the first send");
+        .expect("rose scans to the tip before the first send");
     // Even with the scan at the tip, a note reads as spendable in `getbalance` (a confirmation
     // count over `get_wallet_summary`) a beat before `propose_transfer` can build its
     // commitment-tree anchor, so a freshly-confirmed spend can transiently fail with -6
@@ -417,7 +417,7 @@ async fn regtest_funded_orchard_receive() {
         json!([funder_ua, 0.4, "", "", null, null, null, null, null, null, null, memo_hex]);
     let deadline = Instant::now() + FUND_TIMEOUT;
     let txid = loop {
-        match zecd.call("sendtoaddress", send_args.clone()).await {
+        match rose.call("sendtoaddress", send_args.clone()).await {
             Ok(v) => break v,
             Err(e) if e.code() == Some(-6) && Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -429,7 +429,7 @@ async fn regtest_funded_orchard_receive() {
     assert_eq!(txid.len(), 64, "txid is display hex");
 
     // gettransaction immediately: unconfirmed send shape (amount excludes the fee).
-    let gt = zecd
+    let gt = rose
         .call("gettransaction", json!([txid]))
         .await
         .expect("gettransaction on our own send");
@@ -448,7 +448,7 @@ async fn regtest_funded_orchard_receive() {
         "raw hex is stored for our own send: {gt}"
     );
     // The send detail's address is the single on-chain Orchard receiver actually paid, not the
-    // full multi-receiver UA the caller typed: zecd reduces every outgoing recipient to its paid
+    // full multi-receiver UA the caller typed: rose reduces every outgoing recipient to its paid
     // receiver so history is identical on the authoring instance and after a restore-from-seed
     // (where only the paid receiver is recoverable from chain). So match the (sole) send detail
     // by category and assert the reduced address is a non-empty Unified Address, rather than
@@ -494,13 +494,13 @@ async fn regtest_funded_orchard_receive() {
         "an unmined send reports a real time, not 0: {gt}"
     );
 
-    // Mine it in and let zecd scan; the send confirms.
-    let tip = zecd.block_count().await.expect("getblockcount");
+    // Mine it in and let rose scan; the send confirms.
+    let tip = rose.block_count().await.expect("getblockcount");
     zebrad.generate_blocks(3).await.expect("confirm the send");
-    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 3, FUND_TIMEOUT)
         .await
-        .expect("zecd scans the confirming blocks");
-    let gt = zecd
+        .expect("rose scans the confirming blocks");
+    let gt = rose
         .call("gettransaction", json!([txid]))
         .await
         .expect("gettransaction after mining");
@@ -524,7 +524,7 @@ async fn regtest_funded_orchard_receive() {
 
     // The poller loop closes: since the pre-send cursor, the send appears; since the fresh
     // cursor, nothing confirmed is left to report.
-    let lsb = zecd
+    let lsb = rose
         .call("listsinceblock", json!([cursor]))
         .await
         .expect("listsinceblock since the pre-send cursor");
@@ -540,7 +540,7 @@ async fn regtest_funded_orchard_receive() {
         .as_str()
         .expect("new lastblock")
         .to_string();
-    let lsb2 = zecd
+    let lsb2 = rose
         .call("listsinceblock", json!([cursor2]))
         .await
         .expect("listsinceblock since the fresh cursor");
@@ -559,29 +559,29 @@ async fn regtest_funded_orchard_receive() {
     // 3 confirmations and the Phase-2 send may have landed in *any* of the 3 just-mined
     // blocks (mempool/template timing), so without this buffer Phase 3's spendable balance
     // is a race.
-    let tip = zecd.block_count().await.expect("getblockcount");
+    let tip = rose.block_count().await.expect("getblockcount");
     zebrad
         .generate_blocks(4)
         .await
         .expect("mature the Phase-2 change");
-    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 4, FUND_TIMEOUT)
         .await
         .expect("scan the change-maturity blocks");
 
-    // Hang the upstream (SIGSTOP zebra - and, in light mode, zecd's lightwalletd too, so the
-    // hop zecd actually talks to is the hung one), then send: the wallet must commit and
+    // Hang the upstream (SIGSTOP zebra - and, in light mode, rose's lightwalletd too, so the
+    // hop rose actually talks to is the hung one), then send: the wallet must commit and
     // return the txid even though the broadcast can't reach anyone - recovery is the
     // rebroadcast loop's job.
     zebrad.pause().expect("SIGSTOP zebra (outage)");
-    if let Some(lwd) = &zecd_lwd {
-        lwd.pause().expect("SIGSTOP zecd's lightwalletd (outage)");
+    if let Some(lwd) = &rose_lwd {
+        lwd.pause().expect("SIGSTOP rose's lightwalletd (outage)");
     }
-    let txid_outage = zecd
+    let txid_outage = rose
         .call("sendtoaddress", json!([funder_ua, 0.1]))
         .await
         .expect("a committed send returns its txid even when broadcast fails");
     let txid_outage = txid_outage.as_str().expect("txid is a string").to_string();
-    let gt = zecd
+    let gt = rose
         .call("gettransaction", json!([txid_outage]))
         .await
         .expect("gettransaction during the outage");
@@ -594,7 +594,7 @@ async fn regtest_funded_orchard_receive() {
     // The daemon reports the outage once the actor notices the dead connection.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let peers = zecd
+        let peers = rose
             .call("getpeerinfo", json!([]))
             .await
             .expect("getpeerinfo");
@@ -644,14 +644,14 @@ async fn regtest_funded_orchard_receive() {
         "{st}"
     );
 
-    // Upstream recovers: zecd reconnects (1-2s backoff), the rebroadcast pass (2s interval)
+    // Upstream recovers: rose reconnects (1-2s backoff), the rebroadcast pass (2s interval)
     // re-submits the tx, and mining confirms it.
     zebrad.resume().expect("SIGCONT zebra (recovery)");
-    if let Some(lwd) = &zecd_lwd {
+    if let Some(lwd) = &rose_lwd {
         lwd.resume()
-            .expect("SIGCONT zecd's lightwalletd (recovery)");
+            .expect("SIGCONT rose's lightwalletd (recovery)");
     }
-    mine_until_confirmed(&zebrad, &zecd, &txid_outage, "outage send after recovery").await;
+    mine_until_confirmed(&zebrad, &rose, &txid_outage, "outage send after recovery").await;
 
     // /readyz returns to 200 once the wallet is reconnected and caught up again.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -674,22 +674,22 @@ async fn regtest_funded_orchard_receive() {
     // The lightwalletd harness used this slot to test tx *expiry* (a committed send that can
     // never broadcast eventually expires and releases its funds). That flow needs the broadcast
     // path down while the chain keeps advancing - two roles a single local zebra node can't
-    // separate (zecd would reconnect and rebroadcast the tx, which then mines) - so expiry and
+    // separate (rose would reconnect and rebroadcast the tx, which then mines) - so expiry and
     // abandonment are covered by unit tests, not this e2e. A plain confirmed send keeps the
     // wallet balance where the concurrent-send burst below expects it (~0.4 ZEC).
-    let tip = zecd.block_count().await.expect("getblockcount");
+    let tip = rose.block_count().await.expect("getblockcount");
     zebrad.generate_blocks(3).await.expect("mature the change");
-    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 3, FUND_TIMEOUT)
         .await
-        .expect("zecd scans the maturity blocks");
-    let txid_p4 = zecd
+        .expect("rose scans the maturity blocks");
+    let txid_p4 = rose
         .call("sendtoaddress", json!([funder_ua, 0.1]))
         .await
         .expect("a normal send succeeds")
         .as_str()
         .expect("txid is a string")
         .to_string();
-    mine_until_confirmed(&zebrad, &zecd, &txid_p4, "phase-4 send").await;
+    mine_until_confirmed(&zebrad, &rose, &txid_p4, "phase-4 send").await;
 
     // ---- concurrent-send burst: the no-double-spend invariant under contention ----
     //
@@ -702,11 +702,11 @@ async fn regtest_funded_orchard_receive() {
     //
     // First let the Phase-4 retry's change age past the trusted-note depth (3, plus one for
     // the block the retry itself may have landed in) so the burst has spendable notes.
-    let tip = zecd.block_count().await.expect("getblockcount");
+    let tip = rose.block_count().await.expect("getblockcount");
     zebrad.generate_blocks(4).await.expect("age the change");
-    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 4, FUND_TIMEOUT)
         .await
-        .expect("zecd scans the change-aging blocks");
+        .expect("rose scans the change-aging blocks");
 
     let burst = json!([funder_ua, 0.25]);
     // While the burst is in flight, getrpcinfo.active_commands must show the concurrent
@@ -715,7 +715,7 @@ async fn regtest_funded_orchard_receive() {
     let watch_active = async {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let ri = zecd
+            let ri = rose
                 .call("getrpcinfo", json!([]))
                 .await
                 .expect("getrpcinfo");
@@ -735,10 +735,10 @@ async fn regtest_funded_orchard_receive() {
         }
     };
     let (a, b, c, d, seen_in_flight) = tokio::join!(
-        zecd.call("sendtoaddress", burst.clone()),
-        zecd.call("sendtoaddress", burst.clone()),
-        zecd.call("sendtoaddress", burst.clone()),
-        zecd.call("sendtoaddress", burst.clone()),
+        rose.call("sendtoaddress", burst.clone()),
+        rose.call("sendtoaddress", burst.clone()),
+        rose.call("sendtoaddress", burst.clone()),
+        rose.call("sendtoaddress", burst.clone()),
         watch_active,
     );
     assert!(
@@ -768,12 +768,12 @@ async fn regtest_funded_orchard_receive() {
     }
 
     // The winner is a real transaction: it mines and confirms like any other send.
-    let tip = zecd.block_count().await.expect("getblockcount");
+    let tip = rose.block_count().await.expect("getblockcount");
     zebrad.generate_blocks(3).await.expect("confirm the winner");
-    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 3, FUND_TIMEOUT)
         .await
-        .expect("zecd scans the winner's confirmations");
-    let gt = zecd
+        .expect("rose scans the winner's confirmations");
+    let gt = rose
         .call("gettransaction", json!([winner_txid]))
         .await
         .expect("gettransaction on the burst winner");
@@ -788,26 +788,26 @@ async fn regtest_funded_orchard_receive() {
     // one transaction: the multi-output proposal path and a transparent (deshielding)
     // recipient, neither of which any other automated test exercises. First age the burst
     // change to trusted spendability (3 confs, +1 for the block the winner landed in).
-    let tip = zecd.block_count().await.expect("getblockcount");
+    let tip = rose.block_count().await.expect("getblockcount");
     zebrad
         .generate_blocks(4)
         .await
         .expect("age the burst change");
-    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 4, FUND_TIMEOUT)
         .await
         .expect("scan the change-aging blocks");
 
     let mut recipients = serde_json::Map::new();
     recipients.insert(funder_ua.clone(), json!(0.05));
     recipients.insert(funder_taddr.clone(), json!(0.02));
-    let txid_many = zecd
+    let txid_many = rose
         .call("sendmany", json!(["", recipients]))
         .await
         .expect("sendmany with two recipients succeeds");
     let txid_many = txid_many.as_str().expect("txid is a string").to_string();
     assert_eq!(txid_many.len(), 64, "sendmany txid is display hex");
 
-    let gt = zecd
+    let gt = rose
         .call("gettransaction", json!([txid_many]))
         .await
         .expect("gettransaction on the sendmany");
@@ -844,7 +844,7 @@ async fn regtest_funded_orchard_receive() {
                 && d["amount"].as_f64() == Some(-0.02)),
         "the transparent recipient detail carries its address and amount: {gt}"
     );
-    mine_until_confirmed(&zebrad, &zecd, &txid_many, "2-output sendmany").await;
+    mine_until_confirmed(&zebrad, &rose, &txid_many, "2-output sendmany").await;
 
     // ---- Phase 6b: z_sendmany - the asynchronous send + operation tracking ----
     //
@@ -852,20 +852,20 @@ async fn regtest_funded_orchard_receive() {
     // transaction on a background task, tracked by z_getoperationstatus / z_getoperationresult
     // / z_listoperationids. First age the 2-output-sendmany change to spendability so the async
     // send has notes to spend.
-    let tip = zecd.block_count().await.expect("getblockcount");
+    let tip = rose.block_count().await.expect("getblockcount");
     zebrad
         .generate_blocks(4)
         .await
         .expect("age the sendmany change");
-    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 4, FUND_TIMEOUT)
         .await
         .expect("scan the change-aging blocks");
 
-    // fromaddress is zecd's own account address (zcashd requires one; zecd validates ownership).
-    let opid = zecd
+    // fromaddress is rose's own account address (zcashd requires one; rose validates ownership).
+    let opid = rose
         .call(
             "z_sendmany",
-            json!([zecd_ua, [{ "address": funder_ua, "amount": 0.01 }]]),
+            json!([rose_ua, [{ "address": funder_ua, "amount": 0.01 }]]),
         )
         .await
         .expect("z_sendmany returns an operation id");
@@ -873,7 +873,7 @@ async fn regtest_funded_orchard_receive() {
     assert!(opid.starts_with("opid-"), "opid shape: {opid}");
 
     // The operation is immediately visible in z_listoperationids for this wallet.
-    let ids = zecd
+    let ids = rose
         .call("z_listoperationids", json!([]))
         .await
         .expect("z_listoperationids");
@@ -887,7 +887,7 @@ async fn regtest_funded_orchard_receive() {
 
     // z_waitforoperation with timeout 0 is the non-blocking single-operation read: it returns
     // the current status object right away, whatever state the send is in.
-    let now = zecd
+    let now = rose
         .call("z_waitforoperation", json!([opid, 0]))
         .await
         .expect("z_waitforoperation with timeout 0");
@@ -908,7 +908,7 @@ async fn regtest_funded_orchard_receive() {
     // client used to write. The 120s budget covers a debug build's slow proving. `finished`
     // separates "the operation ended" from "the wait gave up", so a timeout here fails the test
     // as a timeout rather than being mistaken for a failed send (both are non-errors on the RPC).
-    let obj = zecd
+    let obj = rose
         .call("z_waitforoperation", json!([opid, 120]))
         .await
         .expect("z_waitforoperation");
@@ -935,7 +935,7 @@ async fn regtest_funded_orchard_receive() {
 
     // The wait is non-destructive: z_getoperationstatus still sees the finished operation, and
     // waiting again returns the same terminal status immediately.
-    let st = zecd
+    let st = rose
         .call("z_getoperationstatus", json!([[opid]]))
         .await
         .expect("z_getoperationstatus after the wait");
@@ -944,21 +944,21 @@ async fn regtest_funded_orchard_receive() {
         1,
         "z_waitforoperation must not reap the operation: {st}"
     );
-    let again = zecd
+    let again = rose
         .call("z_waitforoperation", json!([opid]))
         .await
         .expect("z_waitforoperation is repeatable");
     assert_eq!(again["result"]["txid"], json!(op_txid));
 
     // z_getoperationresult returns the finished op exactly once and removes it from memory.
-    let res = zecd
+    let res = rose
         .call("z_getoperationresult", json!([[opid]]))
         .await
         .expect("z_getoperationresult");
     let res = res.as_array().expect("result array");
     assert_eq!(res.len(), 1, "one finished op is returned: {res:?}");
     assert_eq!(res[0]["result"]["txid"], json!(op_txid));
-    let after = zecd
+    let after = rose
         .call("z_getoperationstatus", json!([[opid]]))
         .await
         .expect("z_getoperationstatus after result");
@@ -969,13 +969,13 @@ async fn regtest_funded_orchard_receive() {
     // Once reaped there is nothing to wait for, so z_waitforoperation says so (-8) instead of
     // blocking for the whole timeout - the one place it deviates from z_getoperationstatus's
     // silent omission.
-    let err = zecd
+    let err = rose
         .call("z_waitforoperation", json!([opid, 120]))
         .await
         .expect_err("waiting on a reaped operation must fail fast");
     assert_eq!(err.code(), Some(-8), "reaped opid -> -8: {err}");
 
-    mine_until_confirmed(&zebrad, &zecd, &op_txid, "z_sendmany async operation").await;
+    mine_until_confirmed(&zebrad, &rose, &op_txid, "z_sendmany async operation").await;
 
     // ---- Phase 6c: z_sendmany failure + tracking edge cases ----
     //
@@ -985,7 +985,7 @@ async fn regtest_funded_orchard_receive() {
 
     // A syntactically valid but foreign fromaddress is rejected by the ownership check (-5),
     // distinct from the undecodable-address case the conformance suite covers.
-    let err = zecd
+    let err = rose
         .call(
             "z_sendmany",
             json!([funder_ua, [{ "address": funder_ua, "amount": 0.001 }]]),
@@ -995,10 +995,10 @@ async fn regtest_funded_orchard_receive() {
     assert_eq!(err.code(), Some(-5), "foreign fromaddress -> -5: {err}");
 
     // FullPrivacy (per-call) must reject a transparent recipient, mapping through to build_payment.
-    let err = zecd
+    let err = rose
         .call(
             "z_sendmany",
-            json!([zecd_ua, [{ "address": funder_taddr, "amount": 0.001 }], null, null, "FullPrivacy"]),
+            json!([rose_ua, [{ "address": funder_taddr, "amount": 0.001 }], null, null, "FullPrivacy"]),
         )
         .await
         .expect_err("FullPrivacy must reject a transparent recipient");
@@ -1012,10 +1012,10 @@ async fn regtest_funded_orchard_receive() {
     // Sapling<->Orchard crossing) but NOT *recipients*, so a transparent recipient must still be
     // -8 - exactly as zcashd rejects it. Regression guard for the collapse bug where the three
     // mid-tier policies all fell through to fully-permissive and silently paid transparent.
-    let err = zecd
+    let err = rose
         .call(
             "z_sendmany",
-            json!([zecd_ua, [{ "address": funder_taddr, "amount": 0.001 }], null, null, "AllowRevealedAmounts"]),
+            json!([rose_ua, [{ "address": funder_taddr, "amount": 0.001 }], null, null, "AllowRevealedAmounts"]),
         )
         .await
         .expect_err("AllowRevealedAmounts must reject a transparent recipient");
@@ -1030,10 +1030,10 @@ async fn regtest_funded_orchard_receive() {
     // reject it) and build a valid transaction - proved end-to-end here, not just that
     // build_payment stops rejecting it.
     let memo_only_memo = "6d656d6f2d6f6e6c79"; // "memo-only"
-    let opid = zecd
+    let opid = rose
         .call(
             "z_sendmany",
-            json!([zecd_ua, [{ "address": funder_ua, "amount": 0, "memo": memo_only_memo }]]),
+            json!([rose_ua, [{ "address": funder_ua, "amount": 0, "memo": memo_only_memo }]]),
         )
         .await
         .expect("z_sendmany accepts a zero-valued memo-only output")
@@ -1042,7 +1042,7 @@ async fn regtest_funded_orchard_receive() {
         .to_string();
     let mut memo_only_txid = None;
     for _ in 0..120 {
-        let st = zecd
+        let st = rose
             .call("z_getoperationstatus", json!([[opid]]))
             .await
             .expect("z_getoperationstatus");
@@ -1067,17 +1067,17 @@ async fn regtest_funded_orchard_receive() {
         }
     }
     let memo_only_txid = memo_only_txid.expect("the memo-only send reached success");
-    mine_until_confirmed(&zebrad, &zecd, &memo_only_txid, "z_sendmany memo-only send").await;
+    mine_until_confirmed(&zebrad, &rose, &memo_only_txid, "z_sendmany memo-only send").await;
 
     // minconf is honored: an absurd minconf makes the send unsatisfiable, so the async op
     // reaches `failed` (whereas the default-minconf send in Phase 6b succeeded - that A/B is
     // the proof minconf threads through). The concrete error is librustzcash's
     // `-4 "Must scan blocks first"` (the requested anchor depth is unreachable), so assert the
     // failed-op *shape* - a negative code + a message, no result - not one exact error code.
-    let opid = zecd
+    let opid = rose
         .call(
             "z_sendmany",
-            json!([zecd_ua, [{ "address": funder_ua, "amount": 0.001 }], 9_999_999]),
+            json!([rose_ua, [{ "address": funder_ua, "amount": 0.001 }], 9_999_999]),
         )
         .await
         .expect("z_sendmany with a high minconf still returns an opid")
@@ -1086,7 +1086,7 @@ async fn regtest_funded_orchard_receive() {
         .to_string();
     let mut saw_failed = false;
     for _ in 0..120 {
-        let st = zecd
+        let st = rose
             .call("z_getoperationstatus", json!([[opid]]))
             .await
             .expect("z_getoperationstatus");
@@ -1124,7 +1124,7 @@ async fn regtest_funded_orchard_receive() {
     );
 
     // The tracking RPCs are wallet-routed: an unknown wallet is -18.
-    let err = zecd
+    let err = rose
         .call_wallet("nope", "z_listoperationids", json!([]))
         .await
         .expect_err("an unknown wallet must be rejected");
@@ -1138,21 +1138,21 @@ async fn regtest_funded_orchard_receive() {
     // staged a committed-but-*unbroadcast* tx here by sending during an outage and delivering it
     // by hand; that needs the broadcast path down while the chain advances, which a single zebra
     // node can't do, so this covers sendrawtransaction's accept/idempotency contract instead.)
-    let txid_raw = zecd
+    let txid_raw = rose
         .call("sendtoaddress", json!([funder_ua, 0.01]))
         .await
         .expect("send")
         .as_str()
         .expect("txid is a string")
         .to_string();
-    let raw_hex = zecd
+    let raw_hex = rose
         .call("gettransaction", json!([txid_raw]))
         .await
         .expect("gettransaction")["hex"]
         .as_str()
         .expect("raw hex is stored for the committed send")
         .to_string();
-    let echoed = zecd
+    let echoed = rose
         .call("sendrawtransaction", json!([raw_hex]))
         .await
         .expect("sendrawtransaction accepts the committed raw bytes");
@@ -1161,7 +1161,7 @@ async fn regtest_funded_orchard_receive() {
         Some(txid_raw.as_str()),
         "sendrawtransaction returns the canonical txid for a tx already in the mempool"
     );
-    mine_until_confirmed(&zebrad, &zecd, &txid_raw, "sendrawtransaction send").await;
+    mine_until_confirmed(&zebrad, &rose, &txid_raw, "sendrawtransaction send").await;
 
     // ---- Phase 8: a self-send (pay our own address) is visible and carries its memo ----
     //
@@ -1169,14 +1169,14 @@ async fn regtest_funded_orchard_receive() {
     // transaction as `is_change` (scanning's `find_received`: `is_change =
     // spent_from_accounts.contains(..)`), so a deliberate payment to one of the wallet's own
     // user-facing addresses lands with `is_change = true` even though it was received on an
-    // external-scope address. zecd must still surface it - Bitcoin Core shows a self-send as a
+    // external-scope address. rose must still surface it - Bitcoin Core shows a self-send as a
     // send+receive pair - so the memo on a self-directed output stays reachable. (The
     // discriminator is the recipient key scope, not `is_change`: external = a real payment,
     // internal = true change.) Before the fix this whole transaction vanished from
     // gettransaction/listtransactions/z_listtransactions and the memo was unreachable.
 
     // Mature the Phase-7 change so the self-send has a spendable note (trusted depth 3 + skew).
-    let tip = zecd
+    let tip = rose
         .block_count()
         .await
         .expect("getblockcount before the self-send");
@@ -1184,12 +1184,12 @@ async fn regtest_funded_orchard_receive() {
         .generate_blocks(4)
         .await
         .expect("mature change before the self-send");
-    zecd.wait_until_synced(tip + 4, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 4, FUND_TIMEOUT)
         .await
         .expect("scan the maturing blocks");
 
     // A fresh own address (external/user-facing) and a ZIP-302 text memo to ourselves.
-    let self_addr = zecd
+    let self_addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("getnewaddress for the self-send")
@@ -1198,7 +1198,7 @@ async fn regtest_funded_orchard_receive() {
         .to_string();
     let self_memo_hex = "676d3a2073656c662d73656e64"; // "gm: self-send"
     let self_memo_text = "gm: self-send";
-    let self_txid = zecd
+    let self_txid = rose
         .call(
             "sendtoaddress",
             json!([
@@ -1222,7 +1222,7 @@ async fn regtest_funded_orchard_receive() {
         .expect("txid is a string")
         .to_string();
 
-    let tip = zecd
+    let tip = rose
         .block_count()
         .await
         .expect("getblockcount before confirm");
@@ -1230,7 +1230,7 @@ async fn regtest_funded_orchard_receive() {
         .generate_blocks(3)
         .await
         .expect("confirm the self-send");
-    zecd.wait_until_synced(tip + 3, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 3, FUND_TIMEOUT)
         .await
         .expect("scan the confirming blocks");
 
@@ -1239,7 +1239,7 @@ async fn regtest_funded_orchard_receive() {
     // assert the full self-send shape: a send+receive pair on our own address, memo on receive.
     let deadline = Instant::now() + FUND_TIMEOUT;
     loop {
-        let gt = zecd
+        let gt = rose
             .call("gettransaction", json!([self_txid]))
             .await
             .expect("gettransaction on the self-send");
@@ -1274,7 +1274,7 @@ async fn regtest_funded_orchard_receive() {
             );
 
             // listtransactions surfaces both halves (it used to drop the tx entirely).
-            let lt = zecd
+            let lt = rose
                 .call("listtransactions", json!(["*", 50]))
                 .await
                 .expect("listtransactions");
@@ -1296,7 +1296,7 @@ async fn regtest_funded_orchard_receive() {
             );
 
             // z_listtransactions (zcashd vocabulary) surfaces the receive + memo too.
-            let zlt = zecd
+            let zlt = rose
                 .call("z_listtransactions", json!([50]))
                 .await
                 .expect("z_listtransactions");
@@ -1311,7 +1311,7 @@ async fn regtest_funded_orchard_receive() {
             );
 
             // getreceivedbyaddress counts the self-payment to that address (Bitcoin Core does).
-            let received = zecd
+            let received = rose
                 .call("getreceivedbyaddress", json!([self_addr, 1]))
                 .await
                 .expect("getreceivedbyaddress on the self-send address");
@@ -1331,7 +1331,7 @@ async fn regtest_funded_orchard_receive() {
 
     // ---- Phase 8b: a wallet-authored tx is TRUSTED - its payment output is spendable at 3 ----
     //
-    // zecd marks its own sends trusted at store time (`actor::mark_own_tx_trusted` ->
+    // rose marks its own sends trusted at store time (`actor::mark_own_tx_trusted` ->
     // `WalletWrite::set_tx_trust`), so the ZIP-315 policy applies `trusted_confirmations` (3) to
     // BOTH outputs of the self-send above: the internal change (trusted by key scope already)
     // AND the external-scope payment to our own address. Without the marker the payment output
@@ -1341,7 +1341,7 @@ async fn regtest_funded_orchard_receive() {
     // the tx is at 3-4 confirmations regardless of which of the confirming blocks it landed in -
     // squarely inside the [trusted, untrusted) window where only the marker makes the
     // difference.
-    let tip = zecd
+    let tip = rose
         .block_count()
         .await
         .expect("getblockcount before the trust-window check");
@@ -1349,10 +1349,10 @@ async fn regtest_funded_orchard_receive() {
         .generate_blocks(1)
         .await
         .expect("put the self-send safely past trusted_confirmations");
-    zecd.wait_until_synced(tip + 1, FUND_TIMEOUT)
+    rose.wait_until_synced(tip + 1, FUND_TIMEOUT)
         .await
         .expect("scan into the trust window");
-    let balances = zecd
+    let balances = rose
         .call("getbalances", json!([]))
         .await
         .expect("getbalances inside the trust window");
@@ -1362,7 +1362,7 @@ async fn regtest_funded_orchard_receive() {
         "a wallet-authored self-send's payment output must be trusted (spendable at 3 confs), \
          not untrusted-pending until 10: {balances}"
     );
-    let wi = zecd
+    let wi = rose
         .call("getwalletinfo", json!([]))
         .await
         .expect("getwalletinfo inside the trust window");
@@ -1371,7 +1371,7 @@ async fn regtest_funded_orchard_receive() {
         Some(0.0),
         "getwalletinfo agrees: nothing pending while the young self-send outputs are trusted: {wi}"
     );
-    let gb = zecd
+    let gb = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance inside the trust window");
@@ -1394,12 +1394,12 @@ async fn regtest_funded_orchard_receive() {
     // Issue a send and stop the daemon while it is in flight, then restart and require the
     // transaction to be there and to confirm. The opid is deliberately not looked up afterwards
     // - it is gone by contract, which is the reason a client must reconcile by txid.
-    let self_addr = zecd
+    let self_addr = rose
         .call("getnewaddress", json!([]))
         .await
         .expect("address for the shutdown-drain send");
     let self_addr = self_addr.as_str().expect("address string").to_string();
-    let opid = zecd
+    let opid = rose
         .call(
             "z_sendmany",
             json!([&self_addr, [{"address": &self_addr, "amount": 0.01}]]),
@@ -1410,17 +1410,17 @@ async fn regtest_funded_orchard_receive() {
         opid.as_str().is_some_and(|o| o.starts_with("opid-")),
         "z_sendmany returns an opid: {opid}"
     );
-    zecd.stop_keeping_datadir()
+    rose.stop_keeping_datadir()
         .await
         .expect("stop the daemon with a send in flight");
-    zecd.respawn().await.expect("restart after the stop");
-    zecd.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
+    rose.respawn().await.expect("restart after the stop");
+    rose.wait_until_synced_to_node(&zebrad, FUND_TIMEOUT)
         .await
         .expect("resync after the restart");
 
     // The send must have been stored and broadcast before the actor stopped, so it is in the
     // wallet's history by txid and mines like any other.
-    let after = zecd
+    let after = rose
         .call("listtransactions", json!(["*", 50]))
         .await
         .expect("listtransactions after the restart");
@@ -1432,7 +1432,7 @@ async fn regtest_funded_orchard_receive() {
         .unwrap_or_else(|| panic!("the send accepted before shutdown must survive it: {after}"))
         .clone();
     let drained_txid = drained["txid"].as_str().expect("txid").to_string();
-    mine_until_confirmed(&zebrad, &zecd, &drained_txid, "the pre-shutdown send").await;
+    mine_until_confirmed(&zebrad, &rose, &drained_txid, "the pre-shutdown send").await;
     eprintln!("phase: a send accepted before shutdown was finished, not dropped");
 
     // ---- history equivalence: the three history readers agree, transaction by transaction ----
@@ -1450,7 +1450,7 @@ async fn regtest_funded_orchard_receive() {
     // read out of a view (the balance delta, the fee, the mined height, expiry) is compared here
     // against the view's own answer, so an arithmetic slip in the reconstruction fails loudly
     // rather than quietly reporting a wrong amount.
-    let history = zecd
+    let history = rose
         .call("listtransactions", json!(["*", 1000]))
         .await
         .expect("listtransactions over the whole funded history");
@@ -1470,7 +1470,7 @@ async fn regtest_funded_orchard_receive() {
     }
 
     for txid in &seen_txids {
-        let gt = zecd
+        let gt = rose
             .call("gettransaction", json!([txid]))
             .await
             .unwrap_or_else(|e| {
@@ -1531,7 +1531,7 @@ async fn regtest_funded_orchard_receive() {
 
     // `listsinceblock` with no cursor is the same history under a different query shape (it
     // walks oldest-first with no limit), so it must report exactly the same set of txids.
-    let lsb_all = zecd
+    let lsb_all = rose
         .call("listsinceblock", json!([]))
         .await
         .expect("listsinceblock with no cursor");
@@ -1564,7 +1564,7 @@ async fn regtest_funded_orchard_receive() {
     let page = 3usize;
     let mut from = 0usize;
     loop {
-        let chunk = zecd
+        let chunk = rose
             .call("listtransactions", json!(["*", page, from]))
             .await
             .expect("paged listtransactions");
@@ -1619,10 +1619,10 @@ async fn regtest_funded_orchard_receive() {
     // wallet built from the funded wallet's UFVK - same account, so it scans the same received
     // note, and the viewing key is enough to decrypt the incoming memo. (Watch-only over a
     // mnemonic restore because the UFVK is passed as a CLI arg, sidestepping stdin.)
-    let ufvk = zecd
+    let ufvk = rose
         .export_ufvk("default")
         .expect("export the funded wallet's UFVK");
-    let mut watch_cfg = ZecdConfig::new(
+    let mut watch_cfg = RoseConfig::new(
         zebrad.rpc_port,
         pick_port().expect("pick watch-only rpc port"),
     );
@@ -1631,10 +1631,10 @@ async fn regtest_funded_orchard_receive() {
     let _watch_lwd = attach_backend(&mut watch_cfg, zebrad.rpc_port)
         .await
         .expect("attach watch-only backend");
-    let watch_only = Zecd::start(&watch_cfg)
+    let watch_only = Rose::start(&watch_cfg)
         .await
         .expect("start the watch-only wallet");
-    let tip = zecd
+    let tip = rose
         .block_count()
         .await
         .expect("getblockcount before the watch-only sync");
@@ -1701,8 +1701,8 @@ async fn regtest_funded_orchard_receive() {
         .expect("the restored wallet's funding receive");
     assert_eq!(
         restored_receive["address"].as_str(),
-        Some(zecd_ua.as_str()),
-        "a restored wallet's history must name the receive as its live self did ({zecd_ua}), not \
+        Some(rose_ua.as_str()),
+        "a restored wallet's history must name the receive as its live self did ({rose_ua}), not \
          by whichever encoding the block scan recorded: {restored_receive}"
     );
     let restored_receive_info = watch_only
@@ -1726,7 +1726,7 @@ async fn regtest_funded_orchard_receive() {
         .as_u64()
         .expect("a received entry carries its diversifier index");
     let restored_info = watch_only
-        .call("getaddressinfo", json!([zecd_ua]))
+        .call("getaddressinfo", json!([rose_ua]))
         .await
         .expect("getaddressinfo on the restored wallet");
     assert_eq!(
@@ -1734,8 +1734,8 @@ async fn regtest_funded_orchard_receive() {
         Some(restored_index),
         "getaddressinfo must read back the index the receive entry reports: {restored_info}"
     );
-    let live_info = zecd
-        .call("getaddressinfo", json!([zecd_ua]))
+    let live_info = rose
+        .call("getaddressinfo", json!([rose_ua]))
         .await
         .expect("getaddressinfo on the live wallet");
     assert_eq!(
@@ -1745,12 +1745,12 @@ async fn regtest_funded_orchard_receive() {
     );
     // And the address takes apart into exactly the string history reports for it.
     let parts = watch_only
-        .call("z_listunifiedreceivers", json!([zecd_ua]))
+        .call("z_listunifiedreceivers", json!([rose_ua]))
         .await
         .expect("z_listunifiedreceivers on the restored wallet");
     assert_eq!(
         parts,
-        json!({ "orchard": zecd_ua }),
+        json!({ "orchard": rose_ua }),
         "an orchard-only address takes apart into itself under `orchard`"
     );
 
@@ -1772,11 +1772,11 @@ async fn regtest_funded_orchard_receive() {
     );
 
     // The restored wallet must answer for the address the ORIGINAL wallet handed out. This is
-    // the guard for the per-address reporting bug: the funded wallet got `zecd_ua` from
+    // the guard for the per-address reporting bug: the funded wallet got `rose_ua` from
     // `getnewaddress`, which recorded that exact encoding in its `addresses` table, but this
     // wallet was rebuilt from a viewing key and the chain alone - so every one of its address
     // rows was written by the block scan, which records `UnifiedAddressRequest::ALLOW_ALL`
-    // (transparent + Sapling + Orchard) rather than the Orchard-only encoding zecd issues.
+    // (transparent + Sapling + Orchard) rather than the Orchard-only encoding rose issues.
     //
     // Under whole-string matching that divergence was silent and total: `getreceivedbyaddress`
     // returned 0.00000000 for the wallet's own address while the same funds were listed under a
@@ -1789,14 +1789,14 @@ async fn regtest_funded_orchard_receive() {
     // re-encoding). Note the balance is deliberately not used as a proxy - it stays right in
     // exactly the broken case.
     let restored_recv = watch_only
-        .call("getreceivedbyaddress", json!([zecd_ua]))
+        .call("getreceivedbyaddress", json!([rose_ua]))
         .await
         .expect("getreceivedbyaddress on the restored wallet");
     assert_eq!(
         restored_recv.as_f64(),
         Some(1.0),
         "a restored wallet must credit the funding receive to the address its live self handed \
-         out ({zecd_ua}), not to whichever encoding the block scan recorded: {restored_recv}"
+         out ({rose_ua}), not to whichever encoding the block scan recorded: {restored_recv}"
     );
     let restored_lra = watch_only
         .call("listreceivedbyaddress", json!([1, false]))
@@ -1805,10 +1805,10 @@ async fn regtest_funded_orchard_receive() {
     let restored_lra = restored_lra.as_array().expect("array");
     assert!(
         restored_lra.iter().any(|e| {
-            e["address"] == json!(zecd_ua.as_str())
+            e["address"] == json!(rose_ua.as_str())
                 && e["txids"].as_array().is_some_and(|t| !t.is_empty())
         }),
-        "a restored wallet must report its receipts under the address it issues ({zecd_ua}): \
+        "a restored wallet must report its receipts under the address it issues ({rose_ua}): \
          {restored_lra:?}"
     );
     // ...and must not report them under any other spelling of the same funds. Every address it
@@ -1891,10 +1891,10 @@ async fn regtest_funded_orchard_receive() {
     // (5) the reversibility contract - flipping the knob back on over the SAME data directory
     //     must backfill the memo with no rescan: the skipped requests stay queued in the wallet
     //     DB, so re-enabling drains them on the next caught-up pass.
-    let ufvk = zecd
+    let ufvk = rose
         .export_ufvk("default")
         .expect("export the funded wallet's UFVK for the memo-less twin");
-    let mut memoless_cfg = ZecdConfig::new(
+    let mut memoless_cfg = RoseConfig::new(
         zebrad.rpc_port,
         pick_port().expect("pick memo-less rpc port"),
     );
@@ -1904,10 +1904,10 @@ async fn regtest_funded_orchard_receive() {
     let _memoless_lwd = attach_backend(&mut memoless_cfg, zebrad.rpc_port)
         .await
         .expect("attach memo-less backend");
-    let mut memoless = Zecd::start(&memoless_cfg)
+    let mut memoless = Rose::start(&memoless_cfg)
         .await
         .expect("start the memo-less watch-only wallet");
-    let tip = zecd
+    let tip = rose
         .block_count()
         .await
         .expect("getblockcount before the memo-less sync");
@@ -2050,7 +2050,7 @@ async fn regtest_funded_orchard_receive() {
     // above lands here with a single confirmation, and eight blocks left it one short of the
     // window, which showed up as a rebuilt wallet exactly 0.01 ZEC light.
     const UNTRUSTED_CONFIRMATIONS: i64 = 10;
-    let aged = zecd
+    let aged = rose
         .call("listtransactions", json!(["*", 100]))
         .await
         .expect("listtransactions before aging the wallet's transactions");
@@ -2063,7 +2063,7 @@ async fn regtest_funded_orchard_receive() {
         .unwrap_or(UNTRUSTED_CONFIRMATIONS);
     let need = u32::try_from((UNTRUSTED_CONFIRMATIONS - youngest).max(0)).expect("small depth");
     if need > 0 {
-        let tip = zecd
+        let tip = rose
             .block_count()
             .await
             .expect("getblockcount before aging the wallet's transactions");
@@ -2071,26 +2071,26 @@ async fn regtest_funded_orchard_receive() {
             .generate_blocks(need)
             .await
             .expect("age every wallet transaction past the untrusted window");
-        zecd.wait_until_synced(tip + u64::from(need), FUND_TIMEOUT)
+        rose.wait_until_synced(tip + u64::from(need), FUND_TIMEOUT)
             .await
             .expect("scan the aging blocks");
     }
-    let tip = zecd
+    let tip = rose
         .block_count()
         .await
         .expect("getblockcount before the data-dir wipe (wallet is synced)");
-    let balance_before = zecd
+    let balance_before = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance before the data-dir wipe");
 
-    zecd.restart_wiping_data_db()
+    rose.restart_wiping_data_db()
         .await
-        .expect("restart zecd on an emptied data directory");
+        .expect("restart rose on an emptied data directory");
 
     // Locked, encrypted, empty datadir: no account yet, so address generation is refused until
     // the passphrase arrives.
-    let pre_unlock = zecd.call("getnewaddress", json!([])).await;
+    let pre_unlock = rose.call("getnewaddress", json!([])).await;
     assert!(
         pre_unlock.is_err(),
         "a locked, not-yet-bootstrapped wallet must refuse getnewaddress, got {pre_unlock:?}"
@@ -2098,14 +2098,14 @@ async fn regtest_funded_orchard_receive() {
 
     // The first walletpassphrase supplies the seed; the actor rebuilds the account from
     // keys.toml and rescans from the birthday.
-    zecd.call("walletpassphrase", json!([ENCRYPT_PASSPHRASE, 3600]))
+    rose.call("walletpassphrase", json!([ENCRYPT_PASSPHRASE, 3600]))
         .await
         .expect("walletpassphrase unlocks and triggers the rebuild");
-    zecd.wait_until_synced(tip, FUND_TIMEOUT)
+    rose.wait_until_synced(tip, FUND_TIMEOUT)
         .await
         .expect("the rebuilt wallet rescans back to the tip");
 
-    let balance_after = zecd
+    let balance_after = rose
         .call("getbalance", json!([]))
         .await
         .expect("getbalance after the rebuild");
@@ -2115,21 +2115,21 @@ async fn regtest_funded_orchard_receive() {
     );
 
     // The rebuilt account can actually sign and broadcast: a real send back to the funder.
-    let send = zecd
+    let send = rose
         .call("sendtoaddress", json!([funder_ua, 0.01]))
         .await
         .expect("the rebuilt wallet signs and broadcasts a spend");
     let send_txid = send.as_str().expect("sendtoaddress txid").to_string();
-    mine_until_confirmed(&zebrad, &zecd, &send_txid, "post-rebuild send").await;
+    mine_until_confirmed(&zebrad, &rose, &send_txid, "post-rebuild send").await;
 }
 
 /// Mine one block at a time (giving the rebroadcast/scan loop time between blocks) until
-/// zecd reports the tx confirmed. Panics after ~30 rounds.
-async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &str) {
+/// rose reports the tx confirmed. Panics after ~30 rounds.
+async fn mine_until_confirmed(zebrad: &Zebrad, rose: &Rose, txid: &str, what: &str) {
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_secs(2)).await;
         zebrad.generate_blocks(1).await.expect("mine a block");
-        let gt = zecd
+        let gt = rose
             .call("gettransaction", json!([txid]))
             .await
             .expect("gettransaction while polling for confirmation");
@@ -2138,7 +2138,7 @@ async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &s
             // behind is still unscanned here, and a phase that reads the history twice over
             // the next second sees `confirmations` move between its reads (it did, in CI:
             // 20 against 21 for the same transaction). Leave the wallet at the node's tip.
-            zecd.wait_until_synced_to_node(zebrad, FUND_TIMEOUT)
+            rose.wait_until_synced_to_node(zebrad, FUND_TIMEOUT)
                 .await
                 .expect("scan the blocks mined while polling for confirmation");
             return;
@@ -2153,7 +2153,7 @@ async fn mine_until_confirmed(zebrad: &Zebrad, zecd: &Zecd, txid: &str, what: &s
 fn run_conformance(rpc_port: u16, user: &str, password: &str, passphrase: &str) {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("harness lives inside the zecd repo")
+        .expect("harness lives inside the rose repo")
         .join("scripts/conformance.py");
     let out = std::process::Command::new("python3")
         .arg(&script)

@@ -1,6 +1,6 @@
-//! SOCKS5 proxying for every outbound connection zecd makes.
+//! SOCKS5 proxying for every outbound connection rose makes.
 //!
-//! zecd dials exactly two upstreams - a zebrad JSON-RPC endpoint (plaintext HTTP/1.1, via
+//! rose dials exactly two upstreams - a zebrad JSON-RPC endpoint (plaintext HTTP/1.1, via
 //! `hyper-util`'s legacy client) and a lightwalletd gRPC endpoint (tonic, usually over TLS) -
 //! and `[backend] proxy` routes both through one SOCKS5 proxy. The shared piece is
 //! [`SocksConnector`], a `tower_service::Service<Uri>` that both transports accept as a custom
@@ -10,7 +10,7 @@
 //! Two properties are load-bearing:
 //!
 //! - **The destination is handed to the proxy as a `host:port` string, never as a resolved
-//!   `SocketAddr`** (SOCKS5h semantics). The proxy resolves it, so zecd leaks no DNS traffic and
+//!   `SocketAddr`** (SOCKS5h semantics). The proxy resolves it, so rose leaks no DNS traffic and
 //!   `.onion` destinations - which resolve nowhere locally - work.
 //! - **TLS is layered *over* this connector by the transport, not by it.** The connector always
 //!   yields a plaintext stream; tonic then applies whichever of the five `[backend]` TLS modes
@@ -54,10 +54,10 @@ pub struct SocksProxy {
 impl SocksProxy {
     /// Parse a `socks5://host:port` token.
     ///
-    /// `socks5h://` is accepted as an alias: zecd always resolves the destination proxy-side, so
+    /// `socks5h://` is accepted as an alias: rose always resolves the destination proxy-side, so
     /// the two schemes describe the same behaviour and both canonicalize to `socks5://`.
     ///
-    /// Userinfo (`socks5://user:pass@host:port`) is **rejected** rather than ignored. zecd does
+    /// Userinfo (`socks5://user:pass@host:port`) is **rejected** rather than ignored. rose does
     /// not implement SOCKS username/password authentication, and silently dropping credentials
     /// would send an unauthenticated greeting to a proxy the operator believes is authenticated.
     pub fn parse(token: &str) -> anyhow::Result<SocksProxy> {
@@ -66,7 +66,7 @@ impl SocksProxy {
             Some(("socks5" | "socks5h", rest)) => rest,
             Some((scheme, _)) => {
                 return Err(anyhow!(
-                    "unsupported proxy scheme '{scheme}' in '{token}': zecd supports \
+                    "unsupported proxy scheme '{scheme}' in '{token}': rose supports \
                      socks5:// (and socks5h://, an alias - the destination is always resolved \
                      by the proxy)"
                 ));
@@ -153,7 +153,7 @@ impl std::fmt::Display for SocksProxy {
 /// A connector that dials every destination through a SOCKS5 proxy.
 ///
 /// Implements `tower_service::Service<Uri>`, which is the connector trait for both transports
-/// zecd uses (tonic's `connect_with_connector` and hyper-util's legacy client).
+/// rose uses (tonic's `connect_with_connector` and hyper-util's legacy client).
 #[derive(Clone, Debug)]
 pub struct SocksConnector {
     proxy: SocksProxy,
@@ -192,7 +192,7 @@ impl Service<Uri> for SocksConnector {
                     format!("no host in destination uri '{uri}'"),
                 )
             })?;
-            // Both zecd dial sites always carry an explicit port; the scheme default is a
+            // Both rose dial sites always carry an explicit port; the scheme default is a
             // backstop so a port-less uri cannot silently become port 0.
             let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
                 Some("https") => 443,
@@ -315,7 +315,7 @@ pub(crate) mod test_proxy {
             TestProxy { addr, targets }
         }
 
-        /// The proxy token to configure zecd with.
+        /// The proxy token to configure rose with.
         pub(crate) fn proxy(&self) -> super::SocksProxy {
             super::SocksProxy::parse(&format!("socks5://{}:{}", self.addr.ip(), self.addr.port()))
                 .unwrap()

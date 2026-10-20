@@ -1,6 +1,6 @@
-# zecd on Bitcoin testnet4 over the kyoto (BIP-157) light client: a WATCH-ONLY sibling of
-# the bitcoind-backed wallet in zecd.btc-testnet4.toml, built from that wallet's exported
-# account xpub (`zecd --conf deploy/zecd.btc-testnet4.toml export-xpub --wallet btc`), and
+# rose on Bitcoin testnet4 over the kyoto (BIP-157) light client: a WATCH-ONLY sibling of
+# the bitcoind-backed wallet in rose.btc-testnet4.toml, built from that wallet's exported
+# account xpub (`rose --conf deploy/rose.btc-testnet4.toml export-xpub --wallet btc`), and
 # peered with the same compose node's P2P port (which serves compact block filters:
 # -blockfilterindex + -peerblockfilters in deploy/docker-compose.btc-testnet4.yml).
 #
@@ -8,9 +8,9 @@
 # live chain - the same transactions, the same reorgs (scripts/btc-reorg-watch.py reads
 # both). Distinct datadir and ports so the two daemons coexist on one host.
 #
-#   zecd --conf deploy/zecd.btc-testnet4-view.toml init --wallet view \
+#   rose --conf deploy/rose.btc-testnet4-view.toml init --wallet view \
 #       --xpub '[fingerprint/84h/1h/0h]tpub...' --birthday <height>
-#   ZECD_RPC_PASSWORD=... zecd --conf deploy/zecd.btc-testnet4-view.toml
+#   ROSE_RPC_PASSWORD=... rose --conf deploy/rose.btc-testnet4-view.toml
 #
 # Nothing here can spend: no seed, no age identity. The first sync starts at the shipped
 # testnet4 scan floor (146000) and resolves the birthday to an anchor against the light
@@ -35,11 +35,11 @@ server = "kyoto://127.0.0.1:48333"
 bind = "127.0.0.1"
 port = 48233
 user = "btc"
-# Refused as-is: set ZECD_RPC_PASSWORD in the environment (deploy/.env).
+# Refused as-is: set ROSE_RPC_PASSWORD in the environment (deploy/.env).
 password = "CHANGE-ME"
 
 # 0-conf visibility for the light client: BIP-158 filters are block-derived, so without a
-# feed a payment is first seen in its block. The p2p source is zecd's own relay connection
+# feed a payment is first seen in its block. The p2p source is rose's own relay connection
 # to the wallet's kyoto trusted peer above (announced transactions, fetched and matched
 # locally; a testnet-sized trickle of bandwidth), and it RUNS BY DEFAULT - hence no
 # [mempool] section here. `sources = []` would turn it off. `p2p_snapshot` would add BIP 35

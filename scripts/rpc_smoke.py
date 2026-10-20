@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end RPC smoke test for a running zecd daemon.
+"""End-to-end RPC smoke test for a running rose daemon.
 
 Drives the bitcoind-style JSON-RPC surface over HTTP and asserts the response shapes,
 amounts, and error codes that Bitcoin RPC clients rely on. It only needs the stdlib (no
@@ -7,7 +7,7 @@ third-party deps), exercising the exact wire format.
 
 Usage:
     # Start a synced daemon first, e.g.:
-    #   zecd --datadir ./data --testnet --rpcuser u --rpcpassword p --rpcport 18232
+    #   rose --datadir ./data --testnet --rpcuser u --rpcpassword p --rpcport 18232
     python3 scripts/rpc_smoke.py [--url http://127.0.0.1:18232/] [--user u] [--password p]
 
 Exit code is non-zero if any check fails.
@@ -66,13 +66,13 @@ def main() -> int:
     _, r = call("getblockcount")
     check("getblockcount is int", isinstance(r["result"], int), str(r["result"]))
     _, r = call("getnetworkinfo")
-    check("subversion contains zecd", "zecd" in r["result"]["subversion"], r["result"]["subversion"])
+    check("subversion contains rose", "rose" in r["result"]["subversion"], r["result"]["subversion"])
 
     print("== wallet ==")
     _, r = call("getwalletinfo")
     wi = r["result"]
     check("getwalletinfo.balance numeric", isinstance(wi["balance"], (int, float)))
-    # zecd is stateless: getnewaddress takes no label.
+    # rose is stateless: getnewaddress takes no label.
     _, r = call("getnewaddress", [])
     addr = r["result"]
     check("getnewaddress unified addr", isinstance(addr, str) and addr.startswith(("u1", "utest1")), addr[:16] + "...")

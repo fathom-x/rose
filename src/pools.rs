@@ -1,17 +1,17 @@
 //! Shielded receivers, and the per-wallet sets of them that a wallet's addresses carry.
 //!
-//! zecd is shielded-only. Historically it was Orchard-only for *receiving*; now each wallet
+//! rose is shielded-only. Historically it was Orchard-only for *receiving*; now each wallet
 //! declares which receivers its addresses may carry (`[pools] enabled`) and which of those the
 //! Unified Addresses `getnewaddress` hands out include by default (`default_receivers`). A
 //! default receiver may never name one that isn't enabled - that's a configuration error, caught
 //! at parse time.
 //!
 //! **Both keys select receivers, not value pools**, which is why `[pools]` accepts a shorter list
-//! than the pools zecd reports on a balance. `enabled` additionally decides which pool change is
+//! than the pools rose reports on a balance. `enabled` additionally decides which pool change is
 //! sent to (the strongest receiver's, via [`ReceiverSet::change_pool`]); it does **not** restrict
 //! which notes a send may spend, and spending draws on every pool the wallet holds notes in.
 //!
-//! The [`Receiver`] enum is a zecd-local type rather than `zcash_protocol::ShieldedPool`, and note
+//! The [`Receiver`] enum is a rose-local type rather than `zcash_protocol::ShieldedPool`, and note
 //! that **Ironwood (NU6.3) is NOT a third [`Receiver`] here** - even though upstream `ShieldedPool` now
 //! *does* carry an `Ironwood` variant. Upstream models ironwood as **Orchard "V3" notes**: it
 //! reuses Orchard's keys, addresses, and note cryptography, so there is no ironwood UA receiver
@@ -27,7 +27,7 @@ use std::fmt;
 use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest};
 use zcash_protocol::{PoolType, ShieldedPool};
 
-/// A kind of receiver a zecd wallet's addresses can carry, and so the value pool that funds
+/// A kind of receiver a rose wallet's addresses can carry, and so the value pool that funds
 /// arriving at it land in.
 ///
 /// This is a *receiver* type, not a pool type, which is why there is no `Ironwood` variant: see
@@ -50,10 +50,10 @@ pub enum Receiver {
 }
 
 impl Receiver {
-    /// Every *shielded receiver* zecd supports today, in canonical (precedence) order.
+    /// Every *shielded receiver* rose supports today, in canonical (precedence) order.
     /// Transparent is deliberately excluded: this list drives [`ReceiverSet`] ordering and the
     /// shielded-protocol enumeration in balances/`listunspent`, neither of which apply to
-    /// transparent. It is shorter than the list of pools zecd reports funds in, which also has
+    /// transparent. It is shorter than the list of pools rose reports funds in, which also has
     /// ironwood.
     pub const SUPPORTED: &'static [Receiver] = &[Receiver::Sapling, Receiver::Orchard];
 
@@ -147,7 +147,7 @@ pub enum ReceiverParseError {
     /// ironwood proving key, and `enabled = ["ironwood"]` is the obvious way to ask for it. A
     /// future pool that likewise has no receiver gets a sibling variant, not a rename.
     Ironwood,
-    /// A token naming no receiver zecd knows.
+    /// A token naming no receiver rose knows.
     UnknownToken(String),
 }
 
@@ -170,7 +170,7 @@ impl fmt::Display for ReceiverParseError {
                  notes received at ordinary \"orchard\" addresses, so there is no ironwood \
                  receiver to name here. Name \"orchard\" instead - on a NU6.3-active chain an \
                  orchard receiver is already holding ironwood notes. See the [pools] notes in \
-                 zecd.example.toml",
+                 rose.example.toml",
             ),
             ReceiverParseError::UnknownToken(token) => write!(
                 f,
@@ -256,7 +256,7 @@ impl ReceiverSet {
     ///
     /// **Transparent can never make this true**, which is why the warning it gates does not fire
     /// for a transparent-enabled wallet: a `ReceiverSet` is shielded-only by construction
-    /// ([`ReceiverSet::new`] rejects [`Receiver::Transparent`] outright), and zecd hands its
+    /// ([`ReceiverSet::new`] rejects [`Receiver::Transparent`] outright), and rose hands its
     /// transparent receivers out as *bare* t-addresses rather than inside a unified address, so a
     /// transparent receive is recorded under exactly the string that was handed out. The
     /// divergence needs two *shielded* receivers in one address, which today means
@@ -271,7 +271,7 @@ impl ReceiverSet {
     }
 
     /// The canonical names, in set order - the spelling `ReceiverSet::parse` accepts, so this is
-    /// what renders back into a config file (`zecd config show`).
+    /// what renders back into a config file (`rose config show`).
     pub fn names(&self) -> Vec<&'static str> {
         self.pools.iter().map(|p| p.as_str()).collect()
     }
@@ -287,7 +287,7 @@ impl ReceiverSet {
 
     /// Build the librustzcash address request that includes exactly this set's receivers:
     /// `Require` for each pool present, `Omit` for every other pool, and `Omit` for p2pkh
-    /// (zecd never exposes a transparent receiver). Requiring a receiver makes address
+    /// (rose never exposes a transparent receiver). Requiring a receiver makes address
     /// generation fail if the account's viewing key can't produce it, which is the desired
     /// behaviour: a configured receiver that can't be honoured should surface, not silently
     /// vanish.
@@ -390,8 +390,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ironwood"), "{msg}");
         assert!(msg.contains("orchard"), "{msg}");
-        assert!(msg.contains("zecd.example.toml"), "{msg}");
-        // Nor may it open by calling ironwood an unknown pool. It is a pool zecd fully supports;
+        assert!(msg.contains("rose.example.toml"), "{msg}");
+        // Nor may it open by calling ironwood an unknown pool. It is a pool rose fully supports;
         // what it is not is a *receiver*, and an operator reading "unknown pool" against a build
         // that loads an ironwood proving key and reports `pool == "ironwood"` on their notes
         // reads a contradiction rather than an answer.
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn ua_request_orchard_only_matches_builtin() {
-        // A pure-Orchard receiver set must produce the same request shape zecd used before
+        // A pure-Orchard receiver set must produce the same request shape rose used before
         // (Require orchard, Omit sapling, Omit p2pkh).
         let req = ReceiverSet::single(Receiver::Orchard).to_unified_address_request();
         if let UnifiedAddressRequest::Custom(_) = req {

@@ -1,4 +1,4 @@
-//! On-disk persistence for the BDK engine, over zecd's own rusqlite.
+//! On-disk persistence for the BDK engine, over rose's own rusqlite.
 //!
 //! BDK ships a rusqlite persister of its own, but `bdk_chain` pins `rusqlite ^0.31`, whose
 //! `libsqlite3-sys` cannot coexist with the `rusqlite 0.37` the Zcash engine builds on
@@ -24,7 +24,7 @@ pub fn wallet_db_path(engine_dir: &Path) -> PathBuf {
 
 /// Everything the engine writes into its directory: the wallet database and its WAL
 /// sidecars (a `-wal` holds committed-but-uncheckpointed writes, so the three go together).
-/// `zecd rescan` deletes exactly this list; the kyoto header/filter cache lives in a sibling
+/// `rose rescan` deletes exactly this list; the kyoto header/filter cache lives in a sibling
 /// directory (`config::btc_kyoto_dir`) and is deleted alongside. `keys.toml` sits at the
 /// wallet root, above both.
 pub const ENGINE_ARTIFACTS: [&str; 3] = ["wallet.sqlite", "wallet.sqlite-wal", "wallet.sqlite-shm"];
@@ -49,8 +49,8 @@ fn check_schema_version(conn: &Connection, path: &Path) -> anyhow::Result<()> {
             .context("stamp the schema version")?;
     } else if version > SCHEMA_VERSION {
         anyhow::bail!(
-            "{} was written by a newer zecd (schema version {version}; this build reads \
-             {SCHEMA_VERSION}). Upgrade zecd, or run `zecd rescan --wallet <name>` to rebuild \
+            "{} was written by a newer rose (schema version {version}; this build reads \
+             {SCHEMA_VERSION}). Upgrade rose, or run `rose rescan --wallet <name>` to rebuild \
              the wallet database from the chain",
             path.display()
         );
@@ -331,7 +331,7 @@ fn strip_retired_anchors(
 }
 
 /// Create the wallet database from the account's public keys (seed-derived for a spending
-/// wallet, imported for a watch-only one) - `zecd init`'s half of the engine (the daemon's
+/// wallet, imported for a watch-only one) - `rose init`'s half of the engine (the daemon's
 /// half is `crate::btc::actor::spawn`, which loads it back and verifies it against the same
 /// keys). Refuses a database that already holds wallet data, mirroring init's
 /// no-preexisting-account refusal on the Zcash side.
@@ -384,7 +384,7 @@ impl WalletPersister for Persister {
             let changeset: ChangeSet = serde_json::from_str(&encoded).with_context(|| {
                 format!(
                     "decode stored changeset row {id}: the wallet database was written with a \
-                     changeset encoding this zecd cannot read; run `zecd rescan --wallet <name>` \
+                     changeset encoding this rose cannot read; run `rose rescan --wallet <name>` \
                      to rebuild it from the chain"
                 )
             })?;
@@ -514,8 +514,8 @@ mod tests {
             Ok(_) => panic!("a newer schema must be refused"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("newer zecd"), "{err}");
-        assert!(err.contains("zecd rescan"), "{err}");
+        assert!(err.contains("newer rose"), "{err}");
+        assert!(err.contains("rose rescan"), "{err}");
     }
 
     /// A stored changeset this build cannot decode names the rescan that rebuilds the
@@ -535,7 +535,7 @@ mod tests {
             "{:#}",
             <Persister as WalletPersister>::initialize(&mut persister).unwrap_err()
         );
-        assert!(err.contains("zecd rescan"), "{err}");
+        assert!(err.contains("rose rescan"), "{err}");
     }
 
     /// Creating over existing data is refused by `PersistedWallet::create` (the analog of

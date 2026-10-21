@@ -1145,6 +1145,7 @@ Community Data License Agreement Permissive 2.0
 ================================================================================
 
 Used by:
+  - webpki-roots 0.26.11
   - webpki-roots 1.0.10
 
 # Community Data License Agreement - Permissive - Version 2.0

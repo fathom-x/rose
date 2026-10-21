@@ -221,7 +221,7 @@ bdk_wallet = { version = "3.1", optional = true }
 # The `rand_core` generation BDK's `CoinSelectionAlgorithm::coin_select` bounds its RNG on
 # (0.6). rose's own RNG use is on `rand` 0.10, whose `RngCore` is a different trait, so the
 # ancestor-aware selector names BDK's directly.
-rand_core = { version = "0.6", optional = true }
+rand_core = { version = "0.10", optional = true }
 # The BDK engine's bitcoind chain source: a checkpoint-anchored block/mempool emitter over
 # Bitcoin Core's JSON-RPC (`bitcoincore-rpc`, blocking - the actor drives it under
 # `block_in_place` like the Zcash scan). Shares `bdk_core`/`bitcoin` with `bdk_wallet` 3.x,

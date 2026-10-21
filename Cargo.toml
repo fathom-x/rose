@@ -103,7 +103,7 @@ hex = "0.4"
 age = { version = "0.12", features = ["armor"] }
 bip0039 = { version = "0.14", features = ["std", "all-languages"] }
 # secrecy 0.8, not 0.10: `SecretVec` crosses into librustzcash's seed APIs, which are on 0.8.
-secrecy = "0.8"
+secrecy = "0.10"
 
 # `prost` deserializes the compact-block / treestate / mempool protobuf types that
 # `zcash_client_backend::proto` exposes and the zebra backend constructs (and that

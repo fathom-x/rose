@@ -178,7 +178,7 @@ zcash_address = { package = "zakura-address", version = "2.2", optional = true }
 # message hash (magic + message, each CompactSize-prefixed, double-SHA256), byte-identical to
 # zcashd's `rpc/misc.cpp` and zallet. 0.4, matching the rest of the librustzcash stack -
 # 0.5 exists but taking it would add a second copy for one call site.
-zcash_encoding = { version = "0.4", optional = true }
+zcash_encoding = { version = "0.5", optional = true }
 # `transparent-inputs` lets transparent receivers surface in getrawtransaction/getaddressinfo
 # and the received-by-address read paths; rose's own wallets never expose transparent receivers.
 # `pczt` exposes `create_pczt_from_proposal` / `extract_and_store_transaction_from_pczt`, the

@@ -1,0 +1,29 @@
+# Dependabot: a pull request when a dependency the lockfile pins has an update, with the
+# bump already made and CI run against it. The daily Advisories workflow
+# (.github/workflows/advisories.yml) is the detector; this is the half that does the work
+# when a fixed release exists. Security-advisory PRs also need "Dependabot security updates"
+# enabled in the repository's settings (Settings -> Advanced Security); this file governs
+# the scheduled version updates and the grouping both kinds use.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    # The lockfile is committed, so a routine update is a Cargo.lock change; patch and minor
+    # bumps arrive as one PR a week, a major bump (a real API change) as its own.
+    groups:
+      cargo-patch-and-minor:
+        update-types: ["minor", "patch"]
+    # The Zakura Common forks (the Zcash stack) move in lockstep across the whole family and
+    # the wallet layer pins release candidates; scripts/verify-zakura-graph.sh in CI enforces
+    # the shape. They are bumped by hand, as one change, never one crate at a time.
+    ignore:
+      - dependency-name: "zakura-*"
+    commit-message:
+      prefix: "deps"
+    labels: ["dependencies"]

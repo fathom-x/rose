@@ -240,13 +240,17 @@ bdk_kyoto = { version = "0.17", optional = true }
 # in a scratch container as on a developer box.
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "webpki-tokio"], optional = true }
 # WebSocket client for the BDK engine's opt-in kyoto mempool feed (`src/btc/mempool_feed.rs`,
-# the mempool.space `track-mempool` stream). `rustls-tls-webpki-roots` rides the same rustls
-# 0.23 + tokio-rustls + compiled-in Mozilla roots the rest of the tree already carries; the
-# crate enables no rustls crypto-provider feature of its own, so `ring` stays the only one
-# (see the `tls-ring` note above). `handshake` is what the offline tests' in-process fake
+# the mempool.space `track-mempool` stream). `rustls-tls-native-roots` rides the same rustls
+# 0.23 + tokio-rustls stack the rest of the tree already carries and trusts the host store
+# (and SSL_CERT_FILE), as tonic's `tls-native-roots` does; the images carry a CA bundle for
+# it. It was `rustls-tls-webpki-roots` until 2026-10: that feature pins the retired
+# `webpki-roots 0.26` line, a shim over 1.x that RUSTSEC-2026-0381 names and that has no fixed
+# release, so cargo deny failed on it however current the real root set was. The crate enables
+# no rustls crypto-provider feature of its own, so `ring` stays the only one (see the
+# `tls-ring` note above). `handshake` is what the offline tests' in-process fake
 # feed server needs (`accept_async`). 0.28 is the last line on `sha1 0.10`; 0.29+ wants
 # `digest 0.11`, which the pinned librustzcash pre-release `bip32` cannot share.
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"], optional = true }
 
 # Optional drop-in allocator, enabled by both musl release images (`Dockerfile` and
 # `Dockerfile.arm64`). musl's default `malloc-ng` contends under Orchard proving's multi-threaded

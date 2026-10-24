@@ -2035,6 +2035,18 @@ def s_errors_bitcoin(ctx):
         ck("sendrawtransaction undecodable raises", False)
     except JSONRPCException as e:
         ck("sendrawtransaction undecodable -> code -22", e.code == -22, e.code)
+    # maxfeerate (BTC/kvB) is parsed as Core's ParseFeeRate, before the hex is decoded: a
+    # negative or non-numeric rate is AmountFromValue's -3, and 1 BTC/kvB or more is -8.
+    for label, rate, code in (
+        ("negative", -0.1, -3),
+        ("non-numeric", "lots", -3),
+        ("at 1 BTC/kvB", 1, -8),
+    ):
+        try:
+            rpc.call("sendrawtransaction", "00ff", rate)
+            ck(f"sendrawtransaction {label} maxfeerate raises", False)
+        except JSONRPCException as e:
+            ck(f"sendrawtransaction {label} maxfeerate -> code {code}", e.code == code, e.code)
     # fee_split, rose's extension over subtractfeefrom: position 12 on sendtoaddress (after the
     # Zcash engine's memo at 11), 10 on sendmany. Each case is refused while parsing.
     for label, call, code in (

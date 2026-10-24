@@ -451,10 +451,27 @@ impl BitcoindRpc {
     /// back classified as [`BroadcastError`]: an application rejection (mempool policy,
     /// missing inputs) with bitcoind's own code and message, a transport failure as the
     /// retry-shaped variant.
-    pub fn broadcast_blocking(&self, tx: &Transaction) -> Result<Txid, BroadcastError> {
-        self.client
-            .send_raw_transaction(tx)
-            .map_err(classify_broadcast_error)
+    ///
+    /// `max_fee_rate_sat_per_kvb` is passed on as the node's own `maxfeerate` (BTC/kvB on the
+    /// wire, `0` disabling its check), so a caller's `sendrawtransaction` limit reaches the
+    /// node even for a transaction whose fee the wallet cannot compute. `None` leaves the
+    /// node's default (0.10 BTC/kvB), which is what the wallet's own sends rely on.
+    pub fn broadcast_blocking(
+        &self,
+        tx: &Transaction,
+        max_fee_rate_sat_per_kvb: Option<u64>,
+    ) -> Result<Txid, BroadcastError> {
+        match max_fee_rate_sat_per_kvb {
+            None => self.client.send_raw_transaction(tx),
+            Some(rate) => self.client.call(
+                "sendrawtransaction",
+                &[
+                    bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx).into(),
+                    crate::amount::zats_to_value(rate),
+                ],
+            ),
+        }
+        .map_err(classify_broadcast_error)
     }
 
     /// The block hash at `height`, for `init`'s birthday anchor (the resolved

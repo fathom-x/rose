@@ -758,12 +758,158 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         .expect_err("rebroadcast of a confirmed tx must be rejected");
     assert_eq!(code, -27, "node's own rejection code passes through: {msg}");
 
+    raw_broadcast_fee_guard(&node, &rose, &address, 110).await;
+
     // ---- conformance.py, Bitcoin mode, against the live funded wallet ----
     // The same python-bitcoinrpc-style client the Zcash suites run: Decimal amounts, Core
     // error codes, arity, batching, over every method the engine serves. Its send checks
     // all reject at argument parsing, so it moves no funds; the sends above are the live
     // coverage of the send path.
     run_conformance(rose.rpc_port);
+}
+
+/// The `sendrawtransaction` fee guard, live. Three node-built transactions, each
+/// spending one node output to a single 0.0001 BTC output with the change forgotten, so
+/// all the rest is fee - the mistake Core's `maxfeerate` exists to catch:
+///
+/// 1. Spending the node's change from a payment to this wallet: the wallet holds that
+///    transaction, so it knows the input's value and refuses the broadcast itself (`-25`,
+///    Core's message), on every backend. Nothing reaches the node's mempool.
+/// 2. Spending a node output the wallet has never seen: the fee is not computable here.
+///    Over bitcoind the wallet passes the caller's `maxfeerate`
+///    through and the node refuses it with its own `-25`.
+/// 3. The same transaction with `maxfeerate = 0`: the caller disabled the check, and it is
+///    relayed and accepted.
+async fn raw_broadcast_fee_guard(node: &BitcoinD, rose: &RoseBtc, address: &str, height: u64) {
+    let fund_txid = node
+        .call("sendtoaddress", json!([address, 0.001]))
+        .await
+        .expect("fund for the fee-guard phase");
+    node.mine(1).await;
+    rose.wait_height(height + 1).await;
+    let funding = node
+        .call("gettransaction", json!([fund_txid, false, true]))
+        .await
+        .expect("gettransaction (decoded)");
+    let change = funding["decoded"]["vout"]
+        .as_array()
+        .expect("vout")
+        .iter()
+        .find(|out| out["scriptPubKey"]["address"].as_str() != Some(address))
+        .expect("the funding transaction has a change output");
+    let to = node
+        .call("getnewaddress", json!([]))
+        .await
+        .expect("node address");
+    let to = to.as_str().unwrap();
+
+    // 1. Known input: refused by the wallet before anything is recorded or relayed.
+    let (hex, txid) = forgotten_change_tx(
+        node,
+        fund_txid.as_str().unwrap(),
+        change["n"].as_u64().unwrap(),
+        to,
+    )
+    .await;
+    let (code, msg) = rose
+        .call("sendrawtransaction", json!([hex]))
+        .await
+        .expect_err("a forgotten-change transaction is over the default maxfeerate");
+    assert_eq!(code, -25, "{msg}");
+    assert!(
+        msg.contains("Fee exceeds maximum configured by user"),
+        "the wallet's own refusal, with Core's message: {msg}"
+    );
+    let mempool = node
+        .call("getrawmempool", json!([]))
+        .await
+        .expect("mempool");
+    assert!(
+        !mempool
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == txid.as_str()),
+        "nothing was relayed: {mempool}"
+    );
+
+    // 2. Unknown input: a node output from a transaction the wallet does not hold.
+    let unspent = node
+        .call("listunspent", json!([]))
+        .await
+        .expect("node listunspent");
+    let mut foreign = None;
+    for utxo in unspent.as_array().unwrap() {
+        let utxo_txid = utxo["txid"].as_str().unwrap();
+        if rose
+            .call("gettransaction", json!([utxo_txid]))
+            .await
+            .is_err()
+        {
+            foreign = Some((utxo_txid.to_string(), utxo["vout"].as_u64().unwrap()));
+            break;
+        }
+    }
+    let (foreign_txid, foreign_vout) = foreign.expect("a node output the wallet never saw");
+    let (hex, txid) = forgotten_change_tx(node, &foreign_txid, foreign_vout, to).await;
+    let (code, msg) = rose
+        .call("sendrawtransaction", json!([hex]))
+        .await
+        .expect_err("an unpriceable over-limit transaction is refused");
+    assert_eq!(code, -25, "{msg}");
+    assert!(msg.contains("maxfeerate"), "{msg}");
+
+    // 3. maxfeerate = 0 disables the check: relayed, and in the node's mempool.
+    let relayed = rose
+        .call("sendrawtransaction", json!([hex, 0]))
+        .await
+        .expect("maxfeerate = 0 broadcasts unchecked");
+    assert_eq!(relayed.as_str(), Some(txid.as_str()));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mempool = node
+            .call("getrawmempool", json!([]))
+            .await
+            .expect("mempool");
+        if mempool
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == txid.as_str())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{txid} never reached the node's mempool"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A node-wallet transaction spending `txid:vout` to one 0.0001 BTC output and nothing
+/// else - its change forgotten. Returns its hex and txid.
+async fn forgotten_change_tx(node: &BitcoinD, txid: &str, vout: u64, to: &str) -> (String, String) {
+    let mut outputs = serde_json::Map::new();
+    outputs.insert(to.to_string(), json!(0.0001));
+    let raw = node
+        .call(
+            "createrawtransaction",
+            json!([[{"txid": txid, "vout": vout}], [outputs]]),
+        )
+        .await
+        .expect("createrawtransaction");
+    let signed = node
+        .call("signrawtransactionwithwallet", json!([raw]))
+        .await
+        .expect("signrawtransactionwithwallet");
+    assert_eq!(signed["complete"], json!(true), "{signed}");
+    let hex = signed["hex"].as_str().unwrap().to_string();
+    let decoded = node
+        .call("decoderawtransaction", json!([hex]))
+        .await
+        .expect("decoderawtransaction");
+    (hex, decoded["txid"].as_str().unwrap().to_string())
 }
 
 /// Run `scripts/conformance.py --coin bitcoin` against the regtest daemon, exactly as

@@ -75,8 +75,8 @@ blocks already passed may hold more payments the set could not match: that is wh
 a restore discover until the gap. A reveal by `getnewaddress`, or a change address a send
 takes, and a payment to an address so handed out, get half a lookahead of slack: held exactly to the
 window, a wallet handing out an address per deposit rebuilt the client, and its whole
-script set, on nearly every block (5 s per block at a lookahead of 50,000 for the
-rebuild alone), so the client is rebuilt only once reveals alone have carried the window
+script set, on nearly every block (5 s per block at a lookahead of 50,000 for the rebuild
+alone), so the client is rebuilt only once reveals alone have carried the window
 more than `lookahead / 2` past the set. Every address the wallet handed out stays within
 the set meanwhile, since the set reaches `lookahead - 1` past the index revealed when the
 connection was built, and a handed-out address past the set rebuilds at once regardless;
@@ -527,6 +527,27 @@ transaction whose inputs the wallet still counts as free. Every withdrawal stamp
 eviction no earlier than the sighting it withdraws (`seen_at.max(now)`), because
 `SystemTime` can step backwards between the two reads.
 
+**The fee is checked before any of that**. Core refuses a raw transaction whose
+fee rate exceeds `maxfeerate` (default 0.10 BTC/kvB, `0` disabling the check), which is
+what catches a hand-built transaction that forgot its change output. Rose used to ignore the
+argument, which over bitcoind left the node's own default as the only check and over kyoto
+left none at all. Now `check_raw_tx_fee` runs before the record or the relay, so a refused
+transaction locks no inputs:
+
+- The wallet computes the fee whenever it holds every input's funding output (its own
+  transactions and the parents it was shown) and refuses over `maxfeerate` with Core's `-25`
+  and message. Inputs worth less than the outputs are Core's `-26` `bad-txns-in-belowout`.
+- A transaction spending the wallet's own outputs is also held to `[fees] max_tx_fee_sat`,
+  the cap every send and `bumpfee` meets. `maxfeerate = 0` does not waive it: that argument
+  is the caller's, the cap is the operator's.
+- An input the wallet never saw makes the fee uncomputable. Over bitcoind the node applies
+  the caller's `maxfeerate`, which every raw broadcast now passes through rather than
+  leaving the node's default. Over kyoto nothing downstream checks, so the broadcast is
+  refused unless the caller passes `maxfeerate = 0`.
+- The rebroadcast pass resubmits with `maxfeerate = 0`: every candidate was priced when it was
+  first committed, and the node's default would otherwise refuse, at every tip, a raw
+  broadcast its caller accepted unchecked.
+
 Live coverage is `regtest_btc_send_outcomes.rs` (the `btc-e2e` job), over the bitcoind
 backend: a send the node refuses (`-minrelaytxfee` above the send's rate) leaves balance,
 UTXO set and history untouched; a send whose broadcast dies without a verdict (the
@@ -534,7 +555,11 @@ harness's `RpcProxy` drops exactly the `sendrawtransaction` request, so the sync
 the redial keep working) returns its txid recorded, locks its input against a retry, and is
 resubmitted by the rebroadcast pass once the path clears; and an abandoned unrelayed send
 resubmitted through `sendrawtransaction` is recorded again even while the path is down
-(answering `-25`), and relayed once it clears.
+(answering `-25`), and relayed once it clears. The fee check runs at the end of
+`regtest_btc.rs` and `regtest_btc_kyoto.rs` (`raw_broadcast_fee_guard`), on node-built
+transactions that forget their change: one whose input the wallet knows is refused by the
+wallet on both backends, one whose input it never saw is refused by the node over bitcoind
+and by the wallet over kyoto, and the same one with `maxfeerate = 0` is relayed on both.
 
 ## Send pricing and fee subtraction (Core's optional send parameters)
 

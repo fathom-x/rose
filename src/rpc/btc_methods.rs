@@ -1059,8 +1059,32 @@ async fn sendmany(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, R
 
 async fn sendrawtransaction(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
     let hex = req.require_str(0, "sendrawtransaction requires a hex string")?;
-    let txid = handle.broadcast(hex.to_string()).await?;
+    let max_fee_rate = parse_max_fee_rate(req.param(1))?;
+    let txid = handle.broadcast(hex.to_string(), max_fee_rate).await?;
     Ok(Value::String(txid))
+}
+
+/// Bitcoin Core's `DEFAULT_MAX_RAW_TX_FEE_RATE` (0.10 BTC/kvB), in sat/kvB: the
+/// `sendrawtransaction` fee-rate cap when the caller names none.
+const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
+
+/// Parse `sendrawtransaction`'s `maxfeerate` (BTC/kvB) into sat/kvB, Core's `ParseFeeRate`:
+/// omitted or `null` is the 0.10 BTC/kvB default, `0` disables the check, and the amount
+/// errors are `AmountFromValue`'s (`-3` for a non-number, a malformed literal or a negative
+/// value). A rate at or above 1 BTC/kvB is Core's `-8`: it would not bound anything.
+fn parse_max_fee_rate(v: Option<&Value>) -> Result<u64, RpcError> {
+    match v {
+        None | Some(Value::Null) => Ok(DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB),
+        Some(v) => {
+            let sat_per_kvb = value_to_zats(v)?;
+            if sat_per_kvb >= crate::amount::COIN {
+                return Err(RpcError::invalid_parameter(
+                    "Fee rates larger than or equal to 1BTC/kvB are not accepted",
+                ));
+            }
+            Ok(sat_per_kvb)
+        }
+    }
 }
 
 /// `abandontransaction "txid"` - Core's shape and codes: `null` on success; a malformed txid
@@ -1258,6 +1282,32 @@ mod tests {
         let served: std::collections::BTreeSet<&str> =
             super::BITCOIN_METHODS.iter().copied().collect();
         assert_eq!(gated, served, "METHOD_COINS vs btc_methods::dispatch drift");
+    }
+
+    /// `sendrawtransaction`'s `maxfeerate` parses as Core's `ParseFeeRate`: BTC/kvB to
+    /// sat/kvB, Core's 0.10 default when omitted or null, `0` kept (it disables the check),
+    /// `AmountFromValue`'s `-3`s, and `-8` at or above 1 BTC/kvB.
+    #[test]
+    fn maxfeerate_parses_like_core() {
+        use crate::error::codes;
+        use serde_json::json;
+        let parse = |v: serde_json::Value| super::parse_max_fee_rate(Some(&v));
+        assert_eq!(super::parse_max_fee_rate(None).unwrap(), 10_000_000);
+        assert_eq!(parse(json!(null)).unwrap(), 10_000_000);
+        assert_eq!(parse(json!(0)).unwrap(), 0);
+        assert_eq!(parse(json!(0.01)).unwrap(), 1_000_000);
+        assert_eq!(parse(json!("0.00001")).unwrap(), 1_000);
+        assert_eq!(parse(json!(0.99999999)).unwrap(), 99_999_999);
+        for bad in [json!(-0.1), json!("abc"), json!(true), json!(0.000000001)] {
+            assert_eq!(
+                parse(bad.clone()).unwrap_err().code,
+                codes::RPC_TYPE_ERROR,
+                "{bad}"
+            );
+        }
+        let err = parse(json!(1)).unwrap_err();
+        assert_eq!(err.code, codes::RPC_INVALID_PARAMETER);
+        assert!(err.message.contains("1BTC/kvB"), "{}", err.message);
     }
 
     /// The whole dispatch path against a live Bitcoin wallet actor: the slice methods answer

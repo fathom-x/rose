@@ -361,6 +361,8 @@ enum BtcCommand {
     },
     Broadcast {
         hex: String,
+        /// `maxfeerate` in sat/kvB; `0` disables the check.
+        max_fee_rate_sat_per_kvb: u64,
         reply: oneshot::Sender<Result<String, RpcError>>,
     },
     AbandonTransaction {
@@ -577,9 +579,19 @@ impl BtcWalletHandle {
     }
 
     /// Broadcast a caller-built raw transaction (`sendrawtransaction`). Returns the txid.
-    pub async fn broadcast(&self, hex: String) -> Result<String, RpcError> {
-        self.dispatch(|reply| BtcCommand::Broadcast { hex, reply })
-            .await
+    /// `max_fee_rate_sat_per_kvb` is Core's `maxfeerate` in sat/kvB, `0` disabling the check
+    /// (see `check_raw_tx_fee`).
+    pub async fn broadcast(
+        &self,
+        hex: String,
+        max_fee_rate_sat_per_kvb: u64,
+    ) -> Result<String, RpcError> {
+        self.dispatch(|reply| BtcCommand::Broadcast {
+            hex,
+            max_fee_rate_sat_per_kvb,
+            reply,
+        })
+        .await
     }
 
     /// Mark an unconfirmed wallet transaction (and its unconfirmed descendants) abandoned
@@ -1228,8 +1240,8 @@ fn unix_now() -> u64 {
 /// seconds at 10,000, and the wallet's chain is dense (every applied block is a
 /// checkpoint). `getbalance` took two or three such passes per call and `listunspent` one
 /// per output on top (`get_tx` for the coinbase flag) - 157 s at 10,000 outputs on the
-/// enclave's two hyperthreads, on the actor, holding the sync loop and every send. This
-/// view is built lazily on the first read after a change
+/// enclave's two hyperthreads, on the actor, holding the sync loop and every send.
+/// This view is built lazily on the first read after a change
 /// ([`BtcActor::read_view`]) and dropped at every site that changes the wallet
 /// ([`BtcActor::wallet_changed`]), so a wallet that receives a block every ten minutes
 /// pays the pass once per block however often it is polled, and a send prices its inputs
@@ -2787,7 +2799,13 @@ impl BtcActor {
             let RebroadcastCandidate { tx, txid, parents } = candidate;
             match self.conn.as_ref() {
                 Some(Conn::Bitcoind { rpc, .. }) => {
-                    let outcome = tokio::task::block_in_place(|| rpc.broadcast_blocking(&tx));
+                    // No fee-rate cap on a resubmission: every candidate was priced when it
+                    // was first committed or relayed (an own send under the send path's
+                    // checks, a raw broadcast under its caller's `maxfeerate`), and the
+                    // node's default cap would otherwise refuse - at every tip, forever - a
+                    // raw broadcast its caller accepted with `maxfeerate = 0`.
+                    let outcome =
+                        tokio::task::block_in_place(|| rpc.broadcast_blocking(&tx, Some(0)));
                     match outcome {
                         Ok(_) => {
                             self.rebroadcast_rejections.remove(&txid);
@@ -3170,8 +3188,12 @@ impl BtcActor {
                 let result = self.do_send(recipients, options).await;
                 let _ = reply.send(result);
             }
-            BtcCommand::Broadcast { hex, reply } => {
-                let result = self.do_broadcast(hex).await;
+            BtcCommand::Broadcast {
+                hex,
+                max_fee_rate_sat_per_kvb,
+                reply,
+            } => {
+                let result = self.do_broadcast(hex, max_fee_rate_sat_per_kvb).await;
                 let _ = reply.send(result);
             }
             BtcCommand::AbandonTransaction { txid, reply } => {
@@ -3471,11 +3493,21 @@ impl BtcActor {
     /// this call failing only ever means "no verdict" (see [`crate::btc::kyoto::announce`]).
     /// A kyoto announcement no peer answers within the timeout is not a failure but
     /// [`Relay::Queued`]: the light client holds the transaction and relays it later.
-    async fn upstream_broadcast(&mut self, tx: &Transaction) -> Result<Relay, BroadcastError> {
+    ///
+    /// `max_fee_rate_sat_per_kvb` is bitcoind's `maxfeerate` for this submission (`None`:
+    /// the node's default); kyoto has no node to apply one, which is why `do_broadcast`
+    /// checks the fee itself before it gets here.
+    async fn upstream_broadcast(
+        &mut self,
+        tx: &Transaction,
+        max_fee_rate_sat_per_kvb: Option<u64>,
+    ) -> Result<Relay, BroadcastError> {
         let requester = match self.conn.as_ref() {
             Some(Conn::Bitcoind { rpc, .. }) => {
-                return tokio::task::block_in_place(|| rpc.broadcast_blocking(tx))
-                    .map(|_| Relay::Relayed);
+                return tokio::task::block_in_place(|| {
+                    rpc.broadcast_blocking(tx, max_fee_rate_sat_per_kvb)
+                })
+                .map(|_| Relay::Relayed);
             }
             Some(Conn::Kyoto(kyoto)) => kyoto.requester(),
             None => {
@@ -3627,9 +3659,10 @@ impl BtcActor {
         tx: &Transaction,
         seen_at: u64,
         what: &str,
+        max_fee_rate_sat_per_kvb: Option<u64>,
     ) -> Result<(Txid, RelayOutcome), RpcError> {
         let txid = tx.compute_txid();
-        match self.upstream_broadcast(tx).await {
+        match self.upstream_broadcast(tx, max_fee_rate_sat_per_kvb).await {
             Ok(Relay::Relayed) => Ok((txid, RelayOutcome::Relayed)),
             Ok(Relay::Queued) => {
                 self.note_queued(txid);
@@ -3695,9 +3728,14 @@ impl BtcActor {
     /// transaction, or one already in the wallet (a resubmission), where the record is not
     /// this relay's to settle. The outcome is reported as is - a queued kyoto announcement
     /// comes back as [`Relay::Queued`] for the caller to answer - and a failure goes
-    /// through [`Self::broadcast_failure`].
-    async fn relay_uncommitted(&mut self, tx: &Transaction) -> Result<Relay, RpcError> {
-        match self.upstream_broadcast(tx).await {
+    /// through [`Self::broadcast_failure`]. `max_fee_rate_sat_per_kvb` as on
+    /// [`Self::upstream_broadcast`].
+    async fn relay_uncommitted(
+        &mut self,
+        tx: &Transaction,
+        max_fee_rate_sat_per_kvb: Option<u64>,
+    ) -> Result<Relay, RpcError> {
+        match self.upstream_broadcast(tx, max_fee_rate_sat_per_kvb).await {
             Ok(relay) => Ok(relay),
             Err(e) => Err(self.broadcast_failure(e)),
         }
@@ -3826,7 +3864,7 @@ impl BtcActor {
                 ))
             }
         };
-        let (txid, outcome) = self.relay_committed(&tx, seen_at, "send").await?;
+        let (txid, outcome) = self.relay_committed(&tx, seen_at, "send", None).await?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if ancestor_fee > 0 {
             info!(
@@ -4004,7 +4042,15 @@ impl BtcActor {
         ))
     }
 
-    async fn do_broadcast(&mut self, hex: String) -> Result<String, RpcError> {
+    /// `sendrawtransaction`. The fee is checked first - [`check_raw_tx_fee`] over
+    /// [`Self::raw_tx_pricing`], against the caller's `maxfeerate` and, for a transaction
+    /// spending the wallet's own outputs, `[fees] max_tx_fee_sat` - so a refused
+    /// transaction is neither recorded nor relayed and locks no inputs.
+    async fn do_broadcast(
+        &mut self,
+        hex: String,
+        max_fee_rate_sat_per_kvb: u64,
+    ) -> Result<String, RpcError> {
         if self.conn.is_none() {
             return Err(RpcError::new(
                 codes::RPC_WALLET_ERROR,
@@ -4019,6 +4065,17 @@ impl BtcActor {
                 )
             })?;
         let txid = tx.compute_txid();
+        // Over bitcoind a fee the wallet cannot compute is still checked, by the node, at
+        // the caller's own `maxfeerate` (passed through on every relay below); over kyoto
+        // nothing downstream checks anything.
+        let node_checks = matches!(self.conn, Some(Conn::Bitcoind { .. }));
+        check_raw_tx_fee(
+            &self.raw_tx_pricing(&tx),
+            max_fee_rate_sat_per_kvb,
+            self.fees.max_tx_fee_sat,
+            node_checks,
+        )?;
+        let max_fee_rate = Some(max_fee_rate_sat_per_kvb);
         let tx = Arc::new(tx);
         // A transaction the wallet holds **canonical** - a resubmission of an own send, or
         // of a payment it received - has nothing to commit: relay it and report the
@@ -4035,7 +4092,7 @@ impl BtcActor {
         // naming what the wallet did with it. (A send returns its txid in those cases,
         // because there the record is the product; here the relay is.)
         if self.wallet.get_tx(txid).is_some() {
-            return match self.relay_uncommitted(&tx).await? {
+            return match self.relay_uncommitted(&tx, max_fee_rate).await? {
                 Relay::Relayed => Ok(txid.to_string()),
                 Relay::Queued => Err(not_relayed(
                     txid,
@@ -4050,7 +4107,10 @@ impl BtcActor {
         // verbatim.
         match self.commit_before_relay(&tx, "broadcast", 0)? {
             Commit::Recorded { seen_at } => {
-                match self.relay_committed(&tx, seen_at, "broadcast").await? {
+                match self
+                    .relay_committed(&tx, seen_at, "broadcast", max_fee_rate)
+                    .await?
+                {
                     (txid, RelayOutcome::Relayed) => Ok(txid.to_string()),
                     (txid, RelayOutcome::Queued | RelayOutcome::Unrelayed) => Err(not_relayed(
                         txid,
@@ -4059,7 +4119,7 @@ impl BtcActor {
                     )),
                 }
             }
-            Commit::NotOurs => match self.relay_uncommitted(&tx).await? {
+            Commit::NotOurs => match self.relay_uncommitted(&tx, max_fee_rate).await? {
                 Relay::Relayed => Ok(txid.to_string()),
                 Relay::Queued => {
                     // Nothing records a foreign transaction, so nothing would ever retry it
@@ -4075,6 +4135,38 @@ impl BtcActor {
                     ))
                 }
             },
+        }
+    }
+
+    /// What the wallet can see of `tx`'s fee: the value of every input whose funding output
+    /// it holds (any transaction in its graph - its own, and the parents it was shown),
+    /// whether any of them is its own, the outputs' total and the virtual size. Over
+    /// bitcoind and kyoto alike the graph is the only source: the wallet keeps no UTXO set.
+    fn raw_tx_pricing(&self, tx: &Transaction) -> RawTxPricing {
+        let graph = self.wallet.tx_graph();
+        let mut spends_wallet_output = false;
+        let input_values = tx
+            .input
+            .iter()
+            .map(|input| {
+                graph.get_txout(input.previous_output).map(|txout| {
+                    spends_wallet_output |= self.wallet.is_mine(txout.script_pubkey.clone());
+                    txout.value.to_sat()
+                })
+            })
+            .collect();
+        let output_sat = tx
+            .output
+            .iter()
+            .try_fold(0u64, |total, output| {
+                total.checked_add(output.value.to_sat())
+            })
+            .unwrap_or(u64::MAX);
+        RawTxPricing {
+            input_values,
+            output_sat,
+            vsize: tx.vsize() as u64,
+            spends_wallet_output,
         }
     }
 
@@ -4250,7 +4342,7 @@ impl BtcActor {
                 ))
             }
         };
-        let (new_txid, outcome) = self.relay_committed(&tx, seen_at, "fee bump").await?;
+        let (new_txid, outcome) = self.relay_committed(&tx, seen_at, "fee bump", None).await?;
         info!(
             target: "rose::audit",
             original = %txid,
@@ -4874,6 +4966,104 @@ fn check_max_tx_fee(fee_sat: u64, max_sat: u64) -> Result<(), RpcError> {
                 crate::amount::zats_to_value(max_sat),
             ),
         ));
+    }
+    Ok(())
+}
+
+/// A raw transaction's fee as far as the wallet can see it ([`BtcActor::raw_tx_pricing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawTxPricing {
+    /// Each input's value in satoshis, `None` where the wallet does not hold the output it
+    /// spends.
+    input_values: Vec<Option<u64>>,
+    /// The outputs' total in satoshis (saturating: an overflow cannot be a valid total).
+    output_sat: u64,
+    vsize: u64,
+    /// Whether any input spends one of the wallet's own outputs.
+    spends_wallet_output: bool,
+}
+
+/// Bitcoin Core's refusal for a raw transaction over its fee limit (`-25`,
+/// `TransactionError::MAX_FEE_EXCEEDED`'s message), with the numbers appended.
+fn raw_fee_exceeded(detail: String) -> RpcError {
+    RpcError::new(
+        RPC_VERIFY_ERROR,
+        format!("Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate): {detail}"),
+    )
+}
+
+/// `sendrawtransaction`'s fee check, before anything is recorded or relayed. Bitcoin Core
+/// refuses a raw transaction whose fee rate exceeds `maxfeerate` (sat/kvB here, `0`
+/// disabling the check), which is what catches a hand-built transaction that forgot its
+/// change output. Three rules, in order:
+///
+///  * **Unknown inputs.** With an input the wallet holds no funding output for, the fee
+///    cannot be computed. Over bitcoind (`node_checks`) that is fine: the node applies the
+///    same `maxfeerate`, passed through. Over kyoto nothing would, so the transaction is
+///    refused unless the caller disabled the check with `maxfeerate = 0`.
+///  * **`maxfeerate`.** The fee against the rate over the transaction's virtual size,
+///    rounded up as Core's `CFeeRate::GetFee` does. Inputs worth less than the outputs are
+///    Core's `-26` `bad-txns-in-belowout` - an invalid transaction, refused here rather than
+///    recorded.
+///  * **`[fees] max_tx_fee_sat`.** A transaction that spends the wallet's own outputs pays
+///    its fee from the wallet, so it is also held to the operator's absolute cap - the same
+///    cap every send and `bumpfee` meets. Deliberately **not** waived by `maxfeerate = 0`:
+///    that argument is the caller's, the cap is the operator's.
+fn check_raw_tx_fee(
+    pricing: &RawTxPricing,
+    max_fee_rate_sat_per_kvb: u64,
+    max_tx_fee_sat: u64,
+    node_checks: bool,
+) -> Result<(), RpcError> {
+    let known: Option<Vec<u64>> = pricing.input_values.iter().copied().collect();
+    let Some(known) = known else {
+        if max_fee_rate_sat_per_kvb == 0 || node_checks {
+            return Ok(());
+        }
+        let unknown = pricing.input_values.iter().filter(|v| v.is_none()).count();
+        return Err(RpcError::new(
+            RPC_VERIFY_ERROR,
+            format!(
+                "cannot check the fee against maxfeerate: the wallet does not hold the outputs                  {unknown} of the transaction's {} inputs spend, and a light client has no UTXO                  set to look them up in; pass maxfeerate = 0 to broadcast it unchecked",
+                pricing.input_values.len()
+            ),
+        ));
+    };
+    let input_sat = known
+        .iter()
+        .try_fold(0u64, |total, value| total.checked_add(*value))
+        .unwrap_or(u64::MAX);
+    let Some(fee) = input_sat.checked_sub(pricing.output_sat) else {
+        return Err(RpcError::new(
+            codes::RPC_VERIFY_REJECTED,
+            format!(
+                "bad-txns-in-belowout, value in ({}) < value out ({})",
+                crate::amount::zats_to_value(input_sat),
+                crate::amount::zats_to_value(pricing.output_sat)
+            ),
+        ));
+    };
+    if max_fee_rate_sat_per_kvb > 0 {
+        let max_fee =
+            (u128::from(max_fee_rate_sat_per_kvb) * u128::from(pricing.vsize)).div_ceil(1_000);
+        if u128::from(fee) > max_fee {
+            return Err(raw_fee_exceeded(format!(
+                "the transaction pays {} BTC over {} vB, above maxfeerate {} BTC/kvB (at most \
+                 {} BTC); nothing was broadcast",
+                crate::amount::zats_to_value(fee),
+                pricing.vsize,
+                crate::amount::zats_to_value(max_fee_rate_sat_per_kvb),
+                crate::amount::zats_to_value(u64::try_from(max_fee).unwrap_or(u64::MAX)),
+            )));
+        }
+    }
+    if pricing.spends_wallet_output && fee > max_tx_fee_sat {
+        return Err(raw_fee_exceeded(format!(
+            "the transaction spends this wallet's outputs and pays {} BTC, above [fees] \
+             max_tx_fee_sat = {} BTC; nothing was broadcast",
+            crate::amount::zats_to_value(fee),
+            crate::amount::zats_to_value(max_tx_fee_sat),
+        )));
     }
     Ok(())
 }
@@ -5517,6 +5707,106 @@ mod tests {
         assert!(err.message.contains("0.10000001"), "{}", err.message);
     }
 
+    /// `sendrawtransaction`'s fee check: `maxfeerate` bounds a computable fee, rounded
+    /// up as Core's `GetFee` does and inclusive at the limit; `0` disables it; an input-poor
+    /// transaction is Core's `-26`; and the operator's `max_tx_fee_sat` binds a transaction
+    /// spending wallet outputs even with `maxfeerate = 0`, but not a foreign one.
+    #[test]
+    fn a_raw_broadcast_is_held_to_maxfeerate_and_the_wallet_cap() {
+        const DEFAULT_RATE: u64 = 10_000_000; // 0.10 BTC/kvB
+        const CAP: u64 = 10_000_000; // 0.1 BTC
+        let pricing = |inputs: &[Option<u64>], output_sat: u64, own: bool| RawTxPricing {
+            input_values: inputs.to_vec(),
+            output_sat,
+            vsize: 110,
+            spends_wallet_output: own,
+        };
+
+        // A one-input send that pays 1000 sat over 110 vB: far under the default rate.
+        assert!(check_raw_tx_fee(
+            &pricing(&[Some(101_000)], 100_000, true),
+            DEFAULT_RATE,
+            CAP,
+            false
+        )
+        .is_ok());
+
+        // The forgotten change output: a 1 BTC input paying 0.01 BTC. 0.99 BTC of fee is
+        // ~900k sat/vB, over the default rate - refused on kyoto and bitcoind alike, since
+        // the fee is computable either way.
+        let no_change = pricing(&[Some(100_000_000)], 1_000_000, true);
+        for node_checks in [false, true] {
+            let err = check_raw_tx_fee(&no_change, DEFAULT_RATE, CAP, node_checks).unwrap_err();
+            assert_eq!(err.code, RPC_VERIFY_ERROR);
+            assert!(
+                err.message
+                    .starts_with("Fee exceeds maximum configured by user"),
+                "{}",
+                err.message
+            );
+            assert!(err.message.contains("0.99000000"), "{}", err.message);
+        }
+
+        // At the limit passes, one satoshi over refuses. 110 vB at 0.10 BTC/kvB is exactly
+        // 1_100_000 sat; a rate whose product is fractional rounds the limit up.
+        let at_limit = pricing(&[Some(2_100_000)], 1_000_000, false);
+        assert!(check_raw_tx_fee(&at_limit, DEFAULT_RATE, CAP, false).is_ok());
+        let over = pricing(&[Some(2_100_001)], 1_000_000, false);
+        assert!(check_raw_tx_fee(&over, DEFAULT_RATE, CAP, false).is_err());
+        // 1 sat/kvB over 110 vB is 0.11 sat, so the limit is 1 sat: a 1-sat fee passes.
+        assert!(check_raw_tx_fee(&pricing(&[Some(1_001)], 1_000, false), 1, CAP, false).is_ok());
+
+        // maxfeerate = 0 disables the rate check: a foreign transaction with a huge fee goes.
+        let foreign_no_change = pricing(&[Some(100_000_000)], 1_000_000, false);
+        assert!(check_raw_tx_fee(&foreign_no_change, 0, CAP, false).is_ok());
+        // ...but not the operator's cap on the wallet's own coins (0.99 BTC > 0.1 BTC).
+        let err = check_raw_tx_fee(&no_change, 0, CAP, false).unwrap_err();
+        assert_eq!(err.code, RPC_VERIFY_ERROR);
+        assert!(err.message.contains("max_tx_fee_sat"), "{}", err.message);
+        // The cap is inclusive, like the send path's.
+        assert!(
+            check_raw_tx_fee(&pricing(&[Some(CAP + 1_000)], 1_000, true), 0, CAP, false).is_ok()
+        );
+
+        // Inputs worth less than the outputs: Core's -26, never a negative fee.
+        let err = check_raw_tx_fee(
+            &pricing(&[Some(1_000)], 2_000, true),
+            DEFAULT_RATE,
+            CAP,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_VERIFY_REJECTED);
+        assert!(
+            err.message.contains("bad-txns-in-belowout"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// An input the wallet holds no funding output for makes the fee uncomputable. Over
+    /// kyoto nothing downstream checks it, so the broadcast is refused unless the caller
+    /// passed `maxfeerate = 0`; over bitcoind the node applies the same `maxfeerate`.
+    #[test]
+    fn a_raw_broadcast_with_unknown_inputs_is_refused_only_where_nothing_else_checks() {
+        let pricing = RawTxPricing {
+            input_values: vec![Some(50_000), None],
+            output_sat: 40_000,
+            vsize: 180,
+            spends_wallet_output: true,
+        };
+        let err = check_raw_tx_fee(&pricing, 10_000_000, 10_000_000, false).unwrap_err();
+        assert_eq!(err.code, RPC_VERIFY_ERROR);
+        assert!(
+            err.message.contains("1 of the transaction's 2 inputs"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("maxfeerate = 0"), "{}", err.message);
+        assert!(check_raw_tx_fee(&pricing, 0, 10_000_000, false).is_ok());
+        assert!(check_raw_tx_fee(&pricing, 10_000_000, 10_000_000, true).is_ok());
+    }
+
     /// Core's default bump rate: the original's rate rounded up, plus 1 sat/kvB, plus the
     /// 5 sat/vB wallet increment - an estimate only ever raises it. And BIP 125 rule 4's
     /// floor is the old fee plus 1 sat/vB of the replacement's size, refused as Core's `-8`
@@ -5850,7 +6140,7 @@ mod tests {
         // Dialect-neutral since the engine grew a second backend: the wallet may be offline
         // from a bitcoind or from a kyoto light client, and the message names neither.
         assert!(err.message.contains("upstream"), "{}", err.message);
-        let err = handle.broadcast("00".repeat(20)).await.unwrap_err();
+        let err = handle.broadcast("00".repeat(20), 0).await.unwrap_err();
         assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
 
         // Recipients are validated before the upstream is needed, so a bad one answers the

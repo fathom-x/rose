@@ -27,7 +27,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 #[cfg(feature = "zcash")]
 use std::path::PathBuf;
-#[cfg(feature = "zcash")]
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "zcash")]
@@ -83,7 +82,7 @@ pub type FirstSeen = Arc<Mutex<HashMap<String, i64>>>;
 /// directly from the [`WalletHandle`] - bypassing the actor's serialized command queue - so the
 /// seed can be zeroized promptly even while the actor is blocked proving a long send. `Arc<Mutex>`
 /// mirrors [`FirstSeen`]; the guarded operations are trivial and never `.await` while held.
-#[cfg(feature = "zcash")]
+/// Both engines hold their seed this way (the Bitcoin actor's handle takes the same fast path).
 pub type SharedSeed = Arc<Mutex<keys::SeedKeeper>>;
 
 /// Connection state to lightwalletd, surfaced for monitoring (e.g. to distinguish "all
@@ -1058,7 +1057,7 @@ impl WalletHandle {
         if let Some(seed) = &self.seed {
             // Recover from a poisoned mutex (a panic while a guard was held): a locked-out seed
             // that can never be zeroized would be strictly worse than proceeding.
-            seed.lock().unwrap_or_else(|p| p.into_inner()).lock();
+            keys::seed_guard(seed).lock();
         }
         self.dispatch(|reply| WalletCommand::Lock { reply }).await
     }

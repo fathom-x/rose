@@ -65,13 +65,17 @@ pub struct WalletStore {
     /// diverting deposits to a foreign account. `None` only for a `keys.toml` written before
     /// this field existed; the daemon backfills it trust-on-first-use.
     pinned_ufvk: Option<String>,
-    /// A watch-only **Bitcoin** wallet's imported account key (`init --xpub`, pinned in the
-    /// `[fingerprint/84'/coin'/0']xpub` form `export-xpub` prints - a bare xpub import is
-    /// re-encoded with the assumed origin and fingerprint `00000000`). The Bitcoin analog of
-    /// the UFVK pin: it is the only key material such a wallet has, so it is what the
-    /// daemon verifies the BDK database's descriptors against at every start (a seed wallet
-    /// verifies against the seed instead and pins nothing here), and what a deleted
-    /// database is rebuilt from. `None` for every seed wallet and every Zcash wallet.
+    /// A **Bitcoin** wallet's BIP 84 account key, pinned in the
+    /// `[fingerprint/84'/coin'/0']xpub` form `export-xpub` prints (a bare `init --xpub`
+    /// import is re-encoded with the assumed origin and fingerprint `00000000`). The Bitcoin
+    /// analog of the UFVK pin, recorded by `init` for every Bitcoin wallet, seed-holding or
+    /// not: it is what the daemon verifies the BDK database's descriptors against when no
+    /// seed is in hand (a watch-only wallet, or a passphrase-encrypted one that is locked),
+    /// what every seed exposure is checked against, and what a deleted database is rebuilt
+    /// from. Whether a wallet is watch-only is [`WalletStore::has_seed`], not this field.
+    /// `None` for every Zcash wallet, and for a Bitcoin seed wallet's `keys.toml` written
+    /// before seed wallets carried the pin; the daemon backfills that one the first time it
+    /// holds the decrypted seed.
     pinned_xpub: Option<String>,
 }
 
@@ -94,8 +98,8 @@ struct StoreEncoding {
     /// pre-pin `keys.toml` round-trips unchanged until the daemon backfills it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ufvk: Option<String>,
-    /// See [`WalletStore::pinned_xpub`]. Skipped when absent, so every non-watch-only
-    /// `keys.toml` round-trips unchanged and an older build simply ignores it.
+    /// See [`WalletStore::pinned_xpub`]. Skipped when absent, so every Zcash `keys.toml`
+    /// round-trips unchanged and an older build simply ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     xpub: Option<String>,
 }
@@ -129,19 +133,19 @@ impl WalletStore {
         write_keys_atomic(keys_path, &encoding, true)
     }
 
-    /// [`WalletStore::init_with_mnemonic`] without a UFVK pin, for a wallet whose engine
-    /// keeps no key pin in this file - the Bitcoin engine verifies its database's descriptors
-    /// against the seed at every spawn instead (`crate::btc::actor::spawn`), so the binding
-    /// check lives where the derived keys do. The seed itself is coin-agnostic (`keys.toml`
-    /// deliberately does not name a coin: one seed serves every coin at once).
+    /// [`WalletStore::init_with_mnemonic`] for a **Bitcoin** seed wallet: the pin is the
+    /// account xpub rather than a UFVK (see [`WalletStore::pinned_xpub`]). The seed itself is
+    /// coin-agnostic (`keys.toml` deliberately does not name a coin: one seed serves every
+    /// coin at once).
     #[cfg(feature = "bitcoin")]
-    pub fn init_with_mnemonic_unpinned<'a>(
+    pub fn init_bitcoin_with_mnemonic<'a>(
         keys_path: &Path,
         recipients: impl Iterator<Item = &'a dyn age::Recipient>,
         mnemonic: &Mnemonic,
         birthday: u32,
         birthday_time: Option<u64>,
         network: ZNetwork,
+        xpub: &str,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
             mnemonic: Some(encrypt_mnemonic(recipients, mnemonic)?),
@@ -150,7 +154,7 @@ impl WalletStore {
             birthday_time,
             encryption: None,
             ufvk: None,
-            xpub: None,
+            xpub: Some(xpub.to_string()),
         };
         write_keys_atomic(keys_path, &encoding, true)
     }
@@ -181,17 +185,18 @@ impl WalletStore {
         write_keys_atomic(keys_path, &encoding, true)
     }
 
-    /// [`WalletStore::init_with_passphrase`] without a UFVK pin - see
-    /// [`WalletStore::init_with_mnemonic_unpinned`] for why the Bitcoin engine keeps no pin
-    /// here.
+    /// [`WalletStore::init_with_passphrase`] for a **Bitcoin** seed wallet, pinning the
+    /// account xpub (see [`WalletStore::pinned_xpub`]). The pin is what lets a locked wallet
+    /// verify its database at startup, and `rose rescan` rebuild it, without the seed.
     #[cfg(feature = "bitcoin")]
-    pub fn init_with_passphrase_unpinned(
+    pub fn init_bitcoin_with_passphrase(
         keys_path: &Path,
         passphrase: Passphrase,
         mnemonic: &Mnemonic,
         birthday: u32,
         birthday_time: Option<u64>,
         network: ZNetwork,
+        xpub: &str,
     ) -> anyhow::Result<()> {
         let encoding = StoreEncoding {
             mnemonic: Some(encrypt_phrase_with_passphrase(
@@ -203,7 +208,7 @@ impl WalletStore {
             birthday_time,
             encryption: Some(ENC_PASSPHRASE.to_string()),
             ufvk: None,
-            xpub: None,
+            xpub: Some(xpub.to_string()),
         };
         write_keys_atomic(keys_path, &encoding, true)
     }
@@ -291,6 +296,24 @@ impl WalletStore {
             return Ok(());
         }
         encoding.ufvk = Some(ufvk.to_string());
+        write_keys_atomic(keys_path, &encoding, false)
+    }
+
+    /// [`WalletStore::pin_ufvk`] for a Bitcoin wallet's account xpub: record it, rewriting
+    /// `keys.toml` atomically and preserving every other field. A no-op when the file
+    /// already pins exactly this value. Backfills a seed wallet's `keys.toml` from before
+    /// seed wallets carried the pin; `init` writes the pin directly.
+    #[cfg(feature = "bitcoin")]
+    pub fn pin_xpub(keys_path: &Path, xpub: &str) -> anyhow::Result<()> {
+        let mut text = String::new();
+        std::fs::File::open(keys_path)
+            .map_err(|e| anyhow!("opening {}: {e}", keys_path.display()))?
+            .read_to_string(&mut text)?;
+        let mut encoding: StoreEncoding = toml::from_str(&text)?;
+        if encoding.xpub.as_deref() == Some(xpub) {
+            return Ok(());
+        }
+        encoding.xpub = Some(xpub.to_string());
         write_keys_atomic(keys_path, &encoding, false)
     }
 
@@ -388,8 +411,8 @@ impl WalletStore {
         self.pinned_ufvk.as_deref()
     }
 
-    /// The imported account xpub of a watch-only Bitcoin wallet, if this `keys.toml` is one
-    /// (see the field docs).
+    /// The pinned account xpub of a Bitcoin wallet, if this `keys.toml` carries one (see the
+    /// field docs).
     pub fn pinned_xpub(&self) -> Option<&str> {
         self.pinned_xpub.as_deref()
     }
@@ -401,6 +424,16 @@ impl WalletStore {
         let text = std::fs::read_to_string(keys_path).unwrap();
         let mut encoding: StoreEncoding = toml::from_str(&text).unwrap();
         encoding.ufvk = None;
+        write_keys_atomic(keys_path, &encoding, false).unwrap();
+    }
+
+    /// Test-only: remove the `xpub` pin from an existing `keys.toml`, simulating a Bitcoin
+    /// seed wallet's file written before seed wallets carried the pin.
+    #[cfg(all(test, feature = "bitcoin"))]
+    pub fn strip_xpub_pin_for_tests(keys_path: &Path) {
+        let text = std::fs::read_to_string(keys_path).unwrap();
+        let mut encoding: StoreEncoding = toml::from_str(&text).unwrap();
+        encoding.xpub = None;
         write_keys_atomic(keys_path, &encoding, false).unwrap();
     }
 }
@@ -652,6 +685,104 @@ mod tests {
         // Idempotent: re-pinning the identical value succeeds and changes nothing.
         let before = std::fs::read_to_string(&kp).unwrap();
         WalletStore::pin_ufvk(&kp, UFVK).unwrap();
+        assert_eq!(std::fs::read_to_string(&kp).unwrap(), before);
+    }
+
+    /// A stand-in pinned account xpub: like the UFVK, the store treats it as an opaque string
+    /// (derivation and the binding check live in `btc::keys` and `btc::actor`).
+    #[cfg(feature = "bitcoin")]
+    const XPUB: &str = "[00000000/84'/1'/0']tpubstoreplaceholder";
+
+    /// Both Bitcoin seed constructors record the account xpub, whichever custody model holds
+    /// the seed: it is what lets a locked wallet verify, and rebuild, its database.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn bitcoin_seed_constructors_pin_the_account_xpub() {
+        let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
+        let identity = age::x25519::Identity::generate();
+        let recipient = identity.to_public();
+
+        let dir = tempfile::tempdir().unwrap();
+        let kp = keys_path(dir.path());
+        WalletStore::init_bitcoin_with_mnemonic(
+            &kp,
+            std::iter::once(&recipient as &dyn age::Recipient),
+            &mnemonic,
+            7,
+            Some(1_700_000_000),
+            ZNetwork::Test,
+            XPUB,
+        )
+        .unwrap();
+        let st = WalletStore::read(&kp).unwrap();
+        assert_eq!(st.pinned_xpub(), Some(XPUB));
+        assert_eq!(st.pinned_ufvk(), None);
+        assert!(st.has_seed() && !st.is_encrypted());
+        assert_eq!(st.birthday_time, Some(1_700_000_000));
+
+        let dir = tempfile::tempdir().unwrap();
+        let kp = keys_path(dir.path());
+        let passphrase = || Passphrase::from("correct horse battery".to_string());
+        WalletStore::init_bitcoin_with_passphrase(
+            &kp,
+            passphrase(),
+            &mnemonic,
+            7,
+            None,
+            ZNetwork::Test,
+            XPUB,
+        )
+        .unwrap();
+        let st = WalletStore::read(&kp).unwrap();
+        assert_eq!(st.pinned_xpub(), Some(XPUB));
+        assert!(st.has_seed() && st.is_encrypted());
+        assert!(st
+            .decrypt_seed_with_passphrase(passphrase())
+            .unwrap()
+            .is_some());
+    }
+
+    /// `pin_xpub` backfills a pre-pin Bitcoin seed wallet's file the way `pin_ufvk` does a
+    /// Zcash one: the ciphertext still decrypts, the file stays 0600, and re-pinning the same
+    /// value is a no-op.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn pin_xpub_backfills_preserving_mnemonic_and_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp = keys_path(dir.path());
+        let mnemonic = <Mnemonic<English>>::from_phrase(PHRASE).unwrap();
+        let passphrase = || Passphrase::from("correct horse battery".to_string());
+        WalletStore::init_bitcoin_with_passphrase(
+            &kp,
+            passphrase(),
+            &mnemonic,
+            42,
+            None,
+            ZNetwork::Test,
+            XPUB,
+        )
+        .unwrap();
+        WalletStore::strip_xpub_pin_for_tests(&kp);
+        assert_eq!(WalletStore::read(&kp).unwrap().pinned_xpub(), None);
+
+        WalletStore::pin_xpub(&kp, XPUB).unwrap();
+        let st = WalletStore::read(&kp).unwrap();
+        assert_eq!(st.pinned_xpub(), Some(XPUB));
+        assert!(st.is_encrypted());
+        assert_eq!(st.birthday, 42);
+        assert!(st
+            .decrypt_seed_with_passphrase(passphrase())
+            .unwrap()
+            .is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&kp).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "keys.toml must stay private (0600)");
+        }
+
+        let before = std::fs::read_to_string(&kp).unwrap();
+        WalletStore::pin_xpub(&kp, XPUB).unwrap();
         assert_eq!(std::fs::read_to_string(&kp).unwrap(), before);
     }
 

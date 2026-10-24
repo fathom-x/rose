@@ -1367,28 +1367,6 @@ async fn init_bitcoin_wallet(
     // seed: the two share the birthday rules below.
     let restore = restore_input.is_some() || imported.is_some();
 
-    // Passphrase encryption is refused for a seed-holding Bitcoin wallet, before any
-    // prompt, directory or network I/O. The engine has no `walletpassphrase`: nothing in
-    // the daemon could ever decrypt the seed, so the wallet would start permanently locked
-    // - unable to send, and refused by `rose rescan` for the same reason - while still
-    // counting as the coin's one spending wallet. A watch-only (`--xpub`) wallet holds no
-    // seed, so there is nothing to encrypt and the flag is moot there.
-    if imported.is_none()
-        && matches!(
-            encryption,
-            EncryptionInput::Passphrase(_) | EncryptionInput::DeferredPassphrase(_)
-        )
-    {
-        return Err(anyhow!(
-            "cannot create wallet '{}' with --encrypt: Bitcoin wallets have no \
-             walletpassphrase yet, so a passphrase-encrypted one could never be unlocked to \
-             send or rebuilt by `rose rescan`. Initialize it without --encrypt (the seed is \
-             then age-encrypted to the identity file and unlocks at startup), or create a \
-             watch-only wallet with --xpub if this machine should hold no spending key",
-            wallet
-        ));
-    }
-
     // One spending wallet per coin (the same invariant the daemon enforces at startup),
     // surfaced at init time. Watch-only inits are exempt: any number are allowed. The
     // library opt-in skips it, as on the Zcash path.
@@ -1549,6 +1527,18 @@ async fn init_bitcoin_wallet(
     };
     let birthday = resolved.height;
 
+    // How a seed is protected at rest, settled once every refusal above has had its say and
+    // before anything is written, so a refused init never prompts: a passphrase (age
+    // scrypt; the daemon starts the wallet locked and `walletpassphrase` unlocks it), or by
+    // default the age identity file (unlocked at startup). A watch-only wallet holds no
+    // seed, so there is nothing to encrypt and the flag is moot there.
+    let passphrase = match encryption {
+        _ if imported.is_some() => None,
+        EncryptionInput::Passphrase(passphrase) => Some(passphrase),
+        EncryptionInput::DeferredPassphrase(read) => Some(read()?),
+        EncryptionInput::AgeIdentity => None,
+    };
+
     std::fs::create_dir_all(&wallet_dir)?;
 
     // Watch-only: no seed, so no at-rest secret and no identity file to create. keys.toml
@@ -1581,14 +1571,23 @@ async fn init_bitcoin_wallet(
         });
     }
 
-    let identity_path = config
-        .keys
-        .age_identity
-        .clone()
-        .unwrap_or_else(|| config.datadir.join("identity.txt"));
-    // The identity file is the only custody model left here: passphrase encryption was
-    // refused above, before any I/O.
-    let recipients = ensure_identity(&identity_path).await?;
+    // The identity file is created only for the custody model that uses it.
+    enum AtRest {
+        Passphrase(Passphrase),
+        Identity(PathBuf, Vec<Box<dyn age::Recipient + Send>>),
+    }
+    let at_rest = match passphrase {
+        Some(passphrase) => AtRest::Passphrase(passphrase),
+        None => {
+            let identity_path = config
+                .keys
+                .age_identity
+                .clone()
+                .unwrap_or_else(|| config.datadir.join("identity.txt"));
+            let recipients = ensure_identity(&identity_path).await?;
+            AtRest::Identity(identity_path, recipients)
+        }
+    };
 
     let restore_input_was_none = restore_input.is_none();
     let mnemonic = match restore_input {
@@ -1602,21 +1601,41 @@ async fn init_bitcoin_wallet(
         secret
     };
 
+    // The account keys: what the database is built from, and what keys.toml pins so the
+    // daemon can verify (and rebuild) that database whenever the seed is not in hand - a
+    // passphrase-encrypted wallet starts locked.
+    let account = crate::btc::keys::AccountKeys::from_seed(&seed, btc_network)?;
+
     // keys.toml first, then the wallet database: a failure between the two is self-healing
-    // (the daemon's spawn recreates a missing database from the seed), where the reverse
-    // order would leave a database the already-initialized refusal then trips over.
-    WalletStore::init_with_mnemonic_unpinned(
-        &keys_path,
-        recipients.iter().map(|r| r.as_ref() as _),
-        &mnemonic,
-        birthday,
-        resolved.time,
-        network,
-    )?;
-    crate::btc::store::create_wallet_db(
-        &engine_dir,
-        &crate::btc::keys::AccountKeys::from_seed(&seed, btc_network)?,
-    )?;
+    // (the daemon's spawn recreates a missing database from the seed or the pin), where the
+    // reverse order would leave a database the already-initialized refusal then trips over.
+    let (encrypted, identity_path) = match at_rest {
+        AtRest::Passphrase(passphrase) => {
+            WalletStore::init_bitcoin_with_passphrase(
+                &keys_path,
+                passphrase,
+                &mnemonic,
+                birthday,
+                resolved.time,
+                network,
+                &account.export(),
+            )?;
+            (true, None)
+        }
+        AtRest::Identity(identity_path, recipients) => {
+            WalletStore::init_bitcoin_with_mnemonic(
+                &keys_path,
+                recipients.iter().map(|r| r.as_ref() as _),
+                &mnemonic,
+                birthday,
+                resolved.time,
+                network,
+                &account.export(),
+            )?;
+            (false, Some(identity_path))
+        }
+    };
+    crate::btc::store::create_wallet_db(&engine_dir, &account)?;
     // The resolved birthday anchor is chain-derived cache, so it lives with the engine's
     // own database rather than in `keys.toml`: it is what a kyoto first scan starts from
     // instead of the shipped scan floor (`btc::kyoto::recovery_floor`'s precedence).
@@ -1632,8 +1651,8 @@ async fn init_bitcoin_wallet(
         network,
         birthday,
         watch_only: false,
-        encrypted: false,
-        identity_path: Some(identity_path),
+        encrypted,
+        identity_path,
         generated_mnemonic: restore_input_was_none.then_some(mnemonic),
     })
 }
@@ -1960,11 +1979,17 @@ pub async fn rescan(config: &AppConfig, args: &RescanArgs) -> anyhow::Result<()>
         "Start rose and it will rebuild the account from keys.toml and rescan from birthday {} \
          (requires [keys] bootstrap_from_keys, which is on by default).{}",
         st.birthday,
-        if st.is_encrypted() {
-            "\nThis wallet is passphrase-encrypted: the rebuild starts at the first \
-             `walletpassphrase` after the daemon is up."
-        } else {
-            ""
+        // A pinned account xpub is the Bitcoin engine's: what it rebuilds from while locked.
+        match (st.is_encrypted(), st.pinned_xpub().is_some()) {
+            (true, true) => {
+                "\nThis wallet is passphrase-encrypted: it is rebuilt from the account xpub \
+                 pinned in keys.toml while it stays locked; sending needs `walletpassphrase`."
+            }
+            (true, false) => {
+                "\nThis wallet is passphrase-encrypted: the rebuild starts at the first \
+                 `walletpassphrase` after the daemon is up."
+            }
+            (false, _) => "",
         }
     );
     Ok(())
@@ -2114,12 +2139,14 @@ pub fn rescan_wallet(
 /// missing database from whichever key material it has) and scans from the recorded
 /// birthday, exactly as it does for a database deleted by hand.
 ///
-/// Rebuildable: a seed wallet under the identity-file custody model, and a watch-only wallet
-/// (`keys.toml` pins the account xpub). Refused: a **passphrase-encrypted** Bitcoin wallet -
-/// the daemon has no `walletpassphrase` for the BDK engine yet, so it could never decrypt the
-/// seed to rebuild from and would start with an empty database it cannot fill; deleting it
-/// would turn a wallet that at least reads its history into one that cannot start. `network`
-/// is the daemon's environment (`keys.toml` is coin-agnostic and records that).
+/// Rebuildable: every wallet whose `keys.toml` pins the account xpub - which `init` records
+/// for every Bitcoin wallet, so a passphrase-encrypted one is rebuilt while it stays locked -
+/// and a seed wallet under the identity-file custody model (the seed is decrypted at
+/// startup). Refused: a **passphrase-encrypted** wallet whose `keys.toml` predates the pin -
+/// the daemon could decrypt its seed only at a `walletpassphrase` it cannot reach without a
+/// database, so deleting it would turn a wallet that at least reads its history into one
+/// that cannot start. `network` is the daemon's environment (`keys.toml` is coin-agnostic
+/// and records that).
 #[cfg(feature = "bitcoin")]
 pub fn rescan_bitcoin_wallet(
     network: ZNetwork,
@@ -2141,14 +2168,13 @@ pub fn rescan_bitcoin_wallet(
     }
     let st = WalletStore::read(keys_path)?;
     ensure_store_matches(&st, wallet, network)?;
-    if st.is_encrypted() {
+    if st.is_encrypted() && st.pinned_xpub().is_none() {
         return Err(anyhow!(
-            "wallet '{}' is a passphrase-encrypted Bitcoin wallet: the daemon cannot decrypt \
-             its seed to rebuild the database (there is no `walletpassphrase` for Bitcoin \
-             wallets yet), so a rescan would leave it unable to start. Recreate it with \
-             `rose init --wallet {} --restore` (and no --encrypt) or as a watch-only \
-             `init --xpub` wallet instead.",
-            wallet,
+            "wallet '{}' is a passphrase-encrypted Bitcoin wallet whose keys.toml predates the \
+             account xpub pin, so nothing the daemon can read while it is locked could rebuild \
+             the database and a rescan would leave it unable to start. Start rosed with the \
+             database in place and unlock it once with `walletpassphrase` (that verifies the \
+             seed and records the pin), then rescan.",
             wallet
         ));
     }
@@ -2421,6 +2447,17 @@ mod tests {
         let seed = crate::wallet::keys::decrypt_seed_with_identity(&store, identity)
             .unwrap()
             .expect("seed decrypts");
+        // The identity-custody seed wallet pins its account xpub too (what a locked or
+        // rebuilt wallet is verified against), and it is the one the seed derives.
+        assert_eq!(
+            store.pinned_xpub(),
+            Some(
+                crate::btc::keys::AccountKeys::from_seed(&seed, entry.bitcoin_network())
+                    .unwrap()
+                    .export()
+                    .as_str()
+            )
+        );
         let (handle, _task) = crate::btc::actor::spawn(crate::btc::actor::BtcActorConfig {
             name: "btc".to_string(),
             engine_dir: entry.engine_dir(),
@@ -2428,7 +2465,16 @@ mod tests {
             seed: Some(seed),
             wallet_holds_seed: true,
             encrypted: false,
-            imported_keys: None,
+            keys_path: entry.keys_path(),
+            imported_keys: Some(
+                crate::btc::keys::AccountKeys::from_xpub(
+                    store
+                        .pinned_xpub()
+                        .expect("a seed wallet pins its account xpub"),
+                    entry.bitcoin_network(),
+                )
+                .unwrap(),
+            ),
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
             mempool: crate::config::MempoolConfig::default(),
@@ -2540,6 +2586,7 @@ mod tests {
             seed: None,
             wallet_holds_seed: false,
             encrypted: false,
+            keys_path: view_entry.keys_path(),
             imported_keys: Some(imported),
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
@@ -2656,18 +2703,84 @@ mod tests {
         assert!(outcome.generated_mnemonic.is_some());
     }
 
-    /// `--encrypt` on a seed-holding Bitcoin wallet is refused before the passphrase prompt
-    /// and before anything is written: the engine has no `walletpassphrase`, so the wallet
-    /// could never be unlocked to send. The deferred prompt panics, so reaching it fails.
+    /// `--encrypt` on a seed-holding Bitcoin wallet: the seed is passphrase-encrypted (age
+    /// scrypt), the account xpub is pinned beside it so the daemon can verify and rebuild the
+    /// database while the wallet is locked, the database is built offline, and no identity
+    /// file is created - the passphrase is the whole custody model. The deferred prompt fires
+    /// exactly once.
     #[cfg(all(feature = "bitcoin", feature = "cli"))]
     #[tokio::test(flavor = "multi_thread")]
-    async fn bitcoin_init_refuses_passphrase_encryption() {
+    async fn bitcoin_init_creates_a_passphrase_encrypted_wallet() {
         let dir = tempfile::tempdir().unwrap();
         let config = bitcoin_test_config(dir.path(), "bitcoind://127.0.0.1:1", "");
-        let err = init_wallet(
+        let prompts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = prompts.clone();
+        let phrase =
+            <Mnemonic<English>>::from_phrase(crate::btc::keys::tests::BIP84_MNEMONIC).unwrap();
+        let outcome = init_wallet(
             &config,
             InitOptions {
                 wallet: "btc".to_string(),
+                key: InitKey::Restore(MnemonicInput::Phrase(phrase)),
+                encryption: EncryptionInput::DeferredPassphrase(Box::new(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Passphrase::from("init-pass".to_string()))
+                })),
+                birthday: Some(Birthday::Height(12_345)),
+            },
+        )
+        .await
+        .expect("a passphrase-encrypted bitcoin wallet initializes");
+        assert_eq!(prompts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(outcome.encrypted);
+        assert!(!outcome.watch_only);
+        assert!(outcome.identity_path.is_none());
+        assert!(
+            !dir.path().join("identity.txt").exists(),
+            "the passphrase model needs no identity file"
+        );
+
+        let entry = &config.wallets["btc"];
+        let store = WalletStore::read(&entry.keys_path()).unwrap();
+        assert!(store.has_seed() && store.is_encrypted());
+        assert_eq!(store.birthday, 12_345);
+        let seed = store
+            .decrypt_seed_with_passphrase(Passphrase::from("init-pass".to_string()))
+            .unwrap()
+            .expect("the passphrase decrypts the seed");
+        let account =
+            crate::btc::keys::AccountKeys::from_seed(&seed, entry.bitcoin_network()).unwrap();
+        assert_eq!(store.pinned_xpub(), Some(account.export().as_str()));
+        assert!(crate::btc::store::wallet_db_path(&entry.engine_dir()).exists());
+    }
+
+    /// The passphrase prompt comes after every refusal: a second spending wallet is refused
+    /// without prompting and without writing anything. The deferred prompt panics, so
+    /// reaching it fails.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_init_refuses_before_the_passphrase_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(
+            dir.path(),
+            "bitcoind://127.0.0.1:1",
+            "[wallets.btc2]\ncoin = \"bitcoin\"\n",
+        );
+        init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Height(12_345)),
+            },
+        )
+        .await
+        .expect("the first spending wallet");
+        let err = init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc2".to_string(),
                 key: InitKey::Generate,
                 encryption: EncryptionInput::DeferredPassphrase(Box::new(|| {
                     panic!("the passphrase prompt must not fire for a refused init")
@@ -2677,11 +2790,10 @@ mod tests {
         )
         .await
         .err()
-        .expect("a passphrase-encrypted bitcoin wallet is refused")
+        .expect("a second spending wallet is refused")
         .to_string();
-        assert!(err.contains("--encrypt"), "{err}");
-        assert!(err.contains("walletpassphrase"), "{err}");
-        let entry = &config.wallets["btc"];
+        assert!(err.contains("already holds spending keys"), "{err}");
+        let entry = &config.wallets["btc2"];
         assert!(!entry.keys_path().exists());
         assert!(!entry.engine_dir().exists());
     }
@@ -3775,12 +3887,67 @@ mod tests {
         assert!(removed.is_empty(), "{removed:?}");
     }
 
-    /// Refusals on the Bitcoin side: a passphrase-encrypted wallet (nothing could decrypt the
-    /// seed to rebuild from), a `keys.toml` with neither seed nor xpub, an uninitialized
-    /// wallet, a declined confirmation - and none of them deletes anything.
+    /// A passphrase-encrypted Bitcoin wallet is rebuilt from its pinned account xpub: the
+    /// database and the kyoto cache go, `keys.toml` (ciphertext and pin) stays exactly as it
+    /// was, and the daemon's next spawn recreates the database from the pin while locked.
     #[cfg(feature = "bitcoin")]
     #[test]
-    fn rescan_bitcoin_wallet_refuses_encrypted_keyless_and_declined() {
+    fn rescan_bitcoin_wallet_rebuilds_an_encrypted_wallet_from_the_pin() {
+        use crate::btc::store::{wallet_db_path, Persister};
+        use crate::config::{btc_kyoto_dir, engine_dir};
+        use crate::wallet::store::keys_path;
+        let net = network::regtest();
+        let dir = tempfile::tempdir().unwrap();
+        let keys = keys_path(dir.path());
+        let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
+        let xpub = crate::btc::keys::AccountKeys::from_seed(
+            &SecretVec::new(mnemonic.to_seed("").to_vec()),
+            crate::coin::BitcoinNetwork::Regtest,
+        )
+        .unwrap()
+        .export();
+        WalletStore::init_bitcoin_with_passphrase(
+            &keys,
+            Passphrase::from("test-pass".to_string()),
+            &mnemonic,
+            1,
+            None,
+            net,
+            &xpub,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&keys).unwrap();
+        let engine = engine_dir(dir.path(), crate::coin::Coin::Bitcoin);
+        let kyoto = btc_kyoto_dir(dir.path());
+        drop(Persister::open(&engine).unwrap());
+        std::fs::create_dir_all(&kyoto).unwrap();
+
+        let removed =
+            rescan_bitcoin_wallet(net, "btc", Some(dir.path()), &keys, &engine, &kyoto, |st| {
+                assert!(st.is_encrypted());
+                Ok(true)
+            })
+            .expect("an encrypted wallet with a pinned xpub can be rebuilt");
+        assert!(
+            removed.contains(&"wallet.sqlite".to_string()),
+            "{removed:?}"
+        );
+        assert!(removed.contains(&"kyoto/".to_string()), "{removed:?}");
+        assert!(!wallet_db_path(&engine).exists());
+        assert_eq!(
+            std::fs::read_to_string(&keys).unwrap(),
+            before,
+            "keys.toml is untouched"
+        );
+    }
+
+    /// Refusals on the Bitcoin side: a passphrase-encrypted wallet whose `keys.toml`
+    /// predates the xpub pin (nothing readable while locked could rebuild it), a `keys.toml`
+    /// with neither seed nor xpub, an uninitialized wallet, a declined confirmation - and
+    /// none of them deletes anything.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn rescan_bitcoin_wallet_refuses_unpinned_encrypted_keyless_and_declined() {
         use crate::btc::store::{wallet_db_path, Persister};
         use crate::config::{btc_kyoto_dir, engine_dir};
         use crate::wallet::store::keys_path;
@@ -3789,15 +3956,17 @@ mod tests {
         let enc = tempfile::tempdir().unwrap();
         let enc_keys = keys_path(enc.path());
         let mnemonic = <Mnemonic<English>>::from_phrase(TEST_PHRASE).unwrap();
-        WalletStore::init_with_passphrase_unpinned(
+        WalletStore::init_bitcoin_with_passphrase(
             &enc_keys,
             Passphrase::from("test-pass".to_string()),
             &mnemonic,
             1,
             None,
             net,
+            "[00000000/84'/1'/0']tpubunused",
         )
         .unwrap();
+        WalletStore::strip_xpub_pin_for_tests(&enc_keys);
         let engine = engine_dir(enc.path(), crate::coin::Coin::Bitcoin);
         drop(Persister::open(&engine).unwrap());
         let err = rescan_bitcoin_wallet(
@@ -3809,8 +3978,9 @@ mod tests {
             &btc_kyoto_dir(enc.path()),
             |_| Ok(true),
         )
-        .expect_err("a passphrase-encrypted bitcoin wallet cannot be rebuilt");
+        .expect_err("an unpinned passphrase-encrypted bitcoin wallet cannot be rebuilt");
         assert!(err.to_string().contains("passphrase-encrypted"), "{err}");
+        assert!(err.to_string().contains("walletpassphrase"), "{err}");
         assert!(
             wallet_db_path(&engine).exists(),
             "refusal must not delete anything"

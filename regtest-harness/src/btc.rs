@@ -649,6 +649,46 @@ impl RoseBtc {
             .map(str::to_string)
     }
 
+    /// `rose init --wallet <wallet> --encrypt <extra...>` with `passphrase` supplied through
+    /// `ROSE_WALLET_PASSPHRASE` (the non-interactive path): a passphrase-encrypted wallet,
+    /// which the daemon starts locked. Returns the generated mnemonic, as
+    /// [`RoseBtc::init_ok`] does.
+    pub fn init_encrypted(&self, wallet: &str, passphrase: &str, extra: &[&str]) -> Option<String> {
+        let out = self
+            .cli()
+            .args(["init", "--wallet", wallet, "--encrypt"])
+            .args(extra)
+            .env("ROSE_WALLET_PASSPHRASE", passphrase)
+            .output()
+            .expect("run rose init --encrypt");
+        assert!(
+            out.status.success(),
+            "rose init --wallet {wallet} --encrypt failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .map(str::to_string)
+    }
+
+    /// `rose rescan --wallet <wallet> --yes` (the daemon must be stopped: it takes the
+    /// datadir lock). `Ok(stderr)` on success, `Err(stderr)` on a refusal.
+    pub fn rescan(&self, wallet: &str) -> Result<String, String> {
+        let out = self
+            .cli()
+            .args(["rescan", "--wallet", wallet, "--yes"])
+            .output()
+            .expect("run rose rescan");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if out.status.success() {
+            Ok(stderr)
+        } else {
+            Err(stderr)
+        }
+    }
+
     /// `rose export-xpub --wallet <wallet>`: the account key, or the refusal's stderr.
     pub fn export_xpub(&self, wallet: &str) -> Result<String, String> {
         let out = self

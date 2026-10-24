@@ -1197,6 +1197,38 @@ mod tests {
             w.import_error.is_none(),
             "a healthy wallet carries no import failure, and the key is absent rather than empty"
         );
+        assert!(w.unlocked_until.is_none(), "an unencrypted wallet omits it");
+
+        // Fixture: the Bitcoin handler on a passphrase-encrypted wallet unlocked by
+        // `walletpassphrase` - Core's `unlocked_until`, the unix time the unlock expires.
+        let encrypted = serde_json::json!({
+            "walletname": "btc",
+            "walletversion": 169900,
+            "format": "sqlite",
+            "balance": 0.00100000,
+            "unconfirmed_balance": 0.00000000,
+            "immature_balance": 0.00000000,
+            "txcount": 1,
+            "keypoolsize": 1,
+            "keypoolsize_hd_internal": 0,
+            "paytxfee": 0.00000000,
+            "private_keys_enabled": true,
+            "avoid_reuse": false,
+            "scanning": false,
+            "descriptors": true,
+            "recovery": {
+                "initial_scan": 0,
+                "lookahead": 25,
+                "horizon": 24,
+                "issued_through": 0,
+                "restorable": true,
+            },
+            "coin": "bitcoin",
+            "unlocked_until": 1_793_000_000,
+        });
+        let w: WalletInfo = serde_json::from_value(encrypted).unwrap();
+        assert_eq!(w.unlocked_until, Some(1_793_000_000));
+        assert!(w.private_keys_enabled);
     }
 
     /// `listwalletdir`'s `warnings` names fleet manifests the daemon could not read, so those

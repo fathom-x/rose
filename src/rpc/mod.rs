@@ -305,8 +305,8 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("getnewaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("sendtoaddress", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     ("sendmany", MethodCoins::Only(ZCASH_AND_BITCOIN)),
-    ("walletpassphrase", MethodCoins::Only(ZCASH_ONLY)),
-    ("walletlock", MethodCoins::Only(ZCASH_ONLY)),
+    ("walletpassphrase", MethodCoins::Only(ZCASH_AND_BITCOIN)),
+    ("walletlock", MethodCoins::Only(ZCASH_AND_BITCOIN)),
     // Wallet - async operations
     ("z_sendmany", MethodCoins::Only(ZCASH_ONLY)),
     ("z_shieldcoinbase", MethodCoins::Only(ZCASH_ONLY)),
@@ -608,7 +608,9 @@ async fn dispatch_rose(
         | "getaddressinfo"
         | "getnewaddress"
         | "sendtoaddress"
-        | "sendmany" => {
+        | "sendmany"
+        | "walletpassphrase"
+        | "walletlock" => {
             state.registry.get_coin(wallet)?;
             Err(RpcError::method_not_found(&req.method))
         }

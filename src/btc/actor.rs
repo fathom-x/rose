@@ -68,6 +68,9 @@ use crate::btc::mempool_feed::{feed_target, FeedDelta, FeedEvent, MempoolFeed};
 use crate::btc::store::Persister;
 use crate::coin::BitcoinNetwork;
 use crate::error::{codes, RpcError};
+use crate::wallet::keys::{relock_sleep, seed_guard, unlocked_until_unix, SeedKeeper};
+use crate::wallet::store::{Passphrase, WalletStore};
+use crate::wallet::SharedSeed;
 use bdk_wallet::bitcoin::constants::COINBASE_MATURITY;
 
 /// Command channel depth; matches the Zcash actor's order of magnitude.
@@ -414,6 +417,17 @@ enum BtcCommand {
         conservative: Option<bool>,
         reply: oneshot::Sender<Result<Option<(u64, String)>, RpcError>>,
     },
+    /// `walletpassphrase`: decrypt the seed into memory for `timeout_secs` (see
+    /// `BtcActor::do_unlock`).
+    Unlock {
+        passphrase: Passphrase,
+        timeout_secs: i64,
+        reply: oneshot::Sender<Result<(), RpcError>>,
+    },
+    /// `walletlock`: zeroize the seed now.
+    Lock {
+        reply: oneshot::Sender<Result<(), RpcError>>,
+    },
 }
 
 /// What `listsinceblock` reports: the transactions, oldest first, and the cursor to pass
@@ -509,8 +523,9 @@ pub struct BtcWalletHandle {
     /// from an imported account xpub, so `getwalletinfo` reports `private_keys_enabled`
     /// (and `listunspent` its `spendable`) from the same signal the Zcash side does.
     pub has_seed: bool,
-    /// Whether the seed is passphrase-encrypted - and therefore locked, since nothing can
-    /// unlock a Bitcoin wallet (see [`BtcActorConfig::encrypted`]).
+    /// Whether the seed is passphrase-encrypted (see [`BtcActorConfig::encrypted`]): the
+    /// wallet starts locked and `walletpassphrase` unlocks it. The live lock state is
+    /// [`BtcWalletHandle::unlocked_until`].
     pub encrypted: bool,
     /// The recorded birthday height (`keys.toml`): where a rebuild scans from, and on kyoto
     /// what the recovery floor and anchor resolution are derived from.
@@ -527,6 +542,14 @@ pub struct BtcWalletHandle {
     pub upstream: Option<String>,
     cmd_tx: mpsc::Sender<BtcCommand>,
     status_rx: watch::Receiver<BtcSyncStatus>,
+    /// The actor's seed custody, shared so `walletlock` can zeroize it without waiting on
+    /// the command queue (a sync pass can hold the actor for a while). `Some` only for an
+    /// encrypted wallet - the only kind `walletlock` acts on - exactly as on the Zcash
+    /// `WalletHandle`.
+    seed: Option<SharedSeed>,
+    /// The unlock's expiry as Core reports it (unix seconds, `0` while locked), published by
+    /// the actor on every unlock, lock and relock.
+    unlock_rx: watch::Receiver<i64>,
 }
 
 impl BtcWalletHandle {
@@ -687,6 +710,40 @@ impl BtcWalletHandle {
             .await
     }
 
+    /// `walletpassphrase`: decrypt the seed for `timeout_secs` seconds. Wrong passphrase is
+    /// `-14`, an unencrypted wallet `-15`, a seed that does not derive the wallet's pinned
+    /// account `-4` (the wallet stays locked).
+    pub async fn unlock(&self, passphrase: Passphrase, timeout_secs: i64) -> Result<(), RpcError> {
+        self.dispatch(|reply| BtcCommand::Unlock {
+            passphrase,
+            timeout_secs,
+            reply,
+        })
+        .await
+    }
+
+    /// `walletlock`. The seed is zeroized here first, without waiting on the actor, so it
+    /// takes effect even while a sync pass holds the actor; the actor's `Lock` then clears
+    /// the relock deadline and answers authoritatively (`-15` for an unencrypted wallet,
+    /// which carries no `seed` here and so skips the fast path). Locking twice is a no-op.
+    pub async fn lock(&self) -> Result<(), RpcError> {
+        if let Some(seed) = &self.seed {
+            seed_guard(seed).lock();
+        }
+        self.dispatch(|reply| BtcCommand::Lock { reply }).await
+    }
+
+    /// Bitcoin Core's `getwalletinfo.unlocked_until`: `None` for a wallet that is not
+    /// passphrase-encrypted, `Some(0)` while locked, else the unix time the unlock expires.
+    /// Reads the seed itself first, so a fast-path `walletlock` reports locked at once.
+    pub fn unlocked_until(&self) -> Option<i64> {
+        let seed = self.seed.as_ref()?;
+        if !seed_guard(seed).is_unlocked() {
+            return Some(0);
+        }
+        Some(*self.unlock_rx.borrow())
+    }
+
     /// The actor's latest published sync status.
     pub fn status(&self) -> BtcSyncStatus {
         self.status_rx.borrow().clone()
@@ -701,9 +758,10 @@ impl BtcWalletHandle {
     }
 }
 
-/// The stored wallet disagrees with what the seed derives (or with the configured network):
-/// evidence the wallet database was replaced. The spawn loop treats this as fatal for the
-/// whole node, mirroring `wallet::binding::BindingMismatch` on the Zcash side.
+/// The stored wallet disagrees with what the seed or the pinned account xpub derives, or the
+/// seed disagrees with the pin: evidence the wallet database (or `keys.toml`) was replaced.
+/// The spawn loop treats this as fatal for the whole node, mirroring
+/// `wallet::binding::BindingMismatch` on the Zcash side.
 #[derive(Debug)]
 pub struct BtcBindingMismatch(pub String);
 
@@ -746,26 +804,32 @@ pub struct BtcActorConfig {
     pub name: String,
     pub engine_dir: PathBuf,
     pub network: BitcoinNetwork,
-    /// The decrypted wallet seed. Required to create a wallet database that does not exist
-    /// yet, used - when present - to verify an existing database's descriptors against
-    /// the seed (the binding check: a swapped database fails closed instead of silently
-    /// serving foreign keys, mirroring `wallet::binding` on the Zcash side), and retained
-    /// by the actor for per-send signer derivation.
+    /// The decrypted wallet seed, when the custody model hands it over at startup (the
+    /// identity file with `auto_unlock`; never a passphrase-encrypted wallet, which starts
+    /// locked). When present it creates a missing wallet database, verifies an existing
+    /// one's descriptors (the binding check: a swapped database fails closed instead of
+    /// silently serving foreign keys, mirroring `wallet::binding` on the Zcash side), must
+    /// derive the pinned xpub, and is kept - `mlock`ed, in a [`SeedKeeper`] - for per-send
+    /// signer derivation.
     pub seed: Option<SecretVec<u8>>,
     /// Whether the wallet's `keys.toml` holds a seed at all - distinct from `seed`, which is
     /// absent for a passphrase-encrypted wallet at startup even though the wallet is a
     /// spender. Drives the handle's `has_seed` (and thus watch-only reporting).
     pub wallet_holds_seed: bool,
-    /// Whether that seed is passphrase-encrypted (`keys.toml`'s `encryption` marker). The
-    /// engine has no `walletpassphrase`, so such a wallet is locked for its whole life -
-    /// reported as encrypted and locked rather than as an ordinary spender that happens to
-    /// fail every send. `init --encrypt` refuses to create one now; this covers wallets
-    /// encrypted before that refusal existed.
+    /// Whether that seed is passphrase-encrypted (`keys.toml`'s `encryption` marker). Such a
+    /// wallet starts locked and `walletpassphrase` decrypts the seed for a while (read from
+    /// `keys_path`); sends refuse with `-13` until then.
     pub encrypted: bool,
-    /// A watch-only wallet's imported account keys (`keys.toml`'s `xpub` pin, parsed by the
-    /// caller for the wallet's network). Plays the seed's role for everything but signing:
-    /// creates a missing database and verifies an existing one's descriptors. `None` for a
-    /// seed wallet; a wallet with neither is refused at spawn.
+    /// The wallet's `keys.toml`: where `walletpassphrase` reads the seed ciphertext from, and
+    /// where a pre-pin file's account xpub is backfilled the first time the seed is in hand.
+    pub keys_path: PathBuf,
+    /// The account keys pinned in `keys.toml` (its `xpub`, parsed by the caller for the
+    /// wallet's network). Plays the seed's role for everything but signing - creates a
+    /// missing database and verifies an existing one's descriptors - whenever the seed is
+    /// not in hand: a watch-only wallet, or a passphrase-encrypted one that is locked. With
+    /// the seed in hand as well, the seed must derive it. `None` only for a seed wallet's
+    /// `keys.toml` written before seed wallets carried the pin; a wallet with neither is
+    /// refused at spawn.
     pub imported_keys: Option<AccountKeys>,
     /// The wallet's bitcoind upstream. `None` runs the actor with no sync loop (offline
     /// command service - what the pre-chain-source engine always did, kept for tests).
@@ -816,6 +880,7 @@ pub fn spawn(
         seed,
         wallet_holds_seed: has_seed,
         encrypted,
+        keys_path,
         imported_keys,
         endpoint,
         fees,
@@ -829,13 +894,33 @@ pub fn spawn(
         reconnect_max,
         shutdown,
     } = config;
-    // The account's public keys, from whichever source this wallet has: the seed for a
-    // spending wallet (absent at startup for a passphrase-encrypted one), the imported
-    // xpub for a watch-only wallet. Either is enough to create and to verify the database.
-    let keys = match &seed {
-        Some(seed) => Some(AccountKeys::from_seed(seed, network)?),
-        None => imported_keys,
-    };
+    // The account's public keys, from whichever source this wallet has in hand: the seed
+    // (an auto-unlocked spending wallet) or the pinned xpub (every wallet `init` wrote: a
+    // watch-only one, and a locked passphrase-encrypted one). Either is enough to create
+    // and to verify the database. With both, the seed must derive the pin - a mismatch
+    // means `keys.toml` was assembled from two wallets, the same tampering evidence a
+    // swapped database is.
+    let seed_keys = seed
+        .as_ref()
+        .map(|seed| AccountKeys::from_seed(seed, network))
+        .transpose()?;
+    if let (Some(derived), Some(pinned)) = (&seed_keys, &imported_keys) {
+        if derived.export() != pinned.export() {
+            return Err(anyhow::Error::new(BtcBindingMismatch(format!(
+                "the seed derives the account with fingerprint {} but keys.toml pins one \
+                 with fingerprint {} (one of the two was replaced, or they belong to \
+                 different wallets)",
+                derived.fingerprint, pinned.fingerprint
+            ))));
+        }
+    }
+    // A seed wallet's `keys.toml` from before seed wallets carried the pin: record the
+    // seed-derived xpub once the database has been verified against it below.
+    let backfill_pin = seed_keys
+        .as_ref()
+        .filter(|_| imported_keys.is_none())
+        .map(AccountKeys::export);
+    let keys = seed_keys.or(imported_keys);
     let mut persister = Persister::open(&engine_dir)?;
     let mut load = Wallet::load()
         .check_network(keys::network(network))
@@ -885,8 +970,9 @@ pub fn spawn(
         None => {
             let keys = keys.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "wallet database is empty and no key material (seed or imported xpub) \
-                     is available to create it (run `rose init` for this wallet first)"
+                    "wallet database is empty and no key material (a seed or the account \
+                     xpub pinned in keys.toml) is available to create it (run `rose init` \
+                     for this wallet first)"
                 )
             })?;
             PersistedWallet::create(
@@ -900,6 +986,17 @@ pub fn spawn(
             )?
         }
     };
+
+    if let Some(xpub) = backfill_pin {
+        WalletStore::pin_xpub(&keys_path, &xpub)
+            .map_err(|e| anyhow::anyhow!("pin the account xpub in keys.toml: {e:#}"))?;
+        info!(
+            target: "rose::audit",
+            "pinned the wallet's account xpub in keys.toml (pre-existing wallet upgraded); \
+             the daemon verifies the wallet database against it whenever the seed is not in \
+             hand"
+        );
+    }
 
     // The initial scan depth: reveal external indexes `0..initial_scan` the first time the
     // wallet comes up short of it, so the scan - and a kyoto recovery's script set, which
@@ -974,6 +1071,16 @@ pub fn spawn(
         }
     };
 
+    if encrypted {
+        info!("bitcoin wallet is passphrase-encrypted; locked until walletpassphrase");
+    }
+    let mut keeper = SeedKeeper::locked();
+    if let Some(seed) = seed {
+        keeper.set(seed);
+    }
+    let seed: SharedSeed = Arc::new(std::sync::Mutex::new(keeper));
+    let handle_seed = encrypted.then(|| seed.clone());
+    let (unlock_tx, unlock_rx) = watch::channel(0);
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
     let (status_tx, status_rx) = watch::channel(status_of(
         &wallet,
@@ -990,6 +1097,10 @@ pub fn spawn(
         persister,
         seed,
         watch_only: !has_seed,
+        encrypted,
+        unlock_until: None,
+        unlock_tx,
+        keys_path,
         network,
         endpoint,
         fees,
@@ -1046,6 +1157,8 @@ pub fn spawn(
             upstream,
             cmd_tx,
             status_rx,
+            seed: handle_seed,
+            unlock_rx,
         },
         task,
     ))
@@ -1093,11 +1206,23 @@ enum BlockPull {
 struct BtcActor {
     wallet: PersistedWallet<Persister>,
     persister: Persister,
-    seed: Option<SecretVec<u8>>,
+    /// The decrypted seed while the wallet holds it: from startup for an auto-unlocked
+    /// identity-file wallet, between `walletpassphrase` and the relock for an encrypted one.
+    /// Shared with the handle of an encrypted wallet for `walletlock`'s fast path.
+    seed: SharedSeed,
     /// True for a wallet with no seed on disk at all (an imported-xpub watch-only wallet),
     /// as opposed to one whose seed is merely absent right now: the send refusal names the
     /// right one of the two.
     watch_only: bool,
+    /// Whether the seed is passphrase-encrypted, so `walletpassphrase`/`walletlock` apply.
+    encrypted: bool,
+    /// When the current unlock expires; `None` while locked (or never encrypted).
+    /// Re-running `walletpassphrase` overwrites it; `walletlock` clears it.
+    unlock_until: Option<Instant>,
+    /// Publishes [`Self::unlock_until`] as Core reports it, for the handle.
+    unlock_tx: watch::Sender<i64>,
+    /// See [`BtcActorConfig::keys_path`].
+    keys_path: PathBuf,
     network: BitcoinNetwork,
     endpoint: Option<BtcEndpoint>,
     /// See [`BtcActorConfig::fees`].
@@ -1591,6 +1716,7 @@ impl BtcActor {
             if *self.shutdown.borrow() {
                 break;
             }
+            self.relock_if_expired();
             // Service everything queued before the next sync pass, so a deep catch-up
             // cannot starve sends and reads.
             let mut closed = false;
@@ -1660,6 +1786,9 @@ impl BtcActor {
                         }
                     }
                 },
+                // The unlock's expiry wakes the loop so the seed is zeroized on time, not at
+                // the next command or scheduled pass.
+                _ = relock_sleep(self.unlock_until) => self.relock_if_expired(),
                 _ = tokio::time::sleep(wait) => {}
             }
         }
@@ -2384,7 +2513,7 @@ impl BtcActor {
         true
     }
 
-    /// Record whether the mempool view is established, mirrored into the feed status.
+    /// Record whether the mempool view is established, copied into the feed status.
     fn set_feed_ready(&mut self, ready: bool) {
         self.feed_ready = ready;
         if let Some(status) = &mut self.feed_status {
@@ -3254,6 +3383,16 @@ impl BtcActor {
             BtcCommand::Descriptors { reply } => {
                 let _ = reply.send(Ok(self.descriptors()));
             }
+            BtcCommand::Unlock {
+                passphrase,
+                timeout_secs,
+                reply,
+            } => {
+                let _ = reply.send(self.do_unlock(passphrase, timeout_secs));
+            }
+            BtcCommand::Lock { reply } => {
+                let _ = reply.send(self.do_lock());
+            }
         }
     }
 
@@ -3746,8 +3885,8 @@ impl BtcActor {
         recipients: Vec<(String, u64)>,
         options: BtcSendOptions,
     ) -> Result<BtcSent, RpcError> {
-        // Checked here but borrowed only at the signing step below: the fee and broadcast
-        // calls take `&mut self`, so holding a `&self.seed` across them would not borrow-check.
+        // Checked here, before any fee-oracle round trip, and again at the signing step below
+        // (the seed is borrowed only there, never across an await).
         self.require_signer()?;
         // Recipients first: pure checks, so a typo'd address or a bad amount is refused
         // before the send costs a fee-oracle round trip on the single-writer actor, and
@@ -3897,38 +4036,56 @@ impl BtcActor {
         })
     }
 
-    /// Refuse a spend on a wallet with no seed in hand - Bitcoin Core's `-4` for a wallet
-    /// that cannot sign, worded for which of the two shapes this is: a watch-only wallet has
-    /// nothing to unlock, ever; a locked spending wallet has a seed the custody model did
-    /// not hand over.
-    fn require_signer(&self) -> Result<(), RpcError> {
-        if self.seed.is_some() {
+    /// Refuse a spend on a wallet with no seed in hand (relocking first if the unlock has
+    /// expired). See [`Self::signer_unavailable`] for the codes.
+    fn require_signer(&mut self) -> Result<(), RpcError> {
+        self.relock_if_expired();
+        if seed_guard(&self.seed).is_unlocked() {
             return Ok(());
         }
-        Err(RpcError::new(
-            codes::RPC_WALLET_ERROR,
-            if self.watch_only {
-                "Error: Private keys are disabled for this wallet (watch-only, built from \
-                 an imported xpub); spend from the paired spending wallet"
-            } else {
-                "Error: Private keys are disabled for this wallet, or the wallet is locked \
-                 (bitcoin wallets have no walletpassphrase yet - use an identity-file \
-                 wallet with auto_unlock for unattended sending)"
-            },
-        ))
+        Err(self.signer_unavailable())
+    }
+
+    /// Why this wallet cannot sign right now, in Bitcoin Core's codes and worded for which
+    /// shape it is: a watch-only wallet has nothing to unlock, ever (`-4`); a locked
+    /// passphrase-encrypted one needs `walletpassphrase` (`-13`); an identity-file wallet
+    /// whose seed was not decrypted at startup needs the configuration that does (`-4`).
+    fn signer_unavailable(&self) -> RpcError {
+        if self.watch_only {
+            RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "Error: Private keys are disabled for this wallet (watch-only, built from an \
+                 imported xpub); spend from the paired spending wallet",
+            )
+        } else if self.encrypted {
+            RpcError::unlock_needed()
+        } else {
+            RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "Error: Private keys are disabled for this wallet: its seed was not decrypted \
+                 at startup (the identity-file custody model needs [keys] age_identity and \
+                 auto_unlock = true; a passphrase-encrypted wallet unlocks with \
+                 walletpassphrase instead)",
+            )
+        }
     }
 
     /// Sign a built PSBT and extract the finished transaction. Signers are derived from the
     /// seed per call and dropped with this scope - the custody model's spend half (the
     /// persisted wallet holds public descriptors only). The caller has passed
-    /// [`Self::require_signer`].
+    /// [`Self::require_signer`], but the seed is checked again here: a `walletlock` (whose
+    /// fast path does not wait for this actor) or an expired unlock between that check and
+    /// this one refuses the send as locked rather than signing with a seed the operator has
+    /// already withdrawn.
     fn sign_and_extract(&self, mut psbt: Psbt) -> Result<Arc<Transaction>, RpcError> {
-        let seed = self
-            .seed
-            .as_ref()
-            .ok_or_else(|| RpcError::misc("no seed to sign with"))?;
+        if self.unlock_until.is_some_and(|t| Instant::now() >= t) {
+            return Err(self.signer_unavailable());
+        }
+        let guard = seed_guard(&self.seed);
+        let seed = guard.seed().ok_or_else(|| self.signer_unavailable())?;
         let signing = keys::signing_wallet(seed, self.network)
             .map_err(|e| RpcError::misc(format!("derive signing descriptors: {e:#}")))?;
+        drop(guard);
         let finalized = signing
             .sign(&mut psbt, SignOptions::default())
             .map_err(|e| RpcError::misc(format!("sign: {e}")))?;
@@ -3940,6 +4097,106 @@ impl BtcActor {
         Ok(Arc::new(psbt.extract_tx().map_err(|e| {
             RpcError::misc(format!("extract transaction: {e:?}"))
         })?))
+    }
+
+    /// `walletpassphrase`: decrypt the seed and hold it for `timeout_secs` seconds (Bitcoin
+    /// Core's semantics, mirrored from the Zcash actor's `do_unlock`). Before the seed is
+    /// kept it must derive the wallet's account - the pinned xpub, or for a `keys.toml`
+    /// from before seed wallets carried the pin the database's own descriptors, after which
+    /// the pin is recorded. That check is what retroactively vouches for a database
+    /// verified only against the pin while locked, and catches a `keys.toml` and database
+    /// swapped in together; a mismatch leaves the wallet locked.
+    fn do_unlock(&mut self, passphrase: Passphrase, timeout_secs: i64) -> Result<(), RpcError> {
+        if !self.encrypted {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletpassphrase was called.",
+            ));
+        }
+        let store = WalletStore::read(&self.keys_path)
+            .map_err(|e| RpcError::wallet(format!("reading keys.toml: {e}")))?;
+        // scrypt is deliberately slow (about a second), so it runs off the async worker.
+        let seed = tokio::task::block_in_place(|| store.decrypt_seed_with_passphrase(passphrase))
+            .map_err(|_| {
+                RpcError::new(
+                    codes::RPC_WALLET_PASSPHRASE_INCORRECT,
+                    "Error: The wallet passphrase entered was incorrect.",
+                )
+            })?
+            .ok_or_else(|| RpcError::wallet("wallet has no stored seed"))?;
+        let derived = AccountKeys::from_seed(&seed, self.network)
+            .map_err(|e| RpcError::wallet(format!("derive the account from the seed: {e:#}")))?;
+        let expected = match store.pinned_xpub() {
+            Some(pin) => AccountKeys::from_xpub(pin, self.network)
+                .map_err(|e| RpcError::wallet(format!("the xpub pinned in keys.toml: {e}")))?,
+            None => AccountKeys::from_wallet(&self.wallet).map_err(|e| {
+                RpcError::wallet(format!("read the wallet database's account: {e:#}"))
+            })?,
+        };
+        if derived.export() != expected.export() {
+            warn!(
+                target: "rose::audit",
+                seed_fingerprint = %derived.fingerprint,
+                wallet_fingerprint = %expected.fingerprint,
+                "walletpassphrase refused: the decrypted seed does not derive this wallet's \
+                 account"
+            );
+            return Err(RpcError::wallet(
+                "Error: The decrypted seed does not derive this wallet's account; keys.toml \
+                 and the wallet database disagree (one of them was replaced or belongs to a \
+                 different wallet). Refusing to unlock.",
+            ));
+        }
+        if store.pinned_xpub().is_none() {
+            WalletStore::pin_xpub(&self.keys_path, &derived.export())
+                .map_err(|e| RpcError::wallet(format!("pin the account xpub: {e:#}")))?;
+            info!(
+                target: "rose::audit",
+                "pinned the wallet's account xpub in keys.toml (pre-existing wallet upgraded, \
+                 verified against the decrypted seed)"
+            );
+        }
+        seed_guard(&self.seed).set(seed);
+        info!(target: "rose::audit", timeout_secs, "wallet unlocked via walletpassphrase");
+        self.unlock_until = Some(Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64));
+        self.publish_unlock();
+        // A zero timeout relocks at once, as in Core.
+        self.relock_if_expired();
+        Ok(())
+    }
+
+    /// `walletlock`: zeroize the seed now (the handle has usually done so already, on its
+    /// fast path) and clear the relock deadline.
+    fn do_lock(&mut self) -> Result<(), RpcError> {
+        if !self.encrypted {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_WRONG_ENC_STATE,
+                "Error: running with an unencrypted wallet, but walletlock was called.",
+            ));
+        }
+        seed_guard(&self.seed).lock();
+        self.unlock_until = None;
+        info!(target: "rose::audit", "wallet locked via walletlock");
+        self.publish_unlock();
+        Ok(())
+    }
+
+    /// Zeroize the seed once a `walletpassphrase` timeout has elapsed. Run at the top of every
+    /// loop pass, from the idle `select!`'s relock arm, and before every spend, so a send can
+    /// never sign past the deadline.
+    fn relock_if_expired(&mut self) {
+        if self.unlock_until.is_some_and(|t| Instant::now() >= t) {
+            seed_guard(&self.seed).lock();
+            self.unlock_until = None;
+            info!(target: "rose::audit", "wallet auto-locked (walletpassphrase timeout elapsed)");
+            self.publish_unlock();
+        }
+    }
+
+    /// Publish the unlock's expiry for the handle's `unlocked_until`.
+    fn publish_unlock(&self) {
+        self.unlock_tx
+            .send_replace(unlocked_until_unix(self.unlock_until));
     }
 
     /// Build the PSBT for a subtract-fee send: the listed recipients pay the fee out of
@@ -5098,8 +5355,12 @@ mod tests {
             network: BitcoinNetwork::Main,
             wallet_holds_seed: seed.is_some(),
             encrypted: false,
+            keys_path: dir.join("keys.toml"),
+            // What `init` pins for a seed wallet, so the seed-and-pin agreement holds.
+            imported_keys: seed
+                .as_ref()
+                .map(|seed| AccountKeys::from_seed(seed, BitcoinNetwork::Main).unwrap()),
             seed,
-            imported_keys: None,
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
             mempool: crate::config::MempoolConfig::default(),
@@ -5487,6 +5748,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let testnet3 = BtcActorConfig {
             network: BitcoinNetwork::Testnet3,
+            imported_keys: Some(
+                AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Testnet3).unwrap(),
+            ),
             ..offline_config(dir.path(), Some(bip84_seed()))
         };
         {
@@ -5496,6 +5760,9 @@ mod tests {
         }
         let testnet4 = BtcActorConfig {
             network: BitcoinNetwork::Testnet4,
+            imported_keys: Some(
+                AccountKeys::from_seed(&bip84_seed(), BitcoinNetwork::Testnet4).unwrap(),
+            ),
             ..offline_config(dir.path(), Some(bip84_seed()))
         };
         let err = spawn(testnet4).unwrap_err();
@@ -6622,6 +6889,388 @@ mod tests {
         assert_eq!(
             entry.hex.as_deref(),
             Some(bdk_wallet::bitcoin::consensus::encode::serialize_hex(&two).as_str())
+        );
+    }
+
+    /// The passphrase every encrypted-wallet test below uses.
+    const PASS: &str = "actor-pass";
+
+    /// Some other wallet's seed: derives a different account from [`bip84_seed`].
+    fn other_seed() -> SecretVec<u8> {
+        SecretVec::new(vec![7u8; 64])
+    }
+
+    fn account(seed: &SecretVec<u8>) -> AccountKeys {
+        AccountKeys::from_seed(seed, BitcoinNetwork::Main).unwrap()
+    }
+
+    /// Write a passphrase-encrypted `keys.toml` holding the mnemonic `phrase` and pinning
+    /// `pin` (or nothing, for a file from before seed wallets carried the pin).
+    fn write_encrypted_keys(dir: &std::path::Path, phrase: &str, pin: Option<&AccountKeys>) {
+        let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(phrase).unwrap();
+        let keys_path = dir.join("keys.toml");
+        WalletStore::init_bitcoin_with_passphrase(
+            &keys_path,
+            Passphrase::from(PASS.to_string()),
+            &mnemonic,
+            0,
+            None,
+            crate::network::ZNetwork::Main,
+            // Overwritten below for a pin-less file.
+            &pin.map_or_else(|| account(&bip84_seed()).export(), AccountKeys::export),
+        )
+        .unwrap();
+        if pin.is_none() {
+            WalletStore::strip_xpub_pin_for_tests(&keys_path);
+        }
+    }
+
+    /// A locked passphrase-encrypted wallet over the BIP 84 test mnemonic, as the daemon
+    /// spawns one: no seed in hand, the pinned xpub as its key reference.
+    fn encrypted_config(dir: &std::path::Path) -> BtcActorConfig {
+        write_encrypted_keys(
+            dir,
+            crate::btc::keys::tests::BIP84_MNEMONIC,
+            Some(&account(&bip84_seed())),
+        );
+        encrypted_config_without_keys(dir)
+    }
+
+    async fn try_send(handle: &BtcWalletHandle) -> RpcError {
+        handle
+            .send(
+                vec![(
+                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                    10_000,
+                )],
+                BtcSendOptions::default(),
+            )
+            .await
+            .unwrap_err()
+    }
+
+    /// The send refusal names the wallet's shape: a locked encrypted wallet is Core's `-13`
+    /// (unlock needed), a watch-only one `-4` with nothing to unlock, and an identity-file
+    /// wallet whose seed was not decrypted at startup `-4` naming the configuration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_refusals_distinguish_locked_watch_only_and_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (locked, _task) = spawn(encrypted_config(dir.path())).unwrap();
+        assert_eq!(locked.unlocked_until(), Some(0));
+        let err = try_send(&locked).await;
+        assert_eq!(err.code, codes::RPC_WALLET_UNLOCK_NEEDED, "{}", err.message);
+        assert!(err.message.contains("walletpassphrase"), "{}", err.message);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (watch, _task) = spawn(BtcActorConfig {
+            imported_keys: Some(account(&bip84_seed())),
+            ..offline_config(dir.path(), None)
+        })
+        .unwrap();
+        assert_eq!(watch.unlocked_until(), None);
+        let err = try_send(&watch).await;
+        assert_eq!(err.code, codes::RPC_WALLET_ERROR);
+        assert!(err.message.contains("watch-only"), "{}", err.message);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (not_loaded, _task) = spawn(BtcActorConfig {
+            wallet_holds_seed: true,
+            imported_keys: Some(account(&bip84_seed())),
+            ..offline_config(dir.path(), None)
+        })
+        .unwrap();
+        assert_eq!(not_loaded.unlocked_until(), None);
+        let err = try_send(&not_loaded).await;
+        assert_eq!(err.code, codes::RPC_WALLET_ERROR);
+        assert!(err.message.contains("auto_unlock"), "{}", err.message);
+    }
+
+    /// The whole `walletpassphrase` lifecycle on one wallet: a wrong passphrase is `-14` and
+    /// leaves it locked; the right one unlocks it (reported as a future relock time, and a
+    /// send gets past the signer to the next thing it needs, the upstream); `walletlock`
+    /// relocks it at once; a zero timeout relocks immediately; and a short timeout relocks
+    /// on its own - with no command sent, so it is the actor's relock timer that fired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn walletpassphrase_unlocks_relocks_and_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _task) = spawn(encrypted_config(dir.path())).unwrap();
+
+        let err = handle
+            .unlock(Passphrase::from("wrong".to_string()), 60)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, codes::RPC_WALLET_PASSPHRASE_INCORRECT);
+        assert_eq!(handle.unlocked_until(), Some(0));
+
+        handle
+            .unlock(Passphrase::from(PASS.to_string()), 600)
+            .await
+            .unwrap();
+        let until = handle.unlocked_until().unwrap();
+        assert!(until > unix_now() as i64 + 500, "unlocked_until {until}");
+        let err = try_send(&handle).await;
+        assert_eq!(err.code, codes::RPC_WALLET_ERROR);
+        assert!(err.message.contains("upstream"), "{}", err.message);
+
+        handle.lock().await.unwrap();
+        assert_eq!(handle.unlocked_until(), Some(0));
+        assert_eq!(
+            try_send(&handle).await.code,
+            codes::RPC_WALLET_UNLOCK_NEEDED
+        );
+        // Locking a locked wallet is a no-op, as in Core.
+        handle.lock().await.unwrap();
+
+        handle
+            .unlock(Passphrase::from(PASS.to_string()), 0)
+            .await
+            .unwrap();
+        assert_eq!(handle.unlocked_until(), Some(0));
+        assert_eq!(
+            try_send(&handle).await.code,
+            codes::RPC_WALLET_UNLOCK_NEEDED
+        );
+
+        handle
+            .unlock(Passphrase::from(PASS.to_string()), 1)
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.unlocked_until() != Some(0) {
+            assert!(Instant::now() < deadline, "the unlock never expired");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            try_send(&handle).await.code,
+            codes::RPC_WALLET_UNLOCK_NEEDED
+        );
+    }
+
+    /// `walletpassphrase` and `walletlock` on a wallet that is not passphrase-encrypted are
+    /// Core's wrong-encryption-state error, whether it holds a seed or is watch-only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn passphrase_commands_on_an_unencrypted_wallet_are_wrong_enc_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _task) = spawn(offline_config(dir.path(), Some(bip84_seed()))).unwrap();
+        let err = handle
+            .unlock(Passphrase::from(PASS.to_string()), 60)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, codes::RPC_WALLET_WRONG_ENC_STATE);
+        assert_eq!(
+            handle.lock().await.unwrap_err().code,
+            codes::RPC_WALLET_WRONG_ENC_STATE
+        );
+        assert_eq!(handle.unlocked_until(), None);
+    }
+
+    /// A `keys.toml` whose seed does not derive the account it pins (its ciphertext and its
+    /// pin come from two wallets) never unlocks: `-4`, and the wallet stays locked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unlock_refuses_a_seed_that_does_not_derive_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        // The other wallet's mnemonic, behind this wallet's pin.
+        write_encrypted_keys(
+            dir.path(),
+            "mechanic vehicle helmet decide plug gorilla frost dial october midnight culture \
+             idea mountain fame park social drip bid doctor scatter glance defy moment stage",
+            Some(&account(&bip84_seed())),
+        );
+        let (handle, _task) = spawn(BtcActorConfig {
+            wallet_holds_seed: true,
+            encrypted: true,
+            imported_keys: Some(account(&bip84_seed())),
+            ..offline_config(dir.path(), None)
+        })
+        .unwrap();
+        let err = handle
+            .unlock(Passphrase::from(PASS.to_string()), 60)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, codes::RPC_WALLET_ERROR);
+        assert!(err.message.contains("does not derive"), "{}", err.message);
+        assert_eq!(handle.unlocked_until(), Some(0));
+        assert_eq!(
+            try_send(&handle).await.code,
+            codes::RPC_WALLET_UNLOCK_NEEDED
+        );
+    }
+
+    /// A locked wallet has no seed to check its database against, so the pin does it: a
+    /// database built for another account is the fatal binding mismatch, exactly as it is
+    /// with the seed in hand.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_locked_wallet_verifies_its_database_against_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (handle, task) = spawn(offline_config(dir.path(), Some(other_seed()))).unwrap();
+            drop(handle);
+            task.await.unwrap();
+        }
+        let err = spawn(encrypted_config(dir.path())).unwrap_err();
+        assert!(
+            err.downcast_ref::<BtcBindingMismatch>().is_some(),
+            "expected BtcBindingMismatch, got: {err:#}"
+        );
+    }
+
+    /// With both the seed and the pin in hand, the seed must derive the pin - before the
+    /// database is even consulted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seed_that_disagrees_with_the_pin_is_a_binding_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = spawn(BtcActorConfig {
+            imported_keys: Some(account(&other_seed())),
+            ..offline_config(dir.path(), Some(bip84_seed()))
+        })
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<BtcBindingMismatch>().is_some(),
+            "expected BtcBindingMismatch, got: {err:#}"
+        );
+        assert!(
+            !crate::btc::store::wallet_db_path(&dir.path().join("btc").join("bdk")).exists(),
+            "refused before the database was opened"
+        );
+    }
+
+    /// The pin rebuilds a deleted database while the wallet is locked (what `rose rescan`
+    /// relies on): the rebuilt wallet hands out the same addresses the seed derives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_locked_wallet_rebuilds_a_missing_database_from_the_pin() {
+        let seeded = tempfile::tempdir().unwrap();
+        let (handle, _task) = spawn(offline_config(seeded.path(), Some(bip84_seed()))).unwrap();
+        let expected = handle.new_address().await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _task) = spawn(encrypted_config(dir.path())).unwrap();
+        assert_eq!(handle.unlocked_until(), Some(0));
+        assert_eq!(handle.new_address().await.unwrap(), expected);
+    }
+
+    /// A seed wallet's `keys.toml` from before seed wallets carried the pin gets it the first
+    /// time the seed is in hand: at spawn for an identity-file wallet (after the database has
+    /// been verified against the seed), at the first `walletpassphrase` for an encrypted one
+    /// (after the seed has been checked against the database's own descriptors). A seed the
+    /// database disowns pins nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pre_pin_keys_file_is_pinned_at_the_first_seed_exposure() {
+        let expected = account(&bip84_seed()).export();
+
+        // Identity custody: the seed is decrypted at startup.
+        let dir = tempfile::tempdir().unwrap();
+        let keys_path = dir.path().join("keys.toml");
+        let identity = age::x25519::Identity::generate();
+        let recipient = identity.to_public();
+        WalletStore::init_bitcoin_with_mnemonic(
+            &keys_path,
+            std::iter::once(&recipient as &dyn age::Recipient),
+            &<bip0039::Mnemonic<bip0039::English>>::from_phrase(
+                crate::btc::keys::tests::BIP84_MNEMONIC,
+            )
+            .unwrap(),
+            0,
+            None,
+            crate::network::ZNetwork::Main,
+            &expected,
+        )
+        .unwrap();
+        WalletStore::strip_xpub_pin_for_tests(&keys_path);
+        let (_handle, _task) = spawn(BtcActorConfig {
+            imported_keys: None,
+            ..offline_config(dir.path(), Some(bip84_seed()))
+        })
+        .unwrap();
+        assert_eq!(
+            WalletStore::read(&keys_path).unwrap().pinned_xpub(),
+            Some(expected.as_str())
+        );
+
+        // Passphrase custody: the database exists (from before), the file has no pin, and
+        // the wallet starts locked with nothing to verify the database against yet.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (handle, task) = spawn(offline_config(dir.path(), Some(bip84_seed()))).unwrap();
+            drop(handle);
+            task.await.unwrap();
+        }
+        write_encrypted_keys(dir.path(), crate::btc::keys::tests::BIP84_MNEMONIC, None);
+        let keys_path = dir.path().join("keys.toml");
+        let (handle, _task) = spawn(BtcActorConfig {
+            imported_keys: None,
+            ..encrypted_config_without_keys(dir.path())
+        })
+        .unwrap();
+        assert_eq!(WalletStore::read(&keys_path).unwrap().pinned_xpub(), None);
+        handle
+            .unlock(Passphrase::from(PASS.to_string()), 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            WalletStore::read(&keys_path).unwrap().pinned_xpub(),
+            Some(expected.as_str())
+        );
+
+        // The same pre-pin file over a database built for another account: the seed is
+        // checked against the database's descriptors, refused, and nothing is pinned.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (handle, task) = spawn(offline_config(dir.path(), Some(other_seed()))).unwrap();
+            drop(handle);
+            task.await.unwrap();
+        }
+        write_encrypted_keys(dir.path(), crate::btc::keys::tests::BIP84_MNEMONIC, None);
+        let keys_path = dir.path().join("keys.toml");
+        let (handle, _task) = spawn(BtcActorConfig {
+            imported_keys: None,
+            ..encrypted_config_without_keys(dir.path())
+        })
+        .unwrap();
+        let err = handle
+            .unlock(Passphrase::from(PASS.to_string()), 60)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("does not derive"), "{}", err.message);
+        assert_eq!(WalletStore::read(&keys_path).unwrap().pinned_xpub(), None);
+        assert_eq!(handle.unlocked_until(), Some(0));
+    }
+
+    /// [`encrypted_config`] without writing `keys.toml` (the caller already has).
+    fn encrypted_config_without_keys(dir: &std::path::Path) -> BtcActorConfig {
+        BtcActorConfig {
+            wallet_holds_seed: true,
+            encrypted: true,
+            imported_keys: Some(account(&bip84_seed())),
+            ..offline_config(dir, None)
+        }
+    }
+
+    /// `walletlock` zeroizes the seed from the handle, without the actor: here the actor has
+    /// already stopped, so the `Lock` command itself cannot be delivered - and the seed is
+    /// locked all the same. This is what makes `walletlock` take effect while a long sync
+    /// pass holds the actor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn walletlock_locks_the_seed_without_waiting_for_the_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (handle, task) = spawn(BtcActorConfig {
+            shutdown: stop_rx,
+            ..encrypted_config(dir.path())
+        })
+        .unwrap();
+        handle
+            .unlock(Passphrase::from(PASS.to_string()), 600)
+            .await
+            .unwrap();
+        assert_ne!(handle.unlocked_until(), Some(0));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap();
+        let err = handle.lock().await.unwrap_err();
+        assert!(err.message.contains("not running"), "{}", err.message);
+        assert_eq!(
+            handle.unlocked_until(),
+            Some(0),
+            "the seed was zeroized anyway"
         );
     }
 }

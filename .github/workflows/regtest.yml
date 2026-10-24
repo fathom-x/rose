@@ -116,7 +116,7 @@ env:
   # pin builds is in the new layout; the chain-snapshot cache key below already includes this
   # image, so bumping the pin rebuilds the archive rather than restoring one the funder would
   # have to migrate. The current pin is a pre-rename `zecd` release under the retired
-  # `zecrocks/zecd` registry path; releases of the public tree land at `ghcr.io/fathom-x/rose`,
+  # `zecrocks/zecd` registry path; releases land at `ghcr.io/fathom-x/rose`,
   # so substitute that path (and drop the harness's pre-rename funder shims, see
   # regtest-harness/src/lib.rs `funder_command`) when moving the pin. Resolve a new digest with:
   #   TOKEN=$(curl -sL "https://ghcr.io/token?scope=repository:zecrocks/zecd:pull&service=ghcr.io" | jq -r .token)
@@ -527,7 +527,9 @@ jobs:
   # xpub pairing (regtest_btc_watchonly), restore from mnemonic (regtest_btc_restore), a
   # live reorg (regtest_btc_reorg), a hung node (regtest_btc_hang), coinbase maturity on
   # the read path (regtest_btc_coinbase), the address lookahead on a restore
-  # (regtest_btc_lookahead), and a reorg below the birthday anchor (regtest_btc_reorg_deep);
+  # (regtest_btc_lookahead), a reorg below the birthday anchor (regtest_btc_reorg_deep),
+  # and a passphrase-encrypted wallet's walletpassphrase/walletlock lifecycle and rescan
+  # while locked (regtest_btc_encrypted);
   # plus the kyoto-only 0-conf feed over rose's own P2P relay connection
   # (regtest_btc_p2p_mempool: the node grants the wallet host the `mempool` permission).
   # regtest_btc_send_outcomes drives the send record through the node's rejection, a
@@ -624,7 +626,7 @@ jobs:
             --test regtest_btc_birthday_block --test regtest_btc_send_outcomes \
             --test regtest_btc_bumpfee --test regtest_btc_ancestors \
             --test regtest_btc_kyoto_fees --test regtest_btc_fee_curve \
-            --test regtest_btc_fee_split \
+            --test regtest_btc_fee_split --test regtest_btc_encrypted \
             -- --nocapture 2>&1 | tee btc-e2e.log
           # Every suite self-skips (printing `skipping:`, see the harness's `provisioned`)
           # without a bitcoind or against a feature-less rose. This job supplies both, so a

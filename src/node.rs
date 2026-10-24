@@ -752,10 +752,10 @@ async fn stop_actors(
 
 /// Bring up one Bitcoin wallet: read its `keys.toml`, decrypt the seed where the custody
 /// model allows it (identity file + auto-unlock, exactly the Zcash actor's startup rule),
-/// and spawn the BDK actor. A passphrase-encrypted wallet starts without its seed - the
-/// wallet database already exists from init, so only the binding verification is skipped.
-/// A watch-only wallet has no seed at all; its pinned account xpub takes the seed's place
-/// for the binding verification (and for rebuilding a deleted database).
+/// and spawn the BDK actor. Whenever the seed is not in hand - a watch-only wallet, or a
+/// passphrase-encrypted one, which starts locked until `walletpassphrase` - the account
+/// xpub pinned in `keys.toml` takes its place for the binding verification and for
+/// rebuilding a deleted database; with the seed in hand, the seed must derive the pin.
 #[cfg(feature = "bitcoin")]
 fn spawn_bitcoin_wallet(
     config: &AppConfig,
@@ -791,10 +791,12 @@ fn spawn_bitcoin_wallet(
                 |e| anyhow::anyhow!("wallet '{name}': the xpub pinned in keys.toml: {e}"),
             )?,
         ),
+        // A seed wallet's `keys.toml` from before seed wallets carried the pin: the actor
+        // backfills it from the seed (at spawn, or at the first `walletpassphrase`).
         None if store.has_seed() => None,
         None => anyhow::bail!(
-            "wallet '{}' has neither a seed nor an imported xpub in {} (not a wallet rose \
-             created); re-run `rose init` for it",
+            "wallet '{}' has neither a seed nor a pinned account xpub in {} (not a wallet \
+             rose created); re-run `rose init` for it",
             name,
             keys_path.display()
         ),
@@ -806,6 +808,7 @@ fn spawn_bitcoin_wallet(
         seed,
         wallet_holds_seed: store.has_seed(),
         encrypted: store.has_seed() && store.is_encrypted(),
+        keys_path: keys_path.to_path_buf(),
         imported_keys,
         endpoint: Some(endpoint),
         fees: config.fees.clone(),

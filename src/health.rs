@@ -165,9 +165,10 @@ fn snapshot(state: &AppState) -> Snapshot {
     let mut ready = !loaded.is_empty();
     let mut any_down = false;
     let mut any_actor_down = false;
-    // Both are the Zcash engine's signals - a wallet whose seed is locked, and one still
-    // draining the memo-enhancement backlog - so neither is ever set in a bitcoin-only build.
-    #[cfg_attr(not(feature = "zcash"), allow(unused_mut))]
+    // A wallet whose passphrase-encrypted seed is locked (either engine), and one still
+    // draining the memo-enhancement backlog (the Zcash engine's alone, so never set in a
+    // bitcoin-only build).
+    #[cfg_attr(not(any(feature = "zcash", feature = "bitcoin")), allow(unused_mut))]
     let mut any_locked = false;
     #[cfg_attr(not(feature = "zcash"), allow(unused_mut))]
     let mut any_enhancing = false;
@@ -279,10 +280,10 @@ fn snapshot(state: &AppState) -> Snapshot {
                 if !actor_alive {
                     any_actor_down = true;
                 }
-                // A passphrase-encrypted Bitcoin wallet is locked for good (the engine has
-                // no `walletpassphrase`); like a locked Zcash wallet it stays read-ready and
-                // raises the top-level `locked` flag.
-                if h.encrypted {
+                // A locked passphrase-encrypted Bitcoin wallet, like a locked Zcash one, stays
+                // read-ready and raises the top-level `locked` flag until `walletpassphrase`.
+                let locked = h.unlocked_until() == Some(0);
+                if locked {
                     any_locked = true;
                 }
                 wallets.insert(
@@ -303,7 +304,7 @@ fn snapshot(state: &AppState) -> Snapshot {
                         "birthday": h.birthday,
                         "scanning": st.conn_state == BtcConnState::Syncing,
                         "encrypted": h.encrypted,
-                        "locked": h.encrypted,
+                        "locked": locked,
                         "ready": w_ready,
                     }),
                 );

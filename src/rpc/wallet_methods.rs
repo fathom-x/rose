@@ -16,10 +16,11 @@ use crate::config::SendPrivacy;
 use crate::error::RpcError;
 use crate::operations::{ContextInfo, OperationId};
 use crate::pools::ReceiverSet;
-use crate::rpc::params::{check_balance_dummy, count_from_params, depth_param};
+use crate::rpc::params::{
+    check_balance_dummy, count_from_params, depth_param, walletpassphrase_args,
+};
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
-use crate::wallet::store::Passphrase;
 use crate::wallet::{read, ReceiverRequest, SendSource, SyncStatus, WalletHandle};
 
 pub(crate) fn opt_str(req: &RpcRequest, i: usize) -> Option<String> {
@@ -3192,10 +3193,6 @@ pub(crate) fn z_listoperationids(
     Ok(json!(state.operations.list_ids(&handle.name, filter)))
 }
 
-/// Bitcoin Core clamps the unlock timeout to this many seconds (~3.17 years); larger values
-/// are silently reduced rather than rejected.
-const MAX_UNLOCK_TIMEOUT_SECS: i64 = 100_000_000;
-
 /// `walletpassphrase <passphrase> <timeout>` - decrypt the seed into memory for `timeout`
 /// seconds (auto-relock after). Wrong passphrase is `-14`; an unencrypted wallet is `-15`.
 pub(crate) async fn walletpassphrase(
@@ -3203,22 +3200,9 @@ pub(crate) async fn walletpassphrase(
     wallet: Option<&str>,
     req: &RpcRequest,
 ) -> Result<Value, RpcError> {
-    let passphrase = req.require_str(0, "walletpassphrase requires a passphrase")?;
-    // Timeout (seconds) is required and must be a non-negative integer; huge values are clamped.
-    let timeout = req.param(1).and_then(|v| v.as_i64()).ok_or_else(|| {
-        RpcError::invalid_parameter("walletpassphrase requires an integer timeout (seconds)")
-    })?;
-    if timeout < 0 {
-        return Err(RpcError::invalid_parameter("Timeout cannot be negative."));
-    }
-    if passphrase.is_empty() {
-        return Err(RpcError::invalid_parameter("passphrase cannot be empty"));
-    }
-    let timeout = timeout.min(MAX_UNLOCK_TIMEOUT_SECS);
+    let (passphrase, timeout) = walletpassphrase_args(req)?;
     let handle = state.registry.get(wallet)?.clone();
-    handle
-        .unlock(Passphrase::from(passphrase.to_owned()), timeout)
-        .await?;
+    handle.unlock(passphrase, timeout).await?;
     Ok(Value::Null)
 }
 

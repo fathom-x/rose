@@ -30,7 +30,9 @@ use crate::btc::actor::{
 };
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
-use crate::rpc::params::{check_balance_dummy, count_from_params, depth_param};
+use crate::rpc::params::{
+    check_balance_dummy, count_from_params, depth_param, walletpassphrase_args,
+};
 use crate::server::jsonrpc::RpcRequest;
 
 /// A non-negative depth argument (`minconf`, `maxconf`) with the Zcash handlers' error
@@ -71,6 +73,8 @@ pub(crate) const BITCOIN_METHODS: &[&str] = &[
     "estimatesmartfee",
     "getreceivedbyaddress",
     "listsinceblock",
+    "walletpassphrase",
+    "walletlock",
 ];
 
 /// Route one request for a Bitcoin wallet. `None` = not a method this engine serves
@@ -107,6 +111,8 @@ pub(crate) async fn dispatch(
         "estimatesmartfee" => estimatesmartfee(handle, req).await,
         "getreceivedbyaddress" => getreceivedbyaddress(handle, req).await,
         "listsinceblock" => listsinceblock(handle, req).await,
+        "walletpassphrase" => walletpassphrase(handle, req).await,
+        "walletlock" => handle.lock().await.map(|()| Value::Null),
         _ => return None,
     })
 }
@@ -450,12 +456,22 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         // tells wallets apart by.
         "coin": "bitcoin",
     });
-    // Core reports `unlocked_until` only for an encrypted wallet, 0 while locked. A
-    // passphrase-encrypted Bitcoin wallet is always locked (no `walletpassphrase`).
-    if handle.encrypted {
-        info["unlocked_until"] = json!(0);
+    // Core reports `unlocked_until` only for an encrypted wallet: the unix time the unlock
+    // expires, 0 while locked.
+    if let Some(until) = handle.unlocked_until() {
+        info["unlocked_until"] = json!(until);
     }
     Ok(info)
+}
+
+/// `walletpassphrase <passphrase> <timeout>` - decrypt the seed into memory for `timeout`
+/// seconds (auto-relock after), with the Zcash handler's argument rules and codes: wrong
+/// passphrase `-14`, unencrypted wallet `-15`, a seed that does not derive the wallet's
+/// account `-4`.
+async fn walletpassphrase(handle: &BtcWalletHandle, req: &RpcRequest) -> Result<Value, RpcError> {
+    let (passphrase, timeout) = walletpassphrase_args(req)?;
+    handle.unlock(passphrase, timeout).await?;
+    Ok(Value::Null)
 }
 
 /// `listunspent [minconf] [maxconf] [addresses] [include_unsafe] [query_options]` - Bitcoin
@@ -1347,7 +1363,11 @@ mod tests {
             seed: Some(bip84_seed()),
             wallet_holds_seed: true,
             encrypted: false,
-            imported_keys: None,
+            keys_path: entry.keys_path(),
+            imported_keys: Some(
+                crate::btc::keys::AccountKeys::from_seed(&bip84_seed(), entry.bitcoin_network())
+                    .unwrap(),
+            ),
             endpoint: None,
             fees: crate::config::FeesConfig::default(),
             mempool: crate::config::MempoolConfig::default(),
@@ -1716,13 +1736,8 @@ mod tests {
         assert_eq!(call("listwallets", vec![]).await.unwrap(), json!(["btc"]));
 
         // Everything the engine does not serve reads as method-not-found: a Zcash-dialect
-        // node read, the passphrase surface, and a z_* extension alike.
-        for gated in [
-            "getrawtransaction",
-            "signmessage",
-            "z_sendmany",
-            "walletpassphrase",
-        ] {
+        // node read, message signing, and a z_* extension alike.
+        for gated in ["getrawtransaction", "signmessage", "z_sendmany"] {
             let err = call(gated, vec![]).await.unwrap_err();
             assert_eq!(
                 err.code,
@@ -1730,6 +1745,38 @@ mod tests {
                 "{gated} must 404 for a bitcoin wallet"
             );
         }
+
+        // The passphrase surface is served (Core's semantics, the Zcash handler's argument
+        // rules): malformed arguments are refused before the wallet is consulted, and on an
+        // unencrypted wallet both calls are the wrong-encryption-state error.
+        for (params, expected) in [
+            (
+                vec![json!("x"), json!(-1)],
+                crate::error::codes::RPC_INVALID_PARAMETER,
+            ),
+            (
+                vec![json!(""), json!(60)],
+                crate::error::codes::RPC_INVALID_PARAMETER,
+            ),
+            (
+                vec![json!("x"), json!("soon")],
+                crate::error::codes::RPC_INVALID_PARAMETER,
+            ),
+            (
+                vec![json!("x"), json!(60)],
+                crate::error::codes::RPC_WALLET_WRONG_ENC_STATE,
+            ),
+        ] {
+            assert_eq!(
+                code(call("walletpassphrase", params.clone()).await),
+                expected,
+                "walletpassphrase {params:?}"
+            );
+        }
+        assert_eq!(
+            code(call("walletlock", vec![]).await),
+            crate::error::codes::RPC_WALLET_WRONG_ENC_STATE
+        );
 
         // Labels stay refused (statelessness), and non-bech32 address types are refused.
         let err = call("getnewaddress", vec![json!("label")])

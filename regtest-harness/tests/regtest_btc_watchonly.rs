@@ -9,8 +9,9 @@
 //! clock-derived diversifiers); it sees receives, the spender's sends, and change through
 //! the pinned public descriptors alone; it reports `private_keys_enabled: false` and
 //! `spendable: false`, refuses sends with Bitcoin Core's -4 naming the watch-only custody,
-//! and has no `walletpassphrase` at all; it re-exports the identical key it was built from
-//! (read from the live daemon's database, lock-free); the pinned key verifies the database
+//! and answers `walletpassphrase`/`walletlock` with `-15` (nothing is encrypted); it
+//! re-exports the identical key it was built from (read from the live daemon's database,
+//! lock-free); the pinned key verifies the database
 //! across a restart; and a deleted database is rebuilt from the pin and rescanned to the
 //! same balance - the Bitcoin analog of a watch-only UFVK wallet's rescannability.
 //!
@@ -192,8 +193,8 @@ async fn watch_only_flow(backend: BtcBackend) {
     assert_eq!(unspent[0]["spendable"], json!(true), "{unspent}");
 
     // 5. The watch-only wallet cannot spend: Bitcoin Core's -4, before any funds check
-    //    (it has the funds), naming the watch-only custody. `walletpassphrase` is not a
-    //    method Bitcoin wallets serve at all.
+    //    (it has the funds), naming the watch-only custody, and there is nothing to
+    //    unlock.
     let miner = node.new_address().await;
     for (method, params) in [
         ("sendtoaddress", json!([miner, 0.1])),
@@ -207,11 +208,18 @@ async fn watch_only_flow(backend: BtcBackend) {
         assert!(msg.contains("Private keys are disabled"), "{method}: {msg}");
         assert!(msg.contains("watch-only"), "{method}: {msg}");
     }
-    let (code, _) = rose
-        .call_wallet(VIEW, "walletpassphrase", json!(["pw", 60]))
-        .await
-        .expect_err("walletpassphrase is not served for bitcoin wallets");
-    assert_eq!(code, -32601);
+    // A watch-only wallet has no seed to encrypt: the passphrase pair is Core's
+    // wrong-encryption-state error, as on a Zcash watch-only wallet.
+    for (method, params) in [
+        ("walletpassphrase", json!(["pw", 60])),
+        ("walletlock", json!([])),
+    ] {
+        let (code, msg) = rose
+            .call_wallet(VIEW, method, params)
+            .await
+            .expect_err("a watch-only wallet is not encrypted");
+        assert_eq!(code, -15, "{method}: {msg}");
+    }
     // Nothing moved.
     let mempool = node.mempool().await;
     assert!(

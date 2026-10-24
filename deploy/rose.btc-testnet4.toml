@@ -94,8 +94,8 @@ password = "CHANGE-ME"
 [keys]
 # age identity written by `rose init`; used to decrypt the seed for unattended sending. A
 # bitcoin send derives its signers from that seed per send (no spending material is stored
-# in the BDK database), and there is no `walletpassphrase` for a bitcoin wallet - so a
-# passphrase-encrypted one cannot send at all, and this is the only unattended custody model.
+# in the BDK database). A wallet created with `rose init --encrypt` starts locked instead and
+# sends only after `walletpassphrase`, so this is the unattended custody model.
 age_identity = "./data-btc-testnet4/identity.txt"
 auto_unlock = true
 

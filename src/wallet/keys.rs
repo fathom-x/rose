@@ -5,6 +5,8 @@
 //! and never cached.
 
 use std::path::Path;
+use std::sync::MutexGuard;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use secrecy::{ExposeSecret, SecretVec};
 #[cfg(feature = "zcash")]
@@ -18,6 +20,7 @@ use crate::hardening;
 #[cfg(any(test, feature = "zcash"))]
 use crate::network::ZNetwork;
 use crate::wallet::store::WalletStore;
+use crate::wallet::SharedSeed;
 
 /// The decrypted seed held in `mlock`ed memory: the page(s) backing it are pinned into RAM
 /// (best-effort) so the seed is never written to swap while unlocked, and `munlock`ed before
@@ -51,6 +54,18 @@ impl Drop for MlockedSeed {
 #[derive(Default)]
 pub struct SeedKeeper {
     seed: Option<MlockedSeed>,
+}
+
+/// Redacted: says whether a seed is loaded, never what it is - so a handle that holds the
+/// shared keeper can derive `Debug` without a path to printing the secret.
+impl std::fmt::Debug for SeedKeeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.is_unlocked() {
+            "SeedKeeper(unlocked)"
+        } else {
+            "SeedKeeper(locked)"
+        })
+    }
 }
 
 impl SeedKeeper {
@@ -89,6 +104,13 @@ impl SeedKeeper {
             .map(|s| SecretVec::new(s.expose().to_vec()))
     }
 
+    /// The decrypted seed itself, borrowed in place, if loaded. Unlike [`Self::clone_seed`]
+    /// this makes no copy, so the bytes stay in the `mlock`ed buffer: the Bitcoin engine's
+    /// signer derivation borrows it for the length of one signing pass.
+    pub fn seed(&self) -> Option<&SecretVec<u8>> {
+        self.seed.as_ref().map(|s| &s.seed)
+    }
+
     /// Derive the Unified Spending Key for an account index, or return the bitcoind
     /// "unlock needed" error (-13) if the seed is not loaded.
     ///
@@ -103,6 +125,38 @@ impl SeedKeeper {
         let seed = self.seed.as_ref().ok_or_else(RpcError::unlock_needed)?;
         UnifiedSpendingKey::from_seed(&network, seed.expose(), account_index)
             .map_err(|e| RpcError::wallet(format!("key derivation failed: {e}")))
+    }
+}
+
+/// Lock the shared seed, recovering from a poisoned mutex. The guarded operations (derive/set/
+/// lock/clone) are trivial and shouldn't panic, but if one ever did while holding the guard,
+/// recovering the inner value keeps a single bad command from wedging every later seed access -
+/// and crucially never blocks `walletlock` from zeroizing the seed.
+pub fn seed_guard(seed: &SharedSeed) -> MutexGuard<'_, SeedKeeper> {
+    seed.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sleep until the unlock deadline, or forever when there is none. Used as a `select!` arm so an
+/// encrypted wallet's seed is zeroized promptly once its `walletpassphrase` timeout elapses.
+pub async fn relock_sleep(until: Option<Instant>) {
+    match until {
+        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Bitcoin Core's `getwalletinfo.unlocked_until` for an encrypted wallet: the unix time its
+/// unlock expires, or `0` while it is locked.
+pub fn unlocked_until_unix(until: Option<Instant>) -> i64 {
+    match until {
+        Some(t) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            now + t.saturating_duration_since(Instant::now()).as_secs() as i64
+        }
+        None => 0,
     }
 }
 
@@ -236,6 +290,30 @@ mod tests {
             .unwrap()
             .to_seed("");
         SecretVec::new(seed.to_vec())
+    }
+
+    /// The borrowing accessor follows the keeper's state: nothing while locked, the very
+    /// bytes that were set while unlocked, nothing again once locked; and the shared
+    /// keeper's guard and `Debug` never show the seed.
+    #[test]
+    fn seed_accessor_follows_lock_state_and_debug_redacts() {
+        let shared: SharedSeed = std::sync::Arc::new(std::sync::Mutex::new(SeedKeeper::locked()));
+        assert!(seed_guard(&shared).seed().is_none());
+        assert_eq!(format!("{:?}", seed_guard(&shared)), "SeedKeeper(locked)");
+        seed_guard(&shared).set(SecretVec::new(vec![42u8; 64]));
+        assert_eq!(
+            seed_guard(&shared)
+                .seed()
+                .map(|s| s.expose_secret().to_vec()),
+            Some(vec![42u8; 64])
+        );
+        assert_eq!(format!("{:?}", seed_guard(&shared)), "SeedKeeper(unlocked)");
+        seed_guard(&shared).lock();
+        assert!(seed_guard(&shared).seed().is_none());
+        assert_eq!(unlocked_until_unix(None), 0);
+        assert!(
+            unlocked_until_unix(Some(Instant::now() + std::time::Duration::from_secs(600))) > 0
+        );
     }
 
     /// A locked keeper holds no seed, so any key derivation is the bitcoind -13

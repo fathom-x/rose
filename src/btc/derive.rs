@@ -9,9 +9,9 @@
 //!
 //! The account key comes from one of three places:
 //!
-//! - the wallet itself - the `keys.toml` xpub pin of a watch-only wallet, else the public
-//!   descriptors in its database (what `export-xpub` reads). No seed is decrypted, so a
-//!   locked or watch-only wallet works;
+//! - the wallet itself - the `keys.toml` account xpub pin (every wallet `init` writes), else
+//!   the public descriptors in its database (what `export-xpub` reads). No seed is
+//!   decrypted, so a locked or watch-only wallet works;
 //! - a BIP-39 mnemonic (`--mnemonic`, from `ROSE_MNEMONIC`/`--mnemonic-file`/stdin), the
 //!   air-gapped case;
 //! - an account xpub (`--xpub`, the `[fingerprint/84'/coin'/0']xpub...` form `export-xpub`
@@ -270,9 +270,9 @@ pub fn derive(config: &AppConfig, opts: DeriveOptions<'_>) -> anyhow::Result<Der
     })
 }
 
-/// The wallet's own account key: the `keys.toml` xpub pin of a watch-only wallet, else the
-/// public descriptors in its database (`export-xpub`'s read, which also enforces the
-/// network).
+/// The wallet's own account key: the `keys.toml` account xpub pin, else (a seed wallet's
+/// `keys.toml` from before seed wallets carried the pin) the public descriptors in its
+/// database (`export-xpub`'s read, which also enforces the network).
 fn wallet_keys(
     config: &AppConfig,
     entry: &WalletEntry,

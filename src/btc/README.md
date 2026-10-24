@@ -18,7 +18,10 @@ light client over P2P, with no server and no credentials to provision. **Watch-o
 wallets** pair with a spender through the account xpub: `rose export-xpub` prints it with
 its key origin, `rose init --xpub` builds a seedless wallet from it (any number beside the
 one spender), `keys.toml` pins it, and the wallet syncs, reports and refuses to spend
-exactly as a UFVK watch-only Zcash wallet does. Import is BIP 84 first-account keys only,
+exactly as a UFVK watch-only Zcash wallet does. Every Bitcoin wallet pins its account xpub
+in `keys.toml`, seed-holding or not (the Bitcoin analog of the Zcash UFVK pin): it is what
+the daemon verifies the database against whenever the seed is not in hand, and what a
+deleted database is rebuilt from. Import is BIP 84 first-account keys only,
 the one derivation the engine has; a bare xpub (no key origin, as most wallets show it) is
 accepted as that account and pinned with the all-zero fingerprint. On **mainnet** an xpub
 import or a seed restore requires `--birthday` (a date or height; `--birthday 481824` asks
@@ -75,8 +78,8 @@ blocks already passed may hold more payments the set could not match: that is wh
 a restore discover until the gap. A reveal by `getnewaddress`, or a change address a send
 takes, and a payment to an address so handed out, get half a lookahead of slack: held exactly to the
 window, a wallet handing out an address per deposit rebuilt the client, and its whole
-script set, on nearly every block (5 s per block at a lookahead of 50,000 for the rebuild
-alone), so the client is rebuilt only once reveals alone have carried the window
+script set, on nearly every block (5 s per block at a lookahead of 50,000 for the
+rebuild alone), so the client is rebuilt only once reveals alone have carried the window
 more than `lookahead / 2` past the set. Every address the wallet handed out stays within
 the set meanwhile, since the set reaches `lookahead - 1` past the index revealed when the
 connection was built, and a handed-out address past the set rebuilds at once regardless;
@@ -653,15 +656,57 @@ cannot be bumped again. `conf_target`, `estimate_mode`, `outputs` and
 `original_change_index` are refused rather than ignored, and an unknown option key is
 Core's `-3`. Live: `regtest_btc_bumpfee.rs`, both backends.
 
+## Passphrase encryption (`walletpassphrase` / `walletlock`)
+
+A seed-holding Bitcoin wallet takes either custody model the Zcash side has. The default is
+the identity file (`keys.toml`'s mnemonic is age-encrypted to `identity.txt` and decrypted at
+startup with `auto_unlock`). `rose init --encrypt` instead encrypts it with a passphrase (age
+scrypt): the daemon starts the wallet locked, and Bitcoin Core's `walletpassphrase
+"<pass>" <timeout>` decrypts the seed into `mlock`ed memory until the timeout (capped at
+100,000,000 seconds, as in Core) or a `walletlock`. Codes are Core's: a send or `bumpfee`
+while locked is `-13`, a wrong passphrase `-14`, either call on an unencrypted wallet `-15`.
+`getwalletinfo.unlocked_until` is the relock time (`0` while locked), and `/status` and
+`/readyz` report `locked`. A locked wallet still reads, syncs, receives and issues
+addresses: none of that needs the seed.
+
+What makes a locked wallet work is the **account xpub pin**. `init` records the BIP 84
+account key (`[fingerprint/84'/coin'/0']xpub`, as `export-xpub` prints it) in `keys.toml`
+for every Bitcoin wallet, so with no seed in hand the daemon verifies the BDK database's
+descriptors against the pin at startup (a mismatch is the fatal `BtcBindingMismatch`), and
+`rose rescan` rebuilds a deleted database from it without the passphrase. Every seed
+exposure is checked against the pin as well: an auto-unlocked seed at spawn (fatal on a
+mismatch), and each `walletpassphrase` (`-4`, and the wallet stays locked). A seed wallet's
+`keys.toml` written before seed wallets carried the pin gets it the first time the seed is
+in hand - at spawn for the identity file, at the first `walletpassphrase` for an encrypted
+wallet (after checking the seed against the database's own descriptors) - and until then an
+encrypted one cannot be rescanned. `walletlock` zeroizes the seed from the handle without
+waiting for the actor, so it takes effect while a sync pass holds it. Live:
+`regtest_btc_encrypted.rs`, both backends.
+
+What this does not do, so the feature is not over-read:
+
+- **The wallet database stays plaintext.** `wallet.sqlite` holds the account xpub and the
+  whole history, and the `keys.toml` pin is the xpub in the clear too - it cannot spend, but
+  it discloses every address and balance, exactly as the Zcash side's `data.sqlite` and UFVK
+  pin do. Encrypting the database is a separate, privacy-only project.
+- **Signing keys are not zeroized after a send.** `keys::signing_wallet` builds a throwaway
+  BDK wallet from the master key per send, and BDK's descriptor templates keep copies of the
+  key that are not zeroized on drop. Encryption shortens how long the *seed* is resident; key
+  material from each send can linger in freed memory until overwritten.
+- **While unlocked, the seed is in process memory**, as in Core and on the Zcash side.
+  `mlock`, `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` reduce passive disclosure (swap, core
+  dumps); anyone who can read the process's memory still gets the seed.
+- **The passphrase travels over the RPC transport**, in the request body as in Core: fine on
+  loopback, anything else needs a TLS-terminating proxy.
+- **Unattended sending still needs the identity file** (or watch-only plus an external
+  signer): an encrypted wallet cannot send after a restart until someone unlocks it.
+- **One seed serves both coins.** A `keys.toml` shared across coins exposes the Zcash and
+  Bitcoin funds derived from it alike once the passphrase (or the unlocked seed) is.
+
 ## Not yet implemented
 
 Everything here is refused with a clear error rather than silently ignored or half-done:
 
-- **`walletpassphrase`** - there is no unlock for a bitcoin wallet, so `rose init --encrypt`
-  refuses a seed-holding one (it could never send or be rebuilt by `rescan`); the seed is
-  decrypted only by the identity-file custody model at startup. A wallet encrypted before
-  that refusal existed still starts locked and cannot send, and says so: `encrypted` and
-  `locked` on `/status`, `unlocked_until: 0` on `getwalletinfo`.
 - **Address types other than bech32** (BIP 84 is the engine's only derivation): issuance is
   bech32-only, and a restore of a seed whose history lives on BIP 44/49/86 derivations will
   not see those funds. Additional descriptor templates are the fix, once wanted.
@@ -792,7 +837,8 @@ Everything here is refused with a clear error rather than silently ignored or ha
   wallet, pointing at `export-xpub`. (`rescan` covers bitcoin wallets since 2026-09-05: it deletes
   the BDK database and the kyoto cache, the next spawn rebuilds from the seed or the pinned
   xpub, and `--birthday` moves the recorded birthday first; a passphrase-encrypted bitcoin
-  wallet is refused, since nothing could decrypt its seed to rebuild.)
+  wallet is rebuilt from the pin while it stays locked, and only one whose `keys.toml`
+  predates the pin is refused - one `walletpassphrase` records it.)
 
 Deliberate posture, not a gap: the fee fallback (1 sat/vB on test networks, hard refusal on
 mainnet when the upstream has no answer) mirrors bitcoind's own `fallbackfee` defaults. On

@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -67,7 +67,7 @@ use crate::pools::{Receiver, ReceiverSet};
 use crate::sync::engine;
 use crate::tx_size;
 use crate::wallet::binding;
-use crate::wallet::keys::{self, SeedKeeper};
+use crate::wallet::keys::{self, relock_sleep, seed_guard, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::read;
 use crate::wallet::shard;
@@ -2476,7 +2476,7 @@ impl WalletActor {
                             // set while requests remain so the loop keeps draining (servicing queued
                             // commands and republishing the shrinking backlog between batches)
                             // instead of going idle for a full `sync_interval` between each.
-                            // Panic-isolated (#83): enhancement fetches and decrypts full txs, so it
+                            // Panic-isolated: enhancement fetches and decrypts full txs, so it
                             // shares the block scan's exposure to hostile/edge data - a poison tx is
                             // logged and treated as "no more work this pass" rather than taking the
                             // actor (and all wallet writes) down.
@@ -4777,10 +4777,9 @@ impl WalletActor {
         };
         // For an encrypted wallet, report the absolute relock time (0 = locked), matching
         // Bitcoin Core's `getwalletinfo.unlocked_until`. Unencrypted wallets report `None`.
-        let unlocked_until = self.encrypted.then(|| match self.unlock_until {
-            Some(t) => now_unix() + t.saturating_duration_since(Instant::now()).as_secs() as i64,
-            None => 0,
-        });
+        let unlocked_until = self
+            .encrypted
+            .then(|| keys::unlocked_until_unix(self.unlock_until));
         let status = SyncStatus {
             connected: self.client.is_some(),
             server: Some(self.hub.server().describe()),
@@ -7860,31 +7859,6 @@ async fn mempool_next(
         Some(s) => s.message().await,
         None => std::future::pending().await,
     }
-}
-
-/// Lock the shared seed, recovering from a poisoned mutex. The guarded operations (derive/set/
-/// lock/clone) are trivial and shouldn't panic, but if one ever did while holding the guard,
-/// recovering the inner value keeps a single bad command from wedging every later seed access -
-/// and crucially never blocks `walletlock` from zeroizing the seed.
-fn seed_guard(seed: &SharedSeed) -> std::sync::MutexGuard<'_, SeedKeeper> {
-    seed.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Sleep until the unlock deadline, or forever when there is none. Used as a `select!` arm so an
-/// encrypted wallet's seed is zeroized promptly once its `walletpassphrase` timeout elapses.
-async fn relock_sleep(until: Option<Instant>) {
-    match until {
-        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
-        None => std::future::pending::<()>().await,
-    }
-}
-
-/// Current unix time in seconds (for reporting `unlocked_until`).
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 /// Whether any recipient in `request` forces a **Sapling output**: a shielded address carrying a

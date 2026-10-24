@@ -21,10 +21,9 @@ shielded fields, a Bitcoin-only one the descriptor-wallet surface (`listdescript
 BIP 84 derivation fields). A method served for a new coin gets its checks by adding the tag.
 In Bitcoin mode every send check rejects at argument parsing, so the suite moves no funds.
 
-`--passphrase`: the wallet passphrase, when the wallet under test is encrypted (Zcash only -
-the Bitcoin engine has no passphrase RPCs). Enables the full encryption state machine
-(lock/unlock/passphrase-change round-trips); the wallet is left as it was found (same
-passphrase, unlocked).
+`--passphrase`: the wallet passphrase, when the wallet under test is encrypted (either
+engine). Enables the full encryption state machine (lock/unlock round-trips); the wallet is
+left as it was found (same passphrase, unlocked).
 """
 import argparse
 import base64
@@ -465,8 +464,11 @@ def s_getwalletinfo(ctx):
         ck("getwalletinfo scanning is an object or False",
            scanning is False or isinstance(scanning, dict), repr(scanning))
         ck("txcount is an int", isinstance(wi["txcount"], int), repr(wi["txcount"]))
-        # No passphrase RPCs on this engine, so no encryption state to report.
-        ck("getwalletinfo omits unlocked_until", "unlocked_until" not in wi)
+        # Encryption state is reported as Core does: `unlocked_until` only on a
+        # passphrase-encrypted wallet (checked by the encryption section).
+        ck("getwalletinfo unlocked_until absent or an int",
+           "unlocked_until" not in wi or isinstance(wi["unlocked_until"], int),
+           repr(wi.get("unlocked_until")))
     ctx.wi = wi
 
 
@@ -2081,12 +2083,11 @@ def s_errors_bitcoin(ctx):
         except JSONRPCException as e:
             ck(f"{label} -> code {code}", e.code == code, e.code)
     # Everything the engine does not serve is method-not-found, whatever the dialect: Zcash's
-    # block lookups and fee stubs, the passphrase pair, and the z_* extensions alike.
+    # block lookups and fee stubs and the z_* extensions alike. (The passphrase pair is
+    # served; the encryption section covers it.)
     for m, params in (
         ("getblockhash", [0]),
         ("settxfee", [0.0001]),
-        ("walletpassphrase", ["x", 60]),
-        ("walletlock", []),
         ("getrawtransaction", ["00" * 32]),
         ("z_sendmany", [addr, []]),
         ("z_getaddressforaccount", [0]),
@@ -2143,7 +2144,7 @@ def s_errors_bitcoin(ctx):
         ck("bad auth -> 401", e.code == 401, e.code)
 
 
-@section("wallet encryption state", ZCASH)
+@section("wallet encryption state", *BOTH)
 def s_encryption(ctx):
     rpc, ck, addr, args, wi = ctx.rpc, ctx.ck, ctx.addr, ctx.args, ctx.wi
     # Adapts to the wallet under test: an encrypted wallet reports unlocked_until and verifies
@@ -2167,8 +2168,10 @@ def s_encryption(ctx):
             ck("locked wallet reports unlocked_until 0",
                rpc.call("getwalletinfo")["unlocked_until"] == 0)
             try:
-                # The lock check precedes input selection, so no funds are needed.
-                rpc.call("sendtoaddress", addr, "0.01")
+                # The lock check precedes input selection, so no funds are needed. In Bitcoin
+                # mode the amount is unaffordable anyway, so the suite still moves no funds.
+                amount = UNAFFORDABLE if args.coin == BITCOIN else "0.01"
+                rpc.call("sendtoaddress", addr, amount)
                 ck("locked wallet refuses to send", False)
             except JSONRPCException as e:
                 ck("locked send -> -13", e.code == -13, e.code)

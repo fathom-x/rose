@@ -13,7 +13,16 @@ yanked = "deny"
 # to `toml`. (The previous exception, RUSTSEC-2026-0173 - proc-macro-error2 unmaintained -
 # went away when `age` 0.12 moved to i18n-embed-fl 0.10, which depends on the maintained
 # proc-macro-error3 fork, and getset 0.1.7, orchard's build-time dependency, dropped it too.)
-ignore = [{ id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained: compile-time i18n config parser behind age, no upgrade exists yet" }]
+# RUSTSEC-2026-0387: `crypto-bigint` 0.5.5 has secret-dependent branches in operations meant
+# to be constant-time; only 0.7.6 is fixed. It reaches the tree only through `age` -> `p256`
+# (`elliptic-curve` 0.13 pins crypto-bigint 0.5), which age uses for its P-256 tag
+# recipients. rose encrypts and decrypts with X25519 and scrypt stanzas only, so no secret
+# ever meets P-256 arithmetic. age 0.12.1 is its newest release; drop the exception when age
+# moves to p256 0.14.
+ignore = [
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained: compile-time i18n config parser behind age, no upgrade exists yet" },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing leaks: reached only via age's P-256 recipients, which rose never uses; no age release on a fixed version yet" },
+]
 
 [licenses]
 version = 2

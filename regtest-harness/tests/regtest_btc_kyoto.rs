@@ -9,6 +9,10 @@
 //! `submit_package`, checkpoint persistence across a restart (`ScanType::Sync`), and a
 //! second send from the resumed wallet spending the first send's change - priced by an
 //! explicit `fee_rate`, the operator's override for exactly this oracle-less backend.
+//! Last, `scripts/conformance.py --coin bitcoin` against the live kyoto wallet: several
+//! responses are built differently on this backend (`getwalletinfo`, the fee estimates from
+//! rose's own chain rather than the node's), and their Core shape is otherwise checked over
+//! bitcoind only.
 //!
 //! Deliberately a sibling of `regtest_btc.rs` rather than a shared module: each regtest
 //! binary is an independent stack (ports, node flags, config shape all differ here), and
@@ -517,6 +521,12 @@ async fn btc_wallet_receives_and_sends_over_kyoto_bip157() {
     );
 
     raw_broadcast_fee_guard(&node, &rose, &address, 113).await;
+
+    // ---- conformance.py, Bitcoin mode, against the live kyoto wallet ----
+    // The same client `regtest_btc.rs` runs over bitcoind: Decimal amounts, Core error
+    // codes, arity, batching, over every method the engine serves. Its send checks all
+    // reject at argument parsing, so it moves no funds.
+    run_conformance(rose.rpc_port);
 }
 
 /// The `sendrawtransaction` fee guard, live. Three node-built transactions, each
@@ -661,4 +671,38 @@ async fn forgotten_change_tx(node: &BitcoinD, txid: &str, vout: u64, to: &str) -
         .await
         .expect("decoderawtransaction");
     (hex, decoded["txid"].as_str().unwrap().to_string())
+}
+
+/// Run `scripts/conformance.py --coin bitcoin` against the regtest daemon, as
+/// `regtest_btc.rs::run_conformance` does over bitcoind. Skips with a notice when `python3`
+/// is unavailable so a local run without it does not fail confusingly.
+fn run_conformance(rpc_port: u16) {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("harness lives inside the rose repo")
+        .join("scripts/conformance.py");
+    let out = Command::new("python3")
+        .arg(&script)
+        .args([
+            "--coin",
+            "bitcoin",
+            "--url",
+            &format!("http://127.0.0.1:{rpc_port}/"),
+            "--user",
+            "zec",
+            "--password",
+            "secret",
+        ])
+        .output();
+    match out {
+        Err(e) => eprintln!("SKIP conformance.py: python3 unavailable ({e})"),
+        Ok(out) => {
+            println!("{}", String::from_utf8_lossy(&out.stdout));
+            assert!(
+                out.status.success(),
+                "conformance.py reported failures:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 }

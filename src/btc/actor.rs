@@ -3271,6 +3271,13 @@ impl BtcActor {
     /// captured before the bump - would make the original canonical again, in the same
     /// second as often as not. The wallet's own replacement is authoritative until a block
     /// says otherwise: if the network kept the original instead, its confirmation settles it.
+    ///
+    /// Every sighting that survives is stamped after whatever it conflicts with
+    /// ([`seen_after_conflicts`]): an upstream holds one of two conflicting transactions,
+    /// so the one it reports now is the one that replaced the other. A foreign fee bump the
+    /// P2P feed relays in its original's second (relay carries no first-seen time, so both
+    /// are stamped with the second they arrived) would otherwise lose the tie half the time
+    /// and stay hidden until a block settled it.
     fn drop_superseded_sightings(
         &self,
         sightings: Vec<(Arc<Transaction>, u64)>,
@@ -3286,6 +3293,10 @@ impl BtcActor {
                     );
                 }
                 !drop
+            })
+            .map(|(tx, seen)| {
+                let seen = seen_after_conflicts(&self.wallet, &tx, seen);
+                (tx, seen)
             })
             .collect()
     }
@@ -4981,6 +4992,22 @@ fn replaced_by_own_send(wallet: &Wallet, tx: &Transaction) -> bool {
     })
 }
 
+/// The `last_seen` to record for a sighting of `tx` first seen at `seen`: one past the
+/// latest sighting of any transaction in the graph that spends one of its inputs, when that
+/// is not already earlier. BDK keeps the later-seen of two conflicting unconfirmed
+/// transactions and breaks a tie by txid, so a replacement sighted in its original's
+/// second must not tie. See [`BtcActor::drop_superseded_sightings`].
+fn seen_after_conflicts(wallet: &Wallet, tx: &Transaction, seen: u64) -> u64 {
+    let txid = tx.compute_txid();
+    let graph = wallet.tx_graph();
+    tx.input
+        .iter()
+        .flat_map(|txin| graph.outspends(txin.previous_output))
+        .filter(|spender| **spender != txid)
+        .filter_map(|spender| graph.get_tx_node(*spender).and_then(|node| node.last_seen))
+        .fold(seen, |at, conflict| at.max(conflict + 1))
+}
+
 /// [`BtcActor::ancestry`] over a bare wallet, given the funded set.
 fn wallet_ancestry(wallet: &Wallet, funded: &HashSet<Txid>) -> Ancestry {
     let txs: Vec<Unconfirmed> = wallet
@@ -6447,6 +6474,22 @@ mod tests {
         // BDK prices by weight (a rounded-up vsize reads fractionally under the rate).
         assert!(fee * 4_000 >= rate * replacement.weight().to_wu());
 
+        // A sighting of the replacement in its original's second - a foreign bump the P2P
+        // feed relays that fast, with no first-seen time - is stamped one past the original,
+        // so the tie BDK breaks by txid cannot hide it; a later one keeps its own time, and
+        // a re-sighting of the original is not its own conflict (seen_after_conflicts).
+        assert_eq!(
+            seen_after_conflicts(&wallet, &replacement, 1_800_000_000),
+            1_800_000_001
+        );
+        assert_eq!(
+            seen_after_conflicts(&wallet, &replacement, 1_800_000_005),
+            1_800_000_005
+        );
+        assert_eq!(
+            seen_after_conflicts(&wallet, &original, 1_800_000_000),
+            1_800_000_000
+        );
         wallet.apply_unconfirmed_txs([(Arc::clone(&replacement), 1_800_000_001)]);
         let canonical: Vec<Txid> = wallet.transactions().map(|t| t.tx_node.txid).collect();
         assert!(canonical.contains(&new_txid), "{canonical:?}");

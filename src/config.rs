@@ -608,6 +608,15 @@ pub struct WalletEntry {
     /// Bitcoin counterpart of `transparent_initial_scan`. `0` (the default) reveals
     /// nothing; carried at `0` on a Zcash wallet.
     pub initial_scan: u32,
+    /// Let a kyoto wallet spend with no mempool view of its own unconfirmed history
+    /// (`[wallets.<name>] allow_sends_without_mempool_view`, Bitcoin wallets only; default
+    /// `false`). A wallet whose database may be missing an earlier instance's unconfirmed
+    /// sends - restored, rescanned, or rebuilt on an empty datadir - refuses to spend over
+    /// kyoto until a snapshot-taking `[mempool]` feed establishes that view, since the
+    /// inputs of those sends look unspent and a new send could double-spend one
+    /// (`BtcActor::send_gate`). `true` accepts that risk and spends at once. Inert over
+    /// bitcoind, whose mempool pass is the view; carried at `false` on a Zcash wallet.
+    pub allow_sends_without_mempool_view: bool,
 }
 
 impl WalletEntry {
@@ -1898,6 +1907,9 @@ struct WalletFile {
     /// The Bitcoin engine's initial scan depth (external indexes revealed at spawn).
     /// Bitcoin wallets only - a Zcash wallet's is `transparent_initial_scan`.
     initial_scan: Option<u32>,
+    /// Let a kyoto wallet spend before it has a mempool view of its own unconfirmed
+    /// history. Bitcoin wallets only.
+    allow_sends_without_mempool_view: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2815,6 +2827,13 @@ impl AppConfig {
                      transparent_initial_scan)"
                 );
             }
+            if is_zcash && w.allow_sends_without_mempool_view.is_some() {
+                anyhow::bail!(
+                    "[wallets.{name}] allow_sends_without_mempool_view does not apply to a \
+                     zcash wallet (it lets a kyoto Bitcoin wallet spend before it has a \
+                     mempool view of its own unconfirmed history)"
+                );
+            }
             let dir = w.dir.clone().unwrap_or_else(|| wallet_dir(&datadir, name));
             let backend_override = resolve_wallet_backend(name, w)?;
             #[cfg(feature = "zcash")]
@@ -2873,6 +2892,9 @@ impl AppConfig {
                         .unwrap_or_else(|| crate::init::default_fresh_wallet_birthday_margin(coin)),
                     lookahead: w.lookahead.unwrap_or(DEFAULT_LOOKAHEAD),
                     initial_scan: w.initial_scan.unwrap_or(0),
+                    allow_sends_without_mempool_view: w
+                        .allow_sends_without_mempool_view
+                        .unwrap_or(false),
                 },
             );
         }
@@ -2905,6 +2927,7 @@ impl AppConfig {
                     .unwrap_or(crate::init::FRESH_WALLET_BIRTHDAY_MARGIN),
                 lookahead: DEFAULT_LOOKAHEAD,
                 initial_scan: 0,
+                allow_sends_without_mempool_view: false,
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {
@@ -5428,6 +5451,44 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("transparent_initial_scan"), "{err}");
+    }
+
+    /// `allow_sends_without_mempool_view`: off by default, taken as given on a
+    /// Bitcoin wallet, and refused on a Zcash wallet, which has no kyoto send gate.
+    #[cfg(feature = "zcash")]
+    #[test]
+    #[cfg(all(feature = "cli", feature = "bitcoin"))]
+    fn allow_sends_without_mempool_view_is_a_bitcoin_wallet_knob() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("rose.toml");
+        let resolve = |body: &str| {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
+            AppConfig::resolve(&cli)
+        };
+        let cfg =
+            resolve("network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n")
+                .unwrap();
+        assert!(!cfg.wallets["btc"].allow_sends_without_mempool_view);
+        let cfg = resolve(
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n\
+             allow_sends_without_mempool_view = true\n",
+        )
+        .unwrap();
+        assert!(cfg.wallets["btc"].allow_sends_without_mempool_view);
+        let err = resolve(
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.zec]\n\
+             allow_sends_without_mempool_view = true\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(
+                "[wallets.zec] allow_sends_without_mempool_view does not apply to a zcash wallet"
+            ),
+            "{err}"
+        );
     }
 
     #[cfg(feature = "zcash")]

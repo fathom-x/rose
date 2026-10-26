@@ -528,6 +528,7 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
                 .unwrap_or(FRESH_WALLET_BIRTHDAY_MARGIN),
             lookahead: crate::config::DEFAULT_LOOKAHEAD,
             initial_scan: 0,
+            allow_sends_without_mempool_view: false,
         })
 }
 
@@ -1553,6 +1554,8 @@ async fn init_bitcoin_wallet(
             network,
             &keys.export(),
         )?;
+        // No seed-history record (`btc::store::SeedHistory`): a watch-only wallet never
+        // spends, so the send gate that reads it never applies.
         crate::btc::store::create_wallet_db(&engine_dir, &keys)?;
         if let Some((height, hash)) = &resolved.anchor {
             let mut persister = crate::btc::store::Persister::open(&engine_dir)?;
@@ -1639,10 +1642,19 @@ async fn init_bitcoin_wallet(
     // The resolved birthday anchor is chain-derived cache, so it lives with the engine's
     // own database rather than in `keys.toml`: it is what a kyoto first scan starts from
     // instead of the shipped scan floor (`btc::kyoto::recovery_floor`'s precedence).
+    let mut persister = crate::btc::store::Persister::open(&engine_dir)?;
     if let Some((height, hash)) = &resolved.anchor {
-        let mut persister = crate::btc::store::Persister::open(&engine_dir)?;
         persister.save_birthday_anchor(*height, hash)?;
     }
+    // What the database knows about the seed's past (`btc::store::SeedHistory`): a freshly
+    // generated seed has no earlier instance, so no send of one can be pending; a restored
+    // one may have sends this database never saw, and over kyoto stays unable to send
+    // until a mempool view is established (`BtcActor::send_gate`).
+    persister.save_seed_history(if restore_input_was_none {
+        crate::btc::store::SeedHistory::Fresh
+    } else {
+        crate::btc::store::SeedHistory::Unverified
+    })?;
 
     Ok(InitOutcome {
         wallet,
@@ -2482,6 +2494,7 @@ mod tests {
             birthday_time: None,
             lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
             initial_scan: 0,
+            allow_sends_without_mempool_view: false,
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),
@@ -2595,6 +2608,7 @@ mod tests {
             birthday_time: None,
             lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
             initial_scan: 0,
+            allow_sends_without_mempool_view: false,
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),
@@ -2701,6 +2715,53 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.birthday, 12_345);
         assert!(outcome.generated_mnemonic.is_some());
+    }
+
+    /// What `init` records about the seed's past: a freshly generated seed has no
+    /// earlier instance, so its database is `Fresh` and a kyoto send never waits on a
+    /// mempool view; a restored one may have unconfirmed sends this database never saw.
+    #[cfg(all(feature = "bitcoin", feature = "cli"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoin_init_records_whether_the_seed_has_a_past() {
+        use crate::btc::keys::tests::BIP84_MNEMONIC;
+        use crate::btc::store::{Persister, SeedHistory};
+        let history = |config: &AppConfig| {
+            Persister::open(&config.wallets["btc"].engine_dir())
+                .unwrap()
+                .seed_history()
+                .unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), "bitcoind://127.0.0.1:1", "");
+        init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Generate,
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Height(12_345)),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(history(&config), Some(SeedHistory::Fresh));
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = bitcoin_test_config(dir.path(), "bitcoind://127.0.0.1:1", "");
+        let phrase = <Mnemonic<English>>::from_phrase(BIP84_MNEMONIC).unwrap();
+        init_wallet(
+            &config,
+            InitOptions {
+                wallet: "btc".to_string(),
+                key: InitKey::Restore(MnemonicInput::Phrase(phrase)),
+                encryption: EncryptionInput::AgeIdentity,
+                birthday: Some(Birthday::Height(12_345)),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(history(&config), Some(SeedHistory::Unverified));
     }
 
     /// `--encrypt` on a seed-holding Bitcoin wallet: the seed is passphrase-encrypted (age
@@ -3554,6 +3615,7 @@ mod tests {
                 fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
                 lookahead: crate::config::DEFAULT_LOOKAHEAD,
                 initial_scan: 0,
+                allow_sends_without_mempool_view: false,
             },
         );
         wallets.insert(
@@ -3575,6 +3637,7 @@ mod tests {
                 fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
                 lookahead: crate::config::DEFAULT_LOOKAHEAD,
                 initial_scan: 0,
+                allow_sends_without_mempool_view: false,
             },
         );
 
@@ -3627,6 +3690,7 @@ mod tests {
                     fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
                     lookahead: crate::config::DEFAULT_LOOKAHEAD,
                     initial_scan: 0,
+                    allow_sends_without_mempool_view: false,
                 },
             );
         }

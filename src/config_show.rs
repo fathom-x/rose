@@ -470,6 +470,13 @@ pub fn render(config: &AppConfig) -> String {
             kv(&mut s, "lookahead", w.lookahead);
             // Likewise the initial scan depth: the other half of what a restore covers.
             kv(&mut s, "initial_scan", w.initial_scan);
+            // Always rendered: it is an accepted risk, and a reader auditing a deployment
+            // should see whether a kyoto wallet spends without a mempool view.
+            kv(
+                &mut s,
+                "allow_sends_without_mempool_view",
+                w.allow_sends_without_mempool_view,
+            );
             if let Some(server) = &w.backend.server {
                 match crate::btc::chain::resolve_for_wallet(config, w) {
                     Ok(resolved) => {

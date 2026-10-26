@@ -755,6 +755,7 @@ mod tests {
             fresh_wallet_birthday_margin: crate::init::FRESH_WALLET_BIRTHDAY_MARGIN,
             lookahead: crate::config::DEFAULT_LOOKAHEAD,
             initial_scan: 0,
+            allow_sends_without_mempool_view: false,
         };
 
         assert_eq!(

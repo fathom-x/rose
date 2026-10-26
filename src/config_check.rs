@@ -503,6 +503,64 @@ fn check_backend(config: &AppConfig, findings: &mut Vec<Finding>) {
         }
     }
 
+    // A kyoto wallet that can spend but has no way to learn its own unconfirmed history.
+    // After a restore, a `rose rescan` or a start on an empty datadir, its database may be
+    // missing an earlier instance's unconfirmed sends, and the actor then refuses to spend
+    // (`BtcActor::send_gate`) - for an enclave that restores on every boot, at every boot.
+    // A warning, not an error: the daemon starts and syncs, and whether sends are refused
+    // depends on how the database was made, not on anything in this file. Read the way the
+    // actor reads it: the same `feed_target` and `takes_snapshots`, and the seed's presence
+    // in `keys.toml` (read-only, never decrypted) - a watch-only wallet never spends, and an
+    // uninitialized one may yet hold a seed.
+    //
+    // The opt-out is an accepted double-spend risk, so it is reported wherever it is set,
+    // in the same words the daemon logs at every start of the wallet.
+    #[cfg(feature = "bitcoin")]
+    for (name, wallet) in &config.wallets {
+        if wallet.coin != crate::coin::Coin::Bitcoin {
+            continue;
+        }
+        if wallet.allow_sends_without_mempool_view {
+            findings.push(Finding::warning(format!(
+                "[wallets.{name}] {}",
+                crate::btc::actor::sends_without_mempool_view_warning(matches!(
+                    crate::btc::chain::resolve_for_wallet(config, wallet),
+                    Ok(crate::btc::chain::BtcEndpoint::Kyoto(_))
+                ))
+            )));
+            continue;
+        }
+        let Ok(crate::btc::chain::BtcEndpoint::Kyoto(kyoto)) =
+            crate::btc::chain::resolve_for_wallet(config, wallet)
+        else {
+            continue;
+        };
+        let snapshot_feed = crate::btc::mempool_feed::feed_target(
+            &config.mempool,
+            wallet.bitcoin_network(),
+            kyoto.peers(),
+            kyoto.receive_window(),
+        )
+        .is_some_and(|target| target.takes_snapshots());
+        let keys_path = wallet.keys_path();
+        let watch_only = crate::wallet::store::WalletStore::exists(&keys_path)
+            && crate::wallet::store::WalletStore::read(&keys_path)
+                .is_ok_and(|store| !store.has_seed());
+        if snapshot_feed || watch_only {
+            continue;
+        }
+        findings.push(Finding::warning(format!(
+            "[wallets.{name}] runs on kyoto with no snapshot-taking mempool feed: after a \
+             restore, a `rose rescan` or a start on an empty datadir it refuses to spend, since \
+             unconfirmed sends an earlier instance of the seed made are invisible to it until \
+             they confirm and a new send could double-spend one. Configure [mempool] sources \
+             = [\"p2p\"] with p2p_snapshot = true against a node that grants this host the \
+             mempool permission, or set allow_sends_without_mempool_view = true under \
+             [wallets.{name}] to accept the risk. A wallet `rose init` created from a \
+             generated seed is not affected until it is restored or rescanned"
+        )));
+    }
+
     for (name, wallet) in &config.wallets {
         // A bitcoin wallet's endpoint has its own grammar and preflight (`crate::btc::chain`),
         // and none of the Zcash warnings below apply to it.
@@ -1488,10 +1546,14 @@ mod tests {
                 dir.path()
             )
         };
+        // The send-gate warning names `[mempool]` too, as one of its two fixes; it
+        // has its own test below.
         let about_feed = |findings: &[Finding]| -> Vec<String> {
             warnings(findings)
                 .into_iter()
-                .filter(|w| w.contains("[mempool]"))
+                .filter(|w| {
+                    w.contains("[mempool]") && !w.contains("allow_sends_without_mempool_view")
+                })
                 .map(str::to_string)
                 .collect()
         };
@@ -1545,6 +1607,90 @@ mod tests {
             dir.path(),
         ));
         assert!(about_feed(&off).is_empty(), "{off:?}");
+    }
+
+    /// A kyoto wallet that can spend but has no way to learn its own unconfirmed history
+    /// is warned about, naming both fixes. A snapshot-taking feed, the opt-out, a
+    /// watch-only wallet (a seedless `keys.toml`) and a bitcoind wallet are clean.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn a_kyoto_spender_without_a_mempool_view_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let about_gate = |findings: &[Finding]| -> Vec<String> {
+            warnings(findings)
+                .into_iter()
+                .filter(|w| w.contains("allow_sends_without_mempool_view"))
+                .map(str::to_string)
+                .collect()
+        };
+        let config = |server: &str, wallet_extra: &str, global_extra: &str| {
+            format!(
+                "network = \"test\"\ndatadir = {:?}\n\
+                 [wallets.btc]\ncoin = \"bitcoin\"\nserver = \"{server}\"\n{wallet_extra}\
+                 {global_extra}",
+                dir.path()
+            )
+        };
+        let peer = "kyoto://192.0.2.7:48333";
+
+        // The default feed relays but takes no snapshots: a restore could never send.
+        let relay_only = inspect(&resolve(&config(peer, "", ""), dir.path()));
+        let found = about_gate(&relay_only);
+        assert_eq!(found.len(), 1, "{relay_only:?}");
+        assert!(found[0].contains("[wallets.btc]"), "{found:?}");
+        assert!(found[0].contains("p2p_snapshot = true"), "{found:?}");
+        // No error: the daemon starts and syncs either way.
+        assert!(errors(&relay_only).is_empty(), "{relay_only:?}");
+
+        let snapshots = inspect(&resolve(
+            &config(
+                peer,
+                "",
+                "[mempool]\nsources = [\"p2p\"]\np2p_snapshot = true\n",
+            ),
+            dir.path(),
+        ));
+        assert!(about_gate(&snapshots).is_empty(), "{snapshots:?}");
+        // The opt-out silences the gate finding but is itself reported, as the accepted
+        // double-spend risk it is - on bitcoind too, where it is inert.
+        let opted_out = inspect(&resolve(
+            &config(peer, "allow_sends_without_mempool_view = true\n", ""),
+            dir.path(),
+        ));
+        let found = about_gate(&opted_out);
+        assert_eq!(found.len(), 1, "{opted_out:?}");
+        assert!(found[0].contains("DOUBLE SPEND"), "{found:?}");
+        assert!(!found[0].contains("refuses to spend"), "{found:?}");
+        let opted_out_bitcoind = inspect(&resolve(
+            &config("bitcoind", "allow_sends_without_mempool_view = true\n", ""),
+            dir.path(),
+        ));
+        let found = about_gate(&opted_out_bitcoind);
+        assert_eq!(found.len(), 1, "{opted_out_bitcoind:?}");
+        assert!(found[0].contains("no effect here"), "{found:?}");
+        let bitcoind = inspect(&resolve(&config("bitcoind", "", ""), dir.path()));
+        assert!(about_gate(&bitcoind).is_empty(), "{bitcoind:?}");
+
+        // A watch-only wallet never spends, so it has nothing to gate.
+        let resolved = resolve(&config(peer, "", ""), dir.path());
+        let entry = &resolved.wallets["btc"];
+        let xpub = crate::btc::keys::AccountKeys::from_seed(
+            &crate::btc::keys::tests::bip84_seed(),
+            entry.bitcoin_network(),
+        )
+        .unwrap()
+        .export();
+        std::fs::create_dir_all(entry.keys_path().parent().unwrap()).unwrap();
+        crate::wallet::store::WalletStore::init_bitcoin_view_only(
+            &entry.keys_path(),
+            0,
+            None,
+            resolved.network,
+            &xpub,
+        )
+        .unwrap();
+        let watch_only = inspect(&resolve(&config(peer, "", ""), dir.path()));
+        assert!(about_gate(&watch_only).is_empty(), "{watch_only:?}");
     }
 
     #[test]

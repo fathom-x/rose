@@ -70,6 +70,19 @@ dir = "./data/default"
 # index finds them - but raise it in the configuration a restore will run with before relying
 # on one.
 # initial_scan = 0
+# Bitcoin wallets over kyoto only: spend without a mempool view of the wallet's own
+# unconfirmed history. A light client sees transactions only once they are mined, so a
+# wallet whose database may be missing unconfirmed sends an earlier instance of the same
+# seed made - one restored (`rose init --restore`, `rosed --restore-if-empty`), rescanned,
+# or rebuilt on an empty datadir - would see their inputs as unspent, and a new send could
+# double-spend one: exactly one of the two confirms, and a payout reported sent never
+# arrives. So such a wallet REFUSES to spend (-4) until a snapshot-taking [mempool] feed
+# (sources = ["p2p"], p2p_snapshot = true) has matched the node's whole mempool against it.
+# A wallet `rose init` created from a freshly generated seed has no earlier instance and is
+# never held. `true` accepts the risk and spends at once (with or without a feed). Over
+# the bitcoind backend the node's mempool is the view: such a wallet waits only for the
+# first mempool pass at tip, and this setting has no effect there.
+# allow_sends_without_mempool_view = false
 
 [backend]
 # The chain upstream: a LOCAL zebrad's JSON-RPC ("full mode", the default and the
@@ -179,7 +192,7 @@ reconnect_max_secs = 60
 # wallets (the default) never need it, and a "zebra://" upstream ignores it.
 # assume_transparent_in_compact_blocks = false
 
-# Credentials for the "zebra" / "zebra://host:port" endpoints above. Omit the whole section
+# Credentials for a "zebra://host:port" endpoint above. Omit the whole section
 # when zebrad runs with `enable_cookie_auth = false`. A cookie file wins over user/password
 # and is re-read on every reconnect (zebrad regenerates it at startup).
 # [zebra]
@@ -342,11 +355,11 @@ bootstrap_from_keys = true
 # *receivers*. Ironwood (NU6.3) very much is a value pool: its own bundle in V6 transactions,
 # its own valueBalance, and `pool == "ironwood"` in balances and history. What it lacks is a
 # *receiver*: ironwood notes are Orchard V3 notes reusing Orchard's keys, addresses and
-# receiver, so there is nothing to request or enable. It is compiled in unconditionally and switches on
-# by consensus height, already active on mainnet and testnet, which means an "orchard" wallet
-# is receiving ironwood notes today. Legacy Orchard V2 notes stay spendable, and moving them
-# into ironwood is a real pool crossing that publishes the amount (see [spend] privacy_policy
-# below). enabled = ["ironwood"] is a startup error.
+# receiver, so there is nothing to request or enable. It is compiled in unconditionally and
+# switches on by consensus height, already active on mainnet and testnet, which means an
+# "orchard" wallet is receiving ironwood notes today. Legacy Orchard V2 notes stay spendable,
+# and moving them into ironwood is a real pool crossing that publishes the amount (see
+# [spend] privacy_policy below). enabled = ["ironwood"] is a startup error.
 #
 # `enabled` - the receivers this wallet may hand out, and so the pools it receives into.
 #                       Change is sent to the strongest enabled one (Orchard if enabled). It does
@@ -552,10 +565,11 @@ privacy_policy = "AllowRevealedRecipients"
 # This is one of two settings a running daemon re-reads on SIGHUP (max_tx_bytes below is the
 # other), because a wallet whose notes have fragmented (a miner receiving shielded coinbase,
 # say) fails every payout until it moves, and restarting a live payment wallet to change a
-# number is a poor answer. Consider consolidating with z_mergetoaddress before raising it, since
-# proving cost and memory scale with the action count, and every other send waits behind one
-# large transaction. There is deliberately no RPC that changes this: the cap bounds what a
-# single call can make the daemon prove, so raising it takes access to the process.
+# number is a poor answer. Consider consolidating with z_mergetoaddress before raising it - see
+# "Fragmented wallets" in the README - since proving cost and memory scale with the action
+# count, and every other send waits behind one large transaction. There is deliberately no RPC
+# that changes this: the cap bounds what a single call can make the daemon prove, so raising it
+# takes access to the process.
 orchard_action_limit = 50
 # Largest transaction, in bytes, that a send may build (0 disables the ceiling). This is a
 # *relay* bound, not a consensus one, and it is the binding one: consensus only asks that a
@@ -598,7 +612,7 @@ cache_proving_key = true
 # uncommitted at a time - no double-spend surface); the win is that the actor stays live while
 # the proof runs on a blocking thread. Only engages on the cached-Orchard PCZT path above (an
 # Orchard-only wallet with cache_proving_key on); a Sapling-spending wallet keeps the inline
-# path. OFF by default - enable once validated for your workload.
+# path. OFF by default - enable once validated for your workload (see docs/CONCURRENT_SENDS.md).
 pipeline_proving = false
 # How long the wallet actor spends finishing sends it has ALREADY accepted when it is asked to
 # stop, before dropping whatever is left. A z_sendmany returns an opid immediately and proves on

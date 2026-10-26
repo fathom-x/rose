@@ -271,14 +271,17 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
     }
 
     // 3. Restored with the knob raised past the gap: both payments, the paid address
-    //    recognised at its index, and the recovered funds spend.
+    //    recognised at its index, and the recovered funds spend. The spend is here to prove
+    //    both payments were recovered, not to exercise the kyoto send gate (which
+    //    regtest_btc_restore covers), so the restored wallet accepts spending without a
+    //    mempool view - the original's sends are all mined, so nothing is pending.
     {
         let mut rose = RoseBtc::prepare_with(
             dir.path().join("restore-wide"),
             restore_backend,
             &node,
             &["btc"],
-            "lookahead = 40",
+            "lookahead = 40\nallow_sends_without_mempool_view = true",
         );
         rose.init_ok(
             "btc",

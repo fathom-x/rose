@@ -762,8 +762,15 @@ Everything here is refused with a clear error rather than silently ignored or ha
   wallet reaches tip it asks for a **full** snapshot (the connection forgets what it
   already fetched and re-requests BIP 35), and only that one opens sends. A snapshot is
   delivered only once every transaction it fetched has arrived or drawn a `notfound`, so
-  each was matched first. Without a snapshot-taking feed nothing is blocked - the actor
-  warns at start, loudly for a wallet with no history.
+  each was matched first. **Without a snapshot-taking feed, such a wallet refuses to spend**
+  (sends, `bumpfee`, and a `sendrawtransaction` of wallet coins answer `-4`) unless
+  `[wallets.<name>] allow_sends_without_mempool_view = true` accepts the double-spend risk,
+  which every start then logs as a WARN and `rose config check` reports. "Such a wallet" is
+  persisted with the database (`btc::store::SeedHistory`), so a restart does not lift it: a
+  restore, a `rescan` or a rebuilt datadir stays refused until a full snapshot has matched
+  it, while a wallet `rose init` created from a generated seed - which no earlier instance
+  can have spent from - is never held. Over bitcoind the same databases wait (`-4`) only
+  until the first mempool pass at tip has matched the node's mempool against them.
   **`"mempool_space"`**: the wallet holds one long-lived websocket to a
   mempool.space instance (`wss://mempool.space/api/v1/ws`, per-network paths like
   `/testnet4/api/v1/ws`, no key; `mempool_space_url` overrides it, `ws://` allowed for a

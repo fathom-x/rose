@@ -284,7 +284,95 @@ impl Persister {
             })
             .context("read pending rescan")
     }
+
+    /// Record what the database knows about the seed's unconfirmed history (see
+    /// [`SeedHistory`]). One row, overwritten.
+    ///
+    /// Not chain-derived, unlike the anchor: a deleted row cannot be re-resolved. A
+    /// database without one - written before the record existed - gets the rule that
+    /// predates it (gated only while it has never synced, `BtcActor`'s `MempoolRebuild`),
+    /// so the record tightens the gate and its absence is today's behaviour, never looser.
+    pub fn save_seed_history(&mut self, history: SeedHistory) -> anyhow::Result<()> {
+        self.conn
+            .execute_batch(SEED_HISTORY_TABLE_SQL)
+            .context("create seed_history table")?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO seed_history (id, state) VALUES (0, ?1)",
+                [history.as_str()],
+            )
+            .context("record seed history")?;
+        Ok(())
+    }
+
+    /// The recorded [`SeedHistory`], `None` for a database written before the record
+    /// existed. An unrecognized value (a newer build's) reads as [`SeedHistory::Unverified`],
+    /// the conservative reading. Creates the (empty) table if it is missing, so the read
+    /// needs a writable connection - the actor's own, never a read-only RPC one.
+    pub fn seed_history(&self) -> anyhow::Result<Option<SeedHistory>> {
+        self.conn
+            .execute_batch(SEED_HISTORY_TABLE_SQL)
+            .context("create seed_history table")?;
+        self.conn
+            .query_row("SELECT state FROM seed_history WHERE id = 0", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map(|state| Some(SeedHistory::parse(&state).unwrap_or(SeedHistory::Unverified)))
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+            .context("read seed history")
+    }
 }
+
+/// What this database knows about the seed's unconfirmed history - whether an earlier
+/// instance of the same seed can have left sends this database never saw (see
+/// [`Persister::seed_history`]). Recorded when the database is created and advanced once a
+/// mempool view is established; the kyoto send gate reads it (`BtcActor::send_gate`).
+/// A watch-only database gets no record: it never spends, so the gate never applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedHistory {
+    /// Created by `rose init` from a freshly generated mnemonic: no earlier instance of the
+    /// seed can exist, so no send of one can be pending.
+    Fresh,
+    /// Created for a seed that may have a past - `init --restore`, or the daemon rebuilding
+    /// a missing database (`rose rescan`, a wiped datadir) - and no mempool view has been
+    /// established since. An earlier instance's unconfirmed sends are invisible until they
+    /// confirm, so their inputs look unspent.
+    Unverified,
+    /// A mempool view was established after the database was created (the kyoto feed's
+    /// full snapshot, or a bitcoind mempool pass at tip): every unconfirmed transaction
+    /// the upstream node held was matched against the synced wallet. That is one node's
+    /// mempool, not the network's - a send of an earlier instance that never reached this
+    /// node, or that it had already dropped, is still invisible until it confirms.
+    Verified,
+}
+
+impl SeedHistory {
+    fn as_str(self) -> &'static str {
+        match self {
+            SeedHistory::Fresh => "fresh",
+            SeedHistory::Unverified => "unverified",
+            SeedHistory::Verified => "verified",
+        }
+    }
+
+    fn parse(s: &str) -> Option<SeedHistory> {
+        match s {
+            "fresh" => Some(SeedHistory::Fresh),
+            "unverified" => Some(SeedHistory::Unverified),
+            "verified" => Some(SeedHistory::Verified),
+            _ => None,
+        }
+    }
+}
+
+/// The single-row seed-history table (see [`Persister::save_seed_history`]).
+const SEED_HISTORY_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS seed_history (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    state TEXT NOT NULL
+)";
 
 /// The single-row birthday-anchor table (see [`Persister::save_birthday_anchor`]). The
 /// `CHECK (id = 0)` pins it to one row so a re-resolution replaces rather than accumulates.
@@ -437,6 +525,49 @@ mod tests {
             .network(keys.network),
         )
         .unwrap()
+    }
+
+    /// The seed-history record: absent on a database written before it existed,
+    /// round-trips every state across a reopen (overwriting, one row), and reads an
+    /// unrecognized value - a newer build's - as unverified, the conservative reading.
+    #[test]
+    fn seed_history_round_trips_and_reads_unknown_values_as_unverified() {
+        use super::SeedHistory;
+        let dir = tempfile::tempdir().unwrap();
+        let engine_dir = dir.path().join("btc").join("bdk");
+        assert_eq!(
+            Persister::open(&engine_dir)
+                .unwrap()
+                .seed_history()
+                .unwrap(),
+            None
+        );
+        for state in [
+            SeedHistory::Fresh,
+            SeedHistory::Unverified,
+            SeedHistory::Verified,
+        ] {
+            Persister::open(&engine_dir)
+                .unwrap()
+                .save_seed_history(state)
+                .unwrap();
+            assert_eq!(
+                Persister::open(&engine_dir)
+                    .unwrap()
+                    .seed_history()
+                    .unwrap(),
+                Some(state)
+            );
+        }
+        let persister = Persister::open(&engine_dir).unwrap();
+        persister
+            .conn
+            .execute("UPDATE seed_history SET state = 'audited' WHERE id = 0", [])
+            .unwrap();
+        assert_eq!(
+            persister.seed_history().unwrap(),
+            Some(SeedHistory::Unverified)
+        );
     }
 
     /// The revealed-address cursor survives a close and reopen: reveal two addresses, persist,

@@ -439,6 +439,14 @@ impl BtcBackend {
             BtcBackend::Kyoto => "kyoto",
         }
     }
+
+    /// The `server` a wallet names to dial `node` over this backend.
+    fn server(self, node: &BitcoinD) -> String {
+        match self {
+            BtcBackend::Bitcoind => format!("bitcoind://127.0.0.1:{}", node.rpc_port),
+            BtcBackend::Kyoto => format!("kyoto://127.0.0.1:{}", node.p2p_port),
+        }
+    }
 }
 
 /// A `--features bitcoin` rose serving one or more `coin = "bitcoin"` wallets over one
@@ -456,6 +464,8 @@ pub struct RoseBtc {
     /// config can name it before the daemon starts.
     pub health_port: u16,
     default_wallet: String,
+    /// Where the daemon's stderr goes on the next start (see [`RoseBtc::log_to`]).
+    log: Option<PathBuf>,
 }
 
 impl RoseBtc {
@@ -494,13 +504,9 @@ impl RoseBtc {
         wallet_extra: &str,
         global_extra: &str,
     ) -> RoseBtc {
-        let server = match backend {
-            BtcBackend::Bitcoind => format!("bitcoind://127.0.0.1:{}", node.rpc_port),
-            BtcBackend::Kyoto => format!("kyoto://127.0.0.1:{}", node.p2p_port),
-        };
         Self::prepare_at(
             datadir,
-            &server,
+            &backend.server(node),
             backend == BtcBackend::Bitcoind,
             wallets,
             wallet_extra,
@@ -558,6 +564,7 @@ impl RoseBtc {
             rpc_port: 0,
             health_port,
             default_wallet: wallets[0].to_string(),
+            log: None,
         }
     }
 
@@ -729,16 +736,22 @@ impl RoseBtc {
                 &self.rpc_port.to_string(),
             ])
             .stdout(Stdio::null())
-            .stderr(match std::env::var_os("ROSE_REGTEST_BTC_LOG") {
-                // Debug hook: ROSE_REGTEST_BTC_LOG=<dir> keeps each daemon's stderr as
-                // <dir>/rose-<rpc port>.log (the port makes a rerun's files distinct).
-                Some(dir) => std::fs::File::create(
-                    std::path::Path::new(&dir).join(format!("rose-{}.log", self.rpc_port)),
-                )
-                .map(Stdio::from)
-                .unwrap_or_else(|_| Stdio::null()),
-                None => Stdio::null(),
-            })
+            .stderr(
+                match (&self.log, std::env::var_os("ROSE_REGTEST_BTC_LOG")) {
+                    // A suite asserting on the log (`log_to`): this start's stderr, fresh.
+                    (Some(path), _) => std::fs::File::create(path)
+                        .map(Stdio::from)
+                        .unwrap_or_else(|e| panic!("create {}: {e}", path.display())),
+                    // Debug hook: ROSE_REGTEST_BTC_LOG=<dir> keeps each daemon's stderr as
+                    // <dir>/rose-<rpc port>.log (the port makes a rerun's files distinct).
+                    (None, Some(dir)) => std::fs::File::create(
+                        std::path::Path::new(&dir).join(format!("rose-{}.log", self.rpc_port)),
+                    )
+                    .map(Stdio::from)
+                    .unwrap_or_else(|_| Stdio::null()),
+                    (None, None) => Stdio::null(),
+                },
+            )
             .spawn()
             .expect("spawn rose");
         self.proc = Some(KillOnDrop(proc));
@@ -750,6 +763,57 @@ impl RoseBtc {
             assert!(Instant::now() < deadline, "rose RPC never came up");
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    /// Send the daemon's stderr - its log - to `path` from the next start on, rewritten at
+    /// each start, so a suite can assert on what a start logged.
+    pub fn log_to(&mut self, path: PathBuf) {
+        self.log = Some(path);
+    }
+
+    /// Add `line` (one TOML `key = value`) to `wallet`'s `[wallets.<name>]` table in the
+    /// config this instance runs with; it takes effect at the next start.
+    pub fn set_wallet_option(&self, wallet: &str, line: &str) {
+        let text = std::fs::read_to_string(&self.conf).unwrap();
+        let header = format!("[wallets.{wallet}]\n");
+        assert!(
+            text.contains(&header),
+            "no {header:?} in {}",
+            self.conf.display()
+        );
+        std::fs::write(
+            &self.conf,
+            text.replacen(&header, &format!("{header}{line}\n"), 1),
+        )
+        .unwrap();
+    }
+
+    /// Point `wallet` at `node` over `backend` from the next start on, replacing the `server`
+    /// its `[wallets.<name>]` table names: the same database, moved to the other chain
+    /// source. The `[bitcoind]` credentials stay; a kyoto wallet ignores them.
+    pub fn set_wallet_backend(&self, wallet: &str, backend: BtcBackend, node: &BitcoinD) {
+        let text = std::fs::read_to_string(&self.conf).unwrap();
+        let header = format!("[wallets.{wallet}]");
+        let mut in_table = false;
+        let mut replaced = false;
+        let lines: Vec<String> = text
+            .lines()
+            .map(|line| {
+                if line.starts_with('[') {
+                    in_table = line == header;
+                } else if in_table && !replaced && line.starts_with("server = ") {
+                    replaced = true;
+                    return format!("server = \"{}\"", backend.server(node));
+                }
+                line.to_string()
+            })
+            .collect();
+        assert!(
+            replaced,
+            "no server for {header} in {}",
+            self.conf.display()
+        );
+        std::fs::write(&self.conf, lines.join("\n") + "\n").unwrap();
     }
 
     /// The running daemon's pid (what a benchmark reads `/proc/<pid>/status` for).

@@ -242,12 +242,24 @@ async fn encrypted_flow(backend: BtcBackend) {
     );
     assert_send_needs_unlock(&rose, &miner, "after the rebuild").await;
 
-    // 11. And the rebuilt wallet spends once unlocked.
+    // 11. And the rebuilt wallet spends once unlocked - over bitcoind, whose mempool pass
+    //     shows it any send made before the rebuild. Over kyoto the rebuilt database cannot
+    //     see those until they confirm, and this stack's feed relays but takes no
+    //     snapshots, so unlocked it still refuses (the opt-out and the persisted
+    //     refusal are regtest_btc_restore's). Unlock is checked first: a locked wallet is
+    //     -13 above, before the gate is consulted.
     unlock(&rose, 600).await;
-    let txid = rose
+    let sent = rose
         .call_wallet(WALLET, "sendtoaddress", json!([miner, 0.1]))
-        .await
-        .expect("the rebuilt wallet sends once unlocked");
+        .await;
+    if backend == BtcBackend::Kyoto {
+        let (code, msg) =
+            sent.expect_err("a rebuilt kyoto wallet refuses to spend without a mempool view");
+        assert_eq!(code, -4, "{msg}");
+        assert!(msg.contains("double-spend"), "{msg}");
+        return;
+    }
+    let txid = sent.expect("the rebuilt wallet sends once unlocked");
     node.wait_mempool_contains(txid.as_str().unwrap()).await;
 }
 

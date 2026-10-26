@@ -14,10 +14,17 @@
 //! `getbestblockhash` (the wallet's own checkpoint, against the node's), and
 //! `validateaddress`.
 //!
+//! And the send gate a restore puts in force over kyoto: the kyoto leg is refused
+//! every spend - `sendrawtransaction` of a wallet-funded transaction included - until it
+//! opts out, and still relays what spends none of its coins. The bitcoind leg waits for
+//! the node's mempool: an RPC proxy withholds `getrawmempool` until the leg has seen the
+//! send refused, then lets the first mempool pass at tip through, which opens sends and
+//! records the view; the database then moves to kyoto and spends at once.
+//!
 //! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
-use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc, RpcProxy};
 use serde_json::{json, Value};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -122,13 +129,21 @@ async fn restore_flow(restore_backend: BtcBackend) {
     std::fs::remove_dir_all(dir.path().join("original")).expect("discard the original datadir");
 
     // 2. Restore on a fresh datadir from the phrase alone (a file, the non-interactive
-    //    path), scanning from genesis.
-    let mut rose = RoseBtc::prepare(
-        dir.path().join("restored"),
-        restore_backend,
-        &node,
-        &["btc"],
-    );
+    //    path), scanning from genesis. Over bitcoind through a proxy that withholds the
+    //    node's mempool, so step 5 can see a send wait for it.
+    let proxy = match restore_backend {
+        BtcBackend::Bitcoind => {
+            let proxy = RpcProxy::start(node.rpc_port).await;
+            proxy.drop_method(Some("getrawmempool"));
+            Some(proxy)
+        }
+        BtcBackend::Kyoto => None,
+    };
+    let restored_dir = dir.path().join("restored");
+    let mut rose = match &proxy {
+        Some(proxy) => RoseBtc::prepare_bitcoind_at(restored_dir, proxy.port, &["btc"]),
+        None => RoseBtc::prepare(restored_dir, restore_backend, &node, &["btc"]),
+    };
     let phrase_file = dir.path().join("phrase.txt");
     std::fs::write(&phrase_file, format!("{}\n", original.mnemonic)).unwrap();
     let printed = rose.init_ok(
@@ -263,11 +278,146 @@ async fn restore_flow(restore_backend: BtcBackend) {
     //    kyoto an explicit fee_rate prices it; over bitcoind estimatesmartfee has no data
     //    on a regtest chain either, so the same explicit rate keeps the legs identical.
     let miner = node.new_address().await;
-    let restored_send = rose
-        .call(
-            "sendtoaddress",
-            json!([miner, 0.2, null, null, false, null, null, null, null, 2]),
+    let send = json!([miner, 0.2, null, null, false, null, null, null, null, 2]);
+    if let Some(proxy) = &proxy {
+        // 5. (bitcoind) The restored database may be missing the original's unconfirmed
+        //    sends until the node's mempool is matched against it, and the proxy has
+        //    withheld that mempool all along: sends wait, though every block is in. A send
+        //    beyond the balance probes the gate without spending - refused for the wait
+        //    (`-4`) while it holds, for the funds (`-6`) once it lifts.
+        let probe = json!([miner, 1000.0, null, null, false, null, null, null, null, 2]);
+        // Each failed pass redials, and a probe that lands between dials is refused for
+        // the connection (also `-4`) before it reaches the gate, so read until the gate
+        // answers - and after lifting, until the funds do.
+        let gate = |what: &'static str, done: fn(i64, &str) -> bool| {
+            let rose = &rose;
+            let probe = probe.clone();
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                loop {
+                    let (code, msg) = rose
+                        .call("sendtoaddress", probe.clone())
+                        .await
+                        .expect_err("a probe beyond the balance never sends");
+                    if done(code, &msg) {
+                        return;
+                    }
+                    assert_eq!(code, -4, "{what}: {msg}");
+                    assert!(
+                        msg.contains("mempool view not yet established")
+                            || msg.contains("no connection to the upstream"),
+                        "{what}: {msg}"
+                    );
+                    assert!(std::time::Instant::now() < deadline, "{what}: {msg}");
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        };
+        gate(
+            "a restored bitcoind wallet waits for the node's mempool",
+            |code, msg| code == -4 && msg.contains("mempool view not yet established"),
         )
+        .await;
+        proxy.drop_method(None);
+        gate("the first mempool pass at tip opens sends", |code, _| {
+            code == -6
+        })
+        .await;
+    }
+    if restore_backend == BtcBackend::Kyoto {
+        // 5a. Over kyoto a restored wallet has no view of the original's unconfirmed sends
+        //     (a light client sees them only once mined), and this stack's feed relays
+        //     but takes no mempool snapshots - so it refuses to spend rather than risk a
+        //     double spend. Bitcoind's mempool pass is that view; its leg spends.
+        let refused = |what: &str, (code, msg): (i64, String)| {
+            assert_eq!(code, -4, "{what}: {msg}");
+            assert!(msg.contains("double-spend"), "{what}: {msg}");
+            assert!(
+                msg.contains("allow_sends_without_mempool_view"),
+                "{what}: {msg}"
+            );
+        };
+        refused(
+            "a restored kyoto wallet with no mempool view",
+            rose.call("sendtoaddress", send.clone())
+                .await
+                .expect_err("a restored kyoto wallet refuses to spend without a mempool view"),
+        );
+        // A caller-built spend of the wallet's coins is a spend like any other. The gate
+        // runs before anything checks a signature, so an unsigned transaction over the
+        // recovered change output is enough to reach it.
+        let utxos = rose
+            .call("listunspent", json!([]))
+            .await
+            .expect("listunspent");
+        let utxo = &utxos.as_array().expect("an array")[0];
+        let sats = (utxo["amount"].as_f64().unwrap() * 1e8).round() as u64;
+        let unsigned = node
+            .call(
+                "createrawtransaction",
+                json!([
+                    [{"txid": utxo["txid"], "vout": utxo["vout"]}],
+                    {miner.clone(): (sats - 10_000) as f64 / 1e8}
+                ]),
+            )
+            .await
+            .expect("createrawtransaction over a wallet output");
+        refused(
+            "sendrawtransaction of a wallet-funded transaction",
+            rose.call("sendrawtransaction", json!([unsigned]))
+                .await
+                .expect_err("a raw spend of the wallet's coins is gated too"),
+        );
+        // A transaction that spends none of the wallet's coins is no spend of its: the
+        // gated wallet still relays it.
+        let foreign = node
+            .call(
+                "createrawtransaction",
+                json!([[], {node.new_address().await: 0.1}]),
+            )
+            .await
+            .expect("createrawtransaction");
+        let foreign = node
+            .call("fundrawtransaction", json!([foreign]))
+            .await
+            .expect("fundrawtransaction")["hex"]
+            .clone();
+        let foreign = node
+            .call("signrawtransactionwithwallet", json!([foreign]))
+            .await
+            .expect("signrawtransactionwithwallet")["hex"]
+            .clone();
+        let relayed = rose
+            .call("sendrawtransaction", json!([foreign]))
+            .await
+            .expect("a foreign transaction is relayed by a gated wallet");
+        node.wait_mempool_contains(relayed.as_str().unwrap()).await;
+        // 5b. Persisted with the database, not held in memory: a restart of the synced
+        //     datadir - which now has history of its own - is still refused, or a restart
+        //     would be the way around the refusal.
+        rose.restart().await;
+        rose.wait_height(original.height).await;
+        refused(
+            "the same wallet after a restart",
+            rose.call("sendtoaddress", send.clone())
+                .await
+                .expect_err("a restart does not lift the refusal"),
+        );
+        // 5c. The opt-out spends - and every start says, on the console, what it risks.
+        rose.set_wallet_option("btc", "allow_sends_without_mempool_view = true");
+        let log = dir.path().join("restored-opted-out.log");
+        rose.log_to(log.clone());
+        rose.restart().await;
+        rose.wait_height(original.height).await;
+        let logged = std::fs::read_to_string(&log).expect("the daemon log");
+        assert!(
+            logged.contains("allow_sends_without_mempool_view is set")
+                && logged.contains("DOUBLE SPEND"),
+            "the opted-out start warns of the double-spend risk:\n{logged}"
+        );
+    }
+    let restored_send = rose
+        .call("sendtoaddress", send)
         .await
         .expect("the restored wallet spends");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -300,4 +450,20 @@ async fn restore_flow(restore_backend: BtcBackend) {
         "{balance} after spending 0.2 from {}",
         original.balance
     );
+
+    // 6. The bitcoind leg's mempool pass at tip matched the node's whole mempool against
+    //    the restored wallet and recorded the view as established. Moved to kyoto -
+    //    whose feed here takes no snapshots, so an unverified database would be refused -
+    //    the same database spends at once: the record outlives the backend and the restart.
+    if restore_backend == BtcBackend::Bitcoind {
+        rose.set_wallet_backend("btc", BtcBackend::Kyoto, &node);
+        rose.restart().await;
+        rose.wait_height(original.height + 1).await;
+        let send = json!([miner, 0.01, null, null, false, null, null, null, null, 2]);
+        let moved = rose
+            .call("sendtoaddress", send)
+            .await
+            .expect("a database whose view was established spends over kyoto at once");
+        node.wait_mempool_contains(moved.as_str().unwrap()).await;
+    }
 }

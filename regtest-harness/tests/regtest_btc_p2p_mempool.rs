@@ -26,7 +26,10 @@
 //!    (`-4`) until `mempool_feed.snapshot_applied`; once the rebuilt wallet reaches tip it
 //!    asks for a full snapshot, the node's whole mempool is refetched and matched against a
 //!    wallet that now holds the spent outputs, and the earlier send is back at 0-conf - so
-//!    a second send finds only its change (`-6`) instead of reselecting its inputs.
+//!    a second send finds only its change (`-6`) instead of reselecting its inputs. The
+//!    rebuilt database is recorded `Unverified`, the record `init --restore` writes
+//!    too, so this is also the restore-with-a-snapshot-feed path a deployment that restores
+//!    on every boot takes.
 //!
 //! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
@@ -368,7 +371,8 @@ async fn btc_p2p_mempool_feed_gives_the_kyoto_wallet_zero_conf() {
     std::fs::remove_dir_all(dir.path().join("rosedata").join("btc").join("btc"))
         .expect("wipe the wallet's engine state (keys.toml stays)");
     rose.start().await;
-    // Sends wait for the rebuilt view (whatever else refuses them first, it is -4).
+    // Sends wait for the rebuilt view (whatever else refuses them first, it is -4) - and
+    // with a snapshot feed configured it is the wait, never the no-feed refusal.
     let (code, msg) = rose
         .call(
             "sendtoaddress",
@@ -377,6 +381,7 @@ async fn btc_p2p_mempool_feed_gives_the_kyoto_wallet_zero_conf() {
         .await
         .expect_err("no send before the mempool view is rebuilt");
     assert_eq!(code, -4, "{msg}");
+    assert!(!msg.contains("refusing to spend"), "{msg}");
     rose.wait_height(height).await;
     rose.wait_wallet(
         "btc",

@@ -65,7 +65,7 @@ use crate::btc::chain::{BitcoindRpc, BroadcastError, BtcEndpoint};
 use crate::btc::keys::{self, AccountKeys};
 use crate::btc::kyoto::{KyotoConn, KyotoFailure};
 use crate::btc::mempool_feed::{feed_target, FeedDelta, FeedEvent, MempoolFeed};
-use crate::btc::store::Persister;
+use crate::btc::store::{Persister, SeedHistory};
 use crate::coin::BitcoinNetwork;
 use crate::error::{codes, RpcError};
 use crate::wallet::keys::{relock_sleep, seed_guard, unlocked_until_unix, SeedKeeper};
@@ -857,6 +857,10 @@ pub struct BtcActorConfig {
     /// stays small; the reveal persists, and `getnewaddress` continues past it. `0` reveals
     /// nothing. The Bitcoin counterpart of `transparent_initial_scan`.
     pub initial_scan: u32,
+    /// `[wallets.<name>] allow_sends_without_mempool_view`: let a kyoto wallet whose
+    /// database may be missing an earlier instance's unconfirmed sends spend before a
+    /// mempool view is established (see [`BtcActor::send_gate`]).
+    pub allow_sends_without_mempool_view: bool,
     /// How often to poll the upstream once caught up (`[sync] interval_secs`).
     pub sync_interval: Duration,
     /// Reconnect backoff bounds (`[backend] reconnect_base_secs`/`reconnect_max_secs`).
@@ -889,6 +893,7 @@ pub fn spawn(
         birthday_time,
         lookahead,
         initial_scan,
+        allow_sends_without_mempool_view,
         sync_interval,
         reconnect_base,
         reconnect_max,
@@ -975,7 +980,7 @@ pub fn spawn(
                      for this wallet first)"
                 )
             })?;
-            PersistedWallet::create(
+            let wallet = PersistedWallet::create(
                 &mut persister,
                 Wallet::create(
                     keys.descriptor(KeychainKind::External),
@@ -983,7 +988,11 @@ pub fn spawn(
                 )
                 .network(keys.network)
                 .lookahead(lookahead),
-            )?
+            )?;
+            // A database rebuilt here (`rose rescan`, a wiped datadir) is one whose seed
+            // has a past: an earlier instance's unconfirmed sends are not in it.
+            persister.save_seed_history(SeedHistory::Unverified)?;
+            wallet
         }
     };
 
@@ -1090,8 +1099,21 @@ pub fn spawn(
         None,
     ));
     let span = info_span!("wallet", name = %name);
+    // An accepted double-spend risk is said out loud at every start, whatever the backend
+    // or the database's history, so it cannot sit unnoticed in a config file. Before the
+    // actor's span exists, so the wallet rides as a field.
+    if allow_sends_without_mempool_view {
+        let kyoto = matches!(endpoint, Some(BtcEndpoint::Kyoto(_)));
+        warn!(
+            target: "rose::audit",
+            wallet = %name,
+            "{}",
+            sends_without_mempool_view_warning(kyoto)
+        );
+    }
     let upstream = endpoint.as_ref().map(BtcEndpoint::describe);
     let wallet_never_synced = wallet.latest_checkpoint().height() == 0;
+    let history_unknown = history_unknown_at_start(persister.seed_history()?, wallet_never_synced);
     let actor = BtcActor {
         wallet,
         persister,
@@ -1110,13 +1132,12 @@ pub fn spawn(
         feed_held: HashSet::new(),
         feed_pending_evictions: HashMap::new(),
         feed_ready: false,
-        // A wallet that has never applied a block (its chain is the genesis checkpoint
-        // alone) knows none of its own history: an empty datadir, or one started over.
-        mempool_rebuild: if wallet_never_synced {
+        mempool_rebuild: if history_unknown {
             MempoolRebuild::AwaitingTip
         } else {
             MempoolRebuild::NotNeeded
         },
+        allow_sends_without_mempool_view,
         birthday,
         birthday_time,
         birthday_anchor,
@@ -1300,6 +1321,8 @@ struct BtcActor {
     lookahead: u32,
     /// See [`BtcActorConfig::initial_scan`]; the floor of the recovery horizon.
     initial_scan: u32,
+    /// See [`BtcActorConfig::allow_sends_without_mempool_view`]; read by [`Self::send_gate`].
+    allow_sends_without_mempool_view: bool,
     /// Kyoto only: the wallet tip at which each once-confirmed received transaction was
     /// first seen unconfirmed again - a reorg unwound it - for [`BtcActor::expire_reorged_receives`].
     unconfirmed_since: HashMap<Txid, u32>,
@@ -1621,28 +1644,149 @@ fn tx_history(wallet: &Wallet, count: usize, skip: usize) -> Vec<BtcTxRecord> {
     out
 }
 
-/// Where a wallet that started with no history stands in rebuilding its view of its own
-/// unconfirmed transactions (see `BtcActor::maybe_request_mempool_rebuild`).
+/// Where a wallet whose database may be missing an earlier instance's unconfirmed sends
+/// (`btc::store::SeedHistory::Unverified`, or a pre-record database that has never synced)
+/// stands in rebuilding its view of them (see `BtcActor::maybe_request_mempool_rebuild`).
+/// Anything but `NotNeeded` keeps a kyoto wallet from spending without a mempool view
+/// ([`BtcActor::send_gate`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MempoolRebuild {
-    /// The wallet had history at start (its own sends are on disk), or the rebuild is done.
+    /// Nothing can be missing (a freshly generated seed, a database whose own sends are on
+    /// disk), or the rebuild is done.
     NotNeeded,
-    /// Started with none; waiting to reach tip before asking.
+    /// Possibly missing; waiting to reach tip before asking.
     AwaitingTip,
     /// Asked the feed for a full snapshot at this instant.
     Requested(Instant),
 }
 
-/// Warn, once at start, that a kyoto wallet has no feed that can rebuild its view of its own
-/// unconfirmed transactions - louder when it started with no history, which is exactly when
-/// that view is missing. Sends are not blocked: the operator chose to run without one.
-fn warn_no_mempool_view(rebuild: MempoolRebuild) {
-    if rebuild == MempoolRebuild::AwaitingTip {
+/// Whether a database starts with its unconfirmed history unknown - may be missing an
+/// earlier instance's sends - which is what puts the kyoto send gate and the snapshot
+/// rebuild in force (`MempoolRebuild::AwaitingTip`). Decided by the persisted record
+/// ([`SeedHistory`]), never by this start's state alone, so a restart after a restore's
+/// first sync does not quietly open the gate:
+///
+///  * `Unverified` (a restore, or a database the daemon rebuilt): unknown.
+///  * `Fresh` (a generated seed) or `Verified` (a view was established once): known.
+///  * No record (a database from before it existed): the rule that predates it, unknown
+///    only while the wallet has never applied a block. Upgrading never newly gates a
+///    synced wallet.
+fn history_unknown_at_start(recorded: Option<SeedHistory>, never_synced: bool) -> bool {
+    match recorded {
+        Some(SeedHistory::Unverified) => true,
+        Some(SeedHistory::Fresh | SeedHistory::Verified) => false,
+        None => never_synced,
+    }
+}
+
+/// The kyoto send gate's rules ([`BtcActor::send_gate`]), pure so every case is testable.
+///
+///  * With a snapshot-taking feed, a send waits for the feed's view (`feed_ready`: the
+///    first snapshot after each connect, and for a database that may be missing an earlier
+///    instance's sends the full one taken once it reached tip) - a wait of seconds.
+///  * Without one, a database that may be missing those sends (`history_unknown`) cannot
+///    learn them before they confirm, so it refuses outright, naming the two ways out:
+///    configure the feed, or accept the risk with `allow_sends_without_mempool_view`.
+///    Fail closed because the failure is silent where it lands: one of the two
+///    conflicting transactions confirms, and a payout reported sent never arrives.
+///  * `allow_sends_without_mempool_view` lifts both waits - the operator's acceptance of
+///    the risk, whether or not a feed is configured.
+fn kyoto_send_gate(
+    snapshot_feed: bool,
+    feed_ready: bool,
+    history_unknown: bool,
+    allow_sends_without_mempool_view: bool,
+) -> Result<(), RpcError> {
+    if allow_sends_without_mempool_view {
+        return Ok(());
+    }
+    if snapshot_feed {
+        if !feed_ready {
+            return Err(RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "mempool view not yet established (waiting for the P2P feed's mempool \
+                 snapshot, so this wallet's own unconfirmed transactions are known before it \
+                 spends); retry shortly",
+            ));
+        }
+        return Ok(());
+    }
+    if history_unknown {
+        return Err(RpcError::new(
+            codes::RPC_WALLET_ERROR,
+            "refusing to spend: this kyoto wallet's database may be missing unconfirmed \
+             sends an earlier instance of the same seed made (it was restored, rescanned or \
+             rebuilt on an empty datadir), and a light client sees those only once they are \
+             mined - their inputs look unspent, so a send now could double-spend one. \
+             Configure a snapshot-taking feed ([mempool] sources = [\"p2p\"] with \
+             p2p_snapshot = true, against a node that grants this host the mempool \
+             permission), or set allow_sends_without_mempool_view = true under this wallet's \
+             [wallets.<name>] table to accept the risk",
+        ));
+    }
+    Ok(())
+}
+
+/// The bitcoind send gate ([`BtcActor::send_gate`]): a database that may be missing an
+/// earlier instance's unconfirmed sends (`history_unknown`) waits until the node's
+/// mempool has been matched against the synced wallet - the first mempool pass at tip
+/// after a restore, seconds on regtest, longer on a busy mainnet node. The wait ends on
+/// its own, so `allow_sends_without_mempool_view` (a kyoto knob: there the wait may
+/// never end) does not lift it, and every other database never waits.
+fn bitcoind_send_gate(history_unknown: bool) -> Result<(), RpcError> {
+    if history_unknown {
+        return Err(RpcError::new(
+            codes::RPC_WALLET_ERROR,
+            "mempool view not yet established (this wallet's database may be missing              unconfirmed sends an earlier instance of the same seed made, and the node's              mempool has not yet been matched against it; sends open once the first mempool              pass at tip completes); retry shortly",
+        ));
+    }
+    Ok(())
+}
+
+/// The warning every start logs for a wallet with `allow_sends_without_mempool_view` set:
+/// what the setting gives up, in terms an operator can act on. Over bitcoind the setting
+/// is inert (the node's mempool pass is the view), and the warning says so rather than
+/// staying silent - a config that carries the opt-out is one a later switch to kyoto would
+/// act on.
+pub(crate) fn sends_without_mempool_view_warning(kyoto: bool) -> String {
+    let mut message = String::from(
+        "allow_sends_without_mempool_view is set: this wallet spends without a view of its own \
+         unconfirmed history. After a restore, a `rose rescan` or a start on an empty datadir, \
+         unconfirmed sends an earlier instance of this seed made are invisible over kyoto \
+         until they confirm, so a new send can spend the same inputs - a DOUBLE SPEND: only \
+         one of the two transactions confirms, and a payment this wallet reported as sent \
+         may never arrive. Remove the setting and configure a snapshot-taking [mempool] feed \
+         (sources = [\"p2p\"], p2p_snapshot = true) to have such sends refused instead",
+    );
+    if !kyoto {
+        message.push_str(
+            ". This wallet runs on bitcoind, whose mempool pass already gives it that view, \
+             so the setting has no effect here until the wallet moves to kyoto",
+        );
+    }
+    message
+}
+
+/// Say, once at start, that a kyoto wallet has no feed that can rebuild its view of its own
+/// unconfirmed transactions - loudly when its database may be missing an earlier
+/// instance's sends, which is exactly when that view is needed: sends are then refused
+/// ([`BtcActor::send_gate`]). With the opt-out set, this database's case is the one the
+/// startup warning (`sends_without_mempool_view_warning`) already describes - it is
+/// logged at every start whatever the history - so it is not repeated here.
+fn warn_no_mempool_view(rebuild: MempoolRebuild, allow_sends_without_mempool_view: bool) {
+    if rebuild == MempoolRebuild::AwaitingTip && allow_sends_without_mempool_view {
         warn!(
-            "this kyoto wallet started with no history and has no snapshot-taking mempool \
-             feed ([mempool] sources = [\"p2p\"] with p2p_snapshot = true): its own \
-             unconfirmed transactions from before are unknown until they confirm, and a send \
-             before then may double-spend them"
+            "this start is the case allow_sends_without_mempool_view accepts: the wallet may \
+             be missing an earlier instance's unconfirmed sends and has no snapshot-taking \
+             mempool feed, and it will spend anyway"
+        );
+    } else if rebuild == MempoolRebuild::AwaitingTip {
+        warn!(
+            "this kyoto wallet may be missing an earlier instance's unconfirmed sends (a \
+             restore, a rescan or an empty datadir) and has no snapshot-taking mempool feed \
+             ([mempool] sources = [\"p2p\"] with p2p_snapshot = true): sends are refused \
+             until one establishes that view, or set allow_sends_without_mempool_view = true \
+             under this wallet's [wallets.<name>] table to accept the double-spend risk"
         );
     } else {
         info!(
@@ -1827,6 +1971,10 @@ impl BtcActor {
         let mut rescan: Option<bdk_kyoto::HashCheckpoint> = None;
         // Kyoto: this pass applied an update (what completes a pending rescan).
         let mut kyoto_delivered = false;
+        // Bitcoind: this pass's mempool scan established the view a database that may be
+        // missing an earlier instance's sends was waiting for, recorded below once the
+        // connection is no longer borrowed.
+        let mut view_established = false;
         let result = match conn {
             // Bitcoind, with its mempool pass in flight on a thread: collect the result if
             // it has landed, otherwise there is nothing to pull this pass (the emitter is
@@ -1845,6 +1993,10 @@ impl BtcActor {
                     match event {
                         Ok(event) => {
                             reached_tip = true;
+                            // The pass matched the node's whole mempool against the synced
+                            // wallet: an earlier instance's unconfirmed sends, if any, are in
+                            // it now.
+                            view_established = self.mempool_rebuild != MempoolRebuild::NotNeeded;
                             // The pass fetched the node's whole mempool: keep its txid set,
                             // so the rebroadcast pass skips what the node already holds.
                             self.node_mempool = Some(
@@ -2085,6 +2237,9 @@ impl BtcActor {
         if let Some(time) = resolved_time {
             self.birthday_block_time = Some(time);
         }
+        if view_established {
+            self.note_mempool_view_established();
+        }
         // Act on a resolved anchor only while the wallet is still checkpoint-less: the
         // resolution races the first update, and if an earlier pass applied one, the scan
         // is done - restarting a synced light client would tear down a healthy connection
@@ -2293,7 +2448,7 @@ impl BtcActor {
                      for the network or mempool_space_url); running without the 0-conf feed"
                 );
             }
-            warn_no_mempool_view(self.mempool_rebuild);
+            warn_no_mempool_view(self.mempool_rebuild, self.allow_sends_without_mempool_view);
             return;
         };
         let source = target.source();
@@ -2303,15 +2458,9 @@ impl BtcActor {
             %endpoint,
             "starting the mempool feed (0-conf receives)"
         );
-        let snapshots = matches!(
-            target,
-            crate::btc::mempool_feed::FeedTarget::Peer {
-                snapshot: Some(_),
-                ..
-            }
-        );
+        let snapshots = target.takes_snapshots();
         if !snapshots {
-            warn_no_mempool_view(self.mempool_rebuild);
+            warn_no_mempool_view(self.mempool_rebuild, self.allow_sends_without_mempool_view);
         }
         self.feed_status = Some(MempoolFeedStatus {
             source: source.as_str(),
@@ -2390,7 +2539,7 @@ impl BtcActor {
                     "mempool view rebuilt: every transaction the node holds was matched \
                      against the synced wallet; sends are open"
                 );
-                self.mempool_rebuild = MempoolRebuild::NotNeeded;
+                self.note_mempool_view_established();
             }
             self.set_feed_ready(true);
         }
@@ -2513,6 +2662,19 @@ impl BtcActor {
         true
     }
 
+    /// The wallet's view of its own unconfirmed history is established: every transaction
+    /// the upstream holds was matched against the synced wallet, so an earlier instance's
+    /// pending sends - if any - are now in it. Persisted (`SeedHistory::Verified`), so the
+    /// next start of this database does not gate again. A failed write is logged, not
+    /// fatal: the in-memory state still opens sends now, and the cost is one more gated
+    /// start later, the safe direction.
+    fn note_mempool_view_established(&mut self) {
+        self.mempool_rebuild = MempoolRebuild::NotNeeded;
+        if let Err(e) = self.persister.save_seed_history(SeedHistory::Verified) {
+            warn!("could not record the established mempool view: {e:#}");
+        }
+    }
+
     /// Record whether the mempool view is established, copied into the feed status.
     fn set_feed_ready(&mut self, ready: bool) {
         self.feed_ready = ready;
@@ -2551,27 +2713,28 @@ impl BtcActor {
         feed.request_full_snapshot();
     }
 
-    /// Whether a send may proceed. Over kyoto with a snapshot-taking feed, not until the
-    /// mempool view is established: a wallet rebuilt from an empty datadir does not know
-    /// its own unconfirmed sends from before (a light client sees them only once mined),
-    /// so their inputs look unspent and the next send could double-spend them.
+    /// Whether a send may proceed - every spend of the wallet's coins: `sendtoaddress`/
+    /// `sendmany`, `bumpfee`, and a `sendrawtransaction` that spends wallet outputs. Until
+    /// a mempool view is established, a database that may be missing an earlier
+    /// instance's unconfirmed sends sees their inputs as unspent, and a send could
+    /// double-spend one. Over kyoto, [`kyoto_send_gate`] has the rules. Over bitcoind
+    /// ([`bitcoind_send_gate`]) the view is the node's mempool, matched by the first
+    /// mempool pass at tip, so such a database waits for that pass and nothing else does.
     fn send_gate(&self) -> Result<(), RpcError> {
+        if matches!(self.endpoint, Some(BtcEndpoint::Bitcoind(_))) {
+            return bitcoind_send_gate(self.mempool_rebuild != MempoolRebuild::NotNeeded);
+        }
         if !matches!(self.conn, Some(Conn::Kyoto(_))) {
             return Ok(());
         }
-        let snapshots = self
-            .feed_status
-            .as_ref()
-            .is_some_and(|s| s.snapshot_applied.is_some());
-        if snapshots && !self.feed_ready {
-            return Err(RpcError::new(
-                codes::RPC_WALLET_ERROR,
-                "mempool view not yet established (waiting for the P2P feed's mempool \
-                 snapshot, so this wallet's own unconfirmed transactions are known before it \
-                 spends); retry shortly",
-            ));
-        }
-        Ok(())
+        kyoto_send_gate(
+            self.feed_status
+                .as_ref()
+                .is_some_and(|s| s.snapshot_applied.is_some()),
+            self.feed_ready,
+            self.mempool_rebuild != MempoolRebuild::NotNeeded,
+            self.allow_sends_without_mempool_view,
+        )
     }
 
     fn publish_status(&self) {
@@ -4326,12 +4489,21 @@ impl BtcActor {
         // the caller's own `maxfeerate` (passed through on every relay below); over kyoto
         // nothing downstream checks anything.
         let node_checks = matches!(self.conn, Some(Conn::Bitcoind { .. }));
+        let pricing = self.raw_tx_pricing(&tx);
         check_raw_tx_fee(
-            &self.raw_tx_pricing(&tx),
+            &pricing,
             max_fee_rate_sat_per_kvb,
             self.fees.max_tx_fee_sat,
             node_checks,
         )?;
+        // A caller-built spend of the wallet's coins is a spend like any other, gated the
+        // same way: built from this wallet's view, it may conflict with an earlier
+        // instance's unconfirmed send just as a wallet-built one would. A resubmission of
+        // a transaction the wallet already holds canonical is no new spend, and a foreign
+        // transaction spends nothing of the wallet's.
+        if pricing.spends_wallet_output && self.wallet.get_tx(txid).is_none() {
+            self.send_gate()?;
+        }
         let max_fee_rate = Some(max_fee_rate_sat_per_kvb);
         let tx = Arc::new(tx);
         // A transaction the wallet holds **canonical** - a resubmission of an own send, or
@@ -5368,6 +5540,7 @@ mod tests {
             birthday_time: None,
             lookahead: DEFAULT_LOOKAHEAD,
             initial_scan: 0,
+            allow_sends_without_mempool_view: false,
             sync_interval: Duration::from_secs(20),
             reconnect_base: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
@@ -6072,6 +6245,89 @@ mod tests {
         assert!(err.message.contains("maxfeerate = 0"), "{}", err.message);
         assert!(check_raw_tx_fee(&pricing, 0, 10_000_000, false).is_ok());
         assert!(check_raw_tx_fee(&pricing, 10_000_000, 10_000_000, true).is_ok());
+    }
+
+    /// The kyoto send gate, every case: with a snapshot-taking feed a send waits only
+    /// for the feed's view; without one, a database that may be missing an earlier
+    /// instance's unconfirmed sends refuses outright, naming both ways out; and the opt-out
+    /// lifts both. A database with known history never waits without a feed.
+    #[test]
+    fn kyoto_send_gate_refuses_an_unknown_history_without_a_view() {
+        // (snapshot_feed, feed_ready, history_unknown, allow) -> refused?
+        let cases = [
+            // No snapshot feed: the history decides.
+            ((false, false, false, false), false),
+            ((false, false, true, false), true),
+            ((false, false, true, true), false),
+            // A snapshot feed: wait for its view, whatever the history.
+            ((true, false, false, false), true),
+            ((true, false, true, false), true),
+            ((true, true, false, false), false),
+            ((true, true, true, false), false),
+            // The opt-out lifts the wait too.
+            ((true, false, true, true), false),
+        ];
+        for ((snapshot_feed, ready, unknown, allow), refused) in cases {
+            let verdict = kyoto_send_gate(snapshot_feed, ready, unknown, allow);
+            assert_eq!(
+                verdict.is_err(),
+                refused,
+                "snapshot_feed={snapshot_feed} ready={ready} unknown={unknown} allow={allow}"
+            );
+            if let Err(e) = verdict {
+                assert_eq!(e.code, codes::RPC_WALLET_ERROR);
+            }
+        }
+        let warning = sends_without_mempool_view_warning(true);
+        assert!(warning.contains("DOUBLE SPEND"), "{warning}");
+        assert!(warning.contains("p2p_snapshot = true"), "{warning}");
+        assert!(!warning.contains("bitcoind"), "{warning}");
+        let inert = sends_without_mempool_view_warning(false);
+        assert!(inert.contains("DOUBLE SPEND"), "{inert}");
+        assert!(inert.contains("no effect here"), "{inert}");
+        // Bitcoind: only a database whose history is unknown waits, for the node's mempool.
+        assert!(bitcoind_send_gate(false).is_ok());
+        let wait = bitcoind_send_gate(true).unwrap_err();
+        assert_eq!(wait.code, codes::RPC_WALLET_ERROR);
+        assert!(
+            wait.message.contains("mempool view not yet established"),
+            "{}",
+            wait.message
+        );
+        let err = kyoto_send_gate(false, false, true, false).unwrap_err();
+        assert!(err.message.contains("double-spend"), "{}", err.message);
+        assert!(
+            err.message.contains("p2p_snapshot = true"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("allow_sends_without_mempool_view"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// How a database's start maps onto the send gate. The record decides whenever
+    /// there is one, synced or not; a database from before the record keeps the old rule,
+    /// so an upgrade never gates a wallet that has synced, and still gates one that never
+    /// did.
+    #[test]
+    fn the_recorded_history_decides_whether_a_start_is_gated() {
+        use crate::btc::store::SeedHistory::{Fresh, Unverified, Verified};
+        for never_synced in [false, true] {
+            assert!(history_unknown_at_start(Some(Unverified), never_synced));
+            assert!(!history_unknown_at_start(Some(Fresh), never_synced));
+            assert!(!history_unknown_at_start(Some(Verified), never_synced));
+        }
+        assert!(
+            !history_unknown_at_start(None, false),
+            "an upgraded, synced wallet"
+        );
+        assert!(
+            history_unknown_at_start(None, true),
+            "an upgraded, never-synced wallet"
+        );
     }
 
     /// Core's default bump rate: the original's rate rounded up, plus 1 sat/kvB, plus the
@@ -7146,6 +7402,36 @@ mod tests {
         let (handle, _task) = spawn(encrypted_config(dir.path())).unwrap();
         assert_eq!(handle.unlocked_until(), Some(0));
         assert_eq!(handle.new_address().await.unwrap(), expected);
+    }
+
+    /// A database the daemon creates itself (`rose rescan`, a wiped datadir) belongs to a
+    /// seed that may have a past, so it is recorded unverified - and the record is
+    /// kept, not re-derived, across a restart of the same database.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_database_the_daemon_rebuilds_is_recorded_unverified() {
+        use crate::btc::store::{Persister, SeedHistory};
+        let dir = tempfile::tempdir().unwrap();
+        let config = offline_config(dir.path(), Some(bip84_seed()));
+        let engine_dir = config.engine_dir.clone();
+        let (handle, task) = spawn(config).unwrap();
+        handle.new_address().await.unwrap();
+        assert_eq!(
+            Persister::open(&engine_dir)
+                .unwrap()
+                .seed_history()
+                .unwrap(),
+            Some(SeedHistory::Unverified)
+        );
+        drop(handle);
+        task.await.unwrap();
+        let (_handle, _task) = spawn(offline_config(dir.path(), Some(bip84_seed()))).unwrap();
+        assert_eq!(
+            Persister::open(&engine_dir)
+                .unwrap()
+                .seed_history()
+                .unwrap(),
+            Some(SeedHistory::Unverified)
+        );
     }
 
     /// A seed wallet's `keys.toml` from before seed wallets carried the pin gets it the first

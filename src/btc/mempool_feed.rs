@@ -190,6 +190,20 @@ impl FeedTarget {
             },
         }
     }
+
+    /// Whether this feed takes BIP 35 mempool snapshots: the only kind that can establish
+    /// the wallet's view of its own unconfirmed history (`BtcActor::send_gate`), since a
+    /// relay or websocket feed reports only what is announced after it connects. The
+    /// actor and `rose config check` both read it, so the two cannot disagree on it.
+    pub fn takes_snapshots(&self) -> bool {
+        matches!(
+            self,
+            FeedTarget::Peer {
+                snapshot: Some(_),
+                ..
+            }
+        )
+    }
 }
 
 /// Resolve one named source for a wallet, or `None` when it cannot run there.

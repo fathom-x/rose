@@ -387,6 +387,22 @@ def s_getwalletinfo(ctx):
             ck("recovery.restorable agrees with the horizon",
                rec.get("restorable") == (rec.get("issued_through") is None
                                          or rec["issued_through"] <= rec["horizon"]), rec)
+        # rose extension, Bitcoin wallets only: whether a send would be refused before coin
+        # selection (the connection check and the mempool-view send gate), and why. A closed
+        # gate carries the refusal's text; an open one carries none. The history is the
+        # persisted seed-history record.
+        sg = wi.get("send_gate")
+        ck("getwalletinfo has a send_gate object", isinstance(sg, dict), repr(sg))
+        if isinstance(sg, dict):
+            ck("send_gate.open is a bool", isinstance(sg.get("open"), bool), sg)
+            ck("send_gate.reason is None exactly when open",
+               (sg.get("reason") is None) == bool(sg.get("open")), sg)
+            ck("send_gate.reason is a non-empty string when closed",
+               sg.get("open") or (isinstance(sg.get("reason"), str) and sg["reason"]), sg)
+            ck("send_gate.history is a known record",
+               sg.get("history") in ("fresh", "unverified", "verified", "unrecorded"), sg)
+            ck("send_gate.allow_sends_without_mempool_view is a bool",
+               isinstance(sg.get("allow_sends_without_mempool_view"), bool), sg)
     # rose extension, same shape on both engines: the recorded birthday height, its date as a
     # UTC midnight when known (the operator's, or the mainnet per-day table's) or None, and the
     # resolved scan anchor {height, hash} or None (always None on Zcash and bitcoind wallets).

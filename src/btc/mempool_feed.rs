@@ -549,8 +549,10 @@ pub fn wallet_relevant(wallet: &Wallet, feed_tx: &FeedTx) -> bool {
 /// What the socket task tells the actor.
 #[derive(Debug)]
 pub enum FeedEvent {
-    /// The handshake completed and the subscription was sent.
-    Connected,
+    /// The handshake completed and the subscription was sent. `peer_bloom`: for the P2P
+    /// source, whether the peer advertised `NODE_BLOOM` (the websocket source reports
+    /// `None`).
+    Connected { peer_bloom: Option<bool> },
     /// One delta, reconstructed.
     Delta(FeedDelta),
     /// The P2P source's answer to a BIP 35 `mempool` request: every txid the node holds.
@@ -706,7 +708,11 @@ async fn run_socket(url: &str, events: &mpsc::Sender<FeedEvent>) -> anyhow::Resu
         .await
         .context("send the subscription")?;
     info!(url = %url, "mempool feed connected and subscribed");
-    if events.send(FeedEvent::Connected).await.is_err() {
+    if events
+        .send(FeedEvent::Connected { peer_bloom: None })
+        .await
+        .is_err()
+    {
         return Ok(());
     }
     let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -1253,7 +1259,7 @@ mod tests {
                 .expect("an event within the deadline")
                 .expect("the feed task is alive")
         }
-        assert!(matches!(next(&mut feed).await, FeedEvent::Connected));
+        assert!(matches!(next(&mut feed).await, FeedEvent::Connected { .. }));
         assert_eq!(subscriptions.recv().await.unwrap(), SUBSCRIBE);
         match next(&mut feed).await {
             FeedEvent::Delta(delta) => {
@@ -1265,7 +1271,7 @@ mod tests {
         }
         assert!(matches!(next(&mut feed).await, FeedEvent::Disconnected(_)));
         // The redial subscribes afresh and the stream resumes.
-        assert!(matches!(next(&mut feed).await, FeedEvent::Connected));
+        assert!(matches!(next(&mut feed).await, FeedEvent::Connected { .. }));
         assert_eq!(subscriptions.recv().await.unwrap(), SUBSCRIBE);
         assert!(matches!(next(&mut feed).await, FeedEvent::Delta(_)));
         // Dropping the feed ends the task.
@@ -1326,7 +1332,7 @@ mod tests {
                 .expect("an event within the deadline")
                 .expect("the feed task is alive")
         }
-        assert!(matches!(next(&mut feed).await, FeedEvent::Connected));
+        assert!(matches!(next(&mut feed).await, FeedEvent::Connected { .. }));
         // The snapshot's inv is fetched like any announcement: `a` arrives as a delta (the
         // stale txid draws a notfound, which is silent), then `b` from the plain announcement.
         let mut deltas = Vec::new();
@@ -1357,7 +1363,7 @@ mod tests {
         assert!(matches!(next(&mut feed).await, FeedEvent::Disconnected(_)));
         loop {
             match next(&mut feed).await {
-                FeedEvent::Connected => break,
+                FeedEvent::Connected { .. } => break,
                 FeedEvent::Disconnected(_) => continue,
                 other => panic!("unexpected {other:?}"),
             }
@@ -1388,7 +1394,7 @@ mod tests {
                 .unwrap_or_else(|_| panic!("no delta from {url} within the deadline"))
                 .unwrap();
             match event {
-                FeedEvent::Connected | FeedEvent::Snapshot(_) => {}
+                FeedEvent::Connected { .. } | FeedEvent::Snapshot(_) => {}
                 FeedEvent::Disconnected(why) => panic!("{url}: {why}"),
                 FeedEvent::Delta(delta) => {
                     // A quiet moment yields an empty delta; wait for one with content so the

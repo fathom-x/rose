@@ -371,7 +371,7 @@ pub async fn run_peer(
         .map_err(|_| anyhow!("no connection to {peer} within {HANDSHAKE_TIMEOUT:?}"))?
         .with_context(|| format!("connect to {peer}"))?;
     let (mut reader, mut writer) = stream.into_split();
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let services = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         write_message(
             &mut writer,
             magic,
@@ -380,6 +380,7 @@ pub async fn run_peer(
         .await?;
         let mut acked = false;
         let mut versioned = false;
+        let mut services = ServiceFlags::NONE;
         while !(acked && versioned) {
             match read_message(&mut reader, magic).await? {
                 NetworkMessage::Version(theirs) => {
@@ -388,8 +389,10 @@ pub async fn run_peer(
                         agent = %theirs.user_agent,
                         version = theirs.version,
                         height = theirs.start_height,
+                        services = %theirs.services,
                         "p2p feed: peer version"
                     );
+                    services = theirs.services;
                     versioned = true;
                     write_message(&mut writer, magic, NetworkMessage::Verack).await?;
                 }
@@ -399,12 +402,21 @@ pub async fn run_peer(
                 _ => {}
             }
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<ServiceFlags, anyhow::Error>(services)
     })
     .await
     .map_err(|_| anyhow!("no handshake with {peer} within {HANDSHAKE_TIMEOUT:?}"))??;
-    info!(peer = %peer, snapshot = ?snapshot, "p2p feed connected (relaying)");
-    if events.send(FeedEvent::Connected).await.is_err() {
+    // NODE_BLOOM is what lets a peer answer a BIP 35 `mempool` request from a host it does
+    // not whitelist; the actor reports it and says so when a snapshot feed lacks it.
+    let peer_bloom = services.has(ServiceFlags::BLOOM);
+    info!(peer = %peer, snapshot = ?snapshot, bloom = peer_bloom, "p2p feed connected (relaying)");
+    if events
+        .send(FeedEvent::Connected {
+            peer_bloom: Some(peer_bloom),
+        })
+        .await
+        .is_err()
+    {
         return Ok(());
     }
 

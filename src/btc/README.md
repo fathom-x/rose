@@ -753,7 +753,9 @@ Everything here is refused with a clear error rather than silently ignored or ha
   maintainer closed the request to expose relay (2140-dev/kyoto#220) suggesting a side-car;
   this is that side-car, on a connection of its own beside kyoto's.
   **With snapshots on, kyoto sends wait for the mempool view** (`-4` until
-  `getwalletinfo.mempool_feed.snapshot_applied`, re-armed on every feed redial). The case
+  `getwalletinfo.mempool_feed.snapshot_applied`, re-armed on every feed redial; the gate's
+  whole verdict is `getwalletinfo.send_gate` / `/status`, and `mempool_feed.peer_bloom` says
+  whether the peer can answer the snapshot request unwhitelisted). The case
   it exists for is a wallet started with no history - an empty datadir, a `rescan`, an
   enclave whose rootfs is RAM: a filter client learns of its own earlier unconfirmed sends
   only once they are mined, so their inputs look unspent and the next send could

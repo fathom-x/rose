@@ -24,10 +24,34 @@ estimate needs no config: the page asks rose's own `estimatesmartfee` through th
 |---|---|---|---|
 | RPC user | `--rpc-user` | `ROSE_RPC_USER` | `[rpc] user` |
 | RPC password | *(none - it's a secret)* | `ROSE_RPC_PASSWORD` | `[rpc] password` |
+
+With no password from any of those (or only the `CHANGE-ME` placeholder), the proxy starts in
+**login mode**: the page opens on a login card and asks for the RPC password, checks it against
+rose with one `getblockcount`, and keeps it in the proxy's memory under an `HttpOnly`,
+`SameSite=Strict` session cookie for 12 hours or until "log out"; nothing is written to disk and
+a restart forgets every session. That is for a proxy started before anyone holding the password
+is at the keyboard (an enclave's, whose password is delivered per boot). Anyone who can reach
+the port can try passwords, so keep the bind on loopback.
 | Upstream URL (whole) | `--rpc-url` | `ROSE_RPC_URL` | - |
 | Upstream host | `--rpc-host` | `ROSE_RPC_HOST` | `[rpc] bind` |
 | Upstream port | `--rpc-port` | `ROSE_RPC_PORT` | `[rpc] port` |
 | Upstream scheme | `--rpc-scheme` | `ROSE_RPC_SCHEME` | *(default `http`)* |
+| Attestation URL (enclave mode) | `--attestation-url` | `ROSE_ATTESTATION_URL` | *(default: the upstream host on port 49502; `-` disables)* |
+| Holder page (enclave mode) | `--shard-url` | `ROSE_SHARD_URL` | *(none)* |
+
+`--shard-url` names the deployment's holder page, where a shard is released; the enclave row
+links to it while the enclave waits for shards. A link only: no key is near this proxy.
+
+The page also shows a banner whenever rose's `getwalletinfo.send_gate` (rose 0.11+) says a
+send would be refused before coin selection - no connection to the chain source, or the
+mempool-view wait a restored kyoto wallet sits in until its snapshot lands - with the daemon's
+own reason, so the operator sees it before trying a send rather than as the send's error.
+
+In enclave mode the page also shows the enclave's own state in its Status card and on the
+login card - running (with the commit it attests), up but waiting for shards, or not running -
+from the proxy's `/enclave` probe: a POST to the attestation URL with a random nonce, then one
+credential-free attested call through steve-cli (the same two probes the deployment's
+`scripts/status.sh` makes), cached for ten seconds.
 
 Env-only, nothing mounted:
 
@@ -130,7 +154,7 @@ version tag, not a moving `latest` (none is published). Point `$GUI_IMAGE` at wh
 and the commands below run unchanged:
 
 ```bash
-GUI_IMAGE=ghcr.io/fathom-x/rose-gui:<version>
+GUI_IMAGE=ghcr.io/fathom-x/rose-gui:<version>    # or ...rose-gui:<version> from this tree
 docker pull "$GUI_IMAGE"
 ```
 

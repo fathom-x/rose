@@ -200,6 +200,23 @@ pub struct WalletInfo {
     pub transparent: Option<TransparentInfo>,
     /// Present on Bitcoin wallets only.
     pub recovery: Option<BtcRecoveryInfo>,
+    /// Present on Bitcoin wallets only: whether a send would be refused before coin
+    /// selection, and why (the connection check and the mempool-view send gate).
+    pub send_gate: Option<SendGateInfo>,
+}
+
+/// `getwalletinfo.send_gate` (Bitcoin wallets; also each wallet's `send_gate` on `/status`).
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SendGateInfo {
+    /// Whether a send would pass the connection check and the gate right now.
+    pub open: bool,
+    /// When closed, the refusal a send would get (the `-4`'s own text).
+    pub reason: Option<String>,
+    /// The persisted seed-history record: `fresh`, `unverified`, `verified` or `unrecorded`.
+    pub history: String,
+    /// Whether `[wallets.<name>] allow_sends_without_mempool_view` is set.
+    pub allow_sends_without_mempool_view: bool,
 }
 
 /// `getaddressinfo` (`rpc/wallet_methods.rs::addressinfo_json`).
@@ -1162,6 +1179,10 @@ mod tests {
             w.recovery.is_none(),
             "a Zcash wallet carries no Bitcoin recovery block"
         );
+        assert!(
+            w.send_gate.is_none(),
+            "a Zcash wallet carries no send gate block"
+        );
         // Fixture: the Bitcoin handler's `recovery` block after `getnewaddress` went past
         // the horizon.
         let bitcoin = serde_json::json!({
@@ -1186,6 +1207,12 @@ mod tests {
                 "issued_through": 55,
                 "restorable": false,
             },
+            "send_gate": {
+                "open": false,
+                "reason": "refusing to spend: this kyoto wallet's database may be missing unconfirmed sends an earlier instance of the same seed made",
+                "history": "unverified",
+                "allow_sends_without_mempool_view": false,
+            },
             "coin": "bitcoin",
         });
         let w: WalletInfo = serde_json::from_value(bitcoin).unwrap();
@@ -1193,6 +1220,17 @@ mod tests {
         assert_eq!((r.initial_scan, r.lookahead, r.horizon), (30, 25, 54));
         assert_eq!(r.issued_through, Some(55));
         assert!(!r.restorable);
+        let g = w
+            .send_gate
+            .as_ref()
+            .expect("a Bitcoin wallet reports its send gate");
+        assert!(!g.open && !g.allow_sends_without_mempool_view);
+        assert_eq!(g.history, "unverified");
+        assert!(g
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("refusing to spend"));
         assert!(
             w.import_error.is_none(),
             "a healthy wallet carries no import failure, and the key is absent rather than empty"

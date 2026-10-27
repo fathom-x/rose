@@ -350,7 +350,7 @@ pub enum SeedHistory {
 }
 
 impl SeedHistory {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             SeedHistory::Fresh => "fresh",
             SeedHistory::Unverified => "unverified",

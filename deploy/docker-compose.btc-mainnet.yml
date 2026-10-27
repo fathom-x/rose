@@ -95,6 +95,12 @@ services:
       # index; the two only make sense together.
       - -blockfilterindex=1
       - -peerblockfilters=1
+      # Advertise NODE_BLOOM: Core then answers a BIP 35 `mempool` request from ANY peer, not
+      # only a -whitelist=mempool@ one, which is how the enclave wallet (rose-deploy, pinned to
+      # this node first) rebuilds its view of its own unconfirmed sends on every boot without a
+      # stable IP to whitelist. The cost is serving BIP 37 filter requests, which this node can
+      # afford. No index, no resync: a flag flip.
+      - -peerbloomfilters=1
       # Accept inbound P2P. Implicit in Core's defaults, stated here because publishing 8333
       # below only matters if the node is listening.
       - -listen=1

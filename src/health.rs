@@ -306,6 +306,9 @@ fn snapshot(state: &AppState) -> Snapshot {
                         "encrypted": h.encrypted,
                         "locked": locked,
                         "ready": w_ready,
+                        // Whether a send would be refused before coin selection, and why:
+                        // the same object as `getwalletinfo.send_gate`.
+                        "send_gate": st.send_gate.to_json(),
                     }),
                 );
             }
@@ -535,6 +538,12 @@ mod bitcoin_tests {
             birthday_anchor: None,
             birthday_block_time: None,
             mempool_feed: None,
+            send_gate: crate::btc::actor::SendGateStatus {
+                open: true,
+                reason: None,
+                history: "fresh",
+                allow_sends_without_mempool_view: false,
+            },
         }
     }
 

@@ -432,9 +432,22 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
                 if let Some(applied) = feed.snapshot_applied {
                     obj["snapshot_applied"] = json!(applied);
                 }
+                if let Some(bloom) = feed.peer_bloom {
+                    obj["peer_bloom"] = json!(bloom);
+                }
                 obj
             }
         },
+        // rose extension: whether a send would be refused before it reached coin selection,
+        // and why - the connection check and the send gate (`BtcActor::send_gate`: the
+        // mempool-view wait), as the status publishes them. `open` is what a payout
+        // service polls before sending instead of learning from a `-4`; `reason` is the
+        // refusal's own text when closed; `history` is the persisted seed-history record
+        // (`fresh`, `unverified`, `verified`, or `unrecorded` for a database from before it)
+        // that decides whether the gate arms; the opt-out is named so an operator can see
+        // it is set without the daemon's log, which an enclave does not keep. The signer,
+        // the lock and the funds are separate checks a send still makes.
+        "send_gate": status.send_gate.to_json(),
         // rose extension: what a from-seed restore under this wallet's configuration would
         // recover, the Bitcoin counterpart of the Zcash handler's `transparent` block (see
         // `src/btc/README.md`, "Restores and the address lookahead"). `horizon` is the

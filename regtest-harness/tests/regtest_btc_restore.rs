@@ -343,6 +343,27 @@ async fn restore_flow(restore_backend: BtcBackend) {
                 .await
                 .expect_err("a restored kyoto wallet refuses to spend without a mempool view"),
         );
+        // The refusal is visible before any send is tried: `getwalletinfo.send_gate` says
+        // the gate is closed, why, and that the database's history is the unverified record
+        // a restore writes - what an operator without the daemon's log (an enclave) reads.
+        let gate = rose
+            .call("getwalletinfo", json!([]))
+            .await
+            .expect("getwalletinfo")["send_gate"]
+            .clone();
+        assert_eq!(gate["open"], json!(false), "{gate}");
+        assert_eq!(gate["history"], json!("unverified"), "{gate}");
+        assert_eq!(
+            gate["allow_sends_without_mempool_view"],
+            json!(false),
+            "{gate}"
+        );
+        assert!(
+            gate["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("double-spend")),
+            "{gate}"
+        );
         // A caller-built spend of the wallet's coins is a spend like any other. The gate
         // runs before anything checks a signature, so an unsigned transaction over the
         // recovered change output is enough to reach it.
@@ -414,6 +435,19 @@ async fn restore_flow(restore_backend: BtcBackend) {
             logged.contains("allow_sends_without_mempool_view is set")
                 && logged.contains("DOUBLE SPEND"),
             "the opted-out start warns of the double-spend risk:\n{logged}"
+        );
+        // And the status says the gate is open, with the opt-out named as the reason why.
+        let gate = rose
+            .call("getwalletinfo", json!([]))
+            .await
+            .expect("getwalletinfo")["send_gate"]
+            .clone();
+        assert_eq!(gate["open"], json!(true), "{gate}");
+        assert_eq!(gate["reason"], json!(null), "{gate}");
+        assert_eq!(
+            gate["allow_sends_without_mempool_view"],
+            json!(true),
+            "{gate}"
         );
     }
     let restored_send = rose

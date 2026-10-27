@@ -313,7 +313,77 @@ pub struct BtcSyncStatus {
     /// configured for this wallet - the default, and always the case over bitcoind, which
     /// has a mempool of its own. Reported by `getwalletinfo` as `mempool_feed`.
     pub mempool_feed: Option<MempoolFeedStatus>,
+    /// Whether a send would be refused before it reached coin selection, and why: the
+    /// verdict of [`BtcActor::send_gate`] (plus the connection it needs), published with
+    /// every status so an operator sees a closed gate without a log line - an enclave
+    /// writes none - and a payout service can poll it instead of learning from a `-4`.
+    /// Reported by `getwalletinfo` and `/status` as `send_gate`.
+    pub send_gate: SendGateStatus,
 }
+
+/// The send gate as the status reports it ([`BtcSyncStatus::send_gate`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendGateStatus {
+    /// Whether a send would pass the connection check and the gate right now. The signer,
+    /// the lock and the funds are checked later and separately.
+    pub open: bool,
+    /// When closed: the refusal a send would get, the same text the `-4` carries.
+    pub reason: Option<String>,
+    /// The persisted seed history this start read (`btc::store::SeedHistory`): `fresh`,
+    /// `unverified`, `verified`, or `unrecorded` for a database from before the record.
+    pub history: &'static str,
+    /// Whether `[wallets.<name>] allow_sends_without_mempool_view` is set.
+    pub allow_sends_without_mempool_view: bool,
+}
+
+impl SendGateStatus {
+    /// The one JSON shape `getwalletinfo.send_gate` and `/status` share.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "open": self.open,
+            "reason": self.reason,
+            "history": self.history,
+            "allow_sends_without_mempool_view": self.allow_sends_without_mempool_view,
+        })
+    }
+}
+
+/// The gate's status from its parts, pure so the composition is testable: a closed gate
+/// whose feed takes snapshots from a peer that does not advertise `NODE_BLOOM` gets the
+/// likely cause appended, since Core answers a `mempool` request from such a peer only
+/// under a whitelist, and without one the wait never ends.
+fn send_gate_status_of(
+    verdict: Result<(), RpcError>,
+    feed: Option<&MempoolFeedStatus>,
+    history: Option<SeedHistory>,
+    allow_sends_without_mempool_view: bool,
+) -> SendGateStatus {
+    let mut reason = verdict.err().map(|e| e.message);
+    if let (Some(reason), Some(feed)) = (&mut reason, feed) {
+        if feed.snapshot_applied.is_some() && feed.peer_bloom == Some(false) {
+            reason.push_str(". ");
+            reason.push_str(NO_BLOOM_PEER);
+        }
+    }
+    SendGateStatus {
+        open: reason.is_none(),
+        reason,
+        history: history.map_or("unrecorded", SeedHistory::as_str),
+        allow_sends_without_mempool_view,
+    }
+}
+
+/// Why a snapshot-taking feed on a peer without `NODE_BLOOM` never establishes a view.
+const NO_BLOOM_PEER: &str = "The mempool feed's peer does not advertise NODE_BLOOM, so it \
+    answers a BIP 35 mempool request only if it whitelists this host (-whitelist=mempool@<this \
+    host>); otherwise Core disconnects on each request, the feed reconnects forever and the \
+    snapshot never lands. Run the peer with -peerbloomfilters=1, whitelist this host on it, or \
+    name a peer that advertises NODE_BLOOM as [mempool] p2p_peer";
+
+/// A send's first refusal when the chain source is down; the gate's status reports the
+/// same text, so a poller sees the send that would fail.
+const NO_UPSTREAM: &str = "no connection to the upstream (fee estimation and broadcast need \
+    it); retry once it is reachable";
 
 /// What the wallet knows about its mempool feed (`crate::btc::mempool_feed`), for
 /// `getwalletinfo`. Counters are per actor life, not persisted.
@@ -340,6 +410,10 @@ pub struct MempoolFeedStatus {
     /// datadir, one fetched in full after the wallet reached tip. Sends wait for it (see
     /// `BtcActor::send_gate`). `None` for a feed that takes none.
     pub snapshot_applied: Option<bool>,
+    /// For the P2P source: whether the peer advertised `NODE_BLOOM` in its version
+    /// handshake, which is what lets it answer a BIP 35 `mempool` request from a host it
+    /// does not whitelist. `None` before the first handshake and for the websocket source.
+    pub peer_bloom: Option<bool>,
 }
 
 enum BtcCommand {
@@ -1091,12 +1165,23 @@ pub fn spawn(
     let handle_seed = encrypted.then(|| seed.clone());
     let (unlock_tx, unlock_rx) = watch::channel(0);
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
+    // The persisted seed history (`SeedHistory`): what decides whether the send gate arms
+    // (`history_unknown_at_start` below) and what the status reports as `send_gate.history`.
+    let seed_history = persister.seed_history()?;
+    // The status before the actor runs: no connection yet, so the gate reports the refusal
+    // a send would get.
     let (status_tx, status_rx) = watch::channel(status_of(
         &wallet,
         BtcConnState::Down,
         birthday_anchor.as_ref(),
         None,
         None,
+        send_gate_status_of(
+            Err(RpcError::new(codes::RPC_WALLET_ERROR, NO_UPSTREAM)),
+            None,
+            seed_history,
+            allow_sends_without_mempool_view,
+        ),
     ));
     let span = info_span!("wallet", name = %name);
     // An accepted double-spend risk is said out loud at every start, whatever the backend
@@ -1113,7 +1198,7 @@ pub fn spawn(
     }
     let upstream = endpoint.as_ref().map(BtcEndpoint::describe);
     let wallet_never_synced = wallet.latest_checkpoint().height() == 0;
-    let history_unknown = history_unknown_at_start(persister.seed_history()?, wallet_never_synced);
+    let history_unknown = history_unknown_at_start(seed_history, wallet_never_synced);
     let actor = BtcActor {
         wallet,
         persister,
@@ -1132,6 +1217,8 @@ pub fn spawn(
         feed_held: HashSet::new(),
         feed_pending_evictions: HashMap::new(),
         feed_ready: false,
+        seed_history,
+        warned_no_bloom: false,
         mempool_rebuild: if history_unknown {
             MempoolRebuild::AwaitingTip
         } else {
@@ -1271,6 +1358,11 @@ struct BtcActor {
     /// snapshot that counts (see [`MempoolRebuild`]) since it last connected. Kyoto sends
     /// wait on it ([`Self::send_gate`]); cleared whenever the feed (re)connects or drops.
     feed_ready: bool,
+    /// The persisted seed history this start read, kept for the status (`send_gate.history`)
+    /// and moved to `Verified` when a view is established.
+    seed_history: Option<SeedHistory>,
+    /// Whether the no-NODE_BLOOM warning was logged this actor life (once, not per redial).
+    warned_no_bloom: bool,
     /// Where a wallet that started with no history stands in rebuilding its view of its own
     /// unconfirmed transactions.
     mempool_rebuild: MempoolRebuild,
@@ -1350,6 +1442,7 @@ fn status_of(
     birthday_anchor: Option<&(u32, bdk_wallet::bitcoin::BlockHash)>,
     birthday_block_time: Option<u64>,
     mempool_feed: Option<&MempoolFeedStatus>,
+    send_gate: SendGateStatus,
 ) -> BtcSyncStatus {
     let cp = wallet.latest_checkpoint();
     BtcSyncStatus {
@@ -1359,6 +1452,7 @@ fn status_of(
         birthday_anchor: birthday_anchor.map(|(height, hash)| (*height, hash.to_string())),
         birthday_block_time,
         mempool_feed: mempool_feed.cloned(),
+        send_gate,
     }
 }
 
@@ -2275,6 +2369,7 @@ impl BtcActor {
                 self.birthday_anchor.as_ref(),
                 self.birthday_block_time,
                 self.feed_status.as_ref(),
+                self.send_gate_status(),
             ));
             return true;
         }
@@ -2330,6 +2425,7 @@ impl BtcActor {
                     self.birthday_anchor.as_ref(),
                     self.birthday_block_time,
                     self.feed_status.as_ref(),
+                    self.send_gate_status(),
                 );
                 if applied > 0 {
                     debug!(
@@ -2471,6 +2567,7 @@ impl BtcActor {
             matched: 0,
             dropped: 0,
             snapshot_applied: snapshots.then_some(false),
+            peer_bloom: None,
         });
         self.feed = Some(MempoolFeed::start(
             target,
@@ -2492,12 +2589,24 @@ impl BtcActor {
     /// One feed event. Returns whether it changed the wallet.
     fn on_feed_event(&mut self, event: FeedEvent) -> bool {
         match event {
-            FeedEvent::Connected => {
+            FeedEvent::Connected { peer_bloom } => {
                 // A new connection's view starts over: sends wait for its first snapshot
                 // (requested at connect) rather than trusting the last link's.
                 self.set_feed_ready(false);
+                let mut warn_no_bloom = false;
                 if let Some(status) = &mut self.feed_status {
                     status.connected = true;
+                    status.peer_bloom = peer_bloom;
+                    // A snapshot-taking feed on a peer without NODE_BLOOM is answered only
+                    // under a whitelist; say so once, since the failure otherwise shows
+                    // only as a reconnect loop and refused sends.
+                    warn_no_bloom = status.snapshot_applied.is_some()
+                        && peer_bloom == Some(false)
+                        && !self.warned_no_bloom;
+                }
+                if warn_no_bloom {
+                    self.warned_no_bloom = true;
+                    warn!("{NO_BLOOM_PEER}");
                 }
                 self.publish_status();
                 false
@@ -2670,9 +2779,11 @@ impl BtcActor {
     /// start later, the safe direction.
     fn note_mempool_view_established(&mut self) {
         self.mempool_rebuild = MempoolRebuild::NotNeeded;
-        if let Err(e) = self.persister.save_seed_history(SeedHistory::Verified) {
-            warn!("could not record the established mempool view: {e:#}");
+        match self.persister.save_seed_history(SeedHistory::Verified) {
+            Ok(()) => self.seed_history = Some(SeedHistory::Verified),
+            Err(e) => warn!("could not record the established mempool view: {e:#}"),
         }
+        self.publish_status();
     }
 
     /// Record whether the mempool view is established, copied into the feed status.
@@ -2683,6 +2794,7 @@ impl BtcActor {
                 status.snapshot_applied = Some(ready);
             }
         }
+        self.publish_status();
     }
 
     /// Once a wallet that started with no history reaches tip, ask the feed for a full
@@ -2737,6 +2849,22 @@ impl BtcActor {
         )
     }
 
+    /// The gate as the status reports it: the connection check a send makes first, then
+    /// [`BtcActor::send_gate`], composed by [`send_gate_status_of`].
+    fn send_gate_status(&self) -> SendGateStatus {
+        let verdict = if self.conn.is_none() {
+            Err(RpcError::new(codes::RPC_WALLET_ERROR, NO_UPSTREAM))
+        } else {
+            self.send_gate()
+        };
+        send_gate_status_of(
+            verdict,
+            self.feed_status.as_ref(),
+            self.seed_history,
+            self.allow_sends_without_mempool_view,
+        )
+    }
+
     fn publish_status(&self) {
         let state = if self.conn.is_none() {
             BtcConnState::Down
@@ -2751,6 +2879,7 @@ impl BtcActor {
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
             self.feed_status.as_ref(),
+            self.send_gate_status(),
         ));
     }
 
@@ -2817,6 +2946,7 @@ impl BtcActor {
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
             self.feed_status.as_ref(),
+            self.send_gate_status(),
         ));
     }
 
@@ -3005,6 +3135,7 @@ impl BtcActor {
                     self.birthday_anchor.as_ref(),
                     self.birthday_block_time,
                     self.feed_status.as_ref(),
+                    self.send_gate_status(),
                 ));
                 true
             }
@@ -3023,6 +3154,7 @@ impl BtcActor {
                     self.birthday_anchor.as_ref(),
                     self.birthday_block_time,
                     self.feed_status.as_ref(),
+                    self.send_gate_status(),
                 ));
                 false
             }
@@ -3041,6 +3173,7 @@ impl BtcActor {
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
             self.feed_status.as_ref(),
+            self.send_gate_status(),
         ));
     }
 
@@ -4067,11 +4200,7 @@ impl BtcActor {
         // answers the same `-5`/`-3` offline as online.
         let parsed = parse_recipients(&recipients, self.wallet.network())?;
         if self.conn.is_none() {
-            return Err(RpcError::new(
-                codes::RPC_WALLET_ERROR,
-                "no connection to the upstream (fee estimation and broadcast need it); retry \
-                 once it is reachable",
-            ));
+            return Err(RpcError::new(codes::RPC_WALLET_ERROR, NO_UPSTREAM));
         }
         self.send_gate()?;
         // Fee rate: the caller's explicit `fee_rate` when given (no estimation dial at all -
@@ -4721,11 +4850,7 @@ impl BtcActor {
         self.require_signer()?;
         let original = self.bump_candidate(txid)?;
         if self.conn.is_none() {
-            return Err(RpcError::new(
-                codes::RPC_WALLET_ERROR,
-                "no connection to the upstream (fee estimation and broadcast need it); retry \
-                 once it is reachable",
-            ));
+            return Err(RpcError::new(codes::RPC_WALLET_ERROR, NO_UPSTREAM));
         }
         self.send_gate()?;
         let orig_fee = self
@@ -4962,6 +5087,7 @@ impl BtcActor {
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
             self.feed_status.as_ref(),
+            self.send_gate_status(),
         ));
         info!(
             %txid,
@@ -6278,6 +6404,69 @@ mod tests {
     /// for the feed's view; without one, a database that may be missing an earlier
     /// instance's unconfirmed sends refuses outright, naming both ways out; and the opt-out
     /// lifts both. A database with known history never waits without a feed.
+    #[test]
+    fn send_gate_status_composes_the_verdict_the_history_and_the_bloom_hint() {
+        use crate::btc::store::SeedHistory;
+        let feed = |snapshots: bool, bloom: Option<bool>| MempoolFeedStatus {
+            source: "p2p",
+            endpoint: "p2p://127.0.0.1:1".into(),
+            connected: true,
+            last_delta: None,
+            deltas: 0,
+            matched: 0,
+            dropped: 0,
+            snapshot_applied: snapshots.then_some(false),
+            peer_bloom: bloom,
+        };
+        let refusal = || {
+            Err(RpcError::new(
+                codes::RPC_WALLET_ERROR,
+                "mempool view not yet established",
+            ))
+        };
+        // Open: no reason, and the history string is the record's.
+        let open = send_gate_status_of(Ok(()), None, Some(SeedHistory::Fresh), false);
+        assert!(open.open && open.reason.is_none());
+        assert_eq!(open.history, "fresh");
+        assert_eq!(
+            send_gate_status_of(Ok(()), None, None, true).history,
+            "unrecorded",
+            "a database from before the record says so"
+        );
+        // Closed: the refusal's own text, untouched when the peer advertises bloom or the
+        // feed takes no snapshots.
+        let closed = send_gate_status_of(
+            refusal(),
+            Some(&feed(true, Some(true))),
+            Some(SeedHistory::Unverified),
+            false,
+        );
+        assert!(!closed.open);
+        assert_eq!(
+            closed.reason.as_deref(),
+            Some("mempool view not yet established")
+        );
+        assert_eq!(closed.history, "unverified");
+        let no_snapshots =
+            send_gate_status_of(refusal(), Some(&feed(false, Some(false))), None, false);
+        assert_eq!(
+            no_snapshots.reason.as_deref(),
+            Some("mempool view not yet established")
+        );
+        // A snapshot feed on a peer without NODE_BLOOM: the likely cause is appended.
+        let no_bloom = send_gate_status_of(refusal(), Some(&feed(true, Some(false))), None, true);
+        let reason = no_bloom.reason.clone().unwrap();
+        assert!(reason.starts_with("mempool view not yet established. The mempool feed's peer does not advertise NODE_BLOOM"), "{reason}");
+        assert!(reason.contains("-peerbloomfilters=1"), "{reason}");
+        assert!(no_bloom.allow_sends_without_mempool_view);
+        // The JSON shape both getwalletinfo and /status serve.
+        let json = no_bloom.to_json();
+        assert_eq!(json["open"], false);
+        assert_eq!(json["history"], "unrecorded");
+        assert_eq!(json["allow_sends_without_mempool_view"], true);
+        assert!(json["reason"].as_str().unwrap().contains("NODE_BLOOM"));
+    }
+
     #[test]
     fn kyoto_send_gate_refuses_an_unknown_history_without_a_view() {
         // (snapshot_feed, feed_ready, history_unknown, allow) -> refused?

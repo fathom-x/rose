@@ -36,7 +36,7 @@
   .head .bal { white-space: nowrap; }
   .head .bal small { display: inline; }
   label { display: block; color: var(--dim); font-size: .8rem; margin-top: .6rem; }
-  input[type=text], input[type=number] {
+  input[type=text], input[type=number], input[type=password] {
     width: 100%; background: var(--bg); color: var(--text);
     border: 1px solid var(--line); border-radius: 4px; padding: .45rem .5rem;
     font: inherit;
@@ -50,6 +50,23 @@
   #addr { word-break: break-all; margin-top: .5rem; min-height: 1.5em; }
   .msg { margin-top: .6rem; font-size: .85rem; word-break: break-all; min-height: 1.3em; }
   .msg.ok { color: var(--good); } .msg.err { color: var(--bad); }
+  .state-ok { color: var(--good); } .state-warn { color: var(--accent); } .state-bad { color: var(--bad); }
+  /* The send-gate banner: rose's getwalletinfo.send_gate says a send would be refused
+     before coin selection (no connection, or the mempool-view wait after a restore), and
+     why. Shown above the cards until the gate opens; amber, since it is a wait, not a fault. */
+  .banner { background: var(--panel); border: 1px solid var(--accent); border-left-width: 4px;
+            border-radius: 8px; padding: .6rem .9rem; margin-bottom: 1rem; font-size: .85rem; }
+  .banner b { color: var(--accent); }
+  .banner[hidden] { display: none; }
+  button.ghost.done { color: var(--good); border-color: var(--good); }
+  button.ghost.err, button.copy.err { color: var(--bad); border-color: var(--bad); }
+  /* Login mode: the proxy holds no password, so the page asks for it before anything else.
+     A fixed overlay over the dashboard; the cards underneath stay unpopulated until then. */
+  #login { position: fixed; inset: 0; background: rgba(18, 21, 26, .92); display: flex;
+           align-items: center; justify-content: center; z-index: 10; padding: 1.5rem; }
+  #login[hidden] { display: none; }
+  #login .card { width: min(26rem, 100%); }
+  #logout { margin-left: auto; }
   .tablewrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: .85rem; }
   th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line);
@@ -102,7 +119,30 @@
     <h1>&#9679; rose &middot; bitcoin wallet</h1>
     <div id="cfgbadge" class="sub" style="margin-top:.2rem">&ndash;</div>
   </div>
+  <button id="logout" class="ghost small" hidden title="forget the RPC password this proxy holds for this browser">log out</button>
 </header>
+
+<div id="gatebanner" class="banner" hidden></div>
+
+<!-- Login mode (the proxy was started without the RPC password): shown until the operator
+     enters it. The proxy checks it against rose and keeps it in memory under a session
+     cookie; the page never sees it again. -->
+<div id="login" hidden>
+  <form class="card" id="login-form" autocomplete="on">
+    <h2>Log in</h2>
+    <div class="sub" id="login-where">&ndash;</div>
+    <div class="sub" id="login-enclave" hidden></div>
+    <label for="login-user">RPC user</label>
+    <input id="login-user" type="text" autocomplete="username" spellcheck="false">
+    <label for="login-pass">RPC password</label>
+    <input id="login-pass" type="password" autocomplete="current-password">
+    <div class="row">
+      <button id="login-go" type="submit">log in</button>
+      <span class="sub">checked against the daemon; kept in the proxy's memory for this session only</span>
+    </div>
+    <div class="msg" id="login-msg"></div>
+  </form>
+</div>
 
 
 <div class="grid">
@@ -138,6 +178,9 @@
     </div>
     <span class="sub">block height: <span id="st-height">&ndash;</span></span>
     <span class="sub" id="st-hash"></span>
+    <!-- Enclave mode only: the enclave itself, from the proxy's /enclave probe (its attestation
+         endpoint plus one credential-free attested call), independent of the wallet login. -->
+    <span class="sub" id="st-enclave" hidden></span>
     <span class="sub">birthday height: <span id="st-birthday">&ndash;</span></span>
     <span class="sub">birthdate: <span id="st-birthdate">&ndash;</span></span>
   </div>
@@ -269,12 +312,89 @@ function setWatchOnly(flag) {
 // string in params to raw JSON text spliced into the body after stringify -
 // used for amounts, so what rose parses is exactly the decimal the user typed
 // (rose is strict about 8-dp amounts; no float round-trip on the send path).
+// Login mode. /session says whether the proxy wants the password from us (`login`) and
+// whether this browser already gave it. While logged out the overlay is up and the refresh
+// loop idles, so the proxy is not asked eight times every five seconds for a 401.
+let loginMode = false, loggedIn = true, enclaveMode = false, shardUrl = "";
+
+// Enclave mode: the enclave's own state - running, waiting for shards, or gone - shown in
+// the Status card and on the login card, where a failed login would otherwise be the
+// first sign that there is no enclave to log in to. Polled on its own clock, since the
+// proxy caches the probe for ten seconds anyway.
+async function refreshEnclave() {
+  let text, cls, shardLink = false;
+  try {
+    const e = await (await fetch("/enclave")).json();
+    if (!e.enclave) return;
+    const attests = e.attests ? ` · attests ${e.attests}` : "";
+    if (e.state === "running") { text = `enclave: running${attests}`; cls = "state-ok"; }
+    else if (e.state === "awaiting_shard") { text = `enclave: up, waiting for shards${attests}`; cls = "state-warn"; shardLink = true; }
+    else if (e.state === "down") { text = "enclave: NOT RUNNING (attestation endpoint not answering)"; cls = "state-bad"; }
+    else { text = `enclave: ${e.state}${attests}${e.detail ? " · " + e.detail : ""}`; cls = "state-warn"; }
+  } catch (err) {
+    text = `enclave: unknown (${err.message})`; cls = "state-warn";
+  }
+  for (const id of ["st-enclave", "login-enclave"]) {
+    const el = $(id); el.hidden = false; el.textContent = text; el.className = `sub ${cls}`;
+    // The deployment's holder page, when the proxy was given one (--shard-url): where a
+    // holder goes to release a shard. A link, not a button - the key is not here.
+    if (shardLink && shardUrl) {
+      const a = document.createElement("a"); a.href = shardUrl; a.textContent = "release a shard";
+      a.target = "_blank"; a.rel = "noopener"; el.append(" \u00b7 ", a);
+    }
+  }
+}
+function showLogin() {
+  loggedIn = false;
+  $("login").hidden = false;
+  $("logout").hidden = true;
+  ($("login-user").value ? $("login-pass") : $("login-user")).focus();
+}
+async function checkSession() {
+  try {
+    const s = await (await fetch("/session")).json();
+    loginMode = !!s.login;
+    if (s.user && !$("login-user").value) $("login-user").value = s.user;
+    if (loginMode && !s.logged_in) showLogin();
+    else { loggedIn = true; $("login").hidden = true; $("logout").hidden = !loginMode; }
+  } catch { /* an old proxy without /session: behave as before */ }
+}
+$("login-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const user = $("login-user").value.trim(), password = $("login-pass").value;
+  if (!password) { $("login-msg").className = "msg err"; $("login-msg").textContent = "enter the RPC password"; return; }
+  $("login-go").disabled = true; $("login-msg").className = "msg"; $("login-msg").textContent = "checking...";
+  try {
+    const resp = await fetch("/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user, password }),
+    });
+    const parsed = await resp.json();
+    if (!resp.ok || parsed.error) throw new Error(parsed.error ? parsed.error.message : `HTTP ${resp.status}`);
+    $("login-pass").value = "";
+    $("login-msg").textContent = "";
+    loggedIn = true; $("login").hidden = true; $("logout").hidden = false;
+    loadInfo(); refresh();
+  } catch (e) {
+    $("login-msg").className = "msg err"; $("login-msg").textContent = e.message;
+  } finally {
+    $("login-go").disabled = false;
+  }
+};
+$("logout").onclick = async () => {
+  try { await fetch("/logout", { method: "POST" }); } catch {}
+  showLogin();
+};
+
 async function rpc(method, params = [], raw = {}) {
   let body = JSON.stringify({ jsonrpc: "1.0", id: ++rpcId, method, params });
   for (const [ph, text] of Object.entries(raw)) body = body.replace(`"${ph}"`, text);
   const resp = await fetch("/rpc", {
     method: "POST", headers: { "Content-Type": "application/json" }, body,
   });
+  // The proxy's own 401 is "no session" (login mode): bring the form back, since the
+  // session has ended - a proxy restart, or the 12-hour limit.
+  if (resp.status === 401 && loginMode && loggedIn) showLogin();
   let parsed;
   try { parsed = JSON.parse(await resp.text()); }
   catch { throw new Error(`HTTP ${resp.status} from rose`); }
@@ -294,9 +414,13 @@ const copyBtn = v => v ? `<button class="copy" data-copy="${v}" title="copy">⧉
 document.addEventListener("click", async e => {
   const btn = e.target.closest("button.copy");
   if (!btn) return;
-  await navigator.clipboard.writeText(btn.dataset.copy);
-  btn.classList.add("done"); btn.textContent = "✓";
-  setTimeout(() => { btn.classList.remove("done"); btn.textContent = "⧉"; }, 1200);
+  try {
+    await navigator.clipboard.writeText(btn.dataset.copy);
+    btn.classList.add("done"); btn.textContent = "✓";
+  } catch (e) {
+    btn.classList.add("err"); btn.textContent = "✗"; btn.title = "copy failed: no clipboard access (not a secure context?)";
+  }
+  setTimeout(() => { btn.classList.remove("done", "err"); btn.textContent = "⧉"; btn.title = "copy"; }, 1200);
 });
 
 // The Addresses tab: the account xpub (the receiving descriptor's origin-qualified key,
@@ -361,7 +485,23 @@ $("hideunused").addEventListener("change", () => {
   if (lastAddresses) renderAddresses(...lastAddresses);
 });
 
+// rose's getwalletinfo.send_gate (Bitcoin wallets, rose >= 0.11): whether a send would be
+// refused before coin selection and why - no connection, or the mempool-view wait a
+// restored kyoto wallet sits in until its snapshot lands (or its opt-out). Shown as a
+// banner so the operator sees it before trying a send, not as the send's error. An older
+// daemon has no field: no banner.
+function renderSendGate(gate) {
+  const el = $("gatebanner");
+  if (!gate || gate.open !== false) { el.hidden = true; return; }
+  el.innerHTML = `<b>sends are refused right now</b> (seed history: ${gate.history || "?"}` +
+    `${gate.allow_sends_without_mempool_view ? ", opt-out set" : ""}): ` +
+    `<span id="gatereason"></span>`;
+  $("gatereason").textContent = gate.reason || "";
+  el.hidden = false;
+}
+
 async function refresh() {
+  if (!loggedIn) return;
   try {
     const [balances, height, hash, txs, info, received, descriptors, unspent] = await Promise.all([
       rpc("getbalances"),
@@ -380,6 +520,7 @@ async function refresh() {
       rpc("listunspent", [0]).catch(() => null),
     ]);
     setWatchOnly(info.private_keys_enabled === false);
+    renderSendGate(info.send_gate);
     spendable = Number(balances.mine.trusted);
     $("trusted").textContent = fmt(balances.mine.trusted);
     $("pending").textContent = fmt(balances.mine.untrusted_pending);
@@ -492,6 +633,8 @@ async function loadInfo() {
   try {
     const i = await (await fetch("/info")).json();
     backend = i.backend;
+    shardUrl = i.shard_url || "";
+    if (i.enclave && !enclaveMode) { enclaveMode = true; refreshEnclave(); setInterval(refreshEnclave, 15000); }
     unit = (i.network === "main" || i.network === "mainnet") ? "BTC" : "tBTC";
     for (const el of document.querySelectorAll(".unit")) el.textContent = unit;
     for (const el of document.querySelectorAll(".r-to")) el.placeholder = unit === "BTC" ? "bc1\u2026" : "tb1\u2026";
@@ -501,6 +644,7 @@ async function loadInfo() {
     $("cfgbadge").textContent =
       `${i.network} · ${i.backend} · ${i.wallet}${mode}  (on ${i.machine || "unknown host"})`;
     $("cfgbadge").title = `config: ${i.conf}`;
+    $("login-where").textContent = `${i.network} · ${i.backend} · ${i.wallet} on ${i.machine || "unknown host"}`;
     document.title = `rose btc – ${i.network}/${i.backend}${mode}${i.machine ? " @ " + i.machine : ""}`;
     refreshFee();
   } catch (e) { $("cfgbadge").textContent = ""; }
@@ -533,6 +677,7 @@ function setFeePrefill(value) {
   f.value = String(value); f.dataset.auto = "1";
 }
 async function refreshFee() {
+  if (!loggedIn) return;
   const target = Number($("feetarget").value);
   try {
     const r = await rpc("estimatesmartfee", [target]);
@@ -575,7 +720,21 @@ $("newaddr").onclick = async () => {
     $("addrmsg").className = "msg err"; $("addrmsg").textContent = e.message;
   }
 };
-$("copyaddr").onclick = () => navigator.clipboard.writeText($("addr").textContent);
+// The Receive card's copy button says what it did: "copied" for a moment, or "copy failed"
+// with the address selected for a manual copy (the clipboard API exists only in a secure
+// context - localhost or https - so a page served on a plain LAN address has none).
+$("copyaddr").onclick = async () => {
+  const btn = $("copyaddr");
+  try {
+    await navigator.clipboard.writeText($("addr").textContent);
+    btn.textContent = "copied \u2713"; btn.classList.add("done");
+  } catch (e) {
+    btn.textContent = "copy failed"; btn.classList.add("err");
+    const range = document.createRange(); range.selectNodeContents($("addr"));
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+  }
+  setTimeout(() => { btn.textContent = "copy"; btn.classList.remove("done", "err"); }, 1500);
+};
 
 // Recipient rows. The first cannot be removed, so the form always has one.
 function addRecipient() {
@@ -719,8 +878,10 @@ $("txa-go").onclick = async () => {
   }
 };
 
-loadInfo();  // sets backend, then kicks the first fee refresh
-refresh();
+checkSession().then(() => {  // login mode: the overlay first, and refresh() idles until then
+  loadInfo();  // sets backend, then kicks the first fee refresh
+  refresh();
+});
 setInterval(refresh, 5000);
 setInterval(refreshFee, 30000);  // fee estimate changes slowly; poll less often
 

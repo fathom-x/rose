@@ -66,6 +66,11 @@ services:
       - -txindex=1
       - -blockfilterindex=1
       - -peerblockfilters=1
+      # Advertise NODE_BLOOM: Core then answers a BIP 35 `mempool` request from ANY peer, not
+      # only a -whitelist=mempool@ one. This node is the enclave's testnet4 peer (rose-deploy),
+      # and that reply is how the wallet rebuilt on every boot sees its own unconfirmed sends.
+      # A flag flip: no index, no resync.
+      - -peerbloomfilters=1
       - -listen=1
       # Persistent peers: on testnet4 a CPU-mined block loses a same-height tie to a
       # better-connected miner unless it propagates fast, so this node boots wired to a

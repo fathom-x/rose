@@ -55,14 +55,25 @@ session, sends the one request and prints the answer. About a second per call, w
 dashboard tolerates; a session per call is what the one-request CLI offers, and nothing
 here keeps a key. The credentials still go in an Authorization header, inside the
 encrypted channel.
+
+Login mode (no ROSE_RPC_PASSWORD and no usable [rpc] password): the proxy starts anyway and
+the page asks the operator for the RPC password instead. The password is checked against
+rose (one getblockcount), then kept only in this process's memory under a random session
+cookie (HttpOnly, SameSite=Strict, LOGIN_SESSION_SECS) and attached to each /rpc call for
+that browser; "log out" drops it. Nothing touches disk, and a restart (or --reload's
+re-exec) forgets every session. This is for a proxy started before anyone holding the
+password is at the keyboard - an enclave's, delivered per boot - not a second credential:
+whoever can reach the port can try passwords, so keep the bind on loopback.
 """
 
 import argparse
 import base64
+import http.cookies
 import http.server
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -177,6 +188,15 @@ ALLOWED_METHODS = frozenset({
 })
 
 
+# Login mode: the session cookie's name, and how long a login lasts. Long enough for a
+# working day at the dashboard; a restart forgets every session anyway.
+SESSION_COOKIE = "rose_gui_session"
+LOGIN_SESSION_SECS = 12 * 3600
+
+# Enclave mode: how long an /enclave verdict is reused before the enclave is probed again.
+ENCLAVE_PROBE_SECS = 10
+
+
 def machine_name(flag):
     """The name of the machine this proxy runs on, for the page header: the --machine flag,
     else ROSE_GUI_MACHINE, else the hostname. A container on a bridge network has a random
@@ -223,6 +243,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     auth_header = None
     steve = None  # (steve-cli path, trusted-hashes file) in enclave mode, else None
     info_json = b"{}"  # which config this proxy is serving (set by main)
+    # Login mode (auth_header is None): the user the form is prefilled with, and the live
+    # sessions, cookie token -> (Authorization header, user, expiry).
+    rpc_user = ""
+    sessions = {}
+    sessions_lock = threading.Lock()
+    # Enclave mode: where the attestation document is served (None: not probed), and the
+    # last verdict of /enclave with its time, so the page's polling costs one probe per
+    # ENCLAVE_PROBE_SECS rather than one steve-cli session per request.
+    attestation_url = None
+    enclave_cache = (0.0, None)
+    enclave_lock = threading.Lock()
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
@@ -234,19 +265,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/info":
             self.relay(200, self.info_json)
+        elif self.path == "/enclave":
+            self.relay(200, json.dumps(self.enclave_state()).encode())
+        elif self.path == "/session":
+            # Whether the page must ask for the password, and whether this browser already
+            # did. The user is the form's prefill, never a secret.
+            session = self.session()
+            self.relay(200, json.dumps({
+                "login": self.auth_header is None,
+                "logged_in": self.auth_header is not None or session is not None,
+                "user": session[1] if session else self.rpc_user,
+            }).encode())
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path != "/rpc":
+        if self.path not in ("/rpc", "/login", "/logout"):
             self.send_error(404)
             return
         if not request_is_same_origin(self.headers):
-            self.log_error("refused a cross-origin /rpc request (Origin=%s Sec-Fetch-Site=%s)",
-                           self.headers.get("Origin"), self.headers.get("Sec-Fetch-Site"))
+            self.log_error("refused a cross-origin %s request (Origin=%s Sec-Fetch-Site=%s)",
+                           self.path, self.headers.get("Origin"), self.headers.get("Sec-Fetch-Site"))
             return self.relay(403, rpc_error(-32600, "cross-origin requests are refused"))
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
+        if self.path == "/login":
+            return self.do_login(body)
+        if self.path == "/logout":
+            return self.do_logout()
         # One request at a time, and only the methods the page uses; a batch or an unlisted
         # method is refused with the shape the page already understands (rose's own
         # method-not-found), and never reaches the wallet.
@@ -258,14 +304,153 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not isinstance(method, str) or method not in ALLOWED_METHODS:
             self.log_error("refused /rpc method %r", method if isinstance(call, dict) else "<batch>")
             return self.relay(403, rpc_error(-32601, "Method not allowed through this proxy"))
+        auth = self.auth_header
+        if auth is None:
+            session = self.session()
+            if session is None:
+                # The page shows its login form on this; a script sees a plain refusal.
+                return self.relay(401, rpc_error(-1, "not logged in: this proxy asks for the RPC password"))
+            auth = session[0]
+        self.relay(*self.forward(body, auth))
+
+    # --- enclave mode: is the enclave there? ------------------------------------------
+
+    def enclave_state(self):
+        """The enclave's own state, independent of the wallet credentials, from two probes
+        the deployment's scripts/status.sh makes the same way: the attestation endpoint
+        (POST a random nonce; a document means the enclave is up and says which commit it
+        runs) and, when that answers, one attested getblockcount through steve-cli with no
+        credentials - "upstream unavailable" is an enclave still waiting for its shards, an
+        empty answer is rose refusing the missing credentials, i.e. running. Cached for
+        ENCLAVE_PROBE_SECS. Outside enclave mode: {"enclave": false}."""
+        if not self.steve:
+            return {"enclave": False}
+        now = time.monotonic()
+        with self.enclave_lock:
+            stamp, verdict = self.enclave_cache
+            if verdict is not None and now - stamp < ENCLAVE_PROBE_SECS:
+                return verdict
+            verdict = {"enclave": True, "state": "unknown", "attests": None, "attestation_url": self.attestation_url}
+            if self.attestation_url:
+                nonce = base64.b64encode(secrets.token_bytes(20)).decode()
+                req = urllib.request.Request(
+                    self.attestation_url, data=json.dumps({"nonce": nonce}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        doc = json.loads(resp.read())
+                    commit = ((doc.get("manifest") or {}).get("app_source") or {}).get("commit") or ""
+                    verdict["attests"] = commit[:8] or None
+                    verdict["state"] = "up"
+                except (OSError, ValueError, AttributeError) as e:
+                    verdict["state"] = "down"
+                    verdict["detail"] = f"the attestation endpoint did not answer: {e}"
+            if verdict["state"] in ("up", "unknown"):
+                cli, pcrs = self.steve
+                probe = json.dumps({"jsonrpc": "1.0", "id": "enclave", "method": "getblockcount", "params": []})
+                try:
+                    out = subprocess.run([cli, "--pcrs", pcrs, "--json", probe, self.upstream_url],
+                                         capture_output=True, timeout=60, check=False)
+                    err = out.stderr.decode("utf-8", "replace")
+                    # steve-cli's stderr opens with its trust verdict ("PCR trust: Pinned");
+                    # anything after it is a complaint. No complaint and no body is rose's
+                    # 401 to the missing credentials: the daemon is up.
+                    complaints = [l for l in err.splitlines() if l.strip() and not l.startswith("PCR trust:")]
+                    if "upstream unavailable" in err:
+                        verdict["state"] = "awaiting_shard"
+                    elif out.stdout.strip() or not complaints:
+                        verdict["state"] = "running"
+                    else:
+                        verdict["state"] = "up"
+                        verdict["detail"] = complaints[-1]
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    verdict["detail"] = f"steve-cli failed to run: {e}"
+            self.enclave_cache = (now, verdict)
+            return verdict
+
+    # --- login mode -------------------------------------------------------------------
+
+    def session(self):
+        """The caller's live session (auth header, user, expiry) from its cookie, or None.
+        Expired ones are dropped on sight."""
+        if self.auth_header is not None:
+            return None
+        cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        morsel = cookie.get(SESSION_COOKIE)
+        if morsel is None:
+            return None
+        now = time.monotonic()
+        with self.sessions_lock:
+            entry = self.sessions.get(morsel.value)
+            if entry is not None and entry[2] <= now:
+                del self.sessions[morsel.value]
+                entry = None
+            return entry
+
+    def do_login(self, body):
+        if self.auth_header is not None:
+            return self.relay(400, rpc_error(-1, "this proxy holds the credentials itself; there is nothing to log in to"))
+        try:
+            form = json.loads(body)
+            user = str(form.get("user") or self.rpc_user or "")
+            password = str(form.get("password") or "")
+        except (ValueError, AttributeError):
+            return self.relay(400, rpc_error(-32700, "Parse error"))
+        if not user or not password:
+            return self.relay(400, rpc_error(-1, "a user and a password are needed"))
+        auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+        # Prove the credentials against rose before keeping them: the cheapest wallet-free
+        # call. A 401 (bitcoind-style) or an empty answer through steve is the password; any
+        # other failure is the daemon, reported as such so a wrong password and a dead
+        # daemon are told apart.
+        probe = json.dumps({"jsonrpc": "1.0", "id": "login", "method": "getblockcount", "params": []}).encode()
+        status, answer = self.forward(probe, auth)
+        try:
+            ok = status == 200 and json.loads(answer).get("error") is None
+        except ValueError:
+            ok = False
+        if not ok:
+            if status in (401, 403) or (self.steve and status == 502 and b"credentials refused" in answer):
+                self.log_error("login refused for user %r", user)
+                return self.relay(401, rpc_error(-1, "rose refused the credentials"))
+            return self.relay(502, answer if answer else rpc_error(-1, "rose did not answer the login check"))
+        token = secrets.token_urlsafe(32)
+        with self.sessions_lock:
+            self.sessions[token] = (auth, user, time.monotonic() + LOGIN_SESSION_SECS)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", f"{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/")
+        reply = json.dumps({"ok": True, "user": user}).encode()
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+    def do_logout(self):
+        cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        morsel = cookie.get(SESSION_COOKIE)
+        if morsel is not None:
+            with self.sessions_lock:
+                self.sessions.pop(morsel.value, None)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", f"{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+        reply = b'{"ok": true}'
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+    # --- the upstream call ------------------------------------------------------------
+
+    def forward(self, body, auth_header):
+        """One JSON-RPC request to rose under `auth_header`, as (HTTP status, body)."""
         if self.steve:
-            return self.relay_via_steve(body)
+            return self.forward_via_steve(body, auth_header)
         req = urllib.request.Request(
             self.upstream_url,
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": self.auth_header,
+                "Authorization": auth_header,
             },
             method="POST",
         )
@@ -274,18 +459,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # verbatim so the page sees exactly what a direct client would.
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
-                self.relay(resp.status, resp.read())
+                return resp.status, resp.read()
         except urllib.error.HTTPError as e:
-            self.relay(e.code, e.read())
+            return e.code, e.read()
         except OSError as e:
-            self.relay(
-                502,
-                json.dumps(
-                    {"result": None, "error": {"code": -1, "message": f"rose unreachable: {e}"}, "id": None}
-                ).encode(),
-            )
+            return 502, json.dumps(
+                {"result": None, "error": {"code": -1, "message": f"rose unreachable: {e}"}, "id": None}
+            ).encode()
 
-    def relay_via_steve(self, body):
+    def forward_via_steve(self, body, auth_header):
         """One attested request through steve-cli. It prints the response body alone (no
         status line), so a JSON answer is relayed as 200 whatever rose's HTTP status was -
         the page reads the JSON-RPC error object, not the status - and anything else is a
@@ -293,12 +475,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         cli, pcrs = self.steve
         try:
             out = subprocess.run(
-                [cli, "--pcrs", pcrs, "-H", f"Authorization: {self.auth_header}",
+                [cli, "--pcrs", pcrs, "-H", f"Authorization: {auth_header}",
                  "--json", body.decode("utf-8", "replace"), self.upstream_url],
                 capture_output=True, timeout=120, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as e:
-            return self.relay(502, rpc_error(-1, f"steve-cli failed to run: {e}"))
+            return 502, rpc_error(-1, f"steve-cli failed to run: {e}")
         answer = out.stdout.strip()
         try:
             json.loads(answer)
@@ -310,8 +492,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                       if l.strip() and not l.startswith("PCR trust:")]
             why = detail[-1] if detail else "the enclave answered with no body (credentials refused?)"
             self.log_error("steve-cli gave no JSON answer: %s", why)
-            return self.relay(502, rpc_error(-1, f"enclave call failed: {why}"))
-        self.relay(200, answer)
+            return 502, rpc_error(-1, f"enclave call failed: {why}")
+        return 200, answer
 
     def relay(self, status, body):
         self.send_response(status)
@@ -366,6 +548,20 @@ def main():
              "through steve-cli's attested session to --rpc-url. Env: ROSE_STEVE_PCRS",
     )
     ap.add_argument(
+        "--attestation-url",
+        default="",
+        help="enclave mode: where the enclave serves its attestation document, probed by the "
+             "page's enclave row to tell a running enclave from one waiting for shards or gone. "
+             "Default: --rpc-url's host on port 49502 (a Nitro enclave; docs/NITRO.md), '-' to "
+             "disable the probe. Env: ROSE_ATTESTATION_URL",
+    )
+    ap.add_argument(
+        "--shard-url",
+        default="",
+        help="enclave mode: the deployment's holder page (where a shard is released), linked "
+             "from the enclave row while the enclave waits for shards. Env: ROSE_SHARD_URL",
+    )
+    ap.add_argument(
         "--steve-cli",
         default="",
         help="path to steve-cli for --steve-pcrs; default: steve-cli on PATH. Env: ROSE_STEVE_CLI",
@@ -414,14 +610,16 @@ def main():
     # env-over-file rule and has no flag (a secret has no business on a command line).
     user = args.rpc_user or os.environ.get("ROSE_RPC_USER") or rpc.get("user", "")
     password = os.environ.get("ROSE_RPC_PASSWORD") or rpc.get("password", "")
-    if not user or not password:
-        sys.exit("no RPC credentials: set ROSE_RPC_USER and ROSE_RPC_PASSWORD (or [rpc] "
-                 f"user/password in a mounted --conf; this run read {conf_label})")
     # The shipped configs carry a placeholder that rose itself refuses to start on (every
-    # network), so a proxy holding it can only ever fail auth: say so up front, the same way.
+    # network), so a proxy holding it could only ever fail auth: it counts as no password.
     if password.strip().lower() == "change-me":
-        sys.exit("[rpc] password is still the CHANGE-ME placeholder; rose refuses to start on "
-                 "it - set ROSE_RPC_PASSWORD to the password the daemon runs with")
+        password = ""
+    # Without a password the proxy runs in login mode: the page asks for it (see the module
+    # doc). The user is still wanted, as the form's prefill; "btc" is what every shipped
+    # config names.
+    login_mode = not password
+    if login_mode and not user:
+        user = "btc"
 
     # Where rose listens. --rpc-url (or ROSE_RPC_URL) gives the whole base URL; otherwise it is
     # composed from host/port/scheme parts, each with the same flag > env > config > default
@@ -438,8 +636,12 @@ def main():
         base = f"{scheme}://{host}:{port}"
     path = f"/wallet/{args.wallet}" if args.wallet else "/"
     Handler.upstream_url = base.rstrip("/") + path
-    token = base64.b64encode(f"{user}:{password}".encode()).decode()
-    Handler.auth_header = f"Basic {token}"
+    if login_mode:
+        Handler.auth_header = None
+        Handler.rpc_user = user
+    else:
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        Handler.auth_header = f"Basic {token}"
     pcrs = args.steve_pcrs or os.environ.get("ROSE_STEVE_PCRS", "")
     if pcrs:
         if not os.path.isfile(pcrs):
@@ -448,6 +650,12 @@ def main():
         if not cli or not os.path.isfile(cli):
             sys.exit("--steve-pcrs needs steve-cli (on PATH, --steve-cli, or ROSE_STEVE_CLI)")
         Handler.steve = (cli, pcrs)
+        att = args.attestation_url or os.environ.get("ROSE_ATTESTATION_URL", "")
+        if not att:
+            from urllib.parse import urlsplit
+            u = urlsplit(base)
+            att = f"{u.scheme}://{u.hostname}:49502/attestation"
+        Handler.attestation_url = None if att == "-" else att
 
     bd = config.get("bitcoind", {})
 
@@ -469,6 +677,8 @@ def main():
         backend = "kyoto" if (srv or "").lower().startswith("kyoto") else "bitcoind"
     net = os.environ.get("ROSE_NETWORK") or config.get("btc_testnet") or config.get("network") or "?"
     Handler.info_json = json.dumps({
+        "enclave": bool(pcrs),
+        "shard_url": (args.shard_url or os.environ.get("ROSE_SHARD_URL", "")) if pcrs else "",
         "conf": conf_label,
         "machine": machine_name(args.machine),
         "network": net,
@@ -482,8 +692,12 @@ def main():
         watch_and_reexec(sorted(UI_DIR.glob("*.py")))
         print(f"reload: watching {UI_DIR} (index.html is read per request; a .py change re-execs)")
     print(f"UI:   http://{args.bind}:{args.port}/")
-    cred_src = "environment" if os.environ.get("ROSE_RPC_PASSWORD") else conf_label
-    print(f"rose: {Handler.upstream_url}  (user={user!r}, credentials from {cred_src})")
+    if login_mode:
+        print(f"rose: {Handler.upstream_url}  (user={user!r}; LOGIN MODE: no password configured, "
+              "the page asks for it and keeps it in memory for the session)")
+    else:
+        cred_src = "environment" if os.environ.get("ROSE_RPC_PASSWORD") else conf_label
+        print(f"rose: {Handler.upstream_url}  (user={user!r}, credentials from {cred_src})")
     print("fee:  rose's estimatesmartfee through /rpc (the same estimate a send uses)")
     print(f"cfg:  {conf_label}  net={net}  wallet={wallet_name}  backend={backend}  "
           f"machine={machine_name(args.machine)}")

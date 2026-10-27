@@ -369,8 +369,14 @@ $("login-form").onsubmit = async (ev) => {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user, password }),
     });
-    const parsed = await resp.json();
-    if (!resp.ok || parsed.error) throw new Error(parsed.error ? parsed.error.message : `HTTP ${resp.status}`);
+    let parsed;
+    try { parsed = await resp.json(); } catch { throw new Error(`HTTP ${resp.status} from the proxy`); }
+    // The proxy's own errors are {error: {message}}; one relayed from steve-cli is a bare
+    // string ({"error": "upstream unavailable"}). Show either, never a blank line.
+    if (!resp.ok || parsed.error) {
+      const err = parsed.error;
+      throw new Error((err && (err.message || (typeof err === "string" ? err : ""))) || `HTTP ${resp.status}`);
+    }
     $("login-pass").value = "";
     $("login-msg").textContent = "";
     loggedIn = true; $("login").hidden = true; $("logout").hidden = false;

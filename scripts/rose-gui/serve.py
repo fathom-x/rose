@@ -352,11 +352,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     out = subprocess.run([cli, "--pcrs", pcrs, "--json", probe, self.upstream_url],
                                          capture_output=True, timeout=60, check=False)
                     err = out.stderr.decode("utf-8", "replace")
+                    body = out.stdout.decode("utf-8", "replace")
                     # steve-cli's stderr opens with its trust verdict ("PCR trust: Pinned");
                     # anything after it is a complaint. No complaint and no body is rose's
-                    # 401 to the missing credentials: the daemon is up.
+                    # 401 to the missing credentials: the daemon is up. STEVE answering for a
+                    # daemon that is not up yet (the enclave still awaits shards) is a JSON
+                    # body on stdout, {"error": "upstream unavailable"}, not a complaint.
                     complaints = [l for l in err.splitlines() if l.strip() and not l.startswith("PCR trust:")]
-                    if "upstream unavailable" in err:
+                    if "upstream unavailable" in err or "upstream unavailable" in body:
                         verdict["state"] = "awaiting_shard"
                     elif out.stdout.strip() or not complaints:
                         verdict["state"] = "running"
@@ -413,6 +416,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if status in (401, 403) or (self.steve and status == 502 and b"credentials refused" in answer):
                 self.log_error("login refused for user %r", user)
                 return self.relay(401, rpc_error(-1, "rose refused the credentials"))
+            if self.steve and b"upstream unavailable" in answer:
+                # STEVE answers, the daemon behind it does not: the enclave is still waiting
+                # for its shards (or rosed is starting). Nothing to log in to yet.
+                return self.relay(502, rpc_error(-1, "the enclave is up but rose is not running in it yet: it is waiting for a shard, or starting. Try again once the enclave row says running"))
             return self.relay(502, answer if answer else rpc_error(-1, "rose did not answer the login check"))
         token = secrets.token_urlsafe(32)
         with self.sessions_lock:

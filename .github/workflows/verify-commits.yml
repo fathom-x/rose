@@ -1,15 +1,18 @@
-# Every commit since the trusted root is signed by a maintainer (contrib/verify-commits).
-# The root is the repository variable ROSE_TRUSTED_ROOT; unset, the job says so and passes,
-# so the check is armed by setting the variable, not by merging this file.
+# The maintainers' allowlist is vouched for (contrib/verify-commits): on the way from the
+# trusted root to this commit, every change to contrib/verify-commits/ is signed by a key
+# already in the list. The root is the repository variable ROSE_TRUSTED_ROOT; unset, the job
+# says so and passes, so the check is armed by setting the variable, not by merging this file.
 #
-# It runs on the release branch only. A pull request's branch is not checked: its commits
-# need no signature of their own, because the maintainer's signed merge is what vouches
-# for them, so a branch check would fail every branch and prove nothing. `main` joins the
-# list once a signed merge puts the root in its history (the root must be an ancestor).
+# Ordinary commits need no signature here: a deployment requires the commit it records to be
+# signed by a listed key (the script's second rule, not run in CI), and that signature vouches
+# for the line since the last signed one. So a pull request's branch is checked too, and fails
+# only when it changes the allowlist in a commit nobody trusted signed.
 name: verify-commits
 
 on:
   push:
+    branches: [btc]
+  pull_request:
     branches: [btc]
 
 permissions:
@@ -22,12 +25,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Every commit since the trusted root is signed by a maintainer
+          # On a pull request, the branch's own tip: the checkout's HEAD is a merge commit
+          # GitHub made for the run.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Every change to the allowlist since the trusted root is signed by a maintainer
         env:
           ROSE_TRUSTED_ROOT: ${{ vars.ROSE_TRUSTED_ROOT }}
         run: |
           if [ -z "$ROSE_TRUSTED_ROOT" ]; then
-            echo "::notice::ROSE_TRUSTED_ROOT is not set; commit signatures are not checked (set the repository variable to arm this job)"
+            echo "::notice::ROSE_TRUSTED_ROOT is not set; the allowlist chain is not checked (set the repository variable to arm this job)"
             exit 0
           fi
-          contrib/verify-commits/verify-commits.sh HEAD
+          contrib/verify-commits/verify-commits.sh --chain HEAD

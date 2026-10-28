@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-# The maintainers' allowlist, made safe the way Bitcoin Core's contrib/verify-commits does
-# it: walk the first-parent chain from a pinned TRUSTED ROOT commit to <ref>, and require
-# every commit on it to be signed by a key allowed at its PARENT - contrib/verify-commits/
-# allowed_signers (SSH) and keys/*.asc (OpenPGP) as they were in the parent commit - so a
-# change to the allowlist is vouched for by a key already in it, and a commit signed by a
-# key nobody trusted yet (GitHub's web-flow key on a button merge, a stranger's) fails.
-# Merges are commits like any other: the maintainer who made the merge signs it, and that
-# signature vouches for everything the merge brings in. Second parents are not walked.
+# The maintainers' allowlist, made safe from one pin outside the repository, with the rule a
+# deployment repository uses for its own keys:
 #
-#   contrib/verify-commits/verify-commits.sh <ref>
+#   1. THE ALLOWLIST IS VOUCHED FOR. Walking the first-parent chain from a pinned TRUSTED ROOT
+#      commit to <ref>, every commit that changes contrib/verify-commits/ (the SSH signers
+#      file, the OpenPGP keys, this script and its README) must be signed by a key allowed at
+#      its PARENT, so a key is only ever added or removed by a key already trusted, and a
+#      commit signed by a key nobody trusted yet (GitHub's web-flow key on a button merge, a
+#      stranger's) cannot touch the list. Other commits on the chain are not examined: they
+#      may be merged by the button, pushed unsigned, or come from anyone with push access.
+#   2. THE COMMIT YOU SHIP IS SIGNED. <ref> itself must be signed by a key in the allowlist as
+#      of <ref>. That one signature vouches for everything on the line since the last signed
+#      commit, which is why a deployment records only such a commit.
+#
+# A merge counts as changing the allowlist when its tree differs from its first parent's
+# under contrib/verify-commits/, so a button merge of a pull request that adds a key fails and
+# the maintainer merges it signed instead.
+#
+#   contrib/verify-commits/verify-commits.sh <ref>          # 1 and 2
+#   contrib/verify-commits/verify-commits.sh --chain <ref>  # 1 only (what CI runs on every push and pull request)
 #     exit 0 and print the allowlist at <ref> (one `ssh <principal> <key>` or
-#     `openpgp <fingerprint> <file>` line each), or exit 1 naming the first bad commit.
+#     `openpgp <fingerprint> <file>` line each), or exit 1 naming the offending commit.
 #
 # The root is the one trust anchor outside the repository: $ROSE_TRUSTED_ROOT, else the
 # file ~/.config/rose/trusted-root. It must be an ancestor of <ref>, and its own allowlist
-# is trusted as pinned. A deployment repository runs this over the
-# product commit it records, with the root it pins beside its own.
+# (and its copy of this script, which is what a deployment runs) is trusted as pinned.
 #
 # Needs git 2.34+ (SSH signature verification), ssh-keygen, and gpg for OpenPGP keys.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+chain_only=""
+[ "${1:-}" != --chain ] || { chain_only=1; shift; }
 ref=${1:?ref}
 dir=contrib/verify-commits
 root=${ROSE_TRUSTED_ROOT:-}
@@ -66,21 +77,43 @@ signed_by_allowed() { # signed_by_allowed <commit> <dir> -> prints the signer
   return 1
 }
 
-# Oldest first, first-parent only, the root excluded (its allowlist is the pinned trust).
+# The allowlist at <commit>, exported once per commit and listed in <dir>/list.
+list_at() { # list_at <commit> -> prints the directory
+  local c d
+  c=$1; d="$tmp/$c"
+  if [ ! -d "$d" ]; then mkdir -p "$d"; allowlist_at "$c" "$d" > "$d/list"; fi
+  echo "$d"
+}
+
+# 1. Oldest first, first-parent only, the root excluded (its allowlist is the pinned trust):
+#    a commit that changes the allowlist is signed by a key allowed at its parent.
 for c in $(git rev-list --first-parent --reverse "$root..$tip"); do
   parent=$(git rev-parse "$c^1")
-  d="$tmp/$parent"
-  if [ ! -d "$d" ]; then mkdir -p "$d"; allowlist_at "$parent" "$d" > "$d/list"; fi
+  git diff --quiet "$parent" "$c" -- "$dir" && continue
+  d=$(list_at "$parent")
   if [ ! -s "$d/list" ]; then
     echo "error: no allowlist at $(git rev-parse --short "$parent"), the parent of $(git rev-parse --short "$c"): the trusted root must be at or after the commit that added $dir" >&2
     exit 1
   fi
   if ! signer=$(signed_by_allowed "$c" "$d" 2> "$tmp/why"); then
-    echo "error: $(git rev-parse --short "$c") ($(git log -1 --format='%an, %s' "$c" | cut -c1-70)) is not signed by a key allowed at its parent:" >&2
+    echo "error: $(git rev-parse --short "$c") ($(git log -1 --format='%an, %s' "$c" | cut -c1-70)) changes $dir and is not signed by a key allowed at its parent:" >&2
     cat "$tmp/why" >&2
     sed 's/^/  allowed then: /' "$d/list" >&2
     exit 1
   fi
-  echo "ok: $(git rev-parse --short "$c") signed by $signer" >&2
+  echo "ok: $(git rev-parse --short "$c") changes $dir, signed by $signer" >&2
 done
-allowlist_at "$tip" "$tmp/tip"
+
+# 2. The tip is signed by a key in its own (now vouched-for) allowlist.
+d=$(list_at "$tip")
+[ -s "$d/list" ] || { echo "error: no allowlist at $(git rev-parse --short "$tip")" >&2; exit 1; }
+if [ -z "$chain_only" ]; then
+  if ! signer=$(signed_by_allowed "$tip" "$d" 2> "$tmp/why"); then
+    echo "error: $(git rev-parse --short "$tip") ($(git log -1 --format='%an, %s' "$tip" | cut -c1-70)) is not signed by an allowed key; a deployment records only a commit a maintainer signed:" >&2
+    cat "$tmp/why" >&2
+    sed 's/^/  allowed: /' "$d/list" >&2
+    exit 1
+  fi
+  echo "ok: $(git rev-parse --short "$tip") signed by $signer" >&2
+fi
+cat "$d/list"

@@ -1,0 +1,33 @@
+# Every commit since the trusted root is signed by a maintainer (contrib/verify-commits).
+# The root is the repository variable ROSE_TRUSTED_ROOT; unset, the job says so and passes,
+# so the check is armed by setting the variable, not by merging this file.
+#
+# It runs on the release branch only. A pull request's branch is not checked: its commits
+# need no signature of their own, because the maintainer's signed merge is what vouches
+# for them, so a branch check would fail every branch and prove nothing. `main` joins the
+# list once a signed merge puts the root in its history (the root must be an ancestor).
+name: verify-commits
+
+on:
+  push:
+    branches: [btc]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every commit since the trusted root is signed by a maintainer
+        env:
+          ROSE_TRUSTED_ROOT: ${{ vars.ROSE_TRUSTED_ROOT }}
+        run: |
+          if [ -z "$ROSE_TRUSTED_ROOT" ]; then
+            echo "::notice::ROSE_TRUSTED_ROOT is not set; commit signatures are not checked (set the repository variable to arm this job)"
+            exit 0
+          fi
+          contrib/verify-commits/verify-commits.sh HEAD

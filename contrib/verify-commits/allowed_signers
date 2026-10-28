@@ -1,0 +1,8 @@
+# The maintainers' SSH signing keys, in OpenSSH allowed_signers format: the keys a commit
+# on a release branch may be signed with. contrib/verify-commits/verify-commits.sh reads
+# this file at each commit's PARENT, so a change to it is vouched for by a key that was
+# already here. OpenPGP keys go in keys/ beside it. GitHub's own key (the one on commits
+# the web merge button makes) is never listed: a maintainer signs the merge.
+#
+#   <principal> namespaces="git" <key type> <key>
+asher@fathomx.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKy87HxSEheG8vEPhSs9u2KZCtVErAQfpmprtUJCZ2w7

@@ -8,8 +8,14 @@
 # i18n-embed-fl patch; age now depends on i18n-embed-fl 0.10, which carries the fix, so the
 # tree has no [patch.crates-io] entries at all.)
 #
-#   docker build -t rose .                      # runtime image (rose)
+#   docker build -t rose .                      # the image (the runtime image, nothing baked in)
 #   docker build --target export -o ./out .     # extract the static binaries
+#   docker build --target enclave --build-arg ROSE_BAKE=<dir> .   # + a file tree baked in (a TEE deployment)
+#
+# A deployment repository that carries this tree as a subtree builds it from its own root:
+#   docker build -f rose/Dockerfile --build-arg ROSE_SRC=rose --build-arg ROSE_BAKE=bake \
+#     --build-arg ROSE_CARGO_FEATURES="--no-default-features --features mimalloc-secure,bitcoin,server,cli" \
+#     --build-arg ROSE_CLI_CARGO_FEATURES="--no-default-features --features bitcoin" .
 #
 # Dependencies are released crates from crates.io - the Zakura Common `zakura-*` forks of
 # librustzcash plus the upstream crates they leave in place (versions pinned by the committed
@@ -49,14 +55,18 @@ ENV RUSTFLAGS="\
 -C link-arg=-lm \
 -C link-arg=-Wl,--build-id=none"
 WORKDIR /usr/src/rose
-COPY . .
+# Where this tree sits in the build context: `.` when it is the context, `rose` for a
+# deployment repository that carries it as a subtree and builds with its own root as the
+# context (so its bake tree, below, is in the context too). The layer's content is the
+# same either way; the deployment's `.dockerignore` must allow the same files this one does.
+ARG ROSE_SRC=.
+COPY ${ROSE_SRC}/ .
 # The cargo feature flags of the shipped daemon. The default is the image everyone gets:
 # both engines, so one image serves a Zcash or a Bitcoin wallet (a bare `cargo build` is
 # Bitcoin-only; `zcash` is the opt-in). A deployment that needs one engine builds a smaller
-# binary faster by overriding this ARG - an enclave deployment, for instance,
-# renders its Dockerfile from this one with the Bitcoin-only set, `--no-default-features
-# --features mimalloc-secure,bitcoin,server,cli`, dropping the Zcash stack's ~190 crates.
-# Only features change; the runtime contract below does not.
+# binary faster by overriding this ARG - the enclave deployment passes the Bitcoin-only
+# set, `--no-default-features --features mimalloc-secure,bitcoin,server,cli`, dropping the
+# Zcash stack's ~190 crates. Only features change; the runtime contract below does not.
 ARG ROSE_CARGO_FEATURES="--features mimalloc-secure,bitcoin,zcash"
 # The same choice for the `rose` command line (rose-cli/), whose engine features mirror the
 # daemon's (no allocator feature: it proves nothing). Keep the two ARGs on the same engines.
@@ -132,3 +142,27 @@ EXPOSE 8232 18232 9233
 # The daemon. The command line is beside it: `docker run --entrypoint rose ... init`.
 ENTRYPOINT ["rosed"]
 CMD ["--datadir", "/var/lib/rose"]
+
+# --- Stage 4: the enclave image: the runtime image plus a file tree baked in ---
+#
+# A TEE deployment (a Caution or AWS Nitro enclave; docs/dev/BUILD_AND_RELEASE.md) runs the
+# runtime image with its configuration and its sealed secrets inside the image, since the
+# enclave has no storage and no shell: rose.toml, Locksmith's quorum bundle and the
+# encrypted secrets, each at the path the enclave reads it from. ROSE_BAKE names a directory
+# in the build context laid out as the root filesystem it is copied onto
+# (etc/rose/rose.toml, etc/caution/bundle.json, etc/caution/secrets/<NAME>.asc). The
+# default is an empty tree, so `docker build .` (this stage is the last, hence the default
+# target) is the runtime image with nothing added; `--target runtime` is that image without
+# this stage's empty layer. The tree is staged in a stage with a shell and its modes pinned
+# there, never COPY'd straight onto the runtime image: an enclave measures the filesystem
+# verbatim (Nitro's PCR2), and a context file keeps the build host's umask (the rule the
+# license texts follow above). A `.keep` placeholder is dropped, nothing else is.
+FROM builder AS enclave-files
+ARG ROSE_BAKE=deploy/bake
+COPY ${ROSE_BAKE}/ /staged/
+RUN find /staged -name .keep -delete \
+    && find /staged -type d -exec chmod 0755 {} + \
+    && find /staged -type f -exec chmod 0644 {} +
+
+FROM runtime AS enclave
+COPY --from=enclave-files /staged/ /

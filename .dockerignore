@@ -17,3 +17,6 @@
 !LICENSE-MIT
 !LICENSE-APACHE
 !THIRD-PARTY-LICENSES.txt
+# The enclave stage's default bake tree: empty but for its placeholder, so the default
+# build bakes nothing. A deployment passes its own with --build-arg ROSE_BAKE.
+!deploy/bake

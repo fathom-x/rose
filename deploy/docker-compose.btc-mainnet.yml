@@ -63,7 +63,7 @@
 #
 services:
   bitcoind:
-    image: bitcoin/bitcoin:30.2
+    image: bitcoin/bitcoin:30.4
     restart: unless-stopped
     # Run as root: the retired node ran bitcoind as root, so the datadir contents are
     # root-owned. Matching that avoids chown-ing 871 GB. (Optional later: stop the node,

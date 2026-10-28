@@ -594,7 +594,7 @@ jobs:
       # (deploy/bitcoin-core/SHA256SUMS), whose own provenance - 15 independent guix.sigs
       # builder attestations plus an OpenTimestamps anchor in the Bitcoin chain - is
       # documented (with the bump procedure) in deploy/bitcoin-core/README.md.
-      BITCOIN_CORE_VERSION: "30.2"
+      BITCOIN_CORE_VERSION: "30.4"
     steps:
       - uses: actions/checkout@v4
 
@@ -623,7 +623,7 @@ jobs:
           cd "$(mktemp -d)"
           curl -sfLO "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_CORE_VERSION}/${tarball}"
           # Checked against the manifest committed in this repo, not one fetched beside the
-          # tarball (--ignore-missing: the manifest covers every 30.2 artifact, we hold one).
+          # tarball (--ignore-missing: the manifest covers every 30.4 artifact, we hold one).
           sha256sum --check --ignore-missing "${GITHUB_WORKSPACE}/deploy/bitcoin-core/SHA256SUMS"
           mkdir -p ~/bitcoin-core
           tar -xzf "$tarball" -C ~/bitcoin-core --strip-components=1

@@ -11,9 +11,9 @@ name: verify-commits
 
 on:
   push:
-    branches: [btc]
+    branches: [main]
   pull_request:
-    branches: [btc]
+    branches: [main]
 
 permissions:
   contents: read

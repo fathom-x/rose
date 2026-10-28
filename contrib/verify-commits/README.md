@@ -30,15 +30,15 @@ Two rules:
    commit, which is why a deployment records only such a commit: after merging with the
    button, ship by pushing a signed commit (an empty one will do) and recording that.
 
-`--chain` runs rule 1 alone. CI runs that on every push to `btc` and every pull request
+`--chain` runs rule 1 alone. CI runs that on every push to `main` and every pull request
 (`.github/workflows/verify-commits.yml`) once the repository variable `ROSE_TRUSTED_ROOT` is
 set; until then the job reports that it is unset and passes. A branch therefore fails CI only
 when it changes the allowlist in a commit nobody trusted signed, which is when you want to
 hear about it early.
 
 ```sh
-ROSE_TRUSTED_ROOT=<sha> contrib/verify-commits/verify-commits.sh origin/btc           # both rules
-ROSE_TRUSTED_ROOT=<sha> contrib/verify-commits/verify-commits.sh --chain origin/btc   # the allowlist only
+ROSE_TRUSTED_ROOT=<sha> contrib/verify-commits/verify-commits.sh origin/main           # both rules
+ROSE_TRUSTED_ROOT=<sha> contrib/verify-commits/verify-commits.sh --chain origin/main   # the allowlist only
 ```
 
 To add a maintainer: append their SSH key to `allowed_signers` (`ssh-keygen -Y` needs the

@@ -37,7 +37,7 @@ name: rose-btc-regtest
 
 services:
   bitcoind:
-    image: bitcoin/bitcoin:30.2
+    image: bitcoin/bitcoin:30.4
     restart: unless-stopped
     command:
       - -regtest

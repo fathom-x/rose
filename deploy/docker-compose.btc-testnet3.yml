@@ -50,7 +50,7 @@ name: rose-btc-testnet3
 
 services:
   bitcoind:
-    image: bitcoin/bitcoin:30.2
+    image: bitcoin/bitcoin:30.4
     restart: unless-stopped
     command:
       - -testnet

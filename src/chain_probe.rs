@@ -1,4 +1,4 @@
-//! `rose chain info`: dial the configured upstream and report its chain tip, without a wallet.
+//! `rose chain-info`: dial the configured upstream and report its chain tip, without a wallet.
 //!
 //! This exists because there was no way to answer two questions before a wallet existed.
 //! [`crate::config_check`] is deliberately offline - it reports what the daemon *would* refuse,
@@ -17,7 +17,7 @@ use anyhow::Context;
 use zcash_client_backend::data_api::AccountBirthday;
 use zcash_protocol::consensus::BlockHeight;
 
-use crate::chain::{ChainSource, UnsupportedUpgrade};
+use crate::chain::{ChainSource, UnsupportedKind, UnsupportedUpgrade};
 use crate::config::AppConfig;
 use crate::network::ZNetwork;
 
@@ -43,16 +43,18 @@ pub struct ChainInfo {
     pub suggested_birthday: u32,
     /// Consensus branch ID in force at the tip, when the upstream reports one.
     pub tip_branch_id: Option<u32>,
-    /// Network upgrades the upstream knows of that this build does not - the outdated-build
-    /// signal. Empty is the healthy case.
+    /// Network upgrades the upstream and this build disagree on - an unrecognized branch, a
+    /// known one this build schedules at a different height, or one this build schedules that
+    /// the upstream node never adopted. Empty is the healthy case.
     pub unsupported_upgrades: Vec<UnsupportedUpgrade>,
     /// How long the dial plus both queries took.
     pub elapsed: Duration,
 }
 
 impl ChainInfo {
-    /// Whether this build understands every upgrade the upstream reports, and is on the right
-    /// chain - i.e. whether a wallet against this endpoint would sync.
+    /// Whether this build and the upstream agree on every upgrade, and the upstream is on the
+    /// right chain - i.e. whether a wallet against this endpoint would sync the network's
+    /// chain. A pending disagreement counts: it is a fork scheduled for a known height.
     pub fn is_usable(&self) -> bool {
         self.network_matches != Some(false) && self.unsupported_upgrades.is_empty()
     }
@@ -174,11 +176,18 @@ pub async fn probe(config: &AppConfig, server_override: Option<&str>) -> anyhow:
         h.reverse();
         hex::encode(h)
     });
+    let network_matches = crate::wallet::actor::chain_name_is_main(&info.chain_name)
+        .map(|upstream_is_main| upstream_is_main == matches!(config.network, ZNetwork::Main));
+    let mut unsupported_upgrades = crate::chain::unsupported_upgrades(&info, &config.network);
+    if network_matches == Some(false) {
+        // Comparing another chain's schedule against this network's flags every upgrade; the
+        // wrong-chain refusal is the finding, and the heights would only bury it.
+        unsupported_upgrades.retain(|u| u.kind == UnsupportedKind::UnknownBranch);
+    }
     Ok(ChainInfo {
         server: server.describe(),
         network: config.network,
-        network_matches: crate::wallet::actor::chain_name_is_main(&info.chain_name)
-            .map(|upstream_is_main| upstream_is_main == matches!(config.network, ZNetwork::Main)),
+        network_matches,
         chain_name: info.chain_name.clone(),
         tip_height,
         tip_hash,
@@ -192,7 +201,7 @@ pub async fn probe(config: &AppConfig, server_override: Option<&str>) -> anyhow:
                 .unwrap_or(crate::init::FRESH_WALLET_BIRTHDAY_MARGIN),
         ),
         tip_branch_id: info.tip_branch_id,
-        unsupported_upgrades: crate::chain::unsupported_upgrades(&info),
+        unsupported_upgrades,
         elapsed,
     })
 }
@@ -241,19 +250,65 @@ pub async fn run(config: &AppConfig, args: &crate::config::ChainInfoArgs) -> any
     }
     if !info.unsupported_upgrades.is_empty() {
         for u in &info.unsupported_upgrades {
+            let at = match u.activation_height {
+                Some(h) => format!(" at height {h}"),
+                None => String::new(),
+            };
+            let verdict = match u.kind {
+                UnsupportedKind::UnknownBranch => "that this rose build does not know".to_string(),
+                UnsupportedKind::ActivationHeightMismatch { expected: Some(h) } => format!(
+                    "that this rose build schedules at height {h}; transactions built across \
+                     the difference would be rejected"
+                ),
+                UnsupportedKind::ActivationHeightMismatch { expected: None } => {
+                    "that this rose build has not scheduled on this network; transactions \
+                     built after it activates would be rejected"
+                        .to_string()
+                }
+                UnsupportedKind::UpstreamNotUpgraded => String::new(),
+            };
+            if u.kind == UnsupportedKind::UpstreamNotUpgraded {
+                if u.active {
+                    eprintln!(
+                        "error: this rose build activates network upgrade {} (branch id \
+                         {:08x}){at}, and the upstream node has not adopted it: its chain past \
+                         that height follows the old rules and is a fork the network abandoned. \
+                         {}",
+                        u.name,
+                        u.branch_id,
+                        crate::chain::NODE_UPGRADE_GUIDANCE,
+                    );
+                } else {
+                    eprintln!(
+                        "warning: this rose build activates network upgrade {} (branch id \
+                         {:08x}){at}, and the upstream node does not know it: the node will \
+                         stay on the old rules and fork off there. {}",
+                        u.name,
+                        u.branch_id,
+                        crate::chain::NODE_UPGRADE_GUIDANCE,
+                    );
+                }
+                continue;
+            }
             eprintln!(
-                "{}: upstream reports network upgrade {} (branch id {:08x}){} that this rose \
-                 build does not know",
+                "{}: upstream reports network upgrade {} (branch id {:08x}){at} {verdict}",
                 if u.active { "error" } else { "warning" },
                 u.name,
                 u.branch_id,
-                match u.activation_height {
-                    Some(h) => format!(" at height {h}"),
-                    None => String::new(),
-                },
             );
         }
-        if info.unsupported_upgrades.iter().any(|u| u.active) {
+        let active = |kind: fn(&UnsupportedKind) -> bool| {
+            info.unsupported_upgrades
+                .iter()
+                .any(|u| u.active && kind(&u.kind))
+        };
+        if active(|k| *k == UnsupportedKind::UpstreamNotUpgraded) {
+            anyhow::bail!(
+                "the upstream node has not adopted a network upgrade this rose build follows; \
+                 upgrade the node before syncing a wallet against it"
+            );
+        }
+        if active(|k| *k != UnsupportedKind::UpstreamNotUpgraded) {
             anyhow::bail!(
                 "this rose build cannot follow the upstream's current consensus rules; update \
                  rose before syncing a wallet against it"
@@ -280,12 +335,25 @@ fn json_report(info: &ChainInfo) -> serde_json::Value {
         "unsupported_upgrades": info
             .unsupported_upgrades
             .iter()
-            .map(|u| serde_json::json!({
-                "name": u.name,
-                "branch_id": format!("{:08x}", u.branch_id),
-                "activation_height": u.activation_height,
-                "active": u.active,
-            }))
+            .map(|u| {
+                let (kind, expected) = match u.kind {
+                    UnsupportedKind::UnknownBranch => ("unknown_branch", None),
+                    UnsupportedKind::ActivationHeightMismatch { expected } => {
+                        ("activation_height_mismatch", expected)
+                    }
+                    UnsupportedKind::UpstreamNotUpgraded => {
+                        ("upstream_not_upgraded", u.activation_height)
+                    }
+                };
+                serde_json::json!({
+                    "name": u.name,
+                    "branch_id": format!("{:08x}", u.branch_id),
+                    "activation_height": u.activation_height,
+                    "active": u.active,
+                    "kind": kind,
+                    "expected_activation_height": expected,
+                })
+            })
             .collect::<Vec<_>>(),
         "usable": info.is_usable(),
         "elapsed_ms": info.elapsed.as_millis(),
@@ -318,6 +386,7 @@ mod tests {
             name: "future".into(),
             activation_height: Some(5),
             active,
+            kind: UnsupportedKind::UnknownBranch,
         }
     }
 

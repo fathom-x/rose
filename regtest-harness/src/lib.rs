@@ -181,6 +181,27 @@ const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
 /// branch id and zebra rejects the tx (loud failure, not silent). Needs zebrad >= 6.2.2, which
 /// accepts the `"NU6.3"` activation-height key.
 pub const NU6_3_ACTIVATION_HEIGHT: u32 = 8;
+
+/// NU7 activation height for the regtest chain, from `ROSE_REGTEST_NU7_HEIGHT` - the same variable
+/// `rose`'s `network::regtest()` reads, so the node, the wallet under test and the [`Funder`]
+/// (which inherits the environment) agree by construction. CI sets it to 12 for the whole tier
+/// (`REGTEST_NU7_HEIGHT` in `regtest.yml`, also part of the chain-snapshot cache key), since NU7
+/// is scheduled on both public networks; that needs a funder release that reads the variable
+/// (0.9.0-rc2 or later). Unset, as in a plain local run, leaves NU7 off the chain. A height must
+/// sit above [`NU6_3_ACTIVATION_HEIGHT`] and be a multiple of 3 (ZIP 259 requires every NU7
+/// activation height to be). Needs a node that accepts the `NU7` activation-height key
+/// (zebrad >= 7.0.0-rc.0, zakura >= 1.5.0).
+///
+/// A set but unparseable value panics rather than silently dropping NU7, for the reason
+/// `network::regtest()` gives: a schedule disagreement surfaces far away as an opaque rejection.
+pub fn regtest_nu7_height() -> Option<u32> {
+    let s = std::env::var("ROSE_REGTEST_NU7_HEIGHT").ok()?;
+    Some(
+        s.trim().parse().unwrap_or_else(|_| {
+            panic!("ROSE_REGTEST_NU7_HEIGHT must be a block height, got {s:?}")
+        }),
+    )
+}
 /// ZIP-271 one-time lockbox disbursement paid in the NU6.1 activation block's coinbase. A P2SH
 /// regtest address and a token amount (<= the pool accrued by [`NU6_2_ACTIVATION_HEIGHT`]).
 const LOCKBOX_DISBURSEMENT_ADDR: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
@@ -209,6 +230,10 @@ pub struct Zebrad {
     /// NU6.3 (ironwood) activation height. Preserved across `restart_with_miner` so the rebuilt
     /// config keeps the same schedule.
     nu6_3_height: u32,
+    /// NU7 activation height written into the node's config (`None`: the node does not schedule
+    /// NU7). Normally [`regtest_nu7_height`]; [`Zebrad::start_without_nu7`] leaves it out to
+    /// stand up a node that never adopted the upgrade. Preserved across restarts.
+    nu7_height: Option<u32>,
     _dir: tempfile::TempDir,
 }
 
@@ -279,7 +304,24 @@ impl Zebrad {
         Self::start_inner(bin, miner_address, NU6_3_ACTIVATION_HEIGHT).await
     }
 
+    /// Launch `zebrad` with NU7 left out of its activation table, whatever
+    /// `ROSE_REGTEST_NU7_HEIGHT` says: a node that was never upgraded for NU7. Past the height
+    /// the rose under test activates NU7 at, this node keeps mining on the NU6.3 rules - the
+    /// fork an un-upgraded node follows on a public network.
+    pub async fn start_without_nu7(bin: &Path) -> Result<Zebrad> {
+        Self::start_scheduled(bin, SEED_MINER_ADDRESS, NU6_3_ACTIVATION_HEIGHT, None).await
+    }
+
     async fn start_inner(bin: &Path, miner_address: &str, nu6_3_height: u32) -> Result<Zebrad> {
+        Self::start_scheduled(bin, miner_address, nu6_3_height, regtest_nu7_height()).await
+    }
+
+    async fn start_scheduled(
+        bin: &Path,
+        miner_address: &str,
+        nu6_3_height: u32,
+        nu7_height: Option<u32>,
+    ) -> Result<Zebrad> {
         let dir = tempfile::tempdir().context("create zebrad dir")?;
         let rpc_port = pick_port()?;
         let net_port = pick_port()?;
@@ -293,6 +335,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 nu6_3_height,
+                nu7_height,
                 RegtestNode::from_env(),
             ),
         )
@@ -305,6 +348,7 @@ impl Zebrad {
             bin: bin.to_path_buf(),
             config_path,
             nu6_3_height,
+            nu7_height,
             _dir: dir,
         };
         zebrad.wait_until_rpc_up().await?;
@@ -315,6 +359,7 @@ impl Zebrad {
     /// Used by the funded e2e to stop minting coinbases to the funder so its existing coinbases
     /// can age past maturity while a throwaway address mines the tail.
     pub async fn restart_with_miner(&mut self, miner_address: &str) -> Result<()> {
+        self.wait_for_tip_backup().await;
         self.stop_gracefully().await;
         let cache_dir = self.state_dir();
         std::fs::write(
@@ -325,6 +370,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 self.nu6_3_height,
+                self.nu7_height,
                 RegtestNode::from_env(),
             ),
         )
@@ -332,6 +378,49 @@ impl Zebrad {
         self.child = spawn_zebrad(&self.bin, &self.config_path)?;
         self.wait_until_rpc_up().await?;
         Ok(())
+    }
+
+    /// Wait until the node's non-finalized state backup holds the current tip, so a restart
+    /// keeps the blocks mined just before it.
+    ///
+    /// On regtest nothing ever finalizes, so every block lives only in the non-finalized state,
+    /// which the node persists by a background task writing one file per block (named by the
+    /// block hash) into `<cache_dir>/non_finalized_state/<network>/`, at most every 5 seconds.
+    /// Stopping before that task catches up loses the blocks it had not written: zakura 1.7.0
+    /// came back at height 0 from a 108-block chain stopped right after mining it. Waiting on the
+    /// tip's own file is the exact condition, so no sleep is needed. A node that keeps no such
+    /// backup never produces the file; after the timeout the restart proceeds as before.
+    async fn wait_for_tip_backup(&self) {
+        let Ok(tip) = self.rpc("getbestblockhash", json!([])).await else {
+            return;
+        };
+        let Some(hash) = tip.as_str().map(str::to_owned) else {
+            return;
+        };
+        // The file name is the hash hex in one byte order or the other depending on the node's
+        // encoding; accept either.
+        let reversed: String = hash
+            .as_bytes()
+            .chunks(2)
+            .rev()
+            .map(|pair| String::from_utf8_lossy(pair).into_owned())
+            .collect();
+        let backup_root = self.state_dir().join("non_finalized_state");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let found = std::fs::read_dir(&backup_root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|net| {
+                    let dir = net.path();
+                    dir.join(&hash).exists() || dir.join(&reversed).exists()
+                });
+            if found || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Stop `zebrad` via the regtest `stop` RPC (which raises SIGINT) and wait for the process
@@ -390,6 +479,7 @@ impl Zebrad {
                 miner_address,
                 &cache_dir.to_string_lossy(),
                 nu6_3_height,
+                regtest_nu7_height(),
                 RegtestNode::from_env(),
             ),
         )
@@ -402,6 +492,7 @@ impl Zebrad {
             bin: bin.to_path_buf(),
             config_path,
             nu6_3_height,
+            nu7_height: regtest_nu7_height(),
             _dir: dir,
         };
         zebrad.wait_until_rpc_up().await?;
@@ -431,6 +522,15 @@ impl Zebrad {
             // the template endpoint itself rather than just `getblockchaininfo`.
             match zebra_rpc_call(&self.rpc_url(), "getblocktemplate", json!([])).await {
                 Ok(_) => return Ok(()),
+                // The node is up and has looked at the miner address: a refusal to build the
+                // coinbase for it is a property of the address and the height, not of readiness,
+                // and retrying cannot change it. Fail now so a caller can react (see
+                // `regtest_coinbase`'s shielded test) instead of after the whole timeout.
+                Err(e) if format!("{e:#}").contains("could not construct coinbase tx") => {
+                    return Err(
+                        e.context("zebrad refused to build a coinbase for its miner address")
+                    );
+                }
                 Err(e) => last_err = e,
             }
             if Instant::now() >= deadline {
@@ -494,6 +594,7 @@ fn zebrad_toml(
     miner_address: &str,
     cache_dir: &str,
     nu6_3_height: u32,
+    nu7_height: Option<u32>,
     node: RegtestNode,
 ) -> String {
     let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
@@ -502,6 +603,11 @@ fn zebrad_toml(
     // NU6.3 (ironwood) activation. Needs zebrad >= 6.2.2; older releases have no `"NU6.3"` key and
     // reject an unknown activation-height entry at startup.
     let nu6_3_line = format!("\"NU6.3\" = {nu6_3_height}\n");
+    // NU7, only when asked for (see `regtest_nu7_height`). Needs zebrad >= 7.0.0-rc.0 / zakura
+    // >= 1.5.0; an older node rejects the unknown key at startup.
+    let nu7_line = nu7_height
+        .map(|h| format!("NU7 = {h}\n"))
+        .unwrap_or_default();
     let mempool_section = mempool_policy_section(node);
     // zakurad runs a second, QUIC P2P stack on every network but mainnet, bound to a fixed
     // `0.0.0.0:8234`. From zakura 1.5.0 a taken port fails startup, so concurrent harness nodes
@@ -530,7 +636,7 @@ NU5 = 1
 NU6 = 1
 "NU6.1" = {nu6_2}
 "NU6.2" = {nu6_2}
-{nu6_3_line}
+{nu6_3_line}{nu7_line}
 # A deferred (lockbox) funding stream so the pool has something to disburse at NU6.1.
 [[network.testnet_parameters.funding_streams]]
 [network.testnet_parameters.funding_streams.height_range]
@@ -1853,24 +1959,36 @@ untrusted_confirmations = 1
 }
 
 /// The config file name a funder release from before the `zecd` -> `rose` rename looks up in
-/// its datadir, and the environment variable it reads the regtest NU6.3 height from. CI's
-/// pinned funder (see [`funder_bin`]) is such a release, so [`write_funder_toml`] also writes
-/// the old name and [`funder_command`] maps the harness's own `ROSE_REGTEST_NU63_HEIGHT` onto
-/// the old variable, so the two sides keep agreeing by construction. Both go away once
-/// `ROSE_FUNDER_IMAGE` is bumped to a `rose` release.
+/// its datadir, and the environment variables it reads the regtest NU6.3 and NU7 heights
+/// from. CI's pinned funder (see [`funder_bin`]) is such a release, so [`write_funder_toml`]
+/// also writes the old name and [`funder_command`] maps the harness's own
+/// `ROSE_REGTEST_NU63_HEIGHT`/`ROSE_REGTEST_NU7_HEIGHT` onto the old variables, so the two
+/// sides keep agreeing by construction. All of it goes away once `ROSE_FUNDER_IMAGE` is bumped
+/// to a `rose` release.
 const FUNDER_LEGACY_CONF_FILE: &str = "zecd.toml";
 const FUNDER_LEGACY_NU63_HEIGHT_ENV: &str = "ZECD_REGTEST_NU63_HEIGHT";
+const FUNDER_LEGACY_NU7_HEIGHT_ENV: &str = "ZECD_REGTEST_NU7_HEIGHT";
 
-/// A `Command` for a funder binary, with the regtest NU6.3 height mirrored onto the variable
-/// a pre-rename release reads (see [`FUNDER_LEGACY_NU63_HEIGHT_ENV`]); a `rosed` funder reads
-/// `ROSE_REGTEST_NU63_HEIGHT` from the inherited environment as before. Every funder spawn goes
-/// through here (the daemon with no subcommand, which a pre-rename release serves on too): a
-/// funder that misses the height commits to the pre-NU6.3 branch id and the node rejects
-/// everything it sends.
+/// A `Command` for a funder binary, with the regtest activation heights mirrored onto the
+/// variables a pre-rename release reads (see [`FUNDER_LEGACY_NU63_HEIGHT_ENV`]); a `rosed`
+/// funder reads `ROSE_REGTEST_NU63_HEIGHT`/`ROSE_REGTEST_NU7_HEIGHT` from the inherited
+/// environment as before. Every funder spawn goes through here (the daemon with no subcommand,
+/// which a pre-rename release serves on too): a funder that misses a height commits to the
+/// previous branch id and the node rejects everything it sends. An unset NU7 height is
+/// mirrored as unset, so a chain that leaves NU7 off (regtest_orchard_v2_spend) does not hand
+/// the funder a stale value from the process environment.
 fn funder_command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     if let Some(height) = std::env::var_os("ROSE_REGTEST_NU63_HEIGHT") {
         cmd.env(FUNDER_LEGACY_NU63_HEIGHT_ENV, height);
+    }
+    match std::env::var_os("ROSE_REGTEST_NU7_HEIGHT") {
+        Some(height) => {
+            cmd.env(FUNDER_LEGACY_NU7_HEIGHT_ENV, height);
+        }
+        None => {
+            cmd.env_remove(FUNDER_LEGACY_NU7_HEIGHT_ENV);
+        }
     }
     cmd
 }
@@ -2617,6 +2735,31 @@ impl Rose {
         Ok(())
     }
 
+    /// Run `rose chain-info --json` against this instance's own configuration (same datadir,
+    /// same `rose.toml`, so the same upstream the daemon dials) and return whether it exited
+    /// zero, with its JSON report. `chain-info` takes no datadir lock, so it runs beside the live
+    /// daemon.
+    pub fn chain_info(&self) -> Result<(bool, Value)> {
+        let out = Command::new(rose_bin())
+            .args([
+                "--datadir",
+                self._datadir.path().to_str().unwrap(),
+                "--regtest",
+                "chain-info",
+                "--json",
+            ])
+            .output()
+            .context("spawn rose chain-info")?;
+        let report = serde_json::from_slice(&out.stdout).with_context(|| {
+            format!(
+                "rose chain-info --json printed no JSON ({}):\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })?;
+        Ok((out.status.success(), report))
+    }
+
     /// GET one of the health endpoints (`"/healthz"`, `"/readyz"`, `"/status"`) and return its
     /// JSON body. These are a separate, unauthenticated listener, so this bypasses the RPC port
     /// and its credentials entirely - which is the point of probing them: they are what a
@@ -3225,14 +3368,13 @@ fn write_rose_toml(datadir: &Path, cfg: &RoseConfig) -> Result<()> {
         Some(grpc_port) => format!("http://127.0.0.1:{grpc_port}"),
         None => format!("zebra://127.0.0.1:{}", cfg.zebra_rpc_port),
     };
-    // In light mode, assert the upstream's transparent-in-compact-blocks capability. The
-    // harness builds lightwalletd from a 0.5.x release, which serves that data - but no
-    // released lightwalletd populates `GetLightdInfo.lightwalletProtocolVersion`, so rose's
-    // connect-time probe cannot see the capability and would refuse every transparent wallet.
-    let backend_capability = match cfg.lightwalletd_grpc_port {
-        Some(_) => "assume_transparent_in_compact_blocks = true\n",
-        None => "",
-    };
+    // NB no `[backend] assume_transparent_in_compact_blocks` in light mode. The harness builds
+    // lightwalletd from a release that advertises the versioned protocol
+    // (`GetLightdInfo.lightwalletProtocolVersion`, first populated in v0.5.4), so rose's own
+    // connect-time probe decides - which is the path a real light-mode deployment takes, and the
+    // one the transparent lwd suites never exercised while the harness asserted the capability
+    // out of band. A local `LIGHTWALLETD_BIN` older than 0.5.4 now refuses transparent wallets,
+    // exactly as it would in production.
     // Optional `[spend]` knobs: `cache_proving_key` (no current test - see the field's docs),
     // `privacy_policy` (fully-transparent spend e2e), `pipeline_proving` and
     // `orchard_action_limit` (stress test), `max_tx_bytes` (merge e2e). Emit the section only
@@ -3340,7 +3482,7 @@ server = "{server}"
 connect_timeout_secs = 5
 reconnect_base_secs = 1
 reconnect_max_secs = 2
-{backend_capability}
+
 [rpc]
 bind = "127.0.0.1"
 port = {rpc_port}
@@ -3448,7 +3590,7 @@ mod tests {
         assert!(zakura.ends_with("\n\n"), "{zakura}");
 
         // And it lands in the rendered config as its own top-level table, ahead of `[mining]`.
-        let render = |node| zebrad_toml(1, 2, SEED_MINER_ADDRESS, "/tmp/state", 8, node);
+        let render = |node| zebrad_toml(1, 2, SEED_MINER_ADDRESS, "/tmp/state", 8, None, node);
         let zakura_toml = render(RegtestNode::Zakura);
         let mempool_at = zakura_toml
             .find("\n[mempool]\n")
@@ -3456,6 +3598,32 @@ mod tests {
         let mining_at = zakura_toml.find("\n[mining]\n").expect("[mining] section");
         assert!(mempool_at < mining_at, "{zakura_toml}");
         assert!(!render(RegtestNode::Zebra).contains("[mempool]"));
+    }
+
+    /// NU7 is written into the activation table only when a height is given, directly after
+    /// NU6.3 so the table stays in upgrade order; the default config is unchanged.
+    #[test]
+    fn the_nu7_activation_line_is_written_only_when_asked_for() {
+        let without = zebrad_toml(
+            1,
+            2,
+            SEED_MINER_ADDRESS,
+            "/tmp/state",
+            8,
+            None,
+            RegtestNode::Zebra,
+        );
+        assert!(!without.contains("NU7"), "{without}");
+        let with = zebrad_toml(
+            1,
+            2,
+            SEED_MINER_ADDRESS,
+            "/tmp/state",
+            8,
+            Some(12),
+            RegtestNode::Zebra,
+        );
+        assert!(with.contains("\"NU6.3\" = 8\nNU7 = 12\n"), "{with}");
     }
 
     #[test]

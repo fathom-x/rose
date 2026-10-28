@@ -57,6 +57,129 @@ impl ZNetwork {
     pub fn is_regtest(&self) -> bool {
         matches!(self, ZNetwork::Regtest)
     }
+
+    /// The peer protocol version ([ZIP 204]) of the newest network upgrade this build schedules
+    /// on this network - the number `getnetworkinfo.protocolversion` reports.
+    ///
+    /// rose speaks no P2P, so there is no wire version to report. The useful answer is the one
+    /// a node gives: which consensus rules this build follows. Each upgrade's minimum peer
+    /// version is that statement in the network's own vocabulary, and a node that has not
+    /// reached it is disconnected after activation, so a fixed number goes stale with the next
+    /// upgrade. Deriving it from the schedule means a protocol-crate bump that schedules an
+    /// upgrade moves this value with it.
+    ///
+    /// "Schedules", not "has activated": a build carrying a future activation height already
+    /// follows those rules from that height, which is what a node's advertised version says
+    /// too. The values are zebra's `Version::min_specified_for_upgrade`; testnet and regtest
+    /// share testnet's, and from NU7 on mainnet and testnet are assigned distinct versions.
+    ///
+    /// [ZIP 204]: https://zips.z.cash/zip-0204
+    #[cfg(feature = "zcash")]
+    pub fn protocol_version(&self) -> u32 {
+        protocol_version_of(self)
+    }
+}
+
+/// [`ZNetwork::protocol_version`] over any [`Parameters`]: mainnet takes the mainnet numbers,
+/// every other network type testnet's (regtest included).
+#[cfg(feature = "zcash")]
+pub fn protocol_version_of<P: Parameters>(params: &P) -> u32 {
+    use NetworkUpgrade::*;
+    // Newest first; the first one this network schedules decides.
+    const NEWEST_FIRST: [NetworkUpgrade; 11] = [
+        Nu7, Nu6_3, Nu6_2, Nu6_1, Nu6, Nu5, Canopy, Heartwood, Blossom, Sapling, Overwinter,
+    ];
+    let mainnet = params.network_type() == NetworkType::Main;
+    let Some(newest) = NEWEST_FIRST
+        .into_iter()
+        .find(|nu| params.activation_height(*nu).is_some())
+    else {
+        return 170_002;
+    };
+    let (main, test) = match newest {
+        Nu7 => (170_190, 170_180),
+        Nu6_3 => (170_160, 170_160),
+        Nu6_2 => (170_150, 170_150),
+        Nu6_1 => (170_140, 170_130),
+        Nu6 => (170_120, 170_110),
+        Nu5 => (170_100, 170_050),
+        Canopy => (170_013, 170_012),
+        Heartwood => (170_011, 170_010),
+        Blossom => (170_009, 170_008),
+        Sapling => (170_007, 170_007),
+        Overwinter => (170_005, 170_003),
+    };
+    if mainnet {
+        main
+    } else {
+        test
+    }
+}
+
+/// Every network upgrade this build knows, oldest first.
+#[cfg(feature = "zcash")]
+pub const NETWORK_UPGRADES: [NetworkUpgrade; 11] = [
+    NetworkUpgrade::Overwinter,
+    NetworkUpgrade::Sapling,
+    NetworkUpgrade::Blossom,
+    NetworkUpgrade::Heartwood,
+    NetworkUpgrade::Canopy,
+    NetworkUpgrade::Nu5,
+    NetworkUpgrade::Nu6,
+    NetworkUpgrade::Nu6_1,
+    NetworkUpgrade::Nu6_2,
+    NetworkUpgrade::Nu6_3,
+    NetworkUpgrade::Nu7,
+];
+
+/// An upgrade's display name as zcashd and zebra spell it in `getblockchaininfo.upgrades`
+/// (`"NU6.3"`, where the protocol crate's own `Display` says `"Nu6.3"`).
+#[cfg(feature = "zcash")]
+pub fn upgrade_name(nu: NetworkUpgrade) -> &'static str {
+    match nu {
+        NetworkUpgrade::Overwinter => "Overwinter",
+        NetworkUpgrade::Sapling => "Sapling",
+        NetworkUpgrade::Blossom => "Blossom",
+        NetworkUpgrade::Heartwood => "Heartwood",
+        NetworkUpgrade::Canopy => "Canopy",
+        NetworkUpgrade::Nu5 => "NU5",
+        NetworkUpgrade::Nu6 => "NU6",
+        NetworkUpgrade::Nu6_1 => "NU6.1",
+        NetworkUpgrade::Nu6_2 => "NU6.2",
+        NetworkUpgrade::Nu6_3 => "NU6.3",
+        NetworkUpgrade::Nu7 => "NU7",
+    }
+}
+
+/// One network upgrade this build schedules on a network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "zcash")]
+pub struct ScheduledUpgrade {
+    pub upgrade: NetworkUpgrade,
+    /// [`upgrade_name`] of the upgrade.
+    pub name: &'static str,
+    /// The consensus branch id the upgrade activates.
+    pub branch_id: u32,
+    pub activation_height: u32,
+}
+
+/// The upgrades `params` schedules, oldest first: this build's own answer to
+/// `getblockchaininfo.upgrades`, and the schedule an upstream is checked against for the
+/// upgrades it has *not* adopted (`chain::unsupported_upgrades`).
+#[cfg(feature = "zcash")]
+pub fn scheduled_upgrades<P: Parameters>(params: &P) -> Vec<ScheduledUpgrade> {
+    NETWORK_UPGRADES
+        .into_iter()
+        .filter_map(|nu| {
+            let h = params.activation_height(nu)?;
+            Some(ScheduledUpgrade {
+                upgrade: nu,
+                name: upgrade_name(nu),
+                branch_id: u32::from(nu.branch_id()),
+                activation_height: u32::from(h),
+            })
+        })
+        .collect()
 }
 
 #[cfg(feature = "zcash")]
@@ -210,38 +333,96 @@ mod tests {
         }
     }
 
-    /// NU7 is scheduled on testnet and nowhere else. The testnet height is what lets rose
-    /// build transactions past activation there: `BranchId::for_height` picks the NU7 branch id
+    /// NU7 is scheduled on both public networks, at ZIP 259's heights. The height is what lets
+    /// rose build transactions past activation: `BranchId::for_height` picks the NU7 branch id
     /// from it, and a build that lacked it would keep committing to NU6.3 and be rejected by
-    /// every upgraded node. Mainnet is unscheduled, and the moment that changes this test is
-    /// the reminder to say so in the docs and the release notes.
+    /// every upgraded node. Mainnet's height arrived with the `zakura-protocol` 4.0.0 family;
+    /// before it, this test pinned mainnet as unscheduled.
     #[cfg(feature = "zcash")]
     #[test]
-    fn nu7_is_scheduled_on_testnet_only() {
-        let testnet = ZNetwork::Test
-            .activation_height(NetworkUpgrade::Nu7)
-            .expect("the pinned protocol schedules NU7 on testnet");
-        assert_eq!(testnet, BlockHeight::from_u32(4_465_026));
-        assert!(
-            ZNetwork::Test
-                .activation_height(NetworkUpgrade::Nu6_3)
-                .is_some_and(|nu63| nu63 < testnet),
-            "NU7 must activate after NU6.3"
-        );
-        assert_eq!(
-            BranchId::for_height(&ZNetwork::Test, testnet),
-            BranchId::Nu7,
-            "transactions built at the activation height commit to the NU7 branch id"
-        );
-        assert_eq!(
-            BranchId::for_height(&ZNetwork::Test, testnet - 1),
-            BranchId::Nu6_3,
-        );
-        assert_eq!(
-            ZNetwork::Main.activation_height(NetworkUpgrade::Nu7),
-            None,
-            "the pinned protocol now schedules NU7 on mainnet - update the docs and notes"
-        );
+    fn nu7_is_scheduled_on_both_networks() {
+        for (net, height) in [(ZNetwork::Test, 4_465_026), (ZNetwork::Main, 3_543_405)] {
+            let nu7 = net
+                .activation_height(NetworkUpgrade::Nu7)
+                .expect("the pinned protocol schedules NU7");
+            assert_eq!(nu7, BlockHeight::from_u32(height), "{net:?}");
+            assert!(
+                net.activation_height(NetworkUpgrade::Nu6_3)
+                    .is_some_and(|nu63| nu63 < nu7),
+                "NU7 must activate after NU6.3 on {net:?}"
+            );
+            assert_eq!(
+                BranchId::for_height(&net, nu7),
+                BranchId::Nu7,
+                "transactions built at the activation height commit to the NU7 branch id"
+            );
+            assert_eq!(BranchId::for_height(&net, nu7 - 1), BranchId::Nu6_3);
+        }
+    }
+
+    /// The reported protocol version follows the newest upgrade this build schedules: NU7 on
+    /// both public networks, which ZIP 204 numbers differently (170180 testnet, 170190 mainnet).
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn protocol_version_follows_the_newest_scheduled_upgrade() {
+        assert_eq!(ZNetwork::Test.protocol_version(), 170_180);
+        assert_eq!(ZNetwork::Main.protocol_version(), 170_190);
+
+        let h = |n| Some(BlockHeight::from_u32(n));
+        let local = |nu6_3, nu7| LocalNetwork {
+            overwinter: h(1),
+            sapling: h(1),
+            blossom: h(1),
+            heartwood: h(1),
+            canopy: h(1),
+            nu5: h(1),
+            nu6: h(1),
+            nu6_1: h(4),
+            nu6_2: h(4),
+            nu6_3,
+            nu7,
+        };
+        // Regtest takes testnet's numbers, and an upgrade it does not schedule does not count.
+        assert_eq!(protocol_version_of(&local(None, None)), 170_150);
+        assert_eq!(protocol_version_of(&local(h(8), None)), 170_160);
+        assert_eq!(protocol_version_of(&local(h(8), h(12))), 170_180);
+    }
+
+    /// The schedule lists what the network activates, oldest first, under the names nodes use,
+    /// and leaves out an upgrade the network does not schedule.
+    #[cfg(feature = "zcash")]
+    #[test]
+    fn scheduled_upgrades_follow_the_network() {
+        let main = scheduled_upgrades(&ZNetwork::Main);
+        assert_eq!(main.first().map(|u| u.name), Some("Overwinter"));
+        let nu7 = main.last().expect("mainnet schedules upgrades");
+        assert_eq!(nu7.name, "NU7");
+        assert_eq!(nu7.branch_id, u32::from(BranchId::Nu7));
+        assert_eq!(nu7.activation_height, 3_543_405);
+        assert!(main
+            .windows(2)
+            .all(|w| w[0].activation_height <= w[1].activation_height));
+
+        let h = |n| Some(BlockHeight::from_u32(n));
+        let without_nu7 = LocalNetwork {
+            overwinter: h(1),
+            sapling: h(1),
+            blossom: h(1),
+            heartwood: h(1),
+            canopy: h(1),
+            nu5: h(1),
+            nu6: h(1),
+            nu6_1: h(4),
+            nu6_2: h(4),
+            nu6_3: h(8),
+            nu7: None,
+        };
+        let names: Vec<_> = scheduled_upgrades(&without_nu7)
+            .into_iter()
+            .map(|u| u.name)
+            .collect();
+        assert_eq!(names.last(), Some(&"NU6.3"));
+        assert!(!names.contains(&"NU7"));
     }
 
     #[cfg(feature = "zcash")]

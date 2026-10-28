@@ -16,9 +16,11 @@
 //!    refresh, offline-window sweep, `ChainSource::get_address_utxos`) is deleted; shielded-only
 //!    wallets, the default, still run against any server.
 //!
-//! Note no released lightwalletd populates `lightwalletProtocolVersion`, so the probe reports
-//! *incapable* for every real server - `[backend] assume_transparent_in_compact_blocks` is the
-//! operator's out-of-band assertion, and is what the regtest harness sets in lwd mode.
+//! lightwalletd 0.5.0 through 0.5.3 serve the versioned protocol but leave
+//! `lightwalletProtocolVersion` empty, so the probe reports them *incapable*;
+//! `[backend] assume_transparent_in_compact_blocks` is the operator's out-of-band assertion for
+//! those. v0.5.4 is the first release that advertises the field, and the regtest harness runs it
+//! through the probe with no assertion.
 
 use std::sync::Arc;
 
@@ -62,9 +64,9 @@ impl LwdSource {
             .get_lightd_info(service::Empty {})
             .await?
             .into_inner();
-        // Legacy servers predate the field and report "". So does every released lightwalletd
-        // to date - the reference implementation never populates it - which is why the operator
-        // can assert the capability out of band ([backend]
+        // Legacy servers predate the field and report "". So do lightwalletd 0.5.0-0.5.3, which
+        // serve the data without advertising it (v0.5.4 is the first that does) - which is why
+        // the operator can assert the capability out of band ([backend]
         // assume_transparent_in_compact_blocks).
         let advertised = !info.lightwallet_protocol_version.is_empty();
         let pool_types_capable = advertised || assume_capable;
@@ -214,11 +216,17 @@ impl ChainSource for LwdSource {
             .into_inner();
         Ok(ServerInfo {
             chain_name: info.chain_name,
+            // `blockHeight` and `consensusBranchId` come from one `getblockchaininfo` call on the
+            // lightwalletd side, so the pair is consistent - which is what lets the detector
+            // check the tip's branch against the one this build expects at that height (the
+            // only way light mode can see a node that did not upgrade).
+            tip_height: u32::try_from(info.block_height).ok().filter(|h| *h > 0),
             // `GetLightdInfo` has no upgrades map, so the outdated-build detector's map half
             // has nothing to inspect in light mode. It does report the branch ruling the tip
             // (`consensusBranchId`, bare hex like `getblockchaininfo`'s), which feeds the
             // detector's belt check: an unrecognized branch there still surfaces as an active
-            // unsupported upgrade.
+            // unsupported upgrade, and a branch older than this build expects at the tip
+            // surfaces as an upstream that did not upgrade.
             upgrades: Vec::new(),
             tip_branch_id: u32::from_str_radix(info.consensus_branch_id.trim(), 16).ok(),
             next_block_branch_id: None,

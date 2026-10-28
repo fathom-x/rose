@@ -25,7 +25,10 @@ name: Regtest E2E
 # harness always configures the node with `"NU6.3"` at NU6_3_ACTIVATION_HEIGHT (8) and the rose
 # under test gets ROSE_REGTEST_NU63_HEIGHT to match. Every funded flow here therefore exercises the
 # pool real users are on - a receive lands as an ironwood (V3) note, and every send builds a V6
-# ironwood bundle. `regtest_ironwood` runs alongside the rest as one more test binary; it holds only
+# ironwood bundle. NU7 (testnet 4,465,026; mainnet 3,543,405) is activated the same way, at
+# REGTEST_NU7_HEIGHT (12), which the harness writes into the node config and the rose under test
+# and the funder both read as ROSE_REGTEST_NU7_HEIGHT - so every funded flow also runs under the
+# NU7 rules (the NU7 consensus branch, the 120-block expiry, ZIP 218's shielded budget). `regtest_ironwood` runs alongside the rest as one more test binary; it holds only
 # the assertions the other flows can't imply (input/change pool pinning and the librustzcash#2554
 # anchor-retention guard). There is no separate ironwood CI tier.
 
@@ -33,11 +36,11 @@ on:
   workflow_dispatch:
     inputs:
       zebra-image:
-        description: "zfnd/zebra image tag to test against (e.g. 6.3.0, latest)"
+        description: "zfnd/zebra image tag to test against (e.g. 7.0.0, latest)"
         required: false
         default: ""
       zakura-image:
-        description: "zakuracore/zakura image tag to test against (e.g. 1.2.0, latest)"
+        description: "zakuracore/zakura image tag to test against (e.g. 1.7.0, latest)"
         required: false
         default: ""
       stress:
@@ -91,14 +94,24 @@ on:
 # and a manual dispatch can name any tag. Bumping a node = changing its one value here (the harness
 # drives the node purely over JSON-RPC, so nothing else needs to move in lockstep).
 #
+# Both pins are the releases that schedule NU7 on mainnet (zebra 7.0.0, zakura 1.7.0), and the
+# regtest chain activates NU7 too (REGTEST_NU7_HEIGHT below), so every PR runs against the
+# consensus rules, config validation and RPC surface the network now requires.
+#
 # IMPORTANT: no workflow env var may start with `ZEBRA_` or `ZAKURA_` - zebrad/zakurad parse
 # such-prefixed environment variables as config overrides and exit with "unknown field" on ones
 # they don't recognise. (The harness also scrubs both prefixes before spawning the node, as a
 # second line of defence.) NB `ZEBRAD_*`/`ZAKURAD_*` (with the trailing D) are safe - the prefix
 # match requires the underscore right after `ZEBRA`/`ZAKURA`.
 env:
-  ZEBRAD_IMAGE_PINNED: "6.3.0"
-  ZAKURAD_IMAGE_PINNED: "1.2.0"
+  ZEBRAD_IMAGE_PINNED: "7.0.0"
+  ZAKURAD_IMAGE_PINNED: "1.7.0"
+  # The regtest NU7 activation height: above NU6.3's 8 and a multiple of 3, as ZIP 259 requires
+  # of every NU7 activation height. Passed to each step that starts a regtest stack as
+  # ROSE_REGTEST_NU7_HEIGHT, and part of the chain-snapshot cache key. Named without the `ROSE_`
+  # prefix so it reaches only the steps that ask for it: `network::regtest()` refuses an NU7
+  # height without an NU6.3 one, and not every step sets both.
+  REGTEST_NU7_HEIGHT: "12"
   # The funding wallet is a *released* rose, from its own digest-pinned GHCR image. Running a
   # release rather than the build under test keeps the two sides of every funded test independent -
   # a regression on this branch cannot mask itself by being present in both the wallet under test
@@ -115,29 +128,37 @@ env:
   # migrates an existing flat wallet directory into it on first start, so a funder datadir this
   # pin builds is in the new layout; the chain-snapshot cache key below already includes this
   # image, so bumping the pin rebuilds the archive rather than restoring one the funder would
-  # have to migrate. The current pin is a pre-rename `zecd` release under the retired
-  # `zecrocks/zecd` registry path; releases land at `ghcr.io/fathom-x/rose`,
-  # so substitute that path (and drop the harness's pre-rename funder shims, see
-  # regtest-harness/src/lib.rs `funder_command`) when moving the pin. Resolve a new digest with:
+  # have to migrate. 0.9.0-rc2 is the first release that reads `ZECD_REGTEST_NU7_HEIGHT`, and so
+  # the first that can fund the NU7-active chain this tier now runs; it is still on the 2.2
+  # Zakura family, which builds valid NU7 transactions (the default 40-block expiry is a
+  # recommendation, not consensus). It is a pre-rename `zecd` release under the retired
+  # `zecrocks/zecd` registry path, and the harness relays both activation heights to it under
+  # the pre-rename variables (regtest-harness/src/lib.rs `funder_command`); releases
+  # land at `ghcr.io/fathom-x/rose`, so substitute that path and drop the shims
+  # when moving the pin. Resolve a new digest with:
   #   TOKEN=$(curl -sL "https://ghcr.io/token?scope=repository:zecrocks/zecd:pull&service=ghcr.io" | jq -r .token)
   #   curl -sI -H "Authorization: Bearer $TOKEN" \
   #     -H "Accept: application/vnd.oci.image.index.v1+json" \
   #     https://ghcr.io/v2/zecrocks/zecd/manifests/<tag> | grep -i docker-content-digest
-  ROSE_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:4d4c854749f1e9ef6f2a5a56f3c67cae12cccf0da0966326679be95d0c36c708' }}  # 0.7.0
+  ROSE_FUNDER_IMAGE: ${{ inputs.funder-image || 'ghcr.io/zecrocks/zecd@sha256:af8947d1ff4737b615240552804b0ec62ab3eceb43408b3334e40a258b22fc19' }}  # 0.9.0-rc2
   # lightwalletd, built from source at this release tag. Needed only where the *rose under test* is
   # a light client - the `rose-lwd` suite and the dedicated regtest_lwd e2e - since the funder now
   # talks straight to the node. 0.5.0 is the first release serving the versioned lightwallet
   # protocol, which is what carries transparent and Ironwood data in compact blocks; the chain is
   # NU6.3-active throughout, so it also has to parse a V6 transaction, which the old v0.4.19 image
-  # cannot.
-  LIGHTWALLETD_VERSION: "v0.5.3"
+  # cannot. 0.5.4 is the first release that *advertises* that protocol
+  # (`GetLightdInfo.lightwalletProtocolVersion`), which is what lets the harness stop asserting
+  # the capability with `assume_transparent_in_compact_blocks` and run rose's real probe. 0.6.0 is
+  # functionally 0.5.5 rebuilt with Go 1.27.3 for the eMudhra intermediate-CA distrust
+  # (CVE-2026-111943); it needs Go >= 1.26.10 to build.
+  LIGHTWALLETD_VERSION: "v0.6.0"
   # The harness --test targets for the standard (rose) suite. Both node legs (zebra and zakura)
   # run this full list; only the rose-lwd leg overrides it with its own subset (see the matrix
   # `include` below). Extended/stress tests skip in seconds unless their gate is set.
   # regtest_btc (the BDK engine's bitcoind e2e) self-skips here: these legs build rose
   # without the `bitcoin` feature and provision no bitcoind. It runs for real in the
   # dedicated `btc-e2e` job below, which supplies both.
-  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_migration --test regtest_funded --test regtest_ironwood --test regtest_orchard_v2_spend --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_fleet --test regtest_stress_notes --test regtest_btc"
+  HARNESS_TESTS: "--test regtest_e2e --test regtest_binding --test regtest_migration --test regtest_funded --test regtest_ironwood --test regtest_orchard_v2_spend --test regtest_sapling --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_transparent_preexpose_responsive --test regtest_transparent_recovery_window --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_hang --test regtest_reorg --test regtest_multiwallet --test regtest_restore --test regtest_watchonly --test regtest_fleet --test regtest_stress_notes --test regtest_btc --test regtest_stale_node"
 
 concurrency:
   group: regtest-${{ github.event_name }}-${{ github.ref }}
@@ -189,7 +210,7 @@ jobs:
             # regtest_multibackend is extended-tier (it skips in seconds otherwise) and lives
             # only here: it is the one binary needing a lightwalletd AND a zebra endpoint in the
             # same daemon, and lightwalletd is provisioned only on this leg.
-            tests: --test regtest_lwd --test regtest_funded --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_multibackend
+            tests: --test regtest_lwd --test regtest_funded --test regtest_transparent --test regtest_transparent_t2t --test regtest_transparent_gap --test regtest_transparent_offline_restore --test regtest_shielding --test regtest_mergetoaddress --test regtest_coinbase --test regtest_multibackend --test regtest_stale_node
             # Heavier per-slot than the zebra suite (an extra lightwalletd per stack, and
             # regtest_lwd itself runs two lightwalletds plus a second zebra-backed rose twin), so
             # this leg keeps its own slot count rather than the default below. 8 is the 16-core
@@ -321,6 +342,15 @@ jobs:
           path: ${{ runner.temp }}/bin/lightwalletd-release
           key: lwd-release-bin-${{ runner.os }}-${{ env.LIGHTWALLETD_VERSION }}
 
+      # v0.6.0 requires Go >= 1.26.10 and its release is built with 1.27.3, which the runner image
+      # need not carry; pin the same toolchain upstream builds with.
+      - name: Set up Go for the lightwalletd build
+        if: steps.lwd-master-bin.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache: false
+
       - name: Build lightwalletd from its release tag
         if: steps.lwd-master-bin.outputs.cache-hit != 'true'
         run: |
@@ -383,12 +413,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/chain-snapshot
-          key: chain-snapshot-v1-${{ runner.os }}-${{ matrix.node }}-${{ env.NODE_IMAGE }}-${{ env.ROSE_FUNDER_IMAGE }}-${{ hashFiles('regtest-harness/src/lib.rs') }}
+          key: chain-snapshot-v1-${{ runner.os }}-${{ matrix.node }}-${{ env.NODE_IMAGE }}-${{ env.ROSE_FUNDER_IMAGE }}-nu7-${{ env.REGTEST_NU7_HEIGHT }}-${{ hashFiles('regtest-harness/src/lib.rs') }}
 
       - name: Build the funded chain snapshot
         if: steps.snapshot-needed.outputs.needed == 'true' && steps.chain-snapshot.outputs.cache-hit != 'true'
         env:
           ROSE_REGTEST_NU63_HEIGHT: "8"
+          ROSE_REGTEST_NU7_HEIGHT: ${{ env.REGTEST_NU7_HEIGHT }}
           ROSE_REGTEST_NODE: ${{ matrix.node }}
         run: |
           cargo run --release --locked --manifest-path regtest-harness/Cargo.toml \
@@ -404,8 +435,10 @@ jobs:
           # harness writes (regtest-harness's NU6_3_ACTIVATION_HEIGHT). The harness relays the
           # value to the funder (under the pre-rename variable its pinned release reads), so all
           # three agree by construction - and they MUST: a mismatch diverges the NU6.3 consensus
-          # branch id and the node rejects the transactions.
+          # branch id and the node rejects the transactions. NU7 likewise, at REGTEST_NU7_HEIGHT,
+          # relayed the same way.
           ROSE_REGTEST_NU63_HEIGHT: "8"
+          ROSE_REGTEST_NU7_HEIGHT: ${{ env.REGTEST_NU7_HEIGHT }}
           # Select the backend for this matrix leg (zebra/zakura); the harness resolves the node
           # binary from the matching env var (ZEBRAD_BIN / ZAKURAD_BIN, exported above).
           ROSE_REGTEST_NODE: ${{ matrix.node }}
@@ -432,7 +465,7 @@ jobs:
           ROSE_STRESS_NOTE_COUNT: ${{ inputs.stress-note-count }}
           # The shielded-coinbase e2e needs a zebrad whose block template builds valid shielded
           # coinbase (zebra >= 6.0.0; 5.0.0's Orchard coinbase proof fails its own validation),
-          # and self-skips otherwise. The pinned image (6.3.0) and `latest` both have the
+          # and self-skips otherwise. The pinned image (7.0.0) and `latest` both have the
           # capability, so a skip is a failure everywhere except a manual dispatch that names a
           # custom (possibly older) image - guards against the test silently never running. Both
           # node legs run the coinbase suite, and zakura inherits zebra's template code, so the
@@ -498,12 +531,14 @@ jobs:
       # shape through Node::call, against a throwaway zebrad chain (tests/embedded_regtest.rs).
       # In-crate rather than in the harness because the harness is deliberately a black-box
       # driver of the binary and cannot link the library. Zebra leg only (it needs exactly one
-      # zebrad, provisioned above as ZEBRAD_BIN). NB no ROSE_REGTEST_NU63_HEIGHT here: the
-      # test's chain stays pre-NU6.3 by design, and the two sides must agree.
+      # zebrad, provisioned above as ZEBRAD_BIN). The test writes its node config from the same
+      # two activation-height variables rose reads, so both sides agree by construction.
       - name: Run embedded-library end-to-end test
         if: matrix.node == 'zebra' && matrix.suite == 'rose'
         env:
           ROSE_EMBEDDED_REGTEST: "1"
+          ROSE_REGTEST_NU63_HEIGHT: "8"
+          ROSE_REGTEST_NU7_HEIGHT: ${{ env.REGTEST_NU7_HEIGHT }}
         run: cargo test --release --locked --features zcash --test embedded_regtest -- --ignored --nocapture
 
       # run-tests.sh already replays each failing binary's output and tails its node log, so this

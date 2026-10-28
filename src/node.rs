@@ -24,8 +24,6 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "zcash")]
 use tracing::debug;
 use tracing::{error, info, warn};
-#[cfg(feature = "zcash")]
-use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 #[cfg(feature = "zcash")]
 use anyhow::Context as _;
@@ -173,30 +171,14 @@ impl PreparedNode {
         let spender_present = any_wallet_can_spend(&config.wallets);
         #[cfg(feature = "zcash")]
         let orchard_keys = if config.spend.cache_proving_key && spender_present {
-            // Also build the PostNu6_3 (Ironwood) proving key when this network can activate
-            // NU6.3, so post-NU6.3 sends prove the Ironwood bundle from the cache instead of
-            // rebuilding a key per send. NU6.3 is live on mainnet (3_428_143) and testnet
-            // (4_134_000), so both build it; only a regtest chain without
-            // `ROSE_REGTEST_NU63_HEIGHT` skips a keygen no send there could use.
-            let build_ironwood = config
-                .network
-                .activation_height(NetworkUpgrade::Nu6_3)
-                .is_some();
-            let keys = actor::ProvingKeys::new(build_ironwood);
+            let keys = actor::ProvingKeys::new();
             if zcash_wallets_to_spawn(&config) > 0 {
-                info!(
-                    "building Orchard proving key{} in the background (cached for all sends)",
-                    if build_ironwood {
-                        " + Ironwood (PostNu6_3) proving key"
-                    } else {
-                        ""
-                    }
-                );
+                info!("building the Orchard proving key in the background (cached for all sends)");
                 keys.spawn_build();
             } else {
                 debug!(
                     "no initialized Zcash wallet to spawn; skipping the background proving-key \
-                     build (a Zcash send would build the keys on demand)"
+                     build (a Zcash send would build the key on demand)"
                 );
             }
             Some(keys)
@@ -211,12 +193,7 @@ impl PreparedNode {
                 "no wallet holds spending keys; not warming the Orchard proving keys (they build \
                  on demand if a send ever arrives)"
             );
-            Some(actor::ProvingKeys::new(
-                config
-                    .network
-                    .activation_height(NetworkUpgrade::Nu6_3)
-                    .is_some(),
-            ))
+            Some(actor::ProvingKeys::new())
         } else {
             None
         };

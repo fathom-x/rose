@@ -25,6 +25,11 @@ fn connected(state: &AppState) -> bool {
     }
 }
 
+/// What a Bitcoin wallet's `getnetworkinfo` reports as `protocolversion`: the ZIP 204 value is
+/// a Zcash notion, so the Bitcoin engine keeps the fixed value it has always reported.
+#[cfg(any(feature = "bitcoin", not(feature = "zcash")))]
+pub(crate) const BITCOIN_PROTOCOL_VERSION: u32 = 170100;
+
 /// rose's own version in Bitcoin Core's numeric encoding (major*10000 + minor*100 + patch),
 /// derived from Cargo.toml so it can't drift from the crate version.
 fn version_number() -> u64 {
@@ -45,17 +50,27 @@ fn version_number() -> u64 {
 /// `getnetworkinfo` - daemon version/identity in Bitcoin Core's shape; `connections` counts
 /// the single chain upstream (1 when connected, 0 otherwise). That upstream is a local zebrad in
 /// the default full mode, a lightwalletd in light mode; nothing here depends on which.
+/// `protocolversion` is the ZIP 204 version of the newest upgrade this build schedules on the
+/// daemon's network (`ZNetwork::protocol_version`), so it moves with the consensus rules the
+/// build actually follows rather than staying at whatever a release once hard-coded.
 pub(crate) fn getnetworkinfo(state: &AppState) -> Result<Value, RpcError> {
-    Ok(networkinfo_json(connected(state)))
+    // The ZIP 204 version is the Zcash engine's; a build without it reports the fixed value
+    // the Bitcoin engine does.
+    #[cfg(feature = "zcash")]
+    let protocolversion = state.config.network.protocol_version();
+    #[cfg(not(feature = "zcash"))]
+    let protocolversion = BITCOIN_PROTOCOL_VERSION;
+    Ok(networkinfo_json(connected(state), protocolversion))
 }
 
-/// The `getnetworkinfo` object, given whether the wallet's upstream is connected - shared
-/// with the Bitcoin engine's handler, so both report the same shape.
-pub(crate) fn networkinfo_json(up: bool) -> Value {
+/// The `getnetworkinfo` object, given whether the wallet's upstream is connected and the
+/// protocol version to report - shared with the Bitcoin engine's handler, so both report the
+/// same shape (the Bitcoin handler passes [`BITCOIN_PROTOCOL_VERSION`]).
+pub(crate) fn networkinfo_json(up: bool, protocolversion: u32) -> Value {
     json!({
         "version": version_number(),
         "subversion": format!("/rose:{}/", env!("CARGO_PKG_VERSION")),
-        "protocolversion": 170100,
+        "protocolversion": protocolversion,
         "localservices": "0000000000000000",
         "localservicesnames": [],
         "localrelay": false,

@@ -484,10 +484,10 @@ pub enum ReadinessMode {
     /// pending. This is the "scanned to tip, memos still landing" state: balances and note
     /// spendability are current (they come from the block scan), but history RPCs may still be
     /// missing memos/full transaction data, which `getwalletinfo.enhanced_through` bounds
-    /// precisely. Exists because the backlog is not restore-only: on a wallet holding many
-    /// transparent UTXOs, every send (and tip advance) re-emits the recurring spend-search
-    /// requests, so gating on an empty backlog makes `/readyz` flap after routine sends -
-    /// pulling a healthy node out of rotation while every balance RPC was answering correctly.
+    /// precisely. Exists because the backlog is not restore-only: every send and receive queues
+    /// its own enhancement, so gating on an empty backlog briefly takes `/readyz` to 503 after
+    /// routine activity - pulling a healthy node out of rotation while every balance RPC was
+    /// answering correctly.
     /// Opt in (`readiness = "scanned"`) for deployments that route balance/send traffic and
     /// clamp history consumption to `enhanced_through`.
     Scanned,
@@ -813,11 +813,11 @@ pub struct BackendConfig {
     /// inside compact blocks, overriding the `GetLightdInfo.lightwalletProtocolVersion` probe.
     ///
     /// The probe exists because a server that cannot serve that data would silently never
-    /// discover transparent receives. But no released lightwalletd populates the field yet - it
-    /// is specified in the lightwallet protocol and left empty by the reference implementation -
-    /// so the probe reports "incapable" even for a 0.5.x server that does serve the data. This
-    /// knob is the operator's way to say "I know what my server does". Off by default: guessing
-    /// wrong reintroduces exactly the silent-loss failure the probe is there to prevent.
+    /// discover transparent receives. But lightwalletd 0.5.0-0.5.3 leave the field empty while
+    /// serving the data (v0.5.4 is the first release that populates it), so the probe reports
+    /// "incapable" for them. This knob is the operator's way to say "I know what my server
+    /// does"; against v0.5.4 or later it is unnecessary. Off by default: guessing wrong
+    /// reintroduces exactly the silent-loss failure the probe is there to prevent.
     ///
     /// Ignored by `zebra://` endpoints, which always cover transparent data.
     pub assume_transparent_in_compact_blocks: bool,

@@ -35,11 +35,12 @@ if ! command -v cargo-about >/dev/null 2>&1; then
     exit 1
 fi
 
-# The shipped tree: the default features (`server` + `cli` + `bitcoin`) plus the
-# `mimalloc-secure` allocator and the opt-in `zcash` wallet engine the static musl release
-# images build with (both Dockerfiles), on the release targets named in about.toml.
-# `--all-features` would pull optional deps the artifacts don't carry. The `rose` command
-# line (rose-cli/) adds no crate the daemon does not already carry.
+# The shipped tree: the default features (`server` + `cli` + `bitcoin`) plus the opt-in
+# `zcash` wallet engine and the `mimalloc-secure` allocator the arm64 static musl image builds
+# with (the amd64 StageX image takes the same allocator from its libc, so this is a superset
+# of it), on the release targets named in about.toml. `--all-features` would pull optional
+# deps the artifacts don't carry. The `rose` command line (rose-cli/) adds no crate the
+# daemon does not already carry.
 cargo about generate about.hbs \
     --locked \
     --features mimalloc-secure,bitcoin,zcash \

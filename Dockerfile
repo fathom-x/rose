@@ -14,14 +14,16 @@
 #
 # A deployment repository that carries this tree as a subtree builds it from its own root:
 #   docker build -f rose/Dockerfile --build-arg ROSE_SRC=rose --build-arg ROSE_BAKE=bake \
-#     --build-arg ROSE_CARGO_FEATURES="--no-default-features --features mimalloc-secure,bitcoin,server,cli" \
+#     --build-arg ROSE_CARGO_FEATURES="--no-default-features --features bitcoin,server,cli" \
 #     --build-arg ROSE_CLI_CARGO_FEATURES="--no-default-features --features bitcoin" .
 #
 # Dependencies are released crates from crates.io - the Zakura Common `zakura-*` forks of
 # librustzcash plus the upstream crates they leave in place (versions pinned by the committed
 # Cargo.lock), so the build needs network access to fetch them.
 
-FROM stagex/pallet-rust:1.91.1@sha256:4062550919db682ebaeea07661551b5b89b3921e3f3a2b0bc665ddea7f6af1ca AS pallet-rust
+# Rust 1.97 is the Zakura Common 4.0 family's MSRV. The digest is the linux/amd64 manifest
+# within the tag's index, like the other pins here.
+FROM stagex/pallet-rust:1.97.1@sha256:6033fb215dd7c87c885dd7b1c12de42464606dcc0323fc57339318d61f010a30 AS pallet-rust
 # protoc (+ the abseil it links) is needed by zcash_client_backend's build script.
 FROM stagex/user-protobuf:26.1@sha256:b399bb058216a55130d83abcba4e5271d8630fff55abbb02ed40818b0d96ced1 AS protobuf
 FROM stagex/user-abseil-cpp:20240116.2@sha256:183e8aff7b3e8b37ab8e89a20a364a21d99ce506ae624028b92d3bed747d2c06 AS abseil-cpp
@@ -65,9 +67,9 @@ COPY ${ROSE_SRC}/ .
 # both engines, so one image serves a Zcash or a Bitcoin wallet (a bare `cargo build` is
 # Bitcoin-only; `zcash` is the opt-in). A deployment that needs one engine builds a smaller
 # binary faster by overriding this ARG - the enclave deployment passes the Bitcoin-only
-# set, `--no-default-features --features mimalloc-secure,bitcoin,server,cli`, dropping the
+# set, `--no-default-features --features bitcoin,server,cli`, dropping the
 # Zcash stack's ~190 crates. Only features change; the runtime contract below does not.
-ARG ROSE_CARGO_FEATURES="--features mimalloc-secure,bitcoin,zcash"
+ARG ROSE_CARGO_FEATURES="--features bitcoin,zcash"
 # The same choice for the `rose` command line (rose-cli/), whose engine features mirror the
 # daemon's (no allocator feature: it proves nothing). Keep the two ARGs on the same engines.
 ARG ROSE_CLI_CARGO_FEATURES="--features bitcoin,zcash"
@@ -88,17 +90,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --path . \
         --bin rosed \
         --target ${TARGET_ARCH} \
-        # musl's default allocator is ~5-6x slower than glibc under Orchard proving's
-        # multi-threaded allocation churn; mimalloc closes the gap. The `-secure` variant adds
-        # heap hardening (guard pages, canary free-lists) for <4% on the proving path, recovering
-        # the mitigations dropped by replacing musl's malloc-ng. glibc dev/test builds skip this.
-        # (mimalloc-sys compiles C the same way libsqlite3-sys already does here.)
+        # musl's own malloc-ng is ~5-6x slower than glibc under Orchard proving's
+        # multi-threaded allocation churn, and the `mimalloc-secure` feature exists to replace
+        # it with hardened mimalloc (Dockerfile.arm64 takes it). Not here: StageX's musl (from
+        # the 1.97.1 pallet) already does - its libc.a carries `mimalloc-secure.o` as `malloc`,
+        # so `System` is hardened mimalloc with no crate. Linking the crate as well puts a
+        # second, different mimalloc beside it, and `--allow-multiple-definition` (above)
+        # merges the two copies' shared globals (`_mi_heap_main` among them): the binary died
+        # with SIGBUS on its first realloc, before printing `--version`. So the ARG's default
+        # names no allocator feature, and a deployment overriding it must not add one.
         # `zcash` is the librustzcash wallet engine, off by default for `cargo build`; the
         # shipped image carries both engines so one image serves a Zcash or a Bitcoin wallet
         # (a binary without an engine refuses its `coin` at config resolve).
-        # THIRD-PARTY-LICENSES.txt is generated with the same feature set - keep
-        # scripts/generate-licenses.sh in step with the ARG's default (a narrower build
-        # embeds the same superset of notices; nothing is missing).
+        # THIRD-PARTY-LICENSES.txt is generated with `mimalloc-secure` as well (the arm64
+        # image's set, a superset of this one) - keep scripts/generate-licenses.sh in step.
         ${ROSE_CARGO_FEATURES} \
     && cargo install \
         --frozen \

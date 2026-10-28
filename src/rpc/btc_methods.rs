@@ -107,6 +107,7 @@ pub(crate) async fn dispatch(
         "getblockchaininfo" => Ok(getblockchaininfo(handle)),
         "getnetworkinfo" => Ok(crate::rpc::network::networkinfo_json(
             handle.status().conn_state != BtcConnState::Down,
+            crate::rpc::network::BITCOIN_PROTOCOL_VERSION,
         )),
         "estimatesmartfee" => estimatesmartfee(handle, req).await,
         "getreceivedbyaddress" => getreceivedbyaddress(handle, req).await,

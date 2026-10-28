@@ -2,7 +2,7 @@
 name = "rose-cli"
 version = "0.10.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 description = "rose: the operator's command line for the rosed wallet daemon - wallet setup and configuration subcommands, plus a bitcoin-cli-style JSON-RPC client"
 repository = "https://github.com/fathom-x/rose"

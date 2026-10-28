@@ -1,7 +1,7 @@
 # Mainnet override for the self-hosted stack. The base docker-compose.yml is testnet by default;
-# this override swaps each service's config file for its mainnet variant. The zebra image is
-# unchanged (6.0.0 activates ironwood at the network's activation height). Ports and wiring are
-# unchanged, so the same workflow applies - just add `-f docker-compose.mainnet.yml`:
+# this override swaps each service's config file for its mainnet variant, and pins mainnet's own
+# zebra release. Ports and wiring are unchanged, so the same workflow applies - just add
+# `-f docker-compose.mainnet.yml`:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml up -d zebra
 #   docker compose -f docker-compose.yml -f docker-compose.mainnet.yml run --rm --entrypoint rose rose init --wallet default
@@ -12,6 +12,9 @@
 
 services:
   zebra:
+    # Same zebra image as the base file: zebra 7 schedules mainnet NU7 at 3,543,405, and a 6.x
+    # node falls off the chain there. Run it with a rose release whose protocol crate carries the
+    # same height (`rose chain info` reports a schedule the build disagrees with).
     volumes:
       - ./zebrad.mainnet.toml:/etc/zebra/zebrad.toml:ro
 

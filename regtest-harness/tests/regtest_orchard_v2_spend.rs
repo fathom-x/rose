@@ -53,6 +53,11 @@ async fn regtest_legacy_orchard_note_spends_after_nu6_3() {
     };
     // Before anything spawns: rose and the funder read it at startup.
     std::env::set_var("ROSE_REGTEST_NU63_HEIGHT", NU6_3_HEIGHT.to_string());
+    // The tier activates NU7 at 12, below this chain's late NU6.3, which no build accepts
+    // (upgrades activate in order). NU7 has nothing to add to a legacy-Orchard spend, so this
+    // chain leaves it off, and the node config, rose and the funder all read the same unset
+    // variable.
+    std::env::remove_var("ROSE_REGTEST_NU7_HEIGHT");
 
     let (zebrad, funder) = start_funded_chain_live_at(&zebrad_bin, NU6_3_HEIGHT)
         .await

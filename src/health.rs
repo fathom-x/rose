@@ -30,7 +30,7 @@ use crate::wallet::SyncStatus;
 /// check is applied by the caller.
 #[cfg(feature = "zcash")]
 fn wallet_ready(st: &SyncStatus, cfg: &HealthConfig) -> bool {
-    if !st.connected {
+    if !st.connected || st.upstream_refusal.is_some() {
         return false;
     }
     match cfg.readiness {
@@ -55,9 +55,9 @@ fn wallet_ready(st: &SyncStatus, cfg: &HealthConfig) -> bool {
         // spendability come from the block scan and are current in this state; only history
         // completeness lags, and `getwalletinfo.enhanced_through` bounds that precisely. The
         // strict mode's `pending_enhancements == 0` gate is right for a from-birthday restore
-        // (hours of backfill) but also fires in steady state: a wallet holding many transparent
-        // UTXOs re-emits its recurring spend-search requests on every send/tip advance, so the
-        // strict gate pulls a healthy node out of rotation after routine sends. This mode is the
+        // (hours of backfill) but also fires briefly in steady state, after each send or receive
+        // queues its own enhancement. (The wallet layer's recurring transparent spend searches,
+        // which once made it fire on every tip advance, are no longer counted.) This mode is the
         // opt-out for deployments that clamp history consumption to `enhanced_through`.
         ReadinessMode::Scanned => match (st.chain_tip, st.fully_scanned) {
             (Some(tip), Some(scanned)) => tip.saturating_sub(scanned) <= cfg.max_scan_lag,
@@ -145,6 +145,11 @@ struct Snapshot {
     /// distinct `readyz` reason so an operator can tell "scanned to tip, backfilling memos" apart
     /// from "still scanning blocks" - the two look identical without it (both not-ready, scan done).
     any_enhancing: bool,
+    /// Some wallet's actor is refusing its upstream - a node that never adopted a network
+    /// upgrade this build follows (`SyncStatus::upstream_refusal`). Reported ahead of
+    /// `upstream_down`, which it would otherwise read as: the fix is on the node, and an alert
+    /// that says "down" sends an operator looking for a crashed process that is running fine.
+    any_refused: bool,
     wallets: Value,
 }
 
@@ -172,6 +177,8 @@ fn snapshot(state: &AppState) -> Snapshot {
     let mut any_locked = false;
     #[cfg_attr(not(feature = "zcash"), allow(unused_mut))]
     let mut any_enhancing = false;
+    #[cfg_attr(not(feature = "zcash"), allow(unused_mut))]
+    let mut any_refused = false;
     let mut wallets = Map::new();
     for (name, wallet) in loaded {
         let coin = wallet.coin().name();
@@ -198,6 +205,9 @@ fn snapshot(state: &AppState) -> Snapshot {
                 // it as a distinct signal (not a readiness failure) so an operator/controller can
                 // tell "needs walletpassphrase" apart from "still syncing" without breaking
                 // read-only or watch-only deployments that are legitimately ready while locked.
+                if st.upstream_refusal.is_some() {
+                    any_refused = true;
+                }
                 let locked = is_locked(&st);
                 if locked {
                     any_locked = true;
@@ -223,6 +233,7 @@ fn snapshot(state: &AppState) -> Snapshot {
                         "actor_alive": actor_alive,
                         "server": st.server,
                         "conn_state": st.conn_state.as_str(),
+                        "upstream_refusal": st.upstream_refusal,
                         "chain_tip": st.chain_tip,
                         "fully_scanned": st.fully_scanned,
                         "scan_lag": scan_lag,
@@ -326,6 +337,7 @@ fn snapshot(state: &AppState) -> Snapshot {
         any_actor_down,
         any_locked,
         any_enhancing,
+        any_refused,
         wallets: Value::Object(wallets),
     }
 }
@@ -351,6 +363,8 @@ async fn readyz(State(state): State<AppState>) -> Response {
         // process restart; an enhancing wallet is scanned to tip but not yet serving full history).
         body["reason"] = json!(if snap.any_actor_down {
             "actor_down"
+        } else if snap.any_refused {
+            "upstream_not_upgraded"
         } else if snap.any_down {
             "upstream_down"
         } else if snap.any_enhancing {
@@ -499,6 +513,22 @@ mod tests {
         let mut enhancing = st(true, Some(4_080_983), Some(4_080_983));
         enhancing.pending_enhancements = 29_660;
         assert!(wallet_ready(&enhancing, &connected));
+    }
+
+    /// A wallet refusing an upstream that never adopted a network upgrade is not ready in any
+    /// mode, even if the published status still reads connected and caught up (the refusal is
+    /// published as the client is dropped; nothing may report ready across that window).
+    #[test]
+    fn a_refused_upstream_is_never_ready() {
+        let mut refused = st(true, Some(4_465_100), Some(4_465_100));
+        refused.upstream_refusal = Some("the upstream node has not adopted NU7".to_string());
+        for mode in [
+            ReadinessMode::Synced,
+            ReadinessMode::Scanned,
+            ReadinessMode::Connected,
+        ] {
+            assert!(!wallet_ready(&refused, &cfg(mode)), "{mode:?}");
+        }
     }
 
     #[test]

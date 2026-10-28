@@ -29,7 +29,9 @@
 //!    a second send finds only its change (`-6`) instead of reselecting its inputs. The
 //!    rebuilt database is recorded `Unverified`, the record `init --restore` writes
 //!    too, so this is also the restore-with-a-snapshot-feed path a deployment that restores
-//!    on every boot takes.
+//!    on every boot takes. While the view is rebuilt the wait shows as progress:
+//!    `mempool_feed.snapshot_progress` reports the snapshot being collected, and
+//!    clears once it is applied.
 //!
 //! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
@@ -382,6 +384,27 @@ async fn btc_p2p_mempool_feed_gives_the_kyoto_wallet_zero_conf() {
         .expect_err("no send before the mempool view is rebuilt");
     assert_eq!(code, -4, "{msg}");
     assert!(!msg.contains("refusing to spend"), "{msg}");
+    // The wait is visible as progress while it lasts: the gate reports itself closed with
+    // the snapshot being collected beside it - what the node announced, what is still
+    // being fetched, and the window it collects over. The connect snapshot and the
+    // full one requested at tip both collect for the whole window, so the report shows for
+    // at least that long; `announced` counts the pre-restart send the node still holds.
+    rose.wait_wallet(
+        "btc",
+        "getwalletinfo",
+        json!([]),
+        "a snapshot in progress is reported while the mempool view is rebuilt",
+        |v| {
+            let sp = &v["mempool_feed"]["snapshot_progress"];
+            v["send_gate"]["open"] == json!(false)
+                && sp["announced"].as_u64() >= Some(1)
+                && sp["pending"].as_u64().is_some()
+                && sp["window"].as_u64() >= Some(1)
+                && sp["requested_at"].as_u64() > Some(0)
+                && sp["elapsed"].as_u64().is_some()
+        },
+    )
+    .await;
     rose.wait_height(height).await;
     rose.wait_wallet(
         "btc",
@@ -391,6 +414,17 @@ async fn btc_p2p_mempool_feed_gives_the_kyoto_wallet_zero_conf() {
         |v| v["mempool_feed"]["snapshot_applied"] == json!(true),
     )
     .await;
+    // Delivered: the report clears, and the scan is at the tip.
+    let info = rose
+        .call("getwalletinfo", json!([]))
+        .await
+        .expect("getwalletinfo");
+    assert_eq!(
+        info["mempool_feed"]["snapshot_progress"],
+        json!(null),
+        "{info}"
+    );
+    assert_eq!(info["scanning"], json!(false), "{info}");
     let tx = rose
         .call("gettransaction", json!([spent]))
         .await

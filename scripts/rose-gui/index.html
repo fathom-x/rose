@@ -58,6 +58,24 @@
             border-radius: 8px; padding: .6rem .9rem; margin-bottom: 1rem; font-size: .85rem; }
   .banner b { color: var(--accent); }
   .banner[hidden] { display: none; }
+  /* The two waits behind a closed gate, as three steps under the banner: the block scan
+     from the birthday anchor to the tip, the mempool snapshot's fetch, and the window the
+     snapshot collects over. Each is a label, a bar and a note; a bar with no measure yet
+     (the node has not answered the snapshot request) sweeps instead of filling. */
+  .steps { margin-top: .6rem; display: grid; gap: .35rem; }
+  .steps[hidden] { display: none; }
+  .step { display: grid; grid-template-columns: 12.5rem minmax(6rem, 1fr) minmax(0, 2fr);
+          gap: .6rem; align-items: center; color: var(--dim); }
+  .step.active { color: var(--text); }
+  .step.done .label { color: var(--good); }
+  @media (max-width: 640px) { .step { grid-template-columns: 1fr; gap: .15rem; } }
+  .bar { height: .45rem; background: var(--bg); border: 1px solid var(--line);
+         border-radius: 3px; overflow: hidden; position: relative; }
+  .bar i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .4s; }
+  .step.done .bar i { background: var(--good); }
+  .bar.sweep i { width: 30%; position: absolute; animation: sweep 1.4s linear infinite; }
+  @keyframes sweep { from { left: -30%; } to { left: 100%; } }
+  .step .note { font-size: .8rem; overflow-wrap: anywhere; }
   button.ghost.done { color: var(--good); border-color: var(--good); }
   button.ghost.err, button.copy.err { color: var(--bad); border-color: var(--bad); }
   /* Login mode: the proxy holds no password, so the page asks for it before anything else.
@@ -122,7 +140,17 @@
   <button id="logout" class="ghost small" hidden title="forget the RPC password this proxy holds for this browser">log out</button>
 </header>
 
-<div id="gatebanner" class="banner" hidden></div>
+<div id="gatebanner" class="banner" hidden>
+  <div id="gatetext"></div>
+  <div id="gatesteps" class="steps" hidden>
+    <div class="step" id="step-scan"><span class="label">scanning blocks</span>
+      <span class="bar"><i></i></span><span class="note"></span></div>
+    <div class="step" id="step-fetch"><span class="label">fetching the mempool</span>
+      <span class="bar"><i></i></span><span class="note"></span></div>
+    <div class="step" id="step-window"><span class="label">waiting out the window</span>
+      <span class="bar"><i></i></span><span class="note"></span></div>
+  </div>
+</div>
 
 <!-- Login mode (the proxy was started without the RPC password): shown until the operator
      enters it. The proxy checks it against rose and keeps it in memory under a session
@@ -495,15 +523,81 @@ $("hideunused").addEventListener("change", () => {
 // refused before coin selection and why - no connection, or the mempool-view wait a
 // restored kyoto wallet sits in until its snapshot lands (or its opt-out). Shown as a
 // banner so the operator sees it before trying a send, not as the send's error. An older
-// daemon has no field: no banner.
-function renderSendGate(gate) {
+// daemon has no field: no banner. Under it, the wait's progress (renderGateSteps).
+function renderSendGate(info) {
+  const gate = info.send_gate;
   const el = $("gatebanner");
   if (!gate || gate.open !== false) { el.hidden = true; return; }
-  el.innerHTML = `<b>sends are refused right now</b> (seed history: ${gate.history || "?"}` +
+  $("gatetext").innerHTML = `<b>sends are refused right now</b> (seed history: ${gate.history || "?"}` +
     `${gate.allow_sends_without_mempool_view ? ", opt-out set" : ""}): ` +
     `<span id="gatereason"></span>`;
   $("gatereason").textContent = gate.reason || "";
+  renderGateSteps(info);
   el.hidden = false;
+}
+
+// One step of the gate's progress: `frac` fills the bar (null sweeps it: no measure yet),
+// `state` is "pending", "active" or "done", `note` the text beside it.
+function setStep(id, state, frac, note) {
+  const step = $(id);
+  step.className = `step ${state}`;
+  const bar = step.querySelector(".bar");
+  bar.classList.toggle("sweep", frac === null);
+  bar.querySelector("i").style.width = frac === null ? "" : `${Math.round(Math.min(Math.max(frac, 0), 1) * 100)}%`;
+  step.querySelector(".note").textContent = note;
+}
+
+// The two waits folded into a closed gate, as three steps (rose >= 0.11): the block scan
+// from the birthday anchor to the tip (getwalletinfo.scanning: progress, height and tip),
+// the mempool snapshot's fetch (mempool_feed.snapshot_progress: announced and pending,
+// indeterminate until the node's first inv), and the collection window the snapshot waits
+// out before it is delivered (elapsed over window). Shown only when the gate is the
+// mempool-view wait of a snapshot-taking feed, or a scan is running: a gate closed for
+// another reason (no connection, no feed configured) has no steps to show.
+function renderGateSteps(info) {
+  const steps = $("gatesteps");
+  const scanning = info.scanning && typeof info.scanning === "object" ? info.scanning : null;
+  const feed = info.mempool_feed && typeof info.mempool_feed === "object" ? info.mempool_feed : {};
+  const snapshots = typeof feed.snapshot_applied === "boolean";
+  if (!scanning && !snapshots) { steps.hidden = true; return; }
+  if (scanning) {
+    const tip = Number.isInteger(scanning.tip) ? scanning.tip : null;
+    const height = Number.isInteger(scanning.height) ? scanning.height : null;
+    const frac = tip === null ? null : Number(scanning.progress) || 0;
+    const note = height === null ? "" :
+      tip === null ? `height ${height}, the node's tip not known yet` : `height ${height} of ${tip}`;
+    setStep("step-scan", "active", frac, note);
+  } else {
+    setStep("step-scan", "done", 1, "at the node's tip");
+  }
+  for (const id of ["step-fetch", "step-window"]) $(id).hidden = !snapshots;
+  if (!snapshots) { steps.hidden = false; return; }
+  const sp = feed.snapshot_progress && typeof feed.snapshot_progress === "object" ? feed.snapshot_progress : null;
+  if (feed.snapshot_applied) {
+    setStep("step-fetch", "done", 1, "snapshot applied");
+    setStep("step-window", "done", 1, "");
+  } else if (sp) {
+    const announced = Number(sp.announced) || 0, pending = Number(sp.pending) || 0;
+    if (announced === 0) {
+      setStep("step-fetch", "active", null, "waiting for the node to announce its mempool");
+    } else {
+      setStep("step-fetch", "active", (announced - pending) / announced,
+              `${announced - pending} of ${announced} transactions`);
+    }
+    const elapsed = Number(sp.elapsed) || 0, span = Number(sp.window) || 30;
+    const overdue = elapsed >= span && pending > 0;
+    setStep("step-window", elapsed >= span ? "done" : "active", elapsed / span,
+            overdue ? `${span}s passed; waiting for the last ${pending} fetches`
+                    : `${Math.min(elapsed, span)}s of ${span}s: giving the node time to announce everything`);
+  } else if (scanning) {
+    setStep("step-fetch", "pending", 0, "after the scan");
+    setStep("step-window", "pending", 0, "");
+  } else {
+    setStep("step-fetch", "pending", null,
+            feed.state === "connected" ? "requesting the node's mempool" : "mempool feed connecting");
+    setStep("step-window", "pending", 0, "");
+  }
+  steps.hidden = false;
 }
 
 async function refresh() {
@@ -526,7 +620,7 @@ async function refresh() {
       rpc("listunspent", [0]).catch(() => null),
     ]);
     setWatchOnly(info.private_keys_enabled === false);
-    renderSendGate(info.send_gate);
+    renderSendGate(info);
     spendable = Number(balances.mine.trusted);
     $("trusted").textContent = fmt(balances.mine.trusted);
     $("pending").textContent = fmt(balances.mine.untrusted_pending);

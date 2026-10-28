@@ -403,6 +403,36 @@ def s_getwalletinfo(ctx):
                sg.get("history") in ("fresh", "unverified", "verified", "unrecorded"), sg)
             ck("send_gate.allow_sends_without_mempool_view is a bool",
                isinstance(sg.get("allow_sends_without_mempool_view"), bool), sg)
+        # rose extension, Bitcoin wallets only: the opt-in `[mempool]` feed. `disabled` with
+        # nothing else when none is configured; otherwise the counters, and for a feed that
+        # takes BIP 35 snapshots `snapshot_applied` (what sends wait for) beside
+        # `snapshot_progress`: None between snapshots, else the one being collected, with
+        # what the node announced, what is still being fetched, when it was requested and
+        # the window it collects over. This suite's stacks run the feed with and without
+        # snapshots, so both shapes are constrained.
+        mf = wi.get("mempool_feed")
+        ck("getwalletinfo has a mempool_feed object", isinstance(mf, dict), repr(mf))
+        if isinstance(mf, dict):
+            ck("mempool_feed.state is known",
+               mf.get("state") in ("disabled", "connecting", "connected"), mf)
+            if mf.get("state") == "disabled":
+                ck("a disabled feed carries nothing else", set(mf) == {"state"}, mf)
+            else:
+                for f in ("source", "endpoint", "deltas", "matched", "dropped"):
+                    ck(f"mempool_feed has {f}", f in mf, mf)
+                ck("snapshot_progress is present exactly for a snapshot feed",
+                   ("snapshot_progress" in mf) == ("snapshot_applied" in mf), mf)
+                sp = mf.get("snapshot_progress")
+                ck("snapshot_progress is None or an object",
+                   sp is None or isinstance(sp, dict), repr(sp))
+                if isinstance(sp, dict):
+                    ck("snapshot_progress counts are non-negative integers",
+                       all(isinstance(sp.get(f), int) and sp[f] >= 0
+                           for f in ("announced", "pending", "requested_at", "elapsed", "window")),
+                       sp)
+                    ck("snapshot_progress.pending never exceeds announced",
+                       sp.get("pending", 0) <= sp.get("announced", 0), sp)
+                    ck("snapshot_progress.window is positive", sp.get("window", 0) > 0, sp)
     # rose extension, same shape on both engines: the recorded birthday height, its date as a
     # UTC midnight when known (the operator's, or the mainnet per-day table's) or None, and the
     # resolved scan anchor {height, hash} or None (always None on Zcash and bitcoind wallets).
@@ -460,6 +490,24 @@ def s_getwalletinfo(ctx):
         # getbestblockhash answer - and `upstream_connected` is the one signal that the chain
         # source is reachable (Bitcoin wallets serve no getpeerinfo).
         ck("getwalletinfo.coin is bitcoin", wi.get("coin") == "bitcoin", repr(wi.get("coin")))
+        # `scanning` is Core's union here too: False at the source's tip, else Core's
+        # `{duration, progress}` plus rose's `height` (scanned through so far) and `tip` (the
+        # source's tip, or None before it has said), so a client can show "height X of Y".
+        # Usually False against this suite's caught-up daemon; the object form is constrained
+        # when it shows (a block landing mid-run), and lives on `regtest_btc_p2p_mempool`.
+        ck("getwalletinfo scanning is an object or False",
+           scanning is False or isinstance(scanning, dict), repr(scanning))
+        if isinstance(scanning, dict):
+            ck("scanning.progress is a fraction",
+               isinstance(scanning.get("progress"), (int, float, decimal.Decimal))
+               and 0 <= scanning["progress"] <= 1, scanning)
+            ck("scanning.duration is a non-negative integer",
+               isinstance(scanning.get("duration"), int) and scanning["duration"] >= 0, scanning)
+            ck("scanning.height is a height", isinstance(scanning.get("height"), int), scanning)
+            ck("scanning.tip is a height or None",
+               scanning.get("tip") is None or isinstance(scanning["tip"], int), scanning)
+            ck("scanning.height never exceeds a known tip",
+               scanning.get("tip") is None or scanning["height"] <= scanning["tip"], scanning)
         lpb = wi.get("lastprocessedblock")
         ck("lastprocessedblock is {hash,height}",
            isinstance(lpb, dict) and set(lpb) == {"hash", "height"}, lpb)

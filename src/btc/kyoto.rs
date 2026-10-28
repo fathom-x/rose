@@ -77,11 +77,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context as _};
 use bdk_kyoto::bip157::{AddrV2, ServiceFlags};
 use bdk_kyoto::builder::{Builder, BuilderExt as _};
-use bdk_kyoto::{HashCheckpoint, Requester, ScanType, TrustedPeer, Update, Warning};
+use bdk_kyoto::{HashCheckpoint, Info, Requester, ScanType, TrustedPeer, Update, Warning};
 use bdk_wallet::bitcoin::{BlockHash, FeeRate, Transaction, Txid};
 use bdk_wallet::chain::CheckPoint;
 use bdk_wallet::{KeychainKind, Wallet};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -894,11 +894,20 @@ impl KyotoEndpoint {
         // first, and only the verdict escalates the redial.
         let fatal_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fatal_flag = fatal_seen.clone();
+        // The filter download's progress, kept for the actor's status (see
+        // [`KyotoConn::progress`]): the info stream is its only source.
+        let (progress_tx, progress_rx) = watch::channel(None);
         let logs = tokio::spawn(async move {
             let mut info = logging.info_subscriber;
             let mut warns = logging.warning_subscriber;
             let info_drain = async {
                 while let Some(msg) = info.recv().await {
+                    if let Info::Progress(progress) = &msg {
+                        progress_tx.send_replace(Some(KyotoProgress {
+                            fraction: progress.fraction_complete(),
+                            chain_height: progress.chain_height(),
+                        }));
+                    }
                     debug!(upstream = %describe, "kyoto: {msg}");
                 }
             };
@@ -1005,6 +1014,7 @@ impl KyotoEndpoint {
             watch,
             fee_sampler: None,
             started: Some(Instant::now()),
+            progress: progress_rx,
         })
     }
 
@@ -1357,9 +1367,52 @@ pub struct KyotoConn {
     /// When the node started, until the first update is delivered: what the "caught up"
     /// line reports, so a restart's cost is visible in the log.
     started: Option<Instant>,
+    /// The latest filter-download progress the node reported (see [`Self::progress`]),
+    /// written by the info drain.
+    progress: watch::Receiver<Option<KyotoProgress>>,
+}
+
+/// Where the light client's filter download stands, from `bip157`'s progress reports: the
+/// one measure of a first scan's advance before its update lands (the update is one
+/// sync-to-tip, so the wallet's own checkpoint does not move until then).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KyotoProgress {
+    /// `bip157`'s weighted fraction of the header tree's filter headers and filters
+    /// downloaded and checked (filters weigh three times a filter header). `NaN` before the
+    /// tree has a length, which [`Self::scanned_through`] treats as nothing done.
+    pub fraction: f32,
+    /// The node's header chain height: the catch-up's target.
+    pub chain_height: u32,
+}
+
+impl KyotoProgress {
+    /// The height the scan has reached, estimated from the fraction over the tree from
+    /// `from` (the tree start) to the chain height - an estimate, since the fraction weighs
+    /// filters over filter headers, never above the chain height.
+    pub fn scanned_through(&self, from: u32) -> u32 {
+        let span = self.chain_height.saturating_sub(from) as f64;
+        let fraction = f64::from(self.fraction);
+        if !fraction.is_finite() {
+            return from;
+        }
+        let done = (span * fraction.clamp(0.0, 1.0)).floor() as u32;
+        from.saturating_add(done).min(self.chain_height)
+    }
 }
 
 impl KyotoConn {
+    /// The height the header tree is anchored at: where this connection's scan started.
+    pub fn tree_start(&self) -> u32 {
+        self.tree_start
+    }
+
+    /// The latest filter-download progress the node reported, `None` before the first
+    /// report on this connection. Read on the actor's idle poll for the catch-up it
+    /// publishes (`BtcSyncStatus::scan`).
+    pub fn progress(&self) -> Option<KyotoProgress> {
+        *self.progress.borrow()
+    }
+
     /// The birthday block's header time, once the resolution task has it; `None` while it
     /// is still waiting or once it has given up.
     pub fn try_resolved_birthday_time(&mut self) -> Option<u64> {
@@ -1928,6 +1981,28 @@ impl Drop for KyotoConn {
 
 #[cfg(test)]
 mod tests {
+    /// The catch-up height `KyotoProgress` reports: the fraction over the tree, floored,
+    /// never above the chain height, and nothing done for a fraction the tree cannot give
+    /// yet (`0/0`).
+    #[test]
+    fn kyoto_progress_estimates_the_scanned_height_over_the_tree() {
+        use super::KyotoProgress;
+        let at = |fraction: f32| KyotoProgress {
+            fraction,
+            chain_height: 1_100,
+        };
+        assert_eq!(at(0.0).scanned_through(1_000), 1_000);
+        assert_eq!(at(0.5).scanned_through(1_000), 1_050);
+        assert_eq!(at(1.0).scanned_through(1_000), 1_100);
+        assert_eq!(at(1.5).scanned_through(1_000), 1_100, "clamped");
+        assert_eq!(at(f32::NAN).scanned_through(1_000), 1_000, "no length yet");
+        assert_eq!(
+            at(0.5).scanned_through(1_200),
+            1_100,
+            "a start above the reported height (a stale report) never exceeds the tip"
+        );
+    }
+
     use super::*;
 
     fn endpoint(network: BitcoinNetwork, peers: Vec<(IpAddr, Option<u16>)>) -> KyotoEndpoint {

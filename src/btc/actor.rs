@@ -64,7 +64,7 @@ use crate::btc::ancestors::{AncestorAware, Ancestry, Unconfirmed};
 use crate::btc::chain::{BitcoindRpc, BroadcastError, BtcEndpoint};
 use crate::btc::keys::{self, AccountKeys};
 use crate::btc::kyoto::{KyotoConn, KyotoFailure};
-use crate::btc::mempool_feed::{feed_target, FeedDelta, FeedEvent, MempoolFeed};
+use crate::btc::mempool_feed::{feed_target, FeedDelta, FeedEvent, MempoolFeed, SnapshotProgress};
 use crate::btc::store::{Persister, SeedHistory};
 use crate::coin::BitcoinNetwork;
 use crate::error::{codes, RpcError};
@@ -309,6 +309,11 @@ pub struct BtcSyncStatus {
     /// light client once its headers cover the birthday over kyoto. `None` until then.
     /// `getwalletinfo` prefers it for `birthday.time` over the offline record.
     pub birthday_block_time: Option<u64>,
+    /// Where the catch-up to the chain source's tip stands, from the connection that is
+    /// running it: `None` with no connection. Read while `conn_state` is `Syncing`
+    /// (`getwalletinfo.scanning`, and `chain_tip`/`scan_progress` on `/status`); at
+    /// `Ready` the wallet's own height is the tip and this is the finished catch-up.
+    pub scan: Option<ScanProgress>,
     /// The opt-in mempool feed's state (`[mempool]`, kyoto only): `None` when no feed is
     /// configured for this wallet - the default, and always the case over bitcoind, which
     /// has a mempool of its own. Reported by `getwalletinfo` as `mempool_feed`.
@@ -319,6 +324,63 @@ pub struct BtcSyncStatus {
     /// writes none - and a payout service can poll it instead of learning from a `-4`.
     /// Reported by `getwalletinfo` and `/status` as `send_gate`.
     pub send_gate: SendGateStatus,
+}
+
+impl BtcSyncStatus {
+    /// The chain source's tip height as last learned: the wallet's own height once at it,
+    /// the catch-up's target while syncing (kyoto reports it with its first progress
+    /// report, bitcoind at connect), `None` while neither is known.
+    pub fn chain_tip(&self) -> Option<u32> {
+        match self.conn_state {
+            BtcConnState::Ready => Some(self.synced_height),
+            _ => self.scan.as_ref().and_then(|scan| scan.tip),
+        }
+    }
+
+    /// How far the catch-up has come, `0.0..=1.0`: `1.0` at tip, the catch-up's fraction
+    /// while syncing, `0.0` with nothing to measure yet.
+    pub fn scan_progress(&self) -> f64 {
+        match self.conn_state {
+            BtcConnState::Ready => 1.0,
+            _ => self.scan.as_ref().map_or(0.0, ScanProgress::fraction),
+        }
+    }
+}
+
+/// The catch-up one connection runs, from where its scan starts to the source's tip
+/// ([`BtcSyncStatus::scan`]). Over bitcoind the emitter hands blocks over one by one, so
+/// `height` is the wallet's own checkpoint and `tip` the node's height at connect. Over
+/// kyoto the update is one sync-to-tip and the checkpoint does not move before it lands,
+/// so `height` is estimated from the light client's filter-download progress (see
+/// `kyoto::KyotoProgress::scanned_through`) and `tip` is the header chain's height it
+/// reports, `None` before the first report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// The height the catch-up started from: the wallet's checkpoint at connect over
+    /// bitcoind, the header tree's start over kyoto.
+    pub from: u32,
+    /// The height scanned through so far, never below `from`.
+    pub height: u32,
+    /// The chain source's tip height, the target; `None` until the source has said.
+    pub tip: Option<u32>,
+    /// When the catch-up started, unix seconds (what `scanning.duration` counts from).
+    pub started: u64,
+}
+
+impl ScanProgress {
+    /// `(height - from) / (tip - from)`, clamped to `0.0..=1.0`; `0.0` with no tip yet, and
+    /// `1.0` for a tip at or below the start (nothing to scan).
+    pub fn fraction(&self) -> f64 {
+        let Some(tip) = self.tip else {
+            return 0.0;
+        };
+        let span = tip.saturating_sub(self.from);
+        if span == 0 {
+            return 1.0;
+        }
+        let done = self.height.saturating_sub(self.from).min(span);
+        f64::from(done) / f64::from(span)
+    }
 }
 
 /// The send gate as the status reports it ([`BtcSyncStatus::send_gate`]).
@@ -373,6 +435,10 @@ fn send_gate_status_of(
     }
 }
 
+/// How often a syncing kyoto wallet's actor reads the light client's progress for the
+/// status while it waits for the update (`BtcSyncStatus::scan`).
+const SCAN_PROGRESS_POLL: Duration = Duration::from_secs(1);
+
 /// Why a snapshot-taking feed on a peer without `NODE_BLOOM` never establishes a view.
 const NO_BLOOM_PEER: &str = "The mempool feed's peer does not advertise NODE_BLOOM, so it \
     answers a BIP 35 mempool request only if it whitelists this host (-whitelist=mempool@<this \
@@ -414,6 +480,10 @@ pub struct MempoolFeedStatus {
     /// handshake, which is what lets it answer a BIP 35 `mempool` request from a host it
     /// does not whitelist. `None` before the first handshake and for the websocket source.
     pub peer_bloom: Option<bool>,
+    /// For a feed that takes snapshots: the one being collected right now, `None` between
+    /// snapshots (and always for a feed that takes none). Reported by `getwalletinfo` as
+    /// `mempool_feed.snapshot_progress`, so the wait a send sits in shows as progress.
+    pub snapshot_progress: Option<SnapshotProgress>,
 }
 
 enum BtcCommand {
@@ -1176,6 +1246,7 @@ pub fn spawn(
         birthday_anchor.as_ref(),
         None,
         None,
+        None,
         send_gate_status_of(
             Err(RpcError::new(codes::RPC_WALLET_ERROR, NO_UPSTREAM)),
             None,
@@ -1230,6 +1301,7 @@ pub fn spawn(
         birthday_anchor,
         birthday_block_time: None,
         conn: None,
+        catch_up: None,
         at_tip: false,
         backoff: Backoff::new(reconnect_base, reconnect_max),
         reconnect_base,
@@ -1377,6 +1449,9 @@ struct BtcActor {
     /// first connection that can answer, and kept across reconnects.
     birthday_block_time: Option<u64>,
     conn: Option<Conn>,
+    /// The catch-up the current connection runs (see [`BtcSyncStatus::scan`]): set at
+    /// connect, advanced by each pass, dropped with the connection.
+    catch_up: Option<ScanProgress>,
     /// Whether the last sync pass reached the upstream's tip (drives Ready vs Syncing).
     at_tip: bool,
     backoff: Backoff,
@@ -1441,6 +1516,7 @@ fn status_of(
     conn_state: BtcConnState,
     birthday_anchor: Option<&(u32, bdk_wallet::bitcoin::BlockHash)>,
     birthday_block_time: Option<u64>,
+    scan: Option<&ScanProgress>,
     mempool_feed: Option<&MempoolFeedStatus>,
     send_gate: SendGateStatus,
 ) -> BtcSyncStatus {
@@ -1451,6 +1527,7 @@ fn status_of(
         synced_hash: cp.hash().to_string(),
         birthday_anchor: birthday_anchor.map(|(height, hash)| (*height, hash.to_string())),
         birthday_block_time,
+        scan: scan.cloned(),
         mempool_feed: mempool_feed.cloned(),
         send_gate,
     }
@@ -1995,7 +2072,14 @@ impl BtcActor {
             // Idle: wake on a command, shutdown, or the next scheduled pass (the sync
             // interval while connected, the backoff deadline while not).
             let wait = if self.conn.is_some() {
-                self.sync_interval
+                // A kyoto first scan idles here while the light client downloads filters,
+                // and its progress reaches the status only through the idle poll: poll
+                // it at the status cadence until the update lands.
+                if !self.at_tip && matches!(self.conn, Some(Conn::Kyoto(_))) {
+                    self.sync_interval.min(SCAN_PROGRESS_POLL)
+                } else {
+                    self.sync_interval
+                }
             } else if self.endpoint.is_some() {
                 self.next_attempt
                     .saturating_duration_since(Instant::now())
@@ -2299,6 +2383,13 @@ impl BtcActor {
                 Ok(None) => {
                     resolved_anchor = kyoto.try_resolved_anchor();
                     resolved_time = kyoto.try_resolved_birthday_time();
+                    // Where the filter download stands, for the status: the only measure
+                    // of a first scan's advance before its update lands.
+                    if let (Some(progress), Some(scan)) = (kyoto.progress(), self.catch_up.as_mut())
+                    {
+                        scan.tip = Some(progress.chain_height.max(scan.from));
+                        scan.height = progress.scanned_through(scan.from).max(scan.height);
+                    }
                     Ok(0)
                 }
                 // The node parked itself on a rejected header batch: count it, so the
@@ -2362,12 +2453,14 @@ impl BtcActor {
             // backoff, so the next pass redials immediately and `scan_plan` picks the
             // anchor up.
             self.conn = None;
+            self.catch_up = None;
             self.at_tip = false;
             self.status_tx.send_replace(status_of(
                 &self.wallet,
                 BtcConnState::Syncing,
                 self.birthday_anchor.as_ref(),
                 self.birthday_block_time,
+                self.catch_up.as_ref(),
                 self.feed_status.as_ref(),
                 self.send_gate_status(),
             ));
@@ -2414,6 +2507,20 @@ impl BtcActor {
                 if reached_tip {
                     self.at_tip = true;
                 }
+                // The catch-up follows the wallet's own checkpoint (what bitcoind's emitter
+                // advances block by block), and reaching the tip settles both heights.
+                if let Some(scan) = self.catch_up.as_mut() {
+                    let height = self.wallet.latest_checkpoint().height();
+                    if reached_tip {
+                        scan.height = height.max(scan.from);
+                        scan.tip = Some(height.max(scan.from));
+                    } else {
+                        scan.height = scan.height.max(height);
+                        if let Some(tip) = scan.tip.as_mut() {
+                            *tip = (*tip).max(scan.height);
+                        }
+                    }
+                }
                 let state = if self.at_tip {
                     BtcConnState::Ready
                 } else {
@@ -2424,6 +2531,7 @@ impl BtcActor {
                     state,
                     self.birthday_anchor.as_ref(),
                     self.birthday_block_time,
+                    self.catch_up.as_ref(),
                     self.feed_status.as_ref(),
                     self.send_gate_status(),
                 );
@@ -2568,6 +2676,7 @@ impl BtcActor {
             dropped: 0,
             snapshot_applied: snapshots.then_some(false),
             peer_bloom: None,
+            snapshot_progress: None,
         });
         self.feed = Some(MempoolFeed::start(
             target,
@@ -2597,6 +2706,7 @@ impl BtcActor {
                 if let Some(status) = &mut self.feed_status {
                     status.connected = true;
                     status.peer_bloom = peer_bloom;
+                    status.snapshot_progress = None;
                     // A snapshot-taking feed on a peer without NODE_BLOOM is answered only
                     // under a whitelist; say so once, since the failure otherwise shows
                     // only as a reconnect loop and refused sends.
@@ -2615,12 +2725,21 @@ impl BtcActor {
                 self.set_feed_ready(false);
                 if let Some(status) = &mut self.feed_status {
                     status.connected = false;
+                    status.snapshot_progress = None;
                 }
                 self.publish_status();
                 false
             }
             FeedEvent::Delta(delta) => self.apply_feed_delta(delta),
             FeedEvent::Snapshot(snapshot) => self.apply_feed_snapshot(&snapshot),
+            // The snapshot being collected moved: published, so the wait shows as progress.
+            FeedEvent::SnapshotProgress(progress) => {
+                if let Some(status) = &mut self.feed_status {
+                    status.snapshot_progress = Some(progress);
+                }
+                self.publish_status();
+                false
+            }
         }
     }
 
@@ -2656,6 +2775,8 @@ impl BtcActor {
         if let Some(status) = &mut self.feed_status {
             status.last_delta = Some(now);
             status.deltas += 1;
+            // Delivered: the collection it reported on is over.
+            status.snapshot_progress = None;
         }
         let gone: Vec<Txid> = self
             .feed_held
@@ -2878,6 +2999,7 @@ impl BtcActor {
             state,
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
+            self.catch_up.as_ref(),
             self.feed_status.as_ref(),
             self.send_gate_status(),
         ));
@@ -2945,6 +3067,7 @@ impl BtcActor {
             state,
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
+            self.catch_up.as_ref(),
             self.feed_status.as_ref(),
             self.send_gate_status(),
         ));
@@ -3115,6 +3238,28 @@ impl BtcActor {
                             tokio::task::block_in_place(|| rpc.block_time_blocking(birthday)).ok();
                     }
                 }
+                // The catch-up this connection runs, for the status: over bitcoind from
+                // the wallet's checkpoint to the node's height at connect; over kyoto from
+                // the header tree's start, the tip unknown until the first progress report.
+                let started = unix_now();
+                self.catch_up = Some(match &conn {
+                    Conn::Bitcoind { rpc, .. } => {
+                        let from = self.wallet.latest_checkpoint().height();
+                        let tip = u32::try_from(rpc.tip_at_connect).unwrap_or(u32::MAX);
+                        ScanProgress {
+                            from,
+                            height: from,
+                            tip: Some(tip.max(from)),
+                            started,
+                        }
+                    }
+                    Conn::Kyoto(kyoto) => ScanProgress {
+                        from: kyoto.tree_start(),
+                        height: kyoto.tree_start(),
+                        tip: None,
+                        started,
+                    },
+                });
                 self.conn = Some(conn);
                 self.at_tip = false;
                 // A fresh connection rebroadcasts once at its first tip, whatever the hash.
@@ -3134,6 +3279,7 @@ impl BtcActor {
                     BtcConnState::Syncing,
                     self.birthday_anchor.as_ref(),
                     self.birthday_block_time,
+                    self.catch_up.as_ref(),
                     self.feed_status.as_ref(),
                     self.send_gate_status(),
                 ));
@@ -3153,6 +3299,7 @@ impl BtcActor {
                     BtcConnState::Down,
                     self.birthday_anchor.as_ref(),
                     self.birthday_block_time,
+                    self.catch_up.as_ref(),
                     self.feed_status.as_ref(),
                     self.send_gate_status(),
                 ));
@@ -3163,6 +3310,7 @@ impl BtcActor {
 
     fn drop_conn(&mut self) {
         self.conn = None;
+        self.catch_up = None;
         self.at_tip = false;
         self.rebroadcast_tip = None;
         self.node_mempool = None;
@@ -3172,6 +3320,7 @@ impl BtcActor {
             BtcConnState::Down,
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
+            self.catch_up.as_ref(),
             self.feed_status.as_ref(),
             self.send_gate_status(),
         ));
@@ -5078,6 +5227,7 @@ impl BtcActor {
             return;
         }
         self.conn = None;
+        self.catch_up = None;
         self.at_tip = false;
         self.rebroadcast_tip = None;
         self.node_mempool = None;
@@ -5086,6 +5236,7 @@ impl BtcActor {
             BtcConnState::Syncing,
             self.birthday_anchor.as_ref(),
             self.birthday_block_time,
+            self.catch_up.as_ref(),
             self.feed_status.as_ref(),
             self.send_gate_status(),
         ));
@@ -6400,6 +6551,67 @@ mod tests {
         assert!(check_raw_tx_fee(&pricing, 10_000_000, 10_000_000, true).is_ok());
     }
 
+    /// The catch-up's arithmetic (`getwalletinfo.scanning.progress`): the band scanned over
+    /// the band to scan, nothing without a tip, everything for a tip at the start, and the
+    /// status helpers that read it - at `Ready` the wallet's own height is the tip and the
+    /// progress is whole, whatever the catch-up says.
+    #[test]
+    fn scan_progress_measures_the_catch_up_from_its_start_to_the_tip() {
+        let scan = |height: u32, tip: Option<u32>| ScanProgress {
+            from: 1_000,
+            height,
+            tip,
+            started: 1,
+        };
+        assert_eq!(scan(1_000, None).fraction(), 0.0, "no tip, no denominator");
+        assert_eq!(scan(1_000, Some(1_000)).fraction(), 1.0, "nothing to scan");
+        assert_eq!(
+            scan(1_000, Some(900)).fraction(),
+            1.0,
+            "a tip below the start"
+        );
+        assert_eq!(scan(1_000, Some(1_100)).fraction(), 0.0);
+        assert_eq!(scan(1_050, Some(1_100)).fraction(), 0.5);
+        assert_eq!(scan(1_100, Some(1_100)).fraction(), 1.0);
+        assert_eq!(
+            scan(1_200, Some(1_100)).fraction(),
+            1.0,
+            "clamped above the tip"
+        );
+        assert_eq!(
+            scan(900, Some(1_100)).fraction(),
+            0.0,
+            "clamped below the start"
+        );
+
+        let status = |conn_state: BtcConnState, scan: Option<ScanProgress>| BtcSyncStatus {
+            conn_state,
+            synced_height: 1_000,
+            synced_hash: String::new(),
+            birthday_anchor: None,
+            birthday_block_time: None,
+            scan,
+            mempool_feed: None,
+            send_gate: send_gate_status_of(Ok(()), None, None, false),
+        };
+        let syncing = status(BtcConnState::Syncing, Some(scan(1_050, Some(1_100))));
+        assert_eq!(syncing.chain_tip(), Some(1_100));
+        assert_eq!(syncing.scan_progress(), 0.5);
+        let blind = status(BtcConnState::Syncing, Some(scan(1_000, None)));
+        assert_eq!(blind.chain_tip(), None);
+        assert_eq!(blind.scan_progress(), 0.0);
+        let down = status(BtcConnState::Down, None);
+        assert_eq!(down.chain_tip(), None);
+        assert_eq!(down.scan_progress(), 0.0);
+        let ready = status(BtcConnState::Ready, Some(scan(1_050, Some(1_100))));
+        assert_eq!(
+            ready.chain_tip(),
+            Some(1_000),
+            "at tip, the wallet's height is the tip"
+        );
+        assert_eq!(ready.scan_progress(), 1.0);
+    }
+
     /// The kyoto send gate, every case: with a snapshot-taking feed a send waits only
     /// for the feed's view; without one, a database that may be missing an earlier
     /// instance's unconfirmed sends refuses outright, naming both ways out; and the opt-out
@@ -6417,6 +6629,7 @@ mod tests {
             dropped: 0,
             snapshot_applied: snapshots.then_some(false),
             peer_bloom: bloom,
+            snapshot_progress: None,
         };
         let refusal = || {
             Err(RpcError::new(

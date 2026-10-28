@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 
 use crate::amount::{signed_zats_to_value, value_to_sat_per_kvb, value_to_zats, zats_to_value};
 use crate::btc::actor::{
-    BtcBumpOptions, BtcConnState, BtcFeeSplit, BtcReceipt, BtcSendOptions, BtcSent, BtcTxDetail,
-    BtcTxRecord, BtcWalletHandle,
+    BtcBumpOptions, BtcConnState, BtcFeeSplit, BtcReceipt, BtcSendOptions, BtcSent, BtcSyncStatus,
+    BtcTxDetail, BtcTxRecord, BtcWalletHandle, MempoolFeedStatus,
 };
 use crate::coin::BitcoinNetwork;
 use crate::error::RpcError;
@@ -369,12 +369,9 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         // A descriptor wallet, as every Core wallet since 23 (`listdescriptors` serves it).
         "descriptors": true,
         // Core's shape: `false`, or an object while a scan is running. The catch-up against
-        // the upstream is the closest thing this wallet has to a rescan.
-        "scanning": if status.conn_state == BtcConnState::Syncing {
-            json!({ "duration": 0, "progress": 0.0 })
-        } else {
-            json!(false)
-        },
+        // the upstream is the closest thing this wallet has to a rescan; see
+        // `scanning_json` for the object.
+        "scanning": scanning_json(&status, unix_now()),
         // Core master's `lastprocessedblock`: the wallet's own synced checkpoint, which is
         // also what `getblockcount`/`getbestblockhash` answer for this wallet.
         "lastprocessedblock": {
@@ -431,6 +428,7 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
                 });
                 if let Some(applied) = feed.snapshot_applied {
                     obj["snapshot_applied"] = json!(applied);
+                    obj["snapshot_progress"] = snapshot_progress_json(feed, unix_now());
                 }
                 if let Some(bloom) = feed.peer_bloom {
                     obj["peer_bloom"] = json!(bloom);
@@ -475,6 +473,62 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         info["unlocked_until"] = json!(until);
     }
     Ok(info)
+}
+
+/// `getwalletinfo.scanning`: Core's `false` once the wallet is at its source's tip, else
+/// Core's `{duration, progress}` plus rose's two heights, so a client can show "height X
+/// of Y" and a payout service can read how far the catch-up has come. `progress` is the
+/// band scanned over the band to scan (`BtcSyncStatus::scan`: from the connection's scan
+/// start to the source's tip), `height` the height scanned through so far (over kyoto an
+/// estimate from the light client's filter progress, since its one update moves the
+/// wallet's checkpoint only at the end), `tip` the source's tip or null before it has
+/// said, and `duration` the seconds since the catch-up started. With no connection
+/// running one (between redials), the wallet's own height and nothing else.
+fn scanning_json(status: &BtcSyncStatus, now: u64) -> Value {
+    if status.conn_state != BtcConnState::Syncing {
+        return json!(false);
+    }
+    match &status.scan {
+        Some(scan) => json!({
+            "duration": now.saturating_sub(scan.started),
+            "progress": scan.fraction(),
+            "height": scan.height.max(status.synced_height),
+            "tip": scan.tip,
+        }),
+        None => json!({
+            "duration": 0,
+            "progress": 0.0,
+            "height": status.synced_height,
+            "tip": null,
+        }),
+    }
+}
+
+/// `getwalletinfo.mempool_feed.snapshot_progress`, for a feed that takes snapshots: null
+/// between snapshots, else the one being collected - what the node has announced since the
+/// request (`announced`), what is still being fetched (`pending`), when it was requested
+/// (`requested_at`, unix seconds) and how long since (`elapsed`), and the collection
+/// `window` in seconds after which the snapshot is delivered once nothing is pending. A
+/// client shows fetched-over-announced (indeterminate while `announced` is 0: the node has
+/// not answered yet) and the window elapsing.
+fn snapshot_progress_json(feed: &MempoolFeedStatus, now: u64) -> Value {
+    match &feed.snapshot_progress {
+        None => Value::Null,
+        Some(p) => json!({
+            "announced": p.announced,
+            "pending": p.pending,
+            "requested_at": p.requested_at,
+            "elapsed": now.saturating_sub(p.requested_at),
+            "window": p.window_secs,
+        }),
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `walletpassphrase <passphrase> <timeout>` - decrypt the seed into memory for `timeout`
@@ -1311,6 +1365,96 @@ mod tests {
         let served: std::collections::BTreeSet<&str> =
             super::BITCOIN_METHODS.iter().copied().collect();
         assert_eq!(gated, served, "METHOD_COINS vs btc_methods::dispatch drift");
+    }
+
+    /// `getwalletinfo.scanning` and `mempool_feed.snapshot_progress` from the status: Core's
+    /// `false` at tip; while syncing the catch-up's fraction, heights and duration, with the
+    /// wallet's own height and no tip when no connection is running one; and the snapshot
+    /// being collected with its elapsed time, null between snapshots.
+    #[test]
+    fn scanning_and_snapshot_progress_report_the_two_waits() {
+        use crate::btc::actor::{
+            BtcConnState, BtcSyncStatus, MempoolFeedStatus, ScanProgress, SendGateStatus,
+        };
+        use crate::btc::mempool_feed::SnapshotProgress;
+        use serde_json::json;
+        let status = |conn_state, scan| BtcSyncStatus {
+            conn_state,
+            synced_height: 1_000,
+            synced_hash: String::new(),
+            birthday_anchor: None,
+            birthday_block_time: None,
+            scan,
+            mempool_feed: None,
+            send_gate: SendGateStatus {
+                open: true,
+                reason: None,
+                history: "fresh",
+                allow_sends_without_mempool_view: false,
+            },
+        };
+        let scan = ScanProgress {
+            from: 1_000,
+            height: 1_050,
+            tip: Some(1_200),
+            started: 5_000,
+        };
+        assert_eq!(
+            super::scanning_json(&status(BtcConnState::Ready, Some(scan.clone())), 5_030),
+            json!(false)
+        );
+        assert_eq!(
+            super::scanning_json(&status(BtcConnState::Down, None), 5_030),
+            json!(false)
+        );
+        assert_eq!(
+            super::scanning_json(&status(BtcConnState::Syncing, Some(scan.clone())), 5_030),
+            json!({ "duration": 30, "progress": 0.25, "height": 1_050, "tip": 1_200 })
+        );
+        assert_eq!(
+            super::scanning_json(&status(BtcConnState::Syncing, None), 5_030),
+            json!({ "duration": 0, "progress": 0.0, "height": 1_000, "tip": null })
+        );
+        // A kyoto estimate behind the wallet's own checkpoint never reads below it.
+        let behind = ScanProgress {
+            height: 900,
+            tip: None,
+            ..scan
+        };
+        let v = super::scanning_json(&status(BtcConnState::Syncing, Some(behind)), 5_000);
+        assert_eq!(v["height"], json!(1_000));
+        assert_eq!(v["tip"], json!(null));
+        assert_eq!(v["progress"], json!(0.0));
+
+        let mut feed = MempoolFeedStatus {
+            source: "p2p",
+            endpoint: "p2p://127.0.0.1:1".into(),
+            connected: true,
+            last_delta: None,
+            deltas: 0,
+            matched: 0,
+            dropped: 0,
+            snapshot_applied: Some(false),
+            peer_bloom: Some(true),
+            snapshot_progress: None,
+        };
+        assert_eq!(super::snapshot_progress_json(&feed, 5_000), json!(null));
+        feed.snapshot_progress = Some(SnapshotProgress {
+            announced: 120,
+            pending: 20,
+            requested_at: 4_990,
+            window_secs: 30,
+        });
+        assert_eq!(
+            super::snapshot_progress_json(&feed, 5_000),
+            json!({
+                "announced": 120,
+                "pending": 20,
+                "requested_at": 4_990,
+                "elapsed": 10,
+                "window": 30,
+            })
+        );
     }
 
     /// `sendrawtransaction`'s `maxfeerate` parses as Core's `ParseFeeRate`: BTC/kvB to

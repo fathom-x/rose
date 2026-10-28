@@ -560,6 +560,11 @@ pub enum FeedEvent {
     /// node's mempool - the only eviction signal that source has, since Core never announces
     /// one. The websocket source never sends this (its `removed` deltas are explicit).
     Snapshot(FeedSnapshot),
+    /// Where a snapshot being collected stands, at most once a second while one is: what
+    /// the node has announced since the request and what is still being fetched, so the
+    /// wait a send sits in (see `BtcActor::send_gate`) shows as progress rather than
+    /// silence. The P2P source only; a [`Self::Snapshot`] ends the series.
+    SnapshotProgress(SnapshotProgress),
     /// The socket is gone; the task is already backing off toward a redial.
     Disconnected(String),
 }
@@ -577,6 +582,24 @@ pub struct FeedSnapshot {
     /// When it was requested. A full snapshot matched against the wallet only counts as a
     /// complete view of the mempool if the wallet was itself complete (at tip) by then.
     pub requested_at: std::time::Instant,
+}
+
+/// A BIP 35 snapshot in progress ([`FeedEvent::SnapshotProgress`]): the counts the P2P
+/// session keeps while it collects one, as `getwalletinfo.mempool_feed.snapshot_progress`
+/// reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotProgress {
+    /// Transactions the node has announced since the request (every txid it listed, fetched
+    /// or already known on the connection).
+    pub announced: u64,
+    /// Of those, requested and neither delivered nor reported gone yet.
+    pub pending: u64,
+    /// When the snapshot was requested, unix seconds.
+    pub requested_at: u64,
+    /// How long after the request the announcements still count as the snapshot's
+    /// (`p2p_feed::SNAPSHOT_WINDOW`), in seconds: the snapshot is delivered once the window
+    /// has passed and nothing is pending, so a client can show the window elapsing.
+    pub window_secs: u64,
 }
 
 /// A running feed: the channel the socket task feeds, and the task itself, which dies with
@@ -1341,6 +1364,8 @@ mod tests {
             match next(&mut feed).await {
                 FeedEvent::Delta(d) => deltas.push(d),
                 FeedEvent::Snapshot(s) => snapshot = Some(s),
+                // The collection's progress rides alongside; `p2p_feed`'s own test pins it.
+                FeedEvent::SnapshotProgress(_) => {}
                 other => panic!("unexpected {other:?}"),
             }
         }
@@ -1394,7 +1419,9 @@ mod tests {
                 .unwrap_or_else(|_| panic!("no delta from {url} within the deadline"))
                 .unwrap();
             match event {
-                FeedEvent::Connected { .. } | FeedEvent::Snapshot(_) => {}
+                FeedEvent::Connected { .. }
+                | FeedEvent::Snapshot(_)
+                | FeedEvent::SnapshotProgress(_) => {}
                 FeedEvent::Disconnected(why) => panic!("{url}: {why}"),
                 FeedEvent::Delta(delta) => {
                     // A quiet moment yields an empty delta; wait for one with content so the

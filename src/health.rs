@@ -297,10 +297,16 @@ fn snapshot(state: &AppState) -> Snapshot {
                         "conn_state": st.conn_state.as_str(),
                         // The wallet's own applied height and hash - what its `getblockcount`
                         // answers. At `ready` this is the tip the chain source reported; while
-                        // `syncing` the source's tip is ahead by an amount the engine does not
-                        // measure (see `bitcoin_wallet_ready`), so there is no `scan_lag`.
+                        // `syncing`, `chain_tip` is the source's tip as last learned (null
+                        // before it has said) and `scan_progress` how far the catch-up to it
+                        // has come, the same measure as `getwalletinfo.scanning.progress`.
+                        // No `scan_lag`: over kyoto the wallet's height does not move until
+                        // the one sync-to-tip update lands, so the gap would read as the
+                        // whole band while the progress climbs (see `bitcoin_wallet_ready`).
                         "synced_height": st.synced_height,
                         "synced_hash": st.synced_hash,
+                        "chain_tip": st.chain_tip(),
+                        "scan_progress": st.scan_progress(),
                         "birthday": h.birthday,
                         "scanning": st.conn_state == BtcConnState::Syncing,
                         "encrypted": h.encrypted,
@@ -537,6 +543,7 @@ mod bitcoin_tests {
             synced_hash: String::new(),
             birthday_anchor: None,
             birthday_block_time: None,
+            scan: None,
             mempool_feed: None,
             send_gate: crate::btc::actor::SendGateStatus {
                 open: true,

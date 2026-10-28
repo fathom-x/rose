@@ -60,7 +60,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, trace};
 
-use super::mempool_feed::{FeedDelta, FeedEvent, FeedSnapshot, FeedTx};
+use super::mempool_feed::{FeedDelta, FeedEvent, FeedSnapshot, FeedTx, SnapshotProgress};
 use crate::coin::BitcoinNetwork;
 
 /// What the node sees us as. Bitcoin Core logs it; nothing else reads it.
@@ -237,6 +237,8 @@ fn announced_txids(inventory: &[Inventory]) -> Vec<Txid> {
 /// A snapshot being collected.
 struct Collecting {
     requested_at: Instant,
+    /// `requested_at` as unix seconds, for the progress reports.
+    requested_unix: u64,
     /// Every txid announced since the request.
     collected: HashSet<Txid>,
     /// Requested with `getdata` since, and neither delivered nor reported gone yet.
@@ -253,6 +255,9 @@ struct Session {
     known: HashSet<Txid>,
     /// While a snapshot is being collected.
     snapshot: Option<Collecting>,
+    /// Whether the snapshot's counts changed since the last progress report (see
+    /// [`Self::take_progress`]).
+    progress_due: bool,
     last_ping: Option<u64>,
 }
 
@@ -276,6 +281,7 @@ impl Session {
         if let Some(snapshot) = &mut self.snapshot {
             snapshot.collected.extend(txids.iter().copied());
             snapshot.pending.extend(wanted.iter().copied());
+            self.progress_due = true;
         }
         let wanted: Vec<Inventory> = wanted
             .into_iter()
@@ -308,10 +314,12 @@ impl Session {
         write_message(writer, self.magic, NetworkMessage::MemPool).await?;
         self.snapshot = Some(Collecting {
             requested_at: Instant::now(),
+            requested_unix: unix_now(),
             collected: HashSet::new(),
             pending: HashSet::new(),
             full,
         });
+        self.progress_due = true;
         debug!(full, "p2p feed: requested the node's mempool");
         Ok(())
     }
@@ -319,8 +327,27 @@ impl Session {
     /// A requested transaction arrived, or the node reported it gone.
     fn settled(&mut self, txid: &Txid) {
         if let Some(snapshot) = &mut self.snapshot {
-            snapshot.pending.remove(txid);
+            if snapshot.pending.remove(txid) {
+                self.progress_due = true;
+            }
         }
+    }
+
+    /// The in-progress snapshot's counts, when they changed since the last call - read on
+    /// the settle tick, so a mainnet snapshot's hundred thousand deliveries report once a
+    /// second rather than once each. `None` with no snapshot in progress or nothing new.
+    fn take_progress(&mut self) -> Option<SnapshotProgress> {
+        let snapshot = self.snapshot.as_ref()?;
+        if !self.progress_due {
+            return None;
+        }
+        self.progress_due = false;
+        Some(SnapshotProgress {
+            announced: snapshot.collected.len() as u64,
+            pending: snapshot.pending.len() as u64,
+            requested_at: snapshot.requested_unix,
+            window_secs: SNAPSHOT_WINDOW.as_secs(),
+        })
     }
 
     /// The finished snapshot, once its collection window has passed and every transaction
@@ -336,6 +363,7 @@ impl Session {
             return None;
         }
         let snapshot = self.snapshot.take()?;
+        self.progress_due = false;
         if !snapshot.pending.is_empty() {
             debug!(
                 outstanding = snapshot.pending.len(),
@@ -446,6 +474,7 @@ pub async fn run_peer(
         magic,
         known: HashSet::new(),
         snapshot: None,
+        progress_due: false,
         last_ping: None,
     };
     if snapshot.is_some() {
@@ -458,7 +487,7 @@ pub async fn run_peer(
     let mut resnapshot = tokio::time::interval(snapshot.unwrap_or(Duration::from_secs(3600)));
     resnapshot.tick().await;
     // The snapshot window closes on a timer of its own so a quiet link (no message to
-    // prompt the check) still delivers it.
+    // prompt the check) still delivers it; the same tick paces the progress reports.
     let mut settle = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
@@ -545,6 +574,10 @@ pub async fn run_peer(
                         "p2p feed: mempool snapshot collected"
                     );
                     if events.send(FeedEvent::Snapshot(held)).await.is_err() {
+                        return Ok(());
+                    }
+                } else if let Some(progress) = session.take_progress() {
+                    if events.send(FeedEvent::SnapshotProgress(progress)).await.is_err() {
                         return Ok(());
                     }
                 }
@@ -827,6 +860,68 @@ pub(crate) mod tests {
             read_message(&mut b, Magic::REGTEST).await.unwrap(),
             NetworkMessage::Unknown { .. }
         ));
+    }
+
+    /// The snapshot's progress reports: one at the request (nothing announced yet), one
+    /// per change the settle tick finds, none while nothing moved, and none once the
+    /// snapshot is delivered. The counts are what the actor publishes as
+    /// `mempool_feed.snapshot_progress`.
+    #[tokio::test]
+    async fn snapshot_progress_reports_each_change_once() {
+        let (mut writer, _reader) = tokio::io::duplex(1 << 16);
+        let mut session = Session {
+            magic: magic(BitcoinNetwork::Regtest),
+            known: HashSet::new(),
+            snapshot: None,
+            progress_due: false,
+            last_ping: None,
+        };
+        assert!(
+            session.take_progress().is_none(),
+            "no snapshot, no progress"
+        );
+        session.request_snapshot(&mut writer, true).await.unwrap();
+        let first = session
+            .take_progress()
+            .expect("the request itself is a report");
+        assert_eq!((first.announced, first.pending), (0, 0));
+        assert_eq!(first.window_secs, SNAPSHOT_WINDOW.as_secs());
+        assert!(first.requested_at > 0);
+        assert!(session.take_progress().is_none(), "nothing changed since");
+        let a = Txid::from_byte_array([1; 32]);
+        let b = Txid::from_byte_array([2; 32]);
+        session
+            .on_inv(
+                &mut writer,
+                &[Inventory::Transaction(a), Inventory::Transaction(b)],
+            )
+            .await
+            .unwrap();
+        let announced = session.take_progress().unwrap();
+        assert_eq!((announced.announced, announced.pending), (2, 2));
+        assert_eq!(announced.requested_at, first.requested_at);
+        session.settled(&a);
+        let one_in = session.take_progress().unwrap();
+        assert_eq!((one_in.announced, one_in.pending), (2, 1));
+        // A settle of a txid that was never pending is no change.
+        session.settled(&Txid::from_byte_array([9; 32]));
+        assert!(session.take_progress().is_none());
+        // A re-announcement of a known txid counts as announced, not pending.
+        session
+            .on_inv(&mut writer, &[Inventory::Transaction(a)])
+            .await
+            .unwrap();
+        let again = session.take_progress().unwrap();
+        assert_eq!((again.announced, again.pending), (2, 1));
+        session.settled(&b);
+        assert_eq!(session.take_progress().unwrap().pending, 0);
+        // Delivered: the series ends.
+        tokio::time::sleep(SNAPSHOT_WINDOW).await;
+        let delivered = session
+            .take_snapshot()
+            .expect("window passed, nothing pending");
+        assert_eq!(delivered.held.len(), 2);
+        assert!(session.take_progress().is_none());
     }
 
     #[test]

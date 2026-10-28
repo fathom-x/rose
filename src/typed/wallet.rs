@@ -90,6 +90,16 @@ pub enum Scanning {
         /// rather than falling through to `Idle`.
         #[serde(default)]
         pending_enhancements: u64,
+        /// rose extension (Bitcoin wallets): the height scanned through so far - over kyoto
+        /// an estimate from the light client's filter progress, since its one update moves
+        /// the wallet's checkpoint only at the end. Absent on Zcash wallets and from a rose
+        /// predating the field.
+        #[serde(default)]
+        height: Option<u32>,
+        /// rose extension (Bitcoin wallets): the chain source's tip height, the catch-up's
+        /// target; `None` until the source has said (and on Zcash wallets).
+        #[serde(default)]
+        tip: Option<u32>,
     },
     /// The idle form (always `false`).
     Idle(bool),
@@ -203,6 +213,9 @@ pub struct WalletInfo {
     /// Present on Bitcoin wallets only: whether a send would be refused before coin
     /// selection, and why (the connection check and the mempool-view send gate).
     pub send_gate: Option<SendGateInfo>,
+    /// Present on Bitcoin wallets only: the opt-in `[mempool]` feed's state (`disabled`
+    /// when none is configured).
+    pub mempool_feed: Option<MempoolFeedInfo>,
 }
 
 /// `getwalletinfo.send_gate` (Bitcoin wallets; also each wallet's `send_gate` on `/status`).
@@ -217,6 +230,54 @@ pub struct SendGateInfo {
     pub history: String,
     /// Whether `[wallets.<name>] allow_sends_without_mempool_view` is set.
     pub allow_sends_without_mempool_view: bool,
+}
+
+/// `getwalletinfo.mempool_feed` (Bitcoin wallets; `rpc/btc_methods.rs::getwalletinfo`).
+/// `state` is `disabled`, `connecting` or `connected`; everything else is present only when
+/// a feed is configured, and the two snapshot fields only when it takes snapshots.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MempoolFeedInfo {
+    pub state: String,
+    /// The `[mempool] sources` name the feed runs on.
+    pub source: Option<String>,
+    pub endpoint: Option<String>,
+    /// When the last delta arrived (unix seconds).
+    pub last_delta: Option<u64>,
+    #[serde(default)]
+    pub deltas: u64,
+    #[serde(default)]
+    pub matched: u64,
+    #[serde(default)]
+    pub dropped: u64,
+    /// Whether the mempool view is established since the feed last connected; sends wait
+    /// for it. Present for a snapshot-taking feed only.
+    pub snapshot_applied: Option<bool>,
+    /// The snapshot being collected right now; `None` between snapshots, and absent for a
+    /// feed that takes none.
+    pub snapshot_progress: Option<SnapshotProgressInfo>,
+    /// Whether the P2P peer advertised `NODE_BLOOM`, which lets it answer the snapshot
+    /// request unwhitelisted.
+    pub peer_bloom: Option<bool>,
+}
+
+/// `getwalletinfo.mempool_feed.snapshot_progress`: a BIP 35 snapshot in progress. A client
+/// shows `announced - pending` over `announced` (indeterminate while `announced` is 0: the
+/// node has not answered yet) and `elapsed` over `window`.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SnapshotProgressInfo {
+    /// Transactions the node has announced since the request.
+    pub announced: u64,
+    /// Of those, requested and not yet delivered or reported gone.
+    pub pending: u64,
+    /// When the snapshot was requested, unix seconds.
+    pub requested_at: u64,
+    /// Seconds since the request.
+    pub elapsed: u64,
+    /// The collection window in seconds, after which the snapshot is delivered once nothing
+    /// is pending.
+    pub window: u64,
 }
 
 /// `getaddressinfo` (`rpc/wallet_methods.rs::addressinfo_json`).
@@ -1150,6 +1211,21 @@ mod tests {
         let w: WalletInfo = serde_json::from_value(scanning).unwrap();
         assert!(w.scanning.is_scanning());
         assert_eq!(w.scanning.pending_enhancements(), 42);
+        assert!(
+            matches!(
+                w.scanning,
+                Scanning::Active {
+                    height: None,
+                    tip: None,
+                    ..
+                }
+            ),
+            "a Zcash scan carries no Bitcoin heights"
+        );
+        assert!(
+            w.mempool_feed.is_none(),
+            "a Zcash wallet carries no mempool feed"
+        );
         assert_eq!(w.enhanced_through, Some(118));
         let t = w.transparent.unwrap();
         assert!(t.restorable.unwrap());
@@ -1198,7 +1274,7 @@ mod tests {
             "paytxfee": 0.00000000,
             "private_keys_enabled": true,
             "avoid_reuse": false,
-            "scanning": false,
+            "scanning": { "duration": 30, "progress": 0.25, "height": 1050, "tip": 1200 },
             "descriptors": true,
             "recovery": {
                 "initial_scan": 30,
@@ -1213,9 +1289,55 @@ mod tests {
                 "history": "unverified",
                 "allow_sends_without_mempool_view": false,
             },
+            "mempool_feed": {
+                "state": "connected",
+                "source": "p2p",
+                "endpoint": "p2p://127.0.0.1:48444",
+                "last_delta": 1_793_000_000,
+                "deltas": 12,
+                "matched": 1,
+                "dropped": 0,
+                "snapshot_applied": false,
+                "snapshot_progress": {
+                    "announced": 120,
+                    "pending": 20,
+                    "requested_at": 1_793_000_000,
+                    "elapsed": 10,
+                    "window": 30,
+                },
+                "peer_bloom": true,
+            },
             "coin": "bitcoin",
         });
         let w: WalletInfo = serde_json::from_value(bitcoin).unwrap();
+        // The Bitcoin catch-up's two heights ride the `Active` variant.
+        match &w.scanning {
+            Scanning::Active {
+                progress,
+                height,
+                tip,
+                pending_enhancements,
+                ..
+            } => {
+                assert_eq!(*progress, 0.25);
+                assert_eq!((*height, *tip), (Some(1050), Some(1200)));
+                assert_eq!(*pending_enhancements, 0, "a Bitcoin wallet has no backlog");
+            }
+            Scanning::Idle(_) => panic!("a syncing wallet decodes as Active"),
+        }
+        let feed = w
+            .mempool_feed
+            .as_ref()
+            .expect("a Bitcoin wallet reports its feed");
+        assert_eq!(feed.state, "connected");
+        assert_eq!(feed.snapshot_applied, Some(false));
+        let snapshot = feed
+            .snapshot_progress
+            .as_ref()
+            .expect("a snapshot in progress");
+        assert_eq!((snapshot.announced, snapshot.pending), (120, 20));
+        assert_eq!((snapshot.elapsed, snapshot.window), (10, 30));
+        assert_eq!(feed.peer_bloom, Some(true));
         let r = w.recovery.unwrap();
         assert_eq!((r.initial_scan, r.lookahead, r.horizon), (30, 25, 54));
         assert_eq!(r.issued_through, Some(55));
@@ -1263,10 +1385,14 @@ mod tests {
             },
             "coin": "bitcoin",
             "unlocked_until": 1_793_000_000,
+            "mempool_feed": { "state": "disabled" },
         });
         let w: WalletInfo = serde_json::from_value(encrypted).unwrap();
         assert_eq!(w.unlocked_until, Some(1_793_000_000));
         assert!(w.private_keys_enabled);
+        let feed = w.mempool_feed.unwrap();
+        assert_eq!(feed.state, "disabled");
+        assert!(feed.snapshot_applied.is_none() && feed.snapshot_progress.is_none());
     }
 
     /// `listwalletdir`'s `warnings` names fleet manifests the daemon could not read, so those

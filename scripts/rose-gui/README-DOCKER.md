@@ -46,6 +46,10 @@ The page also shows a banner whenever rose's `getwalletinfo.send_gate` (rose 0.1
 send would be refused before coin selection - no connection to the chain source, or the
 mempool-view wait a restored kyoto wallet sits in until its snapshot lands - with the daemon's
 own reason, so the operator sees it before trying a send rather than as the send's error.
+Under it (rose 0.11+), the wait's progress as three steps: the block scan from the birthday
+anchor to the tip (`getwalletinfo.scanning`: height X of Y), the mempool snapshot's fetch
+(`mempool_feed.snapshot_progress`: fetched over announced, sweeping until the node's first
+announcement), and the collection window the snapshot waits out before it is delivered.
 
 In enclave mode the page also shows the enclave's own state in its Status card and on the
 login card - running (with the commit it attests), up but waiting for shards, or not running -

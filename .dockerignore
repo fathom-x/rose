@@ -8,6 +8,9 @@
 !rust-toolchain.toml
 !src
 !rose-cli
+# A workspace member must be in the context or cargo refuses to load the workspace; the
+# image builds only the two daemon-side binaries from it.
+!rose-petal
 # `example-config` embeds this with include_str!, so the build needs it in the context.
 !rose.example.toml
 # License texts shipped in the runtime image (rose is statically linked, so the

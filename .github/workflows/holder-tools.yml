@@ -1,27 +1,28 @@
-# The shard holder's two tools (contrib/holder-tools: Locksmith's shard client for a
-# self-hosted enclave, bootproof's attestation verifier), built from Locksmith's pinned
-# source for the platforms a holder releases a shard from and published as a release named
-# after this commit (holder-tools-<sha7>). The release is not what a holder trusts: a
-# deployment repository pins its hashes under its own signature, and its holders require the
-# commit it was built from to be signed by a key in contrib/verify-commits/ (so only a
-# release built from a signed commit can be pinned: after merging a change, dispatch this on
-# a signed commit). Runs on every push, to any branch, that changes the tools or this file,
-# so a change is built before its pull request is reviewed, and on dispatch.
+# The shard holder's two tools (the `rose-petal` crate: `rose-petal`, the shard client, and
+# `attestation-check`, the attestation checker), built for the platforms a holder releases a
+# shard from and published as a release named after this commit (holder-tools-<sha7>). The
+# release is not what a holder trusts: a deployment repository pins its hashes under its own
+# signature, and its holders require the commit it was built from to be signed by a key in
+# contrib/verify-commits/ (so only a release built from a signed commit can be pinned: after
+# merging a change, dispatch this on a signed commit). Runs on every push, to any branch, that
+# changes the crate, the lockfile, the build script or this file, so a change is built before
+# its pull request is reviewed, and on dispatch.
 #
-#   linux-amd64   contrib/holder-tools/build.sh in Locksmith's StageX image: static musl,
-#                 reproducible (a deployment's pin rebuilds it and requires the same bytes).
-#   darwin-arm64  a macOS runner with plain cargo; sequoia's nettle and gmp are built from
-#                 pinned source tarballs and linked statically (Homebrew's nettle is 4.0,
-#                 which dropped the pgp.h header the locked nettle-sys wraps, and a holder's
-#                 Mac has no Homebrew to supply dylibs), the card backend takes the system
-#                 PCSC framework. Not reproducible: its hash rests on the signatures alone.
-#                 Allowed to fail: a release without it still serves Linux holders, and the
-#                 deployment's manifest says which platforms a release has.
+#   linux-amd64   contrib/holder-tools/build.sh: a clean export of the tree in the pinned
+#                 rust:alpine image Dockerfile.arm64 uses, static musl, reproducible (a
+#                 deployment's pin rebuilds it and requires the same bytes).
+#   darwin-arm64  a macOS runner with plain cargo on the pinned 1.97.1 toolchain and the
+#                 same determinism flags; no C library beyond the system's (the crate's
+#                 only C is ring's). Expected to reproduce on another Mac with the same
+#                 toolchain; a deployment's manifest says which platforms a release has, and
+#                 a release without this asset still serves Linux holders.
 name: holder-tools
 
 on:
   push:
     paths:
+      - rose-petal/**
+      - Cargo.lock
       - contrib/holder-tools/**
       - .github/workflows/holder-tools.yml
   workflow_dispatch:
@@ -36,11 +37,11 @@ permissions:
 jobs:
   linux-amd64:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build in Locksmith's image and take the two binaries out
+      - name: Build both binaries reproducibly and take them out
         run: |
           contrib/holder-tools/build.sh --out out
           sha256sum out/*
@@ -53,62 +54,28 @@ jobs:
 
   darwin-arm64:
     runs-on: macos-14
-    timeout-minutes: 90
+    timeout-minutes: 45
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Locksmith at the pinned commit, the two tools as bins of its crate
-        run: |
-          # Two seds, not one with alternation: macOS sed is BSD sed.
-          LOCKSMITH_REPO=$(sed -n 's/^LOCKSMITH_REPO=\([^ ]*\).*/\1/p' contrib/holder-tools/build.sh)
-          LOCKSMITH_COMMIT=$(sed -n 's/^LOCKSMITH_COMMIT=\([0-9a-f]*\).*/\1/p' contrib/holder-tools/build.sh)
-          echo "$LOCKSMITH_REPO @ $LOCKSMITH_COMMIT"
-          git clone -q "$LOCKSMITH_REPO" locksmith
-          git -C locksmith checkout -q "$LOCKSMITH_COMMIT"
-          cp contrib/holder-tools/locksmith-send-shard.rs locksmith/crates/locksmith/src/bin/locksmith-send-shard.rs
-          cp contrib/holder-tools/attestation-check/src/main.rs locksmith/crates/locksmith/src/bin/attestation-check.rs
-
-      - name: pkg-config (nettle-sys asks it where nettle is)
-        run: brew install pkg-config
-
-      # Static gmp and nettle 3.10.2 into ./deps: the hashes are the ones Homebrew's own
-      # formulae record for these tarballs.
-      - name: gmp 6.3.0 and nettle 3.10.2 from source, static
-        run: |
-          prefix=$PWD/deps; mkdir -p dl deps; cd dl
-          curl -sSLO https://ftp.gnu.org/gnu/nettle/nettle-3.10.2.tar.gz
-          curl -sSLO https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz   # gmplib.org refuses connections from the runners
-          printf '%s\n' \
-            "fe9ff51cb1f2abb5e65a6b8c10a92da0ab5ab6eaf26e7fc2b675c45f1fb519b5  nettle-3.10.2.tar.gz" \
-            "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898  gmp-6.3.0.tar.xz" | shasum -a 256 -c -
-          jobs=$(sysctl -n hw.ncpu)
-          tar xf gmp-6.3.0.tar.xz
-          (cd gmp-6.3.0 && ./configure -q --prefix="$prefix" --disable-shared --enable-static && make -s -j"$jobs" && make -s install)
-          tar xf nettle-3.10.2.tar.gz
-          (cd nettle-3.10.2 && ./configure -q --prefix="$prefix" --disable-shared --disable-documentation CPPFLAGS="-I$prefix/include" LDFLAGS="-L$prefix/lib" && make -s -j"$jobs" && make -s install)
-          ls "$prefix/lib" && test -f "$prefix/include/nettle/pgp.h"
-
-      - name: Build
-        working-directory: locksmith
+      - name: Build with the pinned toolchain
         env:
-          CARGO_PROFILE_RELEASE_STRIP: "true"
+          RUSTUP_TOOLCHAIN: "1.97.1"
+          SOURCE_DATE_EPOCH: "1"
+          CARGO_INCREMENTAL: "0"
+          # The checkout and the cargo home are the two paths a binary could embed.
+          RUSTFLAGS: "-C codegen-units=1 --remap-path-prefix=${{ github.workspace }}=/usr/src/rose --remap-path-prefix=${{ env.HOME }}/.cargo=/usr/local/cargo"
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.97.1 --profile minimal
           cargo --version
-          # nettle-sys finds nettle through pkg-config and generates its bindings with
-          # clang, which needs the include path spelled out.
-          export PKG_CONFIG_PATH="$PWD/../deps/lib/pkgconfig"
-          export BINDGEN_EXTRA_CLANG_ARGS="-I$PWD/../deps/include"
-          export NETTLE_STATIC=1
-          cargo build --release --locked -p locksmith --bin locksmith-send-shard --bin attestation-check
-          mkdir -p ../out
-          cp target/release/locksmith-send-shard ../out/locksmith-send-shard-darwin-arm64
-          cp target/release/attestation-check ../out/attestation-check-darwin-arm64
-          shasum -a 256 ../out/*
+          cargo build --release --locked -p rose-petal --bins
+          mkdir -p out
+          cp target/release/rose-petal out/rose-petal-darwin-arm64
+          cp target/release/attestation-check out/attestation-check-darwin-arm64
+          shasum -a 256 out/*
           # A holder's Mac has none of the build machine's libraries: only system ones may be linked.
-          for b in ../out/*; do
+          for b in out/*; do
             otool -L "$b"
             if otool -L "$b" | tail -n +2 | grep -v '/usr/lib/\|/System/Library/'; then echo "::error::$b links a library outside the system"; exit 1; fi
           done
@@ -136,7 +103,7 @@ jobs:
           tag=holder-tools-${GITHUB_SHA::7}
           (cd out && sha256sum * | tee SHA256SUMS)
           platforms=$(ls out | sed -n 's/^attestation-check-//p' | tr '\n' ' ')
-          notes="The shard holder's tools (contrib/holder-tools) built from $GITHUB_SHA by the holder-tools workflow: platforms $platforms. Not what a holder trusts by itself: a deployment repository pins these hashes under its own signature (rose-deploy: scripts/holder-tools.sh pin $tag), and its holders require $GITHUB_SHA to be signed by a key in contrib/verify-commits/."
+          notes="The shard holder's tools (the rose-petal crate: rose-petal and attestation-check) built from $GITHUB_SHA by the holder-tools workflow: platforms $platforms. Not what a holder trusts by itself: a deployment repository pins these hashes under its own signature (rose-deploy: scripts/holder-tools.sh pin $tag), and its holders require $GITHUB_SHA to be signed by a key in contrib/verify-commits/."
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber out/*
           else

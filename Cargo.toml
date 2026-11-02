@@ -26,10 +26,12 @@ include = [
 
 # Two crates over one library: this one is the library plus the `rosed` daemon, and
 # `rose-cli/` is the operator's `rose` binary (the admin subcommands and a bitcoin-cli-style
-# RPC client). The regtest harness is deliberately *not* a member: it keeps its own
-# lockfile, isolated from this crate's pinned wallet stack.
+# RPC client). `rose-petal/` is the shard holder's client for an enclave deployment: it shares
+# no code with the daemon (its own small dependency set, no wallet stack) and rides in the
+# workspace for one lockfile, one CI and one release line. The regtest harness is deliberately
+# *not* a member: it keeps its own lockfile, isolated from this crate's pinned wallet stack.
 [workspace]
-members = ["rose-cli"]
+members = ["rose-cli", "rose-petal"]
 exclude = ["regtest-harness"]
 
 [[bin]]

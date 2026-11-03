@@ -3533,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "rose-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3550,7 +3550,7 @@ dependencies = [
 
 [[package]]
 name = "rose-petal"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -3578,7 +3578,7 @@ dependencies = [
 
 [[package]]
 name = "rosed"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "age",
  "anyhow",

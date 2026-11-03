@@ -12,14 +12,19 @@ peers on the Bitcoin network.
 
 - Stateless: every wallet is recoverable from its seed phrase (BIP 39, BIP 84 native SegWit).
 - Kyoto compact block filter light client built in; your own Bitcoin Core node is optional.
-- Watch-only wallets from an account xpub.
+- Watch-only wallets from an account xpub; passphrase-encrypted spending wallets
+  (`rose init --encrypt`, `walletpassphrase`/`walletlock`).
 - Designed to run inside trusted execution environments (TEEs), supporting AWS Nitro Enclaves
-  today.
+  today: the `Dockerfile`'s `enclave` stage bakes a deployment's config and sealed secrets onto
+  the runtime image, `rosed --restore-if-empty` restores the wallet into the enclave's empty
+  storage per boot, and a send gate visible over RPC (`getwalletinfo.send_gate`) says when a
+  restored wallet may not spend yet, and why.
 - Mainnet, testnet4, testnet3 and regtest.
 
-## Two binaries
+## Three crates
 
-Rose ships as two crates over one library, released together:
+Rose ships as three crates, released together: two binaries over one library, and the shard
+holder's client for an enclave deployment.
 
 - **`rosed`** ([crates.io](https://crates.io/crates/rosed)) is the daemon, bitcoind's analog:
   no subcommands, `rosed --datadir ./data` serves JSON-RPC. The same crate is the library
@@ -30,6 +35,12 @@ Rose ships as two crates over one library, released together:
   `rose licenses`, `rose chain-info`) plus a `bitcoin-cli`-style JSON-RPC client - any other
   first word is a method sent to the running daemon (`rose getbalance`,
   `rose --rpcwallet btc listunspent 1`).
+- **`rose-petal`** ([crates.io](https://crates.io/crates/rose-petal)) is the shard holder's
+  client for an enclave deployment: Locksmith's recovery protocol in pure Rust. `rose-petal
+  send` verifies the enclave's Nitro attestation against the deployment's recorded PCRs before
+  releasing the holder's share of the wallet seed, and its second binary, `attestation-check`,
+  verifies a saved attestation document on its own. Prebuilt binaries ship as
+  `holder-tools-<sha7>` releases, built reproducibly from the signed commit they name.
 
 ```sh
 cargo install rosed rose-cli
@@ -38,9 +49,10 @@ rosed --datadir ./data --testnet           # serves JSON-RPC; writes <datadir>/.
 rose --datadir ./data --testnet getblockchaininfo
 ```
 
-The default build serves Bitcoin wallets; `--features zcash` adds the Zcash engine. The Docker
-images (`ghcr.io/fathom-x/rose`), the release tarballs and the `.deb` ship both binaries with
-both engines; the image's entrypoint is `rosed` (`docker run --entrypoint rose ... init` for the
+The default build serves Bitcoin wallets; `--features zcash` adds the Zcash engine (from 0.11.0
+with NU7 scheduled on mainnet, so run it, and a node that follows NU7, before block 3,543,405).
+The Docker images (`ghcr.io/fathom-x/rose`), the release tarballs and the `.deb` ship both
+binaries with both engines; the image's entrypoint is `rosed` (`docker run --entrypoint rose ... init` for the
 command line). `rose example-config` prints the annotated configuration reference.
 
 ## License

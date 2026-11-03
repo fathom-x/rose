@@ -3,7 +3,7 @@ name: Release
 # Tag-driven release tier: pushing a `v*` tag builds the release artifacts for both Linux
 # targets and attaches them to a *draft* GitHub release (a human reviews and publishes),
 # pushes the rose binary Docker images to GHCR (amd64 + arm64) tagged with the semver version,
-# and publishes the two crates to crates.io. The wallet-dashboard image is a separate, much cheaper
+# and publishes the three crates to crates.io. The wallet-dashboard image is a separate, much cheaper
 # build in its own workflow (.github/workflows/docker-gui.yml), which the same `v*` tag also
 # triggers. Note the asymmetry: the GitHub release waits for a human, but the GHCR images and
 # the crates.io version go out on the tag push and cannot be recalled (only overwritten and
@@ -189,11 +189,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The tag names the version everywhere else in this workflow, so a manifest that
-      # disagrees would publish under a number nothing else refers to. The two crates release
-      # in lockstep, so both are checked.
+      # disagrees would publish under a number nothing else refers to. The three crates release
+      # in lockstep, so all are checked.
       - name: Check the manifest versions match the tag
         run: |
-          for crate in rosed rose-cli; do
+          for crate in rosed rose-cli rose-petal; do
             MANIFEST=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg c "${crate}" '.packages[] | select(.name == $c) | .version')
             echo "${crate}: manifest=${MANIFEST} tag=${{ needs.setup.outputs.version }}"
@@ -208,8 +208,9 @@ jobs:
       # other artifact shipped normally; a silent skip here would reproduce that exactly.
       # Re-running the workflow on an already-published version is a no-op, not an error.
       # `rosed` goes first: `rose-cli` depends on it by version, and cargo waits for a
-      # published crate to reach the index before the next publish. Each crate is checked on
-      # its own, so a re-run after a partial publish picks up where it stopped.
+      # published crate to reach the index before the next publish; `rose-petal` depends on
+      # neither. Each crate is checked on its own, so a re-run after a partial publish picks
+      # up where it stopped.
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -219,7 +220,7 @@ jobs:
             echo "::error::CARGO_REGISTRY_TOKEN is not set, so ${VERSION} cannot be published"
             exit 1
           fi
-          for crate in rosed rose-cli; do
+          for crate in rosed rose-cli rose-petal; do
             if curl -sf -H 'User-Agent: rose-release-workflow' "https://index.crates.io/ro/se/${crate}" \
                | jq -e --arg v "${VERSION}" 'select(.vers == $v)' > /dev/null; then
               echo "${crate} ${VERSION} is already on crates.io; nothing to do"

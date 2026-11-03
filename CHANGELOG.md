@@ -5,6 +5,148 @@ All notable changes to rose (`zecd` before 0.10.0) are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.11.0] - 2026-11-03
+
+Three crates now release together: `rosed`, `rose-cli` and the new **`rose-petal`**, the shard
+holder's client for an enclave deployment. Bitcoin spending wallets gain passphrase encryption,
+a send gate that is visible over RPC with the progress behind it, and a `sendrawtransaction`
+that honors `maxfeerate`. The Zcash engine schedules **NU7 on mainnet** (block 3,543,405, about
+2026-11-05): every mainnet Zcash deployment must run this release, and a node that follows NU7,
+before that block.
+
+### Added
+
+- **`rose-petal`, the shard holder's client, as a crate of our own.** Locksmith's recovery
+  protocol in pure Rust, published beside `rosed` and `rose-cli`. `rose-petal send
+  <host[:port]> <trusted_hashes.json> <bundle.json> --keyring <file|dir>` verifies the
+  enclave's Nitro attestation against the deployment's PCRs, decrypts this holder's share from
+  the bundle (raw V0, ImportedV0 or V1), encrypts it to the attested key, signs the request and
+  reads the reply; `inspect` and `import` read a bundle and write the ImportedV0 artifact;
+  `attestation-check` is a second binary of the same crate, a verifier over a saved attestation
+  document (the AWS chain and COSE signature, the nonce echoed, PCR0-2 against a hashes file,
+  the module id against an instance) with JSON verdicts and an archived mode that verifies at
+  the document's own timestamp. The `holder-tools-<sha7>` releases are built from it on every
+  push that changes the crate: linux-amd64 reproducibly in a pinned `rust:alpine` image through
+  `contrib/holder-tools/build.sh`, darwin-arm64 with plain cargo.
+- **The `Dockerfile`'s `enclave` stage and `ROSE_SRC`/`ROSE_BAKE` build args**: the runtime
+  image plus a file tree from the build context baked on with pinned modes (a TEE deployment's
+  config, quorum bundle and sealed secrets), so a deployment builds the enclave image from this
+  `Dockerfile` with two build args instead of a rendered copy. The default tree is empty:
+  `docker build .` is still the runtime image.
+- **`contrib/verify-commits/`**: the maintainers' signing allowlist (SSH `allowed_signers`,
+  OpenPGP keys) and a verifier that requires every commit from a pinned trusted root to be
+  signed by a key listed at its parent, merges included; a deployment checks the commit it
+  builds against it. CI runs it once the `ROSE_TRUSTED_ROOT` repository variable is set.
+- **Passphrase encryption for Bitcoin spending wallets.** `rose init --encrypt` creates an
+  encrypted wallet, the daemon starts it locked, and Core's `walletpassphrase`/`walletlock`
+  unlock and relock it with Core's codes and timeout cap: a locked send or `bumpfee` is `-13`,
+  a wrong passphrase `-14`, an unencrypted wallet `-15`; `getwalletinfo` carries
+  `unlocked_until` and `/status` carries `locked`. Every Bitcoin wallet now pins its BIP 84
+  account xpub in `keys.toml` (the UFVK pin's analog), so a locked or watch-only wallet is
+  verified, and a deleted database rebuilt, from the pin; with the seed in hand the seed must
+  derive it. A `keys.toml` from before the pin is backfilled the first time the seed is in hand.
+- **`getwalletinfo.send_gate` and each Bitcoin wallet's `send_gate` on `/status`**: whether a
+  send would be refused before coin selection (`open`), the refusal it would get (`reason`),
+  the persisted seed-history record (`history`: `fresh`, `unverified`, `verified` or
+  `unrecorded`) and whether `allow_sends_without_mempool_view` is set. A payout service polls
+  `open` instead of learning from a `-4`, and an operator sees a closed gate on a daemon that
+  keeps no log, such as an enclave's. `getwalletinfo.mempool_feed.peer_bloom` reports whether
+  the P2P feed's peer advertises NODE_BLOOM, which is what lets it answer the BIP 35 snapshot
+  request from a host it does not whitelist; a snapshot feed on a peer without it is warned
+  about once at connect, and the gate's reason names it as the likely cause. The shipped
+  compose files turn `-peerbloomfilters=1` on for the project's own nodes.
+- **Sync progress for a Bitcoin wallet.** `getwalletinfo.scanning` was a placeholder
+  (`progress: 0.0`) while a Bitcoin wallet caught up; it now carries the catch-up's `progress`,
+  the `height` scanned through so far (over kyoto, estimated from the light client's filter
+  download, since its one update moves the wallet's height only at the end) and the source's
+  `tip`, and `/status` reports `chain_tip` and `scan_progress` per Bitcoin wallet. While the P2P
+  feed collects a BIP 35 mempool snapshot, the wait a restored kyoto wallet's sends sit in,
+  `getwalletinfo.mempool_feed.snapshot_progress` reports what the node announced, what is still
+  being fetched, and the collection window elapsing. The monitor page (`scripts/rose-gui`) shows
+  both under the send-gate banner as three steps: scanning blocks, fetching the mempool, waiting
+  out the window. It also gains a login mode (with no RPC password in its environment the proxy
+  asks for one and keeps it in memory under a session cookie) and shows an enclave's own state:
+  running with the commit it attests, waiting for shards, or not running.
+- **NU7 support, on mainnet and testnet** (Zcash engine). rose builds and scans transactions
+  past NU7 activation: mainnet block 3,543,405 (ZIP 259, expected around 2026-11-05) and
+  testnet block 4,465,026 (live since 2026-10-04). It is compiled unconditionally and activated
+  by height, as NU6.3 was: transactions from the activation block on commit to branch id
+  `0x77190AD9`, staying on the V6 format, and Orchard-family bundles keep the post-NU6.3
+  circuit. This needed the Zakura Common 4.0 stack (`zakura-protocol` 4.0.0 is the release that
+  sets the mainnet height; the wallet layer moves to `0.1.0-rc9.3`, `zakura-pczt` to
+  `0.1.0-rc9`, `secp256k1` to 0.33, `zcash_script` to 0.6, and `zcash_note_encryption` is now
+  its `zakura-*` fork). Transactions built past NU7 expire 120 blocks after their target (ZIP
+  218's recommendation, about 50 minutes at 25-second blocks), and ZIP 218's shielded budget
+  (330 actions per block, at most 300 Sapling) is enforced at planning time with `-8`.
+- **A node that did not upgrade is refused rather than followed** (Zcash engine). The
+  outdated-build check now also catches an upgrade this build activates that the node never
+  adopted: before the height a warning at connect, from it a refusal (no scanning past the fork,
+  `/readyz` 503 with the new reason `upstream_not_upgraded`, `/status` and
+  `getblockchaininfo.warnings` carry the explanation, a paced reconnect until the node is
+  upgraded), and a schedule that disagrees with the build's is reported both ways. `rose
+  chain-info` reports the finding with `usable: false`.
+
+### Changed
+
+- **The minimum supported Rust version is 1.97** (the Zakura 4.0 family asks for it).
+- **The shipped compose files pin Bitcoin Core 30.4** (the release for the paused-peer
+  send-queue denial of service, bitcoin/bitcoin#36667) and **zebra 7.0.0**, the first zebra to
+  follow NU7; a 6.x node falls off the chain at activation. zebra 7 migrates its state database
+  on first start, so going back means a resync.
+- **The regtest tier runs NU7-active** (NU6.3 at height 8, NU7 at 12), and `conformance.py
+  --coin bitcoin` runs over the kyoto light client as well as bitcoind.
+- The wallet layer's recurring transparent spend searches are left to the block scan, which
+  already finds those spends, so they no longer count toward the enhancement backlog that holds
+  `/readyz` at `enhancing`.
+
+### Fixed
+
+- **A restarted Zcash wallet reports its scanned height from the first RPC.** Its status
+  started out empty and learned the scanned height only once the wallet connected to its node,
+  so `getblockcount` answered 0 (and `getbestblockhash` had nothing) in the moment after every
+  restart, for a wallet that had lost nothing. The status is now seeded from the wallet
+  database, and the scanned height is published before the chain tip is known.
+- **A sender's fee bump of a payment to a Bitcoin wallet shows up at 0-conf at once.** The P2P
+  mempool feed stamps each transaction with the second it arrives, and a replacement relayed in
+  the same second as its original tied with it; the tie went by txid, so about half the time
+  the replacement stayed hidden (`gettransaction` could not find it) until a block settled it.
+  A mempool sighting is now recorded as seen after any transaction it conflicts with, as the
+  wallet's own `bumpfee` already was.
+- **A restored kyoto wallet no longer double-spends its own unconfirmed sends.** A light client
+  sees transactions only once they are mined, so a Bitcoin wallet restored from its seed (`init
+  --restore`, `rosed --restore-if-empty`), rescanned, or rebuilt on an empty datadir could not
+  see unconfirmed sends an earlier instance of the seed had made: their inputs looked unspent, a
+  new send could spend them again, and only one of the two transactions would confirm. Unless a
+  snapshot-taking `[mempool]` feed (`p2p` with `p2p_snapshot = true`) has rebuilt that view,
+  such a wallet now **refuses to spend over kyoto** (`-4` from `sendtoaddress`, `sendmany`,
+  `bumpfee`, and a `sendrawtransaction` of its own coins), and the state is kept with the wallet
+  database, so a restart does not lift it. A wallet `rose init` created from a freshly generated
+  seed is never held. The new per-wallet `allow_sends_without_mempool_view = true` accepts the
+  risk and restores the old behaviour; every start of such a wallet logs a WARN, and `rose
+  config check` reports it. Over the bitcoind backend such a wallet waits (`-4`) only until its
+  first mempool pass at tip has matched the node's mempool.
+- **Bitcoin `sendrawtransaction` honors `maxfeerate` and can no longer broadcast an absurd fee
+  unchecked.** The argument was accepted and ignored, so over bitcoind only the node's own
+  0.10 BTC/kvB default applied, and over kyoto nothing checked the fee at all. It now follows
+  Core: `maxfeerate` in BTC/kvB, default 0.10, `0` disables the check, over the limit is `-25`
+  with Core's message, and the check runs before the transaction is recorded, so a refused one
+  locks no inputs. A transaction spending the wallet's own outputs is also held to `[fees]
+  max_tx_fee_sat`, which `maxfeerate = 0` does not waive. Where the wallet cannot compute the
+  fee (an input it never saw), the node applies the caller's `maxfeerate` over bitcoind; over
+  kyoto the broadcast is refused unless the caller passes `maxfeerate = 0`. That is a behavior
+  change for kyoto callers re-relaying a transaction that spends outputs the wallet never saw.
+- **A reorg-orphaned receipt no longer breaks the history RPCs** (Zcash engine): the
+  expired-unmined read tolerates the NULL the wallet layer's view leaves for it.
+
+### Security
+
+- **tokio 1.54.1** (RUSTSEC-2026-0386, unsound `AsyncFd` constructors; rose never constructs
+  one) and **ctutils 0.4.5** (RUSTSEC-2026-0385).
+- **RUSTSEC-2026-0387** (crypto-bigint 0.5, secret-dependent branches) is accepted in
+  `deny.toml` with its rationale: the only path into rose is `age`'s P-256 recipients, which
+  rose never uses (it encrypts to X25519 recipients and passphrases only), and no fixed release
+  exists below `elliptic-curve` 0.14.
+
 ## [0.10.0] - 2026-10-20
 
 The first release under the new names. `zecd` is now **rose**, shipped as two crates over one

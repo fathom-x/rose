@@ -3,6 +3,10 @@
 
 [advisories]
 # RUSTSEC-2026-0374: `basic-toml` unmaintained, reached only through `age`'s compile-time
-# i18n configuration parser (`i18n-embed-fl` -> `i18n-config`); no upgrade exists yet. The
-# rationale is in deny.toml, which CI enforces; keep the two lists identical.
-ignore = ["RUSTSEC-2026-0374"]
+# i18n configuration parser (`i18n-embed-fl` -> `i18n-config`); no upgrade exists yet.
+# RUSTSEC-2026-0387: `crypto-bigint` 0.5 timing, reached only via age's P-256 recipients,
+# which rose never uses.
+# RUSTSEC-2026-0459: SQLite WAL page-size disclosure, which needs a crafted database + `-wal`
+# pair; rose opens only files it creates in its own datadir.
+# The rationale is in deny.toml, which CI enforces; keep the two lists identical.
+ignore = ["RUSTSEC-2026-0374", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459"]

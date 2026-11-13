@@ -19,9 +19,24 @@ yanked = "deny"
 # recipients. rose encrypts and decrypts with X25519 and scrypt stanzas only, so no secret
 # ever meets P-256 arithmetic. age 0.12.1 is its newest release; drop the exception when age
 # moves to p256 0.14.
+# RUSTSEC-2026-0459 (CVE-2026-119375): bundled SQLite before 3.54.0 reads a `-wal` frame at the
+# WAL header's page size without checking it against the database's, so a crafted database plus
+# `-wal` pair leaves the tail of a page buffer uninitialized and queries return stale process
+# memory. The only trigger is opening a database file pair that a less trusted party wrote.
+# rose never does: every connection (`wallet/open.rs`, `wallet/read.rs`, `btc/store.rs`) opens a
+# path it derives itself under its own datadir (`config::engine_dir`/`shard_engine_dir` +
+# `data_db_path`/`wallet_db_path`); no RPC, CLI flag or config key names a database file
+# (`loadwallet`/`createwallet` read and write fleet TOML manifests, the shard databases are
+# rose's own), and `rose-petal` links no SQLite. A party that can write that datadir can already
+# replace the wallet database and sits beside `keys.toml` and `identity.txt`, so the bug adds no
+# capability there; in the enclave the datadir is created empty at every boot inside the
+# enclave, where nothing outside can write. The fix (libsqlite3-sys 0.39, rusqlite 0.41) cannot
+# resolve yet: `links = "sqlite3"` allows one copy, and every zakura-client-sqlite release
+# requires rusqlite ^0.37. Drop the exception with that bump.
 ignore = [
     { id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained: compile-time i18n config parser behind age, no upgrade exists yet" },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing leaks: reached only via age's P-256 recipients, which rose never uses; no age release on a fixed version yet" },
+    { id = "RUSTSEC-2026-0459", reason = "SQLite WAL page-size disclosure: needs a crafted db + -wal pair, and rose opens only files it creates in its own datadir; fix blocked on zakura-client-sqlite" },
 ]
 
 [licenses]

@@ -451,7 +451,7 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         // recover, the Bitcoin counterpart of the Zcash handler's `transparent` block (see
         // `src/btc/README.md`, "Restores and the address lookahead"). `horizon` is the
         // highest external index such a restore re-derives without further funding
-        // (`max(initial_scan, highest paid index + 1) + lookahead - 1`), `issued_through`
+        // (`max(initial_scan, highest reachable paid index + 1) + lookahead - 1`), `issued_through`
         // the highest index handed out so far (null before the first), and `restorable`
         // whether every issued address lies within the horizon - false exactly when
         // `getnewaddress` has gone past it, which the daemon also warns about at the time;

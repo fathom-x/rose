@@ -95,9 +95,12 @@ floor in the first recovery set, since bdk_kyoto builds it from the last reveale
 while `lookahead` stays small. The two windows the Zcash side keeps apart exist here too:
 the **live window** is BDK's, `lookahead` past the last revealed index, and follows
 issuance; the **recovery horizon** is what a from-seed restore under the same configuration
-re-derives without further funding, `max(initial_scan, highest paid index + 1) + lookahead
-- 1` (`actor::recovery_horizon_for`), and follows funding only, because issuance leaves no
-trace on chain. `getnewaddress` issuing past the horizon warns (`rose::audit`) that a
+re-derives without further funding, `max(initial_scan, highest reachable paid index + 1) +
+lookahead - 1` (`actor::recovery_horizon_for`), and follows funding only, because issuance
+leaves no trace on chain. A paid index counts only if it lies within the window the
+payments below it open (walking up from the floor), because a restore never finds a
+payment past that window and so never leads on from it: such a payment leaves the wallet
+unrestorable rather than curing it. `getnewaddress` issuing past the horizon warns (`rose::audit`) that a
 restore under the current configuration would miss funds received there - not that they
 are lost: the seed controls them, and a restore with `initial_scan` raised past the index
 finds them - and `getwalletinfo.recovery` reports `initial_scan`, `lookahead`, `horizon`,
@@ -106,7 +109,7 @@ horizon): the fix is raising `initial_scan` past `issued_through` in the configu
 restore will run with (`lookahead` works too, but is matched on every block for the
 wallet's life, where a floor is derived once). `regtest_btc_lookahead.rs` restores the gap case at the default
 lookahead with `initial_scan = 30` over both backends, and watches the original's readout
-flip as it issues past the horizon and as the payment there leads a restore on.
+flip as it issues past the horizon and stay flipped once the payment there lands.
 
 ## The two backends are not equivalent
 

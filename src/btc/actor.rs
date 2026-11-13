@@ -933,14 +933,30 @@ pub const INITIAL_SCAN_WARN_ABOVE: u32 = 10_000;
 
 /// The highest external index a from-seed restore re-derives without further funding: the
 /// restore reveals `0..initial_scan` at spawn and the index attributes `lookahead` past the
-/// last revealed one, and every payment it finds (the highest at `last_used`) reveals
-/// through that index and moves the window on. With nothing revealed the window is the
-/// first `lookahead` indexes, which the same arithmetic gives for `initial_scan = 0`.
-fn recovery_horizon_for(initial_scan: u32, last_used: Option<u32>, lookahead: u32) -> u32 {
-    initial_scan
-        .max(last_used.map_or(0, |used| used.saturating_add(1)))
-        .saturating_add(lookahead)
-        .saturating_sub(1)
+/// last revealed one, and every payment it finds reveals through that index and moves the
+/// window on. With nothing revealed the window is the first `lookahead` indexes, which the
+/// same arithmetic gives for `initial_scan = 0`.
+///
+/// `used` is every paid external index, ascending. A payment moves the window only if the
+/// restore can find it, so the walk stops at the first paid index past the window so far:
+/// a payment at an index the running wallet issued past the horizon is credited here but
+/// missed by the restore, and it must not lead the horizon on. Taking the highest
+/// paid index alone reported such a wallet restorable the moment its stranded payment
+/// landed.
+fn recovery_horizon_for(
+    initial_scan: u32,
+    used: impl IntoIterator<Item = u32>,
+    lookahead: u32,
+) -> u32 {
+    let reach = |next: u32| next.saturating_add(lookahead).saturating_sub(1);
+    let mut horizon = reach(initial_scan);
+    for index in used {
+        if index > horizon {
+            break;
+        }
+        horizon = horizon.max(reach(index.saturating_add(1)));
+    }
+    horizon
 }
 
 /// What `spawn` needs to bring a Bitcoin wallet up.
@@ -3494,9 +3510,13 @@ impl BtcActor {
     fn recovery(&self) -> BtcRecovery {
         let index = self.wallet.spk_index();
         let issued_through = index.last_revealed_index(KeychainKind::External);
+        // `keychain_outpoints` is ascending by index (one entry per output, so a reused
+        // address repeats, which the walk tolerates).
         let horizon = recovery_horizon_for(
             self.initial_scan,
-            index.last_used_index(KeychainKind::External),
+            index
+                .keychain_outpoints(KeychainKind::External)
+                .map(|(i, _)| i),
             self.lookahead,
         );
         BtcRecovery {
@@ -6146,11 +6166,19 @@ mod tests {
     /// seed (the binding check): the right seed loads, a different seed fails the spawn.
     #[tokio::test(flavor = "multi_thread")]
     async fn initial_scan_reveals_the_floor_once_and_the_horizon_follows_it() {
-        assert_eq!(recovery_horizon_for(0, None, 25), 24);
-        assert_eq!(recovery_horizon_for(30, None, 25), 54);
-        assert_eq!(recovery_horizon_for(30, Some(29), 25), 54);
-        assert_eq!(recovery_horizon_for(30, Some(60), 25), 85);
-        assert_eq!(recovery_horizon_for(0, Some(0), 25), 25);
+        assert_eq!(recovery_horizon_for(0, [], 25), 24);
+        assert_eq!(recovery_horizon_for(30, [], 25), 54);
+        assert_eq!(recovery_horizon_for(30, [29], 25), 54);
+        assert_eq!(recovery_horizon_for(0, [0], 25), 25);
+        // A chain of payments each within the window of the one before leads it on.
+        assert_eq!(recovery_horizon_for(30, [50, 60], 25), 85);
+        assert_eq!(recovery_horizon_for(0, [0, 0, 20, 45], 25), 70);
+        // A payment past the window is one a restore never finds, so it leads nothing on,
+        // and neither does anything after it: the wallet paid at 0 and 29 with
+        // the default lookahead restores index 0's funds alone.
+        assert_eq!(recovery_horizon_for(30, [60], 25), 54);
+        assert_eq!(recovery_horizon_for(0, [0, 29], 25), 25);
+        assert_eq!(recovery_horizon_for(0, [0, 29, 30], 25), 25);
 
         let dir = tempfile::tempdir().unwrap();
         let mut config = offline_config(dir.path(), Some(bip84_seed()));

@@ -13,7 +13,8 @@
 //! at the default lookahead with `initial_scan = 30`, the one-time floor that covers a
 //! pre-issued address set without widening the window for the wallet's life. The original
 //! always runs over bitcoind, and its `getwalletinfo.recovery` readout flips to
-//! `restorable: false` when it issues past the horizon and back once the payment lands.
+//! `restorable: false` when it issues past the horizon and stays there once the payment
+//! past it lands, since a restore cannot reach that payment.
 //!
 //! The second test pins the other half of a restore over kyoto: a wallet paid
 //! at 140 *consecutive* addresses - no gap at all - restored at the default lookahead. A
@@ -206,13 +207,16 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
         node.mine(1).await;
         rose.wait_height(102).await;
         rose.wait_wallet_balance("btc", 3.0).await;
-        // ...until the payment there leads a restore on: the horizon follows funding.
+        // ...and the payments do not change that: the one at index 0 leads the
+        // window on by one, to 25, and the one at 29 lies past it, so a restore never
+        // finds it to lead on from - which phase 2 below shows. The horizon follows only
+        // funding a restore can reach.
         let wi = rose
             .call("getwalletinfo", json!([]))
             .await
             .expect("getwalletinfo");
-        assert_eq!(wi["recovery"]["horizon"], json!(ISSUED - 1 + 25), "{wi}");
-        assert_eq!(wi["recovery"]["restorable"], json!(true), "{wi}");
+        assert_eq!(wi["recovery"]["horizon"], json!(25), "{wi}");
+        assert_eq!(wi["recovery"]["restorable"], json!(false), "{wi}");
         rose.stop();
         (mnemonic, first, last)
     };

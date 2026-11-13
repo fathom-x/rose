@@ -58,6 +58,13 @@
             border-radius: 8px; padding: .6rem .9rem; margin-bottom: 1rem; font-size: .85rem; }
   .banner b { color: var(--accent); }
   .banner[hidden] { display: none; }
+  /* The recovery banner: rose's getwalletinfo.recovery says an issued address lies past
+     what a from-seed restore under this configuration would look at. Red, since it is a
+     configuration that would lose track of funds on a restore, not a wait that ends. */
+  .banner.risk { border-color: var(--bad); }
+  .banner.risk b { color: var(--bad); }
+  .banner code { font-size: .8rem; }
+  td.past { color: var(--bad); }
   /* The two waits behind a closed gate, as three steps under the banner: the block scan
      from the birthday anchor to the tip, the mempool snapshot's fetch, and the window the
      snapshot collects over. Each is a label, a bar and a note; a bar with no measure yet
@@ -152,6 +159,8 @@
   </div>
 </div>
 
+<div id="recoverybanner" class="banner risk" hidden></div>
+
 <!-- Login mode (the proxy was started without the RPC password): shown until the operator
      enters it. The proxy checks it against rose and keeps it in memory under a session
      cookie; the page never sees it again. -->
@@ -193,6 +202,9 @@
     </div>
     <div id="addr"></div>
     <div class="msg" id="addrmsg"></div>
+    <!-- How many more addresses fit within the recovery horizon (getwalletinfo.recovery),
+         shown once it is close, so the operator raises initial_scan before crossing it. -->
+    <div class="msg" id="addrnote" hidden></div>
   </div>
 
   <!-- Where the wallet stands on the chain: its own synced height (what getblockcount
@@ -497,8 +509,10 @@ function renderAddresses(received, descriptors, unspent) {
   const shown = hideUnused ? all.filter(a => (a.txids || []).length > 0) : all;
   const rows = shown.map(a => {
       const bal = balance.get(a.address) || 0;
+      // An index past the recovery horizon is one a restore would not look at.
+      const past = lastRecovery && Number.isInteger(a.address_index) && a.address_index > lastRecovery.horizon;
       return `<tr>
-        <td>${a.address_index ?? ""}</td>
+        <td${past ? ` class="past" title="past the recovery horizon (index ${lastRecovery.horizon}): a restore from seed under this configuration would not find payments here"` : ""}>${a.address_index ?? ""}${past ? " &#9888;" : ""}</td>
         <td title="${a.address}">${a.address}${copyBtn(a.address)}</td>
         <td class="amt ${bal > 0 ? "pos" : ""}" style="text-align:right">${unspent ? fmtSats(bal) : "?"}</td>
         <td style="text-align:right">${fmt(a.amount)}</td>
@@ -512,6 +526,49 @@ function renderAddresses(received, descriptors, unspent) {
   $("addrs").innerHTML = (rows.length ? rows.join("") : `<tr><td colspan="5" style="color:var(--dim)">${empty}</td></tr>`)
     + (rows.length && hidden ? `<tr><td colspan="5" style="color:var(--dim)">${hidden} unused address${hidden === 1 ? "" : "es"} hidden</td></tr>` : "");
 }
+// rose's getwalletinfo.recovery (Bitcoin wallets): what a from-seed restore under this
+// wallet's configuration would find. `horizon` is the highest receiving index such a restore
+// looks at, `issued_through` the highest this wallet has handed out; past the horizon
+// (`restorable` false) a restore would not see payments to the later addresses until
+// `[wallets.<name>] initial_scan` is raised past them in the configuration it runs with.
+// The funds are not lost - the seed controls them - but nothing else on the page would
+// tell the operator before a restore came up short. An older daemon has no field:
+// no banner. Returns the readout, or null, for the Addresses tab and the Receive card.
+// Addresses this close to the horizon get a note on the Receive card.
+const RECOVERY_NEAR = 5;
+function renderRecovery(info) {
+  const r = info.recovery && typeof info.recovery === "object" ? info.recovery : null;
+  const el = $("recoverybanner"), note = $("addrnote");
+  const horizon = r && Number.isInteger(r.horizon) ? r.horizon : null;
+  const issued = r && Number.isInteger(r.issued_through) ? r.issued_through : null;
+  if (horizon === null) { el.hidden = true; note.hidden = true; return null; }
+  const wallet = typeof info.walletname === "string" && /^[A-Za-z0-9_.-]+$/.test(info.walletname)
+    ? info.walletname : "&lt;name&gt;";
+  if (r.restorable === false && issued !== null) {
+    el.innerHTML = `<b>a restore from seed would miss addresses</b>: this wallet has handed out ` +
+      `receiving addresses through index ${issued}, but a restore under its configuration ` +
+      `(initial_scan ${Number(r.initial_scan) || 0}, lookahead ${Number(r.lookahead) || 0}) ` +
+      `looks only through index ${horizon}. Payments to the later addresses are safe while ` +
+      `this wallet runs, and the seed still controls them, but a restore would not find them. ` +
+      `Raise <code>[wallets.${wallet}] initial_scan</code> to at least ${issued + 1} in the ` +
+      `configuration a restore will run with, before relying on one.`;
+    el.hidden = false;
+    note.hidden = true;
+  } else {
+    el.hidden = true;
+    const left = issued === null ? horizon + 1 : horizon - issued;
+    note.hidden = left > RECOVERY_NEAR;
+    note.className = "msg";
+    note.style.color = "var(--accent)";
+    note.textContent = left > RECOVERY_NEAR ? "" :
+      `${left} more new address${left === 1 ? "" : "es"} before a restore from seed would ` +
+      `stop finding them (recovery horizon: index ${horizon}); raise initial_scan first if ` +
+      `you need more.`;
+  }
+  return { horizon };
+}
+let lastRecovery = null;
+
 // The last data the Addresses tab rendered, so the hide-unused toggle re-renders at once
 // instead of waiting for the next refresh.
 let lastAddresses = null;
@@ -621,6 +678,7 @@ async function refresh() {
     ]);
     setWatchOnly(info.private_keys_enabled === false);
     renderSendGate(info);
+    lastRecovery = renderRecovery(info);
     spendable = Number(balances.mine.trusted);
     $("trusted").textContent = fmt(balances.mine.trusted);
     $("pending").textContent = fmt(balances.mine.untrusted_pending);
@@ -816,6 +874,18 @@ $("newaddr").onclick = async () => {
     const a = await rpc("getnewaddress");
     $("addr").textContent = a;
     $("copyaddr").hidden = false;
+    // rose warns in its own log when this address went past the recovery horizon; an
+    // enclave keeps no log, so re-read the readout now rather than at the next refresh.
+    const info = await rpc("getwalletinfo").catch(() => null);
+    if (info) {
+      lastRecovery = renderRecovery(info);
+      const r = info.recovery;
+      if (r && r.restorable === false && Number.isInteger(r.horizon)) {
+        $("addrmsg").className = "msg err";
+        $("addrmsg").textContent = `this address lies past the recovery horizon (index ${r.horizon}): ` +
+          `a restore from seed under the current configuration would not find payments to it`;
+      }
+    }
   } catch (e) {
     $("addrmsg").className = "msg err"; $("addrmsg").textContent = e.message;
   }

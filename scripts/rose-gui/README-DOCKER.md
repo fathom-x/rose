@@ -51,6 +51,15 @@ anchor to the tip (`getwalletinfo.scanning`: height X of Y), the mempool snapsho
 (`mempool_feed.snapshot_progress`: fetched over announced, sweeping until the node's first
 announcement), and the collection window the snapshot waits out before it is delivered.
 
+A second banner, in red, appears when rose's `getwalletinfo.recovery` says the wallet has
+handed out a receiving address past its recovery horizon: the highest index a from-seed
+restore under the wallet's configuration would look at (`initial_scan` and `lookahead`, led
+on by payments the restore can reach). Payments to those addresses are safe while the
+wallet runs, but a restore would not find them; the banner names the `initial_scan` to set
+in the configuration a restore will run with. The Receive card counts down the last few
+addresses before the horizon, says so when a new address lands past it, and the Addresses
+tab marks the indexes past it.
+
 In enclave mode the page also shows the enclave's own state in its Status card and on the
 login card - running (with the commit it attests), up but waiting for shards, or not running -
 from the proxy's `/enclave` probe: a POST to the attestation URL with a random nonce, then one

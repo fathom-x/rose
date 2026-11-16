@@ -349,6 +349,7 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
     let b = handle.balance().await?;
     let status = handle.status();
     let recovery = handle.recovery().await?;
+    let spend_policy = handle.spend_policy().await?;
     // Core's txcount: every wallet transaction, visible history entry or not - counted,
     // not built.
     let txcount = handle.tx_count().await?;
@@ -456,6 +457,21 @@ async fn getwalletinfo(handle: &BtcWalletHandle) -> Result<Value, RpcError> {
         // whether every issued address lies within the horizon - false exactly when
         // `getnewaddress` has gone past it, which the daemon also warns about at the time;
         // the fix is raising `[wallets.<name>] initial_scan` past `issued_through`.
+        // rose extension: the spending policy (`[wallets.<name>.spend_policy]`), null when
+        // the wallet has none. The rules as configured (`allow_recipients` is the count of
+        // listed addresses, null for no allowlist; the caps in BTC, null when unset) and,
+        // over the window `max_per_day` counts (the last `window_blocks` blocks plus every
+        // unconfirmed send), what went to recipients outside the wallet and what is left.
+        // Derived from the wallet's own history on every call, so a restart reports the
+        // same numbers.
+        "spend_policy": spend_policy.map(|p| json!({
+            "allow_recipients": p.allow_recipients,
+            "max_per_transaction": p.max_per_transaction_sat.map(zats_to_value),
+            "max_per_day": p.max_per_day_sat.map(zats_to_value),
+            "window_blocks": p.window_blocks,
+            "spent_in_window": zats_to_value(p.spent_in_window_sat),
+            "remaining_in_window": p.remaining_in_window_sat.map(zats_to_value),
+        })),
         "recovery": {
             "initial_scan": recovery.initial_scan,
             "lookahead": recovery.lookahead,
@@ -1534,6 +1550,7 @@ mod tests {
             lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
             initial_scan: 0,
             allow_sends_without_mempool_view: false,
+            spend_policy: Default::default(),
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),

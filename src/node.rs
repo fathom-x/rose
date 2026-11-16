@@ -795,6 +795,7 @@ fn spawn_bitcoin_wallet(
         lookahead: entry.lookahead,
         initial_scan: entry.initial_scan,
         allow_sends_without_mempool_view: entry.allow_sends_without_mempool_view,
+        spend_policy: entry.spend_policy.clone(),
         sync_interval: Duration::from_secs(config.sync.interval_secs),
         reconnect_base: Duration::from_secs(config.backend.reconnect_base_secs),
         reconnect_max: Duration::from_secs(config.backend.reconnect_max_secs),

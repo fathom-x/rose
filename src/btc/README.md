@@ -706,6 +706,41 @@ What this does not do, so the feature is not over-read:
 - **One seed serves both coins.** A `keys.toml` shared across coins exposes the Zcash and
   Bitcoin funds derived from it alike once the passphrase (or the unlocked seed) is.
 
+## Spending policy (`[wallets.<name>.spend_policy]`)
+
+`policy.rs` holds a recipient allowlist, a per-send cap and a cap over a 144-block window to
+the transactions the wallet builds. `BtcActor::enforce_spend_policy` runs on the built,
+unsigned transaction in `do_send` (after the fee cap, so a `subtractfeefromamount` send is
+judged on what it actually pays) and in `build_signed_bump`, before a signer exists; a
+refusal is `-4` with the rule and what is left, and a `rose::audit` WARN. Only outputs to
+scripts the wallet does not own (`is_mine`: revealed plus lookahead) are restricted or
+counted, so change and self-sends cost nothing; fees are `max_tx_fee_sat`'s.
+
+The window total is a read, not a counter: `ReadView::outflows` is every canonical
+transaction the wallet funded with its external total and confirmation height, built in
+the same pass as the rest of the view (so a send pays no canonicalization of its own), and
+`window_total` sums those unconfirmed or confirmed within 144 blocks of the wallet's tip.
+A restart therefore reports the same total, and a from-seed restore the same once caught up;
+the gap in between (an earlier instance's unconfirmed sends) is the one the send gate
+already closes. Blocks rather than the clock, because the host sets the enclave's clock and
+only mining sets the height; a host withholding blocks freezes the window, which tightens it.
+A replacement is counted in place of its original (`window_total`'s `exclude`). A funded
+transaction the wallet stopped tracking (abandoned, or retired on a node's rejection) keeps
+counting as unconfirmed while no transaction the wallet holds spends one of its inputs: over
+kyoto `abandontransaction` cannot know whether peers still hold it, and without this an
+abandon plus a fresh send could both confirm past the cap. A send that spends one of its
+inputs (a self-send will do) releases it. With no policy the view computes no outflows. The check
+runs on the single-writer actor, and a send is committed before the next command runs, so
+two concurrent sends cannot both pass on the same allowance.
+
+`sendrawtransaction` of a new transaction spending the wallet's coins is refused while a
+policy is set: the wallet did not build it and can only take it whole. No RPC can sign one
+today, so this closes the door for a future signing surface; resubmissions and foreign relays
+pass. The policy is config-file only on purpose (no environment variable, no RPC): in an
+attested deployment the baked config is in the measurement. Not yet: the Zcash engine (the
+section is refused on a Zcash wallet), per-credential policies, approver signatures.
+Live: `regtest_btc_spend_policy.rs`, over bitcoind (the check is chain-source independent).
+
 ## Not yet implemented
 
 Everything here is refused with a clear error rather than silently ignored or half-done:

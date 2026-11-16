@@ -491,6 +491,31 @@ pub fn render(config: &AppConfig) -> String {
                     ),
                 }
             }
+            // The spending policy, last because it is a sub-table: every key after its
+            // header belongs to it. Rendered whenever set, so an operator (or a shard
+            // holder, before releasing a petal to an image) can read the effective policy
+            // the image carries.
+            let p = &w.spend_policy;
+            if p.is_active() {
+                table(&mut s, &format!("wallets.{name}.spend_policy"));
+                if let Some(list) = &p.allow_recipients {
+                    kv(&mut s, "allow_recipients", list_val(list));
+                }
+                if let Some(v) = p.max_per_transaction_sat {
+                    kv(&mut s, "max_per_transaction_sat", v);
+                }
+                if let Some(v) = p.max_per_day_sat {
+                    kv_note(
+                        &mut s,
+                        "max_per_day_sat",
+                        v,
+                        &format!(
+                            "over the last {} blocks plus unconfirmed sends",
+                            crate::config::SPEND_POLICY_WINDOW_BLOCKS
+                        ),
+                    );
+                }
+            }
         }
         // The remaining per-wallet keys configure the Zcash engine and are refused by
         // `resolve` on any other wallet - and by every wallet in a build without that engine,
@@ -752,6 +777,41 @@ mod tests {
             "{first}"
         );
         assert!(first.contains("readiness = \"connected\""), "{first}");
+    }
+
+    /// The spending policy renders as the wallet's sub-table, every set key at its value,
+    /// and round-trips; a wallet without one renders no such table.
+    #[test]
+    #[cfg(feature = "bitcoin")]
+    fn a_spend_policy_renders_and_round_trips() {
+        use bdk_wallet::bitcoin::{Address, Network, ScriptBuf};
+        let dir = tempfile::tempdir().unwrap();
+        let addr = Address::p2wsh(&ScriptBuf::from_bytes(vec![1]), Network::Testnet).to_string();
+        let first = render(&resolve_from(
+            &format!(
+                "network = \"test\"\ndatadir = {:?}\n[wallets.btc]\ncoin = \"bitcoin\"\n\
+                 [wallets.btc.spend_policy]\nallow_recipients = [\"{addr}\"]\n\
+                 max_per_day_sat = 100000\n[wallets.plain]\ncoin = \"bitcoin\"\n",
+                dir.path()
+            ),
+            dir.path(),
+        ));
+        let section = first
+            .split("[wallets.btc.spend_policy]\n")
+            .nth(1)
+            .expect("the policy renders as a sub-table");
+        assert!(
+            section.starts_with(&format!("allow_recipients = [\"{addr}\"]\n")),
+            "{first}"
+        );
+        assert!(
+            section.contains("max_per_day_sat = 100000  # over the last 144 blocks"),
+            "{first}"
+        );
+        assert!(!section.contains("max_per_transaction_sat"), "{first}");
+        assert!(!first.contains("[wallets.plain.spend_policy]"), "{first}");
+        let round_trip = tempfile::tempdir().unwrap();
+        assert_eq!(first, render(&resolve_from(&first, round_trip.path())));
     }
 
     /// A Bitcoin wallet renders its `coin` (the one non-default key selecting it), none of the

@@ -216,6 +216,25 @@ pub struct WalletInfo {
     /// Present on Bitcoin wallets only: the opt-in `[mempool]` feed's state (`disabled`
     /// when none is configured).
     pub mempool_feed: Option<MempoolFeedInfo>,
+    /// Bitcoin wallets with a `[wallets.<name>.spend_policy]` only (null otherwise): the
+    /// policy's rules and what its window has left.
+    pub spend_policy: Option<SpendPolicyInfo>,
+}
+
+/// `getwalletinfo.spend_policy` (rose extension, Bitcoin wallets with a policy;
+/// `rpc/btc_methods.rs::getwalletinfo`). Amounts count only payments to recipients outside
+/// the wallet; the window is the last `window_blocks` blocks plus every unconfirmed send.
+#[non_exhaustive]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SpendPolicyInfo {
+    /// How many addresses the allowlist names; `None` when any recipient is allowed.
+    pub allow_recipients: Option<u64>,
+    pub max_per_transaction: Option<Amount>,
+    pub max_per_day: Option<Amount>,
+    pub window_blocks: u32,
+    pub spent_in_window: Amount,
+    /// `None` without a `max_per_day`.
+    pub remaining_in_window: Option<Amount>,
 }
 
 /// `getwalletinfo.send_gate` (Bitcoin wallets; also each wallet's `send_gate` on `/status`).
@@ -1307,9 +1326,28 @@ mod tests {
                 },
                 "peer_bloom": true,
             },
+            "spend_policy": {
+                "allow_recipients": 2,
+                "max_per_transaction": 0.30000000,
+                "max_per_day": null,
+                "window_blocks": 144,
+                "spent_in_window": 0.12500000,
+                "remaining_in_window": null,
+            },
             "coin": "bitcoin",
         });
         let w: WalletInfo = serde_json::from_value(bitcoin).unwrap();
+        let p = w.spend_policy.as_ref().expect("the policy block decodes");
+        assert_eq!(p.allow_recipients, Some(2));
+        assert_eq!(
+            p.max_per_transaction.map(|a| a.base_units()),
+            Some(30_000_000)
+        );
+        assert!(p.max_per_day.is_none() && p.remaining_in_window.is_none());
+        assert_eq!(
+            (p.window_blocks, p.spent_in_window.base_units()),
+            (144, 12_500_000)
+        );
         // The Bitcoin catch-up's two heights ride the `Active` variant.
         match &w.scanning {
             Scanning::Active {

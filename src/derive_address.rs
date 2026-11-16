@@ -756,6 +756,7 @@ mod tests {
             lookahead: crate::config::DEFAULT_LOOKAHEAD,
             initial_scan: 0,
             allow_sends_without_mempool_view: false,
+            spend_policy: Default::default(),
         };
 
         assert_eq!(

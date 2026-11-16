@@ -662,6 +662,7 @@ jobs:
             --test regtest_btc_bumpfee --test regtest_btc_ancestors \
             --test regtest_btc_kyoto_fees --test regtest_btc_fee_curve \
             --test regtest_btc_fee_split --test regtest_btc_encrypted \
+            --test regtest_btc_spend_policy \
             -- --nocapture 2>&1 | tee btc-e2e.log
           # Every suite self-skips (printing `skipping:`, see the harness's `provisioned`)
           # without a bitcoind or against a feature-less rose. This job supplies both, so a

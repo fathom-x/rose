@@ -35,4 +35,5 @@ pub mod kyoto;
 pub mod mempool_feed;
 pub mod net;
 pub mod p2p_feed;
+pub mod policy;
 pub mod store;

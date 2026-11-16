@@ -65,6 +65,7 @@ use crate::btc::chain::{BitcoindRpc, BroadcastError, BtcEndpoint};
 use crate::btc::keys::{self, AccountKeys};
 use crate::btc::kyoto::{KyotoConn, KyotoFailure};
 use crate::btc::mempool_feed::{feed_target, FeedDelta, FeedEvent, MempoolFeed, SnapshotProgress};
+use crate::btc::policy::{Outflow, SpendPolicy};
 use crate::btc::store::{Persister, SeedHistory};
 use crate::coin::BitcoinNetwork;
 use crate::error::{codes, RpcError};
@@ -127,6 +128,23 @@ pub struct BtcRecovery {
     pub issued_through: Option<u32>,
     /// Whether every issued address lies within the horizon.
     pub restorable: bool,
+}
+
+/// The spending policy as `getwalletinfo.spend_policy` reports it (see
+/// [`crate::btc::policy`]): the rules, and over the window what went out and what is left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BtcSpendPolicyStatus {
+    /// How many recipients the allowlist names; `None` without an allowlist.
+    pub allow_recipients: Option<usize>,
+    pub max_per_transaction_sat: Option<u64>,
+    pub max_per_day_sat: Option<u64>,
+    /// The window `max_per_day_sat` counts over, in blocks.
+    pub window_blocks: u32,
+    /// Paid to recipients outside the wallet by its unconfirmed sends and those confirmed
+    /// within the window.
+    pub spent_in_window_sat: u64,
+    /// `max_per_day_sat` less `spent_in_window_sat`; `None` without that cap.
+    pub remaining_in_window_sat: Option<u64>,
 }
 
 /// One unspent output, in wire-friendly primitives (the handle's callers are RPC handlers,
@@ -537,6 +555,10 @@ enum BtcCommand {
     Recovery {
         reply: oneshot::Sender<Result<BtcRecovery, RpcError>>,
     },
+    /// The spending policy's readout (`getwalletinfo.spend_policy`); `None` without one.
+    SpendPolicy {
+        reply: oneshot::Sender<Result<Option<BtcSpendPolicyStatus>, RpcError>>,
+    },
     GetTransaction {
         txid: String,
         reply: oneshot::Sender<Result<Option<BtcTxRecord>, RpcError>>,
@@ -807,6 +829,13 @@ impl BtcWalletHandle {
         self.dispatch(|reply| BtcCommand::Recovery { reply }).await
     }
 
+    /// The spending policy's readout (`getwalletinfo.spend_policy`): its rules and what
+    /// the window has left. `None` when the wallet has no policy.
+    pub async fn spend_policy(&self) -> Result<Option<BtcSpendPolicyStatus>, RpcError> {
+        self.dispatch(|reply| BtcCommand::SpendPolicy { reply })
+            .await
+    }
+
     pub async fn get_transaction(&self, txid: String) -> Result<Option<BtcTxRecord>, RpcError> {
         self.dispatch(|reply| BtcCommand::GetTransaction { txid, reply })
             .await
@@ -1021,6 +1050,9 @@ pub struct BtcActorConfig {
     /// database may be missing an earlier instance's unconfirmed sends spend before a
     /// mempool view is established (see [`BtcActor::send_gate`]).
     pub allow_sends_without_mempool_view: bool,
+    /// `[wallets.<name>.spend_policy]`: the recipients this wallet may pay and how much it
+    /// may move (see [`crate::btc::policy`]). The default is no policy.
+    pub spend_policy: crate::config::SpendPolicyConfig,
     /// How often to poll the upstream once caught up (`[sync] interval_secs`).
     pub sync_interval: Duration,
     /// Reconnect backoff bounds (`[backend] reconnect_base_secs`/`reconnect_max_secs`).
@@ -1054,6 +1086,7 @@ pub fn spawn(
         lookahead,
         initial_scan,
         allow_sends_without_mempool_view,
+        spend_policy,
         sync_interval,
         reconnect_base,
         reconnect_max,
@@ -1283,6 +1316,20 @@ pub fn spawn(
             sends_without_mempool_view_warning(kyoto)
         );
     }
+    let spend_policy = SpendPolicy::from_config(&spend_policy, keys::network(network))
+        .map_err(|e| anyhow::anyhow!("wallet '{name}': [wallets.{name}.spend_policy]: {e:#}"))?;
+    if let Some(policy) = &spend_policy {
+        info!(
+            target: "rose::audit",
+            wallet = %name,
+            allow_recipients = ?policy.allow_count(),
+            max_per_transaction_sat = ?policy.max_per_transaction_sat(),
+            max_per_day_sat = ?policy.max_per_day_sat(),
+            window_blocks = crate::btc::policy::WINDOW_BLOCKS,
+            "spending policy in force: sends outside it are refused, and sendrawtransaction \
+             refuses new spends of this wallet's coins"
+        );
+    }
     let upstream = endpoint.as_ref().map(BtcEndpoint::describe);
     let wallet_never_synced = wallet.latest_checkpoint().height() == 0;
     let history_unknown = history_unknown_at_start(seed_history, wallet_never_synced);
@@ -1312,6 +1359,7 @@ pub fn spawn(
             MempoolRebuild::NotNeeded
         },
         allow_sends_without_mempool_view,
+        spend_policy,
         birthday,
         birthday_time,
         birthday_anchor,
@@ -1506,6 +1554,9 @@ struct BtcActor {
     initial_scan: u32,
     /// See [`BtcActorConfig::allow_sends_without_mempool_view`]; read by [`Self::send_gate`].
     allow_sends_without_mempool_view: bool,
+    /// See [`BtcActorConfig::spend_policy`]; `None` is no policy. Enforced by
+    /// [`Self::enforce_spend_policy`] on every built transaction before it is signed.
+    spend_policy: Option<SpendPolicy>,
     /// Kyoto only: the wallet tip at which each once-confirmed received transaction was
     /// first seen unconfirmed again - a reorg unwound it - for [`BtcActor::expire_reorged_receives`].
     unconfirmed_since: HashMap<Txid, u32>,
@@ -1593,6 +1644,11 @@ struct ReadView {
     /// test `read_view_matches_bdk` pins that): a recorded wallet output of a canonical
     /// transaction that no canonical transaction spends, in the index's order.
     unspent: Vec<bdk_wallet::LocalOutput>,
+    /// Every canonical transaction the wallet funded with a payment to a script outside
+    /// it, and what it paid there: the history the spending policy's window counts
+    /// ([`crate::btc::policy::window_total`]). Built in the same pass, so the policy costs
+    /// a send no canonicalization of its own.
+    outflows: Vec<Outflow>,
 }
 
 /// One pass over the canonical transactions, see [`ReadView`].
@@ -1605,17 +1661,38 @@ struct ReadView {
 /// transaction was inserted is in the second set and not the first, and BDK's coin
 /// selection works from the first, so a balance that counted it would be one a send could
 /// not spend.
-fn build_read_view(wallet: &Wallet) -> ReadView {
+///
+/// `outflows` is filled only when the wallet has a spending policy to read it
+/// (`with_outflows`), so a wallet without one pays nothing for it.
+fn build_read_view(wallet: &Wallet, with_outflows: bool) -> ReadView {
     let mut tx_count = 0;
     let mut funded = HashSet::new();
     let mut spent = HashSet::new();
     let mut canonical = HashMap::new();
+    let mut outflows = Vec::new();
     for wtx in wallet.transactions() {
         tx_count += 1;
         let txid = wtx.tx_node.txid;
         let tx = &wtx.tx_node.tx;
         if wallet.sent_and_received(tx).0 > Amount::ZERO {
             funded.insert(txid);
+            let paid_sat = if with_outflows {
+                external_paid_sat(wallet, tx)
+            } else {
+                0
+            };
+            if paid_sat > 0 {
+                outflows.push(Outflow {
+                    txid,
+                    height: match &wtx.chain_position {
+                        bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => {
+                            Some(anchor.block_id.height)
+                        }
+                        bdk_wallet::chain::ChainPosition::Unconfirmed { .. } => None,
+                    },
+                    paid_sat,
+                });
+            }
         }
         // A spend of a wallet output is relevant, so the relevant set holds every
         // canonical spend (BDK's filter walks all canonical transactions for the same).
@@ -1623,6 +1700,33 @@ fn build_read_view(wallet: &Wallet) -> ReadView {
             spent.extend(tx.input.iter().map(|input| input.previous_output));
         }
         canonical.insert(txid, (Arc::clone(tx), wtx.chain_position));
+    }
+    // A funded transaction the wallet stopped tracking - abandoned (over kyoto the wallet
+    // cannot see whether peers still hold it), or retired on a node's rejection - may yet
+    // confirm, as long as no transaction the wallet holds spends one of its inputs. Until
+    // one does, it counts toward the policy's window as unconfirmed: otherwise
+    // `abandontransaction` followed by a fresh send would let both confirm past the cap.
+    // A send (a self-send included) that spends any of its inputs releases it, as does a
+    // bump's replacement for its original.
+    if with_outflows {
+        for node in wallet.tx_graph().full_txs() {
+            let tx = &node.tx;
+            if canonical.contains_key(&node.txid)
+                || tx.is_coinbase()
+                || tx.input.iter().any(|i| spent.contains(&i.previous_output))
+                || wallet.sent_and_received(tx.as_ref()).0 == Amount::ZERO
+            {
+                continue;
+            }
+            let paid_sat = external_paid_sat(wallet, tx);
+            if paid_sat > 0 {
+                outflows.push(Outflow {
+                    txid: node.txid,
+                    height: None,
+                    paid_sat,
+                });
+            }
+        }
     }
     let unspent = wallet
         .spk_index()
@@ -1646,7 +1750,17 @@ fn build_read_view(wallet: &Wallet) -> ReadView {
         tx_count,
         funded,
         unspent,
+        outflows,
     }
+}
+
+/// What `tx` pays to scripts the wallet does not own, in satoshis (the spending policy's
+/// measure: change and self-sends cost nothing).
+fn external_paid_sat(wallet: &Wallet, tx: &Transaction) -> u64 {
+    tx.output
+        .iter()
+        .filter(|o| !wallet.is_mine(o.script_pubkey.clone()))
+        .fold(0u64, |sum, o| sum.saturating_add(o.value.to_sat()))
 }
 
 /// Confirmations of a transaction anchored at `height` against the wallet's own tip
@@ -3541,7 +3655,8 @@ impl BtcActor {
     /// The read path's view of the wallet (see [`ReadView`]), built on first use since
     /// the last change.
     fn read_view(&self) -> &ReadView {
-        self.read_view.get_or_init(|| build_read_view(&self.wallet))
+        self.read_view
+            .get_or_init(|| build_read_view(&self.wallet, self.spend_policy.is_some()))
     }
 
     /// Forget the read view: the wallet changed. Called at every site that applies a
@@ -3688,6 +3803,9 @@ impl BtcActor {
             }
             BtcCommand::Recovery { reply } => {
                 let _ = reply.send(Ok(self.recovery()));
+            }
+            BtcCommand::SpendPolicy { reply } => {
+                let _ = reply.send(Ok(self.spend_policy_status()));
             }
             BtcCommand::Balance { reply } => {
                 // Every bucket on Core's rules, from the same unspent set `listunspent`
@@ -4459,6 +4577,10 @@ impl BtcActor {
             .fee()
             .map_err(|e| RpcError::misc(format!("compute the psbt fee: {e}")))?;
         check_max_tx_fee(fee.to_sat(), self.fees.max_tx_fee_sat)?;
+        // The spending policy, on the transaction exactly as built (what a
+        // `subtractfeefromamount` send actually pays, change exempt), before a signer
+        // exists.
+        self.enforce_spend_policy(&psbt.unsigned_tx, None, "send")?;
 
         let tx = self.sign_and_extract(psbt)?;
         // Commit, then relay (module doc): the send is on disk at 0-conf - its inputs
@@ -4505,6 +4627,65 @@ impl BtcActor {
         Ok(BtcSent {
             txid: txid.to_string(),
             fee_reason: fee_reason.to_string(),
+        })
+    }
+
+    /// Hold a built, unsigned transaction to the spending policy (see
+    /// [`crate::btc::policy`]), answering `-4` with the rule and what is left when it does
+    /// not fit. `replaces` is the original a fee bump takes the place of, left out of the
+    /// window total. Runs on the single-writer actor, so two sends cannot both pass on the
+    /// same remaining allowance: the first is committed (and so in the window) before the
+    /// second is checked.
+    fn enforce_spend_policy(
+        &self,
+        tx: &Transaction,
+        replaces: Option<Txid>,
+        kind: &'static str,
+    ) -> Result<(), RpcError> {
+        let Some(policy) = &self.spend_policy else {
+            return Ok(());
+        };
+        let external: Vec<&bdk_wallet::bitcoin::TxOut> = tx
+            .output
+            .iter()
+            .filter(|o| !self.wallet.is_mine(o.script_pubkey.clone()))
+            .collect();
+        let spent = if policy.max_per_day_sat().is_some() {
+            crate::btc::policy::window_total(
+                &self.read_view().outflows,
+                self.tip_height(),
+                replaces,
+            )
+        } else {
+            0
+        };
+        policy.check(&external, spent).map_err(|refusal| {
+            warn!(
+                target: "rose::audit",
+                kind,
+                rule = refusal.rule(),
+                "spend refused by the spending policy: {}",
+                refusal.message()
+            );
+            RpcError::new(codes::RPC_WALLET_ERROR, refusal.message())
+        })
+    }
+
+    /// The spending policy's readout for `getwalletinfo.spend_policy`, `None` without a
+    /// policy.
+    fn spend_policy_status(&self) -> Option<BtcSpendPolicyStatus> {
+        let policy = self.spend_policy.as_ref()?;
+        let spent =
+            crate::btc::policy::window_total(&self.read_view().outflows, self.tip_height(), None);
+        Some(BtcSpendPolicyStatus {
+            allow_recipients: policy.allow_count(),
+            max_per_transaction_sat: policy.max_per_transaction_sat(),
+            max_per_day_sat: policy.max_per_day_sat(),
+            window_blocks: crate::btc::policy::WINDOW_BLOCKS,
+            spent_in_window_sat: spent,
+            remaining_in_window_sat: policy
+                .max_per_day_sat()
+                .map(|cap| cap.saturating_sub(spent)),
         })
     }
 
@@ -4811,6 +4992,27 @@ impl BtcActor {
         // a transaction the wallet already holds canonical is no new spend, and a foreign
         // transaction spends nothing of the wallet's.
         if pricing.spends_wallet_output && self.wallet.get_tx(txid).is_none() {
+            // A spending policy binds the transactions the wallet builds; a caller-built
+            // one it can only take or leave whole. Today nothing but the seed can sign
+            // one (no signing RPC exists), so this closes a door for later rather than one
+            // open now: a new spend of the wallet's coins is refused outright while a
+            // policy is set. A resubmission of a transaction the wallet holds, and a relay
+            // of a foreign one, spend nothing new and pass.
+            if self.spend_policy.is_some() {
+                warn!(
+                    target: "rose::audit",
+                    %txid,
+                    "sendrawtransaction refused: a new spend of this wallet's coins while a \
+                     spending policy is set"
+                );
+                return Err(RpcError::new(
+                    codes::RPC_WALLET_ERROR,
+                    "Spending policy: sendrawtransaction cannot relay a new spend of this \
+                     wallet's coins while [wallets.<name>.spend_policy] is set (the wallet \
+                     did not build the transaction, so it cannot hold it to the policy); \
+                     use sendtoaddress or sendmany",
+                ));
+            }
             self.send_gate()?;
         }
         let max_fee_rate = Some(max_fee_rate_sat_per_kvb);
@@ -5190,6 +5392,9 @@ impl BtcActor {
             .to_sat();
         check_max_tx_fee(fee, self.fees.max_tx_fee_sat)
             .map_err(|e| RpcError::new(codes::RPC_WALLET_ERROR, e.message))?;
+        // A replacement is counted in place of its original, so a bump that pays the same
+        // recipients passes wherever the original did - unless the policy changed since.
+        self.enforce_spend_policy(&psbt.unsigned_tx, Some(txid), "fee bump")?;
         Ok((self.sign_and_extract(psbt)?, fee))
     }
 
@@ -5865,6 +6070,7 @@ mod tests {
             lookahead: DEFAULT_LOOKAHEAD,
             initial_scan: 0,
             allow_sends_without_mempool_view: false,
+            spend_policy: Default::default(),
             sync_interval: Duration::from_secs(20),
             reconnect_base: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
@@ -5973,7 +6179,7 @@ mod tests {
             (Arc::new(pending_spend), 101u64),
         ]);
 
-        let view = build_read_view(&wallet);
+        let view = build_read_view(&wallet, false);
         let bdk: Vec<bdk_wallet::LocalOutput> = wallet.list_unspent().collect();
         assert_eq!(view.unspent, bdk);
         // Coinbase (ext 0), ext 3 pending, int 0 confirmed change, int 1 pending change.
@@ -6001,6 +6207,44 @@ mod tests {
             .get_tx(receive_txid)
             .unwrap()
             .is_coinbase());
+
+        // The spending policy's outflows: only with a policy, every funded transaction's
+        // payment to foreign scripts (change excluded), at its height or unconfirmed.
+        assert!(view.outflows.is_empty(), "no policy, no outflows");
+        let with = build_read_view(&wallet, true);
+        assert_eq!(with.unspent, view.unspent, "outflows change nothing else");
+        let spend_txid = spend.compute_txid();
+        let outflow = |txid, height, paid_sat| crate::btc::policy::Outflow {
+            txid,
+            height,
+            paid_sat,
+        };
+        assert_eq!(
+            with.outflows,
+            vec![
+                outflow(spend_txid, Some(3), 4_000),
+                outflow(pending_spend_txid, None, 1_000)
+            ]
+        );
+        // Abandoned, it still counts as unconfirmed: nothing the wallet holds spends its
+        // input, so the network may yet confirm it.
+        wallet.apply_evicted_txs([(pending_spend_txid, 200u64)]);
+        let abandoned = build_read_view(&wallet, true);
+        assert!(!abandoned.funded.contains(&pending_spend_txid));
+        assert_eq!(abandoned.outflows, with.outflows);
+        // A self-send of the same input releases it: at most one of the two can confirm,
+        // and this one pays nothing outside the wallet.
+        wallet.apply_unconfirmed_txs([(
+            Arc::new(pay(
+                vec![OutPoint::new(receive_txid, 1)],
+                vec![out(19_000, int(&wallet, 2))],
+            )),
+            300u64,
+        )]);
+        assert_eq!(
+            build_read_view(&wallet, true).outflows,
+            vec![outflow(spend_txid, Some(3), 4_000)]
+        );
     }
 
     /// Micro-benchmark for the read path's growth with the UTXO set, on the

@@ -617,6 +617,49 @@ pub struct WalletEntry {
     /// (`BtcActor::send_gate`). `true` accepts that risk and spends at once. Inert over
     /// bitcoind, whose mempool pass is the view; carried at `false` on a Zcash wallet.
     pub allow_sends_without_mempool_view: bool,
+    /// This wallet's spending policy (`[wallets.<name>.spend_policy]`, Bitcoin wallets
+    /// only for now): the recipients it may pay and how much it may move. Default (every
+    /// field `None`) is no policy, today's behaviour. See [`SpendPolicyConfig`].
+    pub spend_policy: SpendPolicyConfig,
+}
+
+/// A wallet's spending policy (`[wallets.<name>.spend_policy]`): what a caller
+/// holding the RPC credentials may do with the wallet's funds. It bounds a stolen password
+/// (or a compromised host) to "move at most so much, to addresses already trusted".
+///
+/// Deployment state, deliberately: no RPC reads it back into a mutation and no environment
+/// variable overrides it, so changing it is a config change and a restart (in an attested
+/// enclave, a redeploy the quorum approves, since the baked config is in the measurement).
+///
+/// Outputs to the wallet's own scripts (change, self-sends) are never restricted or counted.
+/// Every field `None` is no policy at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpendPolicyConfig {
+    /// The recipients the wallet may pay, as the operator wrote them (validated against
+    /// the wallet's coin and network at resolve). `None` restricts nothing; an empty list
+    /// is refused at resolve rather than read as either "nothing" or "everything".
+    pub allow_recipients: Option<Vec<String>>,
+    /// The most one send may pay to recipients outside the wallet, in satoshis (fees
+    /// excluded; `[fees] max_tx_fee_sat` bounds those).
+    pub max_per_transaction_sat: Option<u64>,
+    /// The most the wallet may pay to recipients outside it over the last
+    /// [`SPEND_POLICY_WINDOW_BLOCKS`] blocks plus its unconfirmed sends, in satoshis, this
+    /// send included. Counted from the wallet's own history, so a restart does not reset it.
+    pub max_per_day_sat: Option<u64>,
+}
+
+/// The window `max_per_day_sat` counts over: 144 blocks, a day at Bitcoin's target spacing.
+/// Blocks rather than wall-clock time, because the clock is the host's to move (an enclave
+/// reads its time from the parent) and the chain's height only mining moves.
+pub const SPEND_POLICY_WINDOW_BLOCKS: u32 = 144;
+
+impl SpendPolicyConfig {
+    /// Whether any rule is set.
+    pub fn is_active(&self) -> bool {
+        self.allow_recipients.is_some()
+            || self.max_per_transaction_sat.is_some()
+            || self.max_per_day_sat.is_some()
+    }
 }
 
 impl WalletEntry {
@@ -1918,6 +1961,17 @@ struct WalletFile {
     /// Let a kyoto wallet spend before it has a mempool view of its own unconfirmed
     /// history. Bitcoin wallets only.
     allow_sends_without_mempool_view: Option<bool>,
+    /// The wallet's spending policy (`[wallets.<name>.spend_policy]`). Bitcoin wallets
+    /// only for now. Config file only: no environment variable reaches it.
+    spend_policy: Option<SpendPolicyFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpendPolicyFile {
+    allow_recipients: Option<Vec<String>>,
+    max_per_transaction_sat: Option<u64>,
+    max_per_day_sat: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2845,6 +2899,15 @@ impl AppConfig {
             }
             let dir = w.dir.clone().unwrap_or_else(|| wallet_dir(&datadir, name));
             let backend_override = resolve_wallet_backend(name, w)?;
+            #[cfg(feature = "bitcoin")]
+            let spend_policy = resolve_spend_policy(
+                name,
+                coin,
+                w.spend_policy.as_ref(),
+                coin.chain_with(network, btc_testnet),
+            )?;
+            #[cfg(not(feature = "bitcoin"))]
+            let spend_policy = resolve_spend_policy(name, coin, w.spend_policy.as_ref())?;
             #[cfg(feature = "zcash")]
             let (
                 enabled,
@@ -2904,6 +2967,7 @@ impl AppConfig {
                     allow_sends_without_mempool_view: w
                         .allow_sends_without_mempool_view
                         .unwrap_or(false),
+                    spend_policy,
                 },
             );
         }
@@ -2937,6 +3001,7 @@ impl AppConfig {
                 lookahead: DEFAULT_LOOKAHEAD,
                 initial_scan: 0,
                 allow_sends_without_mempool_view: false,
+                spend_policy: SpendPolicyConfig::default(),
             });
 
         let backend_file = file.backend.unwrap_or(BackendFile {
@@ -3605,6 +3670,109 @@ fn validate_backend_tls(backend: &BackendConfig) -> anyhow::Result<()> {
 /// Parse a wallet's `[wallets.<name>]` backend override keys. Each key is parsed by the same
 /// helper the global `[backend]` section uses, so the two cannot drift; errors name the exact
 /// TOML key that is wrong.
+/// Resolve `[wallets.<name>.spend_policy]`. Refused outright on a Zcash wallet,
+/// whose send paths do not enforce it yet: a policy that parsed and then bound nothing
+/// would be worse than none. On a Bitcoin wallet every allowlisted address must parse for
+/// the wallet's own network (a mainnet address in a testnet daemon is an error here, never
+/// a silent no-match at send time), and every cap must be a positive amount within the
+/// money range.
+fn resolve_spend_policy(
+    name: &str,
+    coin: Coin,
+    file: Option<&SpendPolicyFile>,
+    #[cfg(feature = "bitcoin")] chain: CoinNetwork,
+) -> anyhow::Result<SpendPolicyConfig> {
+    let Some(file) = file else {
+        return Ok(SpendPolicyConfig::default());
+    };
+    // A build without the Zcash engine has one chain variant, so the binding cannot fail.
+    #[cfg(all(feature = "bitcoin", not(feature = "zcash")))]
+    let CoinNetwork::Bitcoin(network) = chain;
+    #[cfg(all(feature = "bitcoin", feature = "zcash"))]
+    let network = match chain {
+        CoinNetwork::Bitcoin(network) => network,
+        CoinNetwork::Zcash(_) => anyhow::bail!(
+            "[wallets.{name}.spend_policy] does not apply to a {} wallet yet (the spending \
+             policy is enforced by the Bitcoin engine only; remove the section rather than \
+             run a wallet it would not bind)",
+            coin.name()
+        ),
+    };
+    // Only the Zcash arm above names the coin.
+    #[cfg(all(feature = "bitcoin", not(feature = "zcash")))]
+    let _ = coin;
+    #[cfg(not(feature = "bitcoin"))]
+    {
+        // Read, not enforced: the section is refused whole in a build without the engine.
+        let _ = (
+            &file.allow_recipients,
+            file.max_per_transaction_sat,
+            file.max_per_day_sat,
+        );
+        anyhow::bail!(
+            "[wallets.{name}.spend_policy] does not apply to a {} wallet yet (the spending \
+             policy is enforced by the Bitcoin engine only; remove the section rather than \
+             run a wallet it would not bind)",
+            coin.name()
+        );
+    }
+    #[cfg(feature = "bitcoin")]
+    {
+        let cap = |key: &str, value: Option<u64>| -> anyhow::Result<Option<u64>> {
+            match value {
+                Some(0) => anyhow::bail!(
+                    "[wallets.{name}.spend_policy] {key} must be greater than 0 (to refuse \
+                     every payment, stop the wallet instead; to lift the cap, remove the key)"
+                ),
+                Some(v) if v > crate::amount::MAX_MONEY => anyhow::bail!(
+                    "[wallets.{name}.spend_policy] {key} = {v} is more than 21000000 BTC in \
+                     satoshis"
+                ),
+                other => Ok(other),
+            }
+        };
+        let max_per_transaction_sat = cap("max_per_transaction_sat", file.max_per_transaction_sat)?;
+        let max_per_day_sat = cap("max_per_day_sat", file.max_per_day_sat)?;
+        let allow_recipients = match &file.allow_recipients {
+            None => None,
+            Some(list) if list.is_empty() => anyhow::bail!(
+                "[wallets.{name}.spend_policy] allow_recipients is empty; list the addresses \
+                 the wallet may pay, or remove the key to allow any recipient"
+            ),
+            Some(list) => {
+                let bdk_network = crate::btc::keys::network(network);
+                let mut out = Vec::with_capacity(list.len());
+                for addr in list {
+                    let addr = addr.trim();
+                    use std::str::FromStr as _;
+                    bdk_wallet::bitcoin::Address::from_str(addr)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "[wallets.{name}.spend_policy] allow_recipients: {addr:?} is not \
+                                 a Bitcoin address ({e})"
+                            )
+                        })?
+                        .require_network(bdk_network)
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "[wallets.{name}.spend_policy] allow_recipients: {addr} is not \
+                                 an address on this wallet's network ({})",
+                                network.name()
+                            )
+                        })?;
+                    out.push(addr.to_string());
+                }
+                Some(out)
+            }
+        };
+        Ok(SpendPolicyConfig {
+            allow_recipients,
+            max_per_transaction_sat,
+            max_per_day_sat,
+        })
+    }
+}
+
 fn resolve_wallet_backend(name: &str, w: &WalletFile) -> anyhow::Result<WalletBackendOverride> {
     Ok(WalletBackendOverride {
         server: w.server.clone(),
@@ -5508,6 +5676,86 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("transparent_initial_scan"), "{err}");
+    }
+
+    /// `[wallets.<name>.spend_policy]`: absent is no policy; addresses must be on
+    /// the wallet's own network; an empty allowlist, a zero cap, an unknown key and (in a
+    /// build with both engines) a Zcash wallet are refused, never read as something milder.
+    #[test]
+    #[cfg(all(feature = "cli", feature = "bitcoin"))]
+    fn spend_policy_resolves_on_a_bitcoin_wallet_and_refuses_what_it_cannot_bind() {
+        use bdk_wallet::bitcoin::{Address, Network, ScriptBuf};
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("rose.toml");
+        let resolve = |body: &str| {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
+            AppConfig::resolve(&cli)
+        };
+        let addr =
+            |network: Network| Address::p2wsh(&ScriptBuf::from_bytes(vec![7]), network).to_string();
+        let testnet = addr(Network::Testnet);
+        let mainnet = addr(Network::Bitcoin);
+        let head = "network = \"test\"\ndatadir = \"/d\"\n[wallets.btc]\ncoin = \"bitcoin\"\n";
+        let cfg = resolve(head).unwrap();
+        assert!(!cfg.wallets["btc"].spend_policy.is_active());
+
+        let cfg = resolve(&format!(
+            "{head}[wallets.btc.spend_policy]\nallow_recipients = [\"{testnet}\"]\n\
+             max_per_transaction_sat = 50000\nmax_per_day_sat = 200000\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.wallets["btc"].spend_policy,
+            SpendPolicyConfig {
+                allow_recipients: Some(vec![testnet.clone()]),
+                max_per_transaction_sat: Some(50_000),
+                max_per_day_sat: Some(200_000),
+            }
+        );
+
+        let err = |body: String| format!("{:#}", resolve(&format!("{head}{body}")).unwrap_err());
+        let e = err(format!(
+            "[wallets.btc.spend_policy]\nallow_recipients = [\"{mainnet}\"]\n"
+        ));
+        assert!(
+            e.contains("not an address on this wallet's network (testnet3)"),
+            "{e}"
+        );
+        let e = err("[wallets.btc.spend_policy]\nallow_recipients = [\"nope\"]\n".into());
+        assert!(e.contains("is not a Bitcoin address"), "{e}");
+        let e = err("[wallets.btc.spend_policy]\nallow_recipients = []\n".into());
+        assert!(e.contains("allow_recipients is empty"), "{e}");
+        let e = err("[wallets.btc.spend_policy]\nmax_per_day_sat = 0\n".into());
+        assert!(e.contains("max_per_day_sat must be greater than 0"), "{e}");
+        let e =
+            err("[wallets.btc.spend_policy]\nmax_per_transaction_sat = 2100000000000001\n".into());
+        assert!(e.contains("more than 21000000 BTC"), "{e}");
+        let e = err("[wallets.btc.spend_policy]\nmax_per_day = 1.5\n".into());
+        assert!(e.contains("unknown field"), "{e}");
+    }
+
+    /// The Zcash engine does not enforce a spending policy yet, so a Zcash wallet carrying
+    /// one is refused rather than run unbound.
+    #[test]
+    #[cfg(all(feature = "cli", feature = "bitcoin", feature = "zcash"))]
+    fn spend_policy_is_refused_on_a_zcash_wallet() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("rose.toml");
+        std::fs::write(
+            &conf,
+            "network = \"test\"\ndatadir = \"/d\"\n[wallets.zec]\n\
+             [wallets.zec.spend_policy]\nmax_per_day_sat = 1000\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
+        let e = AppConfig::resolve(&cli).unwrap_err().to_string();
+        assert!(
+            e.contains("[wallets.zec.spend_policy] does not apply to a zcash wallet yet"),
+            "{e}"
+        );
     }
 
     /// `allow_sends_without_mempool_view`: off by default, taken as given on a

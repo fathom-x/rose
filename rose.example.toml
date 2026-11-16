@@ -83,6 +83,24 @@ dir = "./data/default"
 # the bitcoind backend the node's mempool is the view: such a wallet waits only for the
 # first mempool pass at tip, and this setting has no effect there.
 # allow_sends_without_mempool_view = false
+#
+# Bitcoin wallets only: the spending policy, which bounds what a caller holding the RPC
+# credentials can do with this wallet's funds. Config file only - no environment variable or
+# RPC changes it, so in an attested enclave the measured image vouches for it. Outputs to
+# the wallet's own addresses (change, self-sends) are never restricted or counted, and fees
+# are not counted ([fees] max_tx_fee_sat bounds those). A send outside the policy is -4,
+# naming the rule and what is left, and nothing is signed. While a policy is set,
+# sendrawtransaction refuses a new spend of this wallet's coins (the wallet did not build it).
+# Omit the section for no policy. On a Zcash wallet the section is refused (not yet enforced).
+# [wallets.default.spend_policy]
+# The only recipients the wallet may pay, on its own network. Omit for any recipient.
+# allow_recipients = ["bc1q..."]
+# The most one send may pay to recipients outside the wallet, in satoshis.
+# max_per_transaction_sat = 1000000
+# The most the wallet may pay out over the last 144 blocks plus its unconfirmed sends, in
+# satoshis, the new send included. Counted in blocks (not the host's clock) from the wallet's
+# own history, so a restart does not reset it; getwalletinfo.spend_policy reports what is left.
+# max_per_day_sat = 5000000
 
 [backend]
 # The chain upstream: a LOCAL zebrad's JSON-RPC ("full mode", the default and the

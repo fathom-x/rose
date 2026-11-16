@@ -529,6 +529,7 @@ pub(crate) fn resolve_wallet_entry(config: &AppConfig, wallet: &str) -> WalletEn
             lookahead: crate::config::DEFAULT_LOOKAHEAD,
             initial_scan: 0,
             allow_sends_without_mempool_view: false,
+            spend_policy: Default::default(),
         })
 }
 
@@ -2495,6 +2496,7 @@ mod tests {
             lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
             initial_scan: 0,
             allow_sends_without_mempool_view: false,
+            spend_policy: Default::default(),
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),
@@ -2609,6 +2611,7 @@ mod tests {
             lookahead: crate::btc::actor::DEFAULT_LOOKAHEAD,
             initial_scan: 0,
             allow_sends_without_mempool_view: false,
+            spend_policy: Default::default(),
             sync_interval: std::time::Duration::from_secs(20),
             reconnect_base: std::time::Duration::from_secs(1),
             reconnect_max: std::time::Duration::from_secs(60),
@@ -3616,6 +3619,7 @@ mod tests {
                 lookahead: crate::config::DEFAULT_LOOKAHEAD,
                 initial_scan: 0,
                 allow_sends_without_mempool_view: false,
+                spend_policy: Default::default(),
             },
         );
         wallets.insert(
@@ -3638,6 +3642,7 @@ mod tests {
                 lookahead: crate::config::DEFAULT_LOOKAHEAD,
                 initial_scan: 0,
                 allow_sends_without_mempool_view: false,
+                spend_policy: Default::default(),
             },
         );
 
@@ -3691,6 +3696,7 @@ mod tests {
                     lookahead: crate::config::DEFAULT_LOOKAHEAD,
                     initial_scan: 0,
                     allow_sends_without_mempool_view: false,
+                    spend_policy: Default::default(),
                 },
             );
         }

@@ -1601,6 +1601,46 @@ mod tests {
         assert_eq!(call("listunspent", vec![]).await.unwrap(), json!([]));
         assert_eq!(call("listtransactions", vec![]).await.unwrap(), json!([]));
 
+        // The account xpub is not RPC surface by default (`[rpc] expose_xpub` off):
+        // listdescriptors reads as method-not-found in every form, ahead of the arity check
+        // and its own parameter parsing, so the gated server hints at nothing.
+        for params in [
+            vec![],
+            vec![json!(true)],
+            vec![json!(false), json!("extra")],
+        ] {
+            let err = call("listdescriptors", params).await.unwrap_err();
+            assert_eq!(err.code, crate::error::codes::RPC_METHOD_NOT_FOUND);
+        }
+        // With the key on it serves Core's shape, the xpub inside, and the arity check
+        // and the private-form refusal come back.
+        let mut open_config = (*state.config).clone();
+        open_config.rpc.expose_xpub = true;
+        let open = AppState {
+            config: Arc::new(open_config),
+            ..state.clone()
+        };
+        let open_call = |method: &str, params: Vec<Value>| {
+            let req = RpcRequest::positional(method.to_string(), params);
+            let state = &open;
+            async move { crate::rpc::dispatch(state, None, &req).await }
+        };
+        let descriptors = open_call("listdescriptors", vec![]).await.unwrap();
+        let descs = descriptors["descriptors"].as_array().unwrap();
+        assert_eq!(descs.len(), 2, "{descriptors}");
+        assert!(
+            descs[0]["desc"].as_str().unwrap().starts_with("wpkh(["),
+            "{descriptors}"
+        );
+        let err = open_call("listdescriptors", vec![json!(true)])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_WALLET_ERROR);
+        let err = open_call("listdescriptors", vec![json!(false), json!("extra")])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::RPC_MISC_ERROR);
+
         // History misses and offline sends fail with their Core codes rather than panicking:
         // an unknown txid is -5, a send with no upstream connection is -4, and a raw
         // broadcast without an upstream is -4 too.

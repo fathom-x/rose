@@ -1107,9 +1107,36 @@ def s_labels_removed(ctx):
         ck("getnewaddress label -> code -8", e.code == -8, e.code)
 
 
+def xpub_gated(rpc):
+    """True when the daemon runs with `[rpc] expose_xpub` off (the default): listdescriptors,
+    the one method that returns the account xpub, then answers -32601 on a Bitcoin wallet,
+    exactly like a method off the safelist. Only meaningful on a Bitcoin wallet (a Zcash wallet
+    answers -32601 either way)."""
+    try:
+        rpc.call("listdescriptors")
+        return False
+    except JSONRPCException as e:
+        if e.code == -32601:
+            return True
+        raise
+
+
 @section("listdescriptors", BITCOIN)
 def s_listdescriptors(ctx):
     rpc, ck = ctx.rpc, ctx.ck
+    if xpub_gated(rpc):
+        # The default: the xpub cannot be rotated, so it is not RPC surface unless the operator
+        # opts in. The gate runs before parameter parsing and the arity check, so every form of
+        # the call reads as a method that does not exist.
+        for label, params in (("private", [True]), ("non-boolean", ["yes"]),
+                              ("extra arg", [False, "extra"])):
+            try:
+                rpc.call("listdescriptors", *params)
+                ck(f"gated listdescriptors {label} raises", False)
+            except JSONRPCException as e:
+                ck(f"gated listdescriptors {label} -> -32601", e.code == -32601, e.code)
+        print("  (listdescriptors gated off: [rpc] expose_xpub is false; shape checks skipped)")
+        return
     # Core's shape over the wallet's two public BIP 84 descriptors: the receiving chain
     # (/0/*) first, change (/1/*) second, the origin-qualified account xpub inside both, and
     # the keychain's next index. Public material only.
@@ -2197,11 +2224,18 @@ def s_errors_bitcoin(ctx):
         ck("validateaddress extra arg raises", False)
     except JSONRPCException as e:
         ck("validateaddress extra arg -> code -1", e.code == -1, e.code)
+    # Over-arity is -1 where the method is served, and -32601 where `[rpc] expose_xpub` gates it
+    # off (the gate runs first, so a hidden method gives no arity hint). A Zcash wallet cannot
+    # tell the two apart by probing, so it accepts either.
+    if ctx.coin == BITCOIN:
+        want = {-32601} if xpub_gated(rpc) else {-1}
+    else:
+        want = {-1, -32601}
     try:
         rpc.call("listdescriptors", False, "extra")
         ck("listdescriptors extra arg raises", False)
     except JSONRPCException as e:
-        ck("listdescriptors extra arg -> code -1", e.code == -1, e.code)
+        ck(f"listdescriptors extra arg -> code {sorted(want)}", e.code in want, e.code)
     if ctx.coin == BITCOIN:
         try:
             rpc.call("abandontransaction", "00" * 32, "extra")

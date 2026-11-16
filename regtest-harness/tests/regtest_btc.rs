@@ -190,6 +190,8 @@ impl RoseBtc {
         let conf = datadir.join("rose.toml");
         // A tight sync interval so the 0-conf mempool pass lands quickly; the health
         // server is disabled to avoid a port pick for a surface this test does not assert.
+        // The xpub is exposed so listdescriptors (here and in conformance.py) checks the
+        // served shape; regtest_btc_encrypted runs conformance on the gated default.
         std::fs::write(
             &conf,
             format!(
@@ -203,7 +205,9 @@ impl RoseBtc {
                  [sync]\n\
                  interval_secs = 1\n\
                  [health]\n\
-                 enabled = false\n"
+                 enabled = false\n\
+                 [rpc]\n\
+                 expose_xpub = true\n"
             ),
         )
         .unwrap();

@@ -325,6 +325,7 @@ mod tests {
             cookiefile: None,
             work_queue: 16,
             allowed_methods: vec![],
+            expose_xpub: false,
             allow_duplicate_shielded_recipients: false,
         };
         test_state_with_rpc(rpc)
@@ -490,6 +491,7 @@ mod tests {
                 ),
                 work_queue: 16,
                 allowed_methods: vec![],
+                expose_xpub: false,
                 allow_duplicate_shielded_recipients: false,
             };
 

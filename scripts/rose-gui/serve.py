@@ -179,13 +179,18 @@ ALLOWED_METHODS = frozenset({
     "getblockcount",
     "getnewaddress",
     "getwalletinfo",
-    "listdescriptors",
     "listreceivedbyaddress",
     "listtransactions",
     "listunspent",
     "sendmany",
     "sendtoaddress",
 })
+
+# The xpub's method, forwarded only with --show-xpub (ROSE_GUI_SHOW_XPUB=1). The xpub watches
+# every address of the account forever and cannot be rotated, so a page anyone with the
+# password can open should not hand it out by default; rose itself serves the method only
+# with [rpc] expose_xpub = true, and `rose export-xpub` is the operator's route without it.
+XPUB_METHODS = frozenset({"listdescriptors"})
 
 
 # Login mode: the session cookie's name, and how long a login lasts. Long enough for a
@@ -243,6 +248,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     auth_header = None
     steve = None  # (steve-cli path, trusted-hashes file) in enclave mode, else None
     info_json = b"{}"  # which config this proxy is serving (set by main)
+    allowed_methods = ALLOWED_METHODS  # plus XPUB_METHODS with --show-xpub (set by main)
     # Login mode (auth_header is None): the user the form is prefilled with, and the live
     # sessions, cookie token -> (Authorization header, user, expiry).
     rpc_user = ""
@@ -301,7 +307,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             return self.relay(400, rpc_error(-32700, "Parse error"))
         method = call.get("method") if isinstance(call, dict) else None
-        if not isinstance(method, str) or method not in ALLOWED_METHODS:
+        if not isinstance(method, str) or method not in self.allowed_methods:
             self.log_error("refused /rpc method %r", method if isinstance(call, dict) else "<batch>")
             return self.relay(403, rpc_error(-32601, "Method not allowed through this proxy"))
         auth = self.auth_header
@@ -597,12 +603,21 @@ def main():
              "from rose's own estimatesmartfee, which is what a send uses",
     )
     ap.add_argument(
+        "--show-xpub",
+        action="store_true",
+        help="forward listdescriptors, so the Addresses tab shows the account xpub (rose serves "
+             "it only with [rpc] expose_xpub = true). Off by default: the xpub cannot be "
+             "rotated. Env: ROSE_GUI_SHOW_XPUB=1",
+    )
+    ap.add_argument(
         "--reload",
         action="store_true",
         help="development: re-exec this server when its source changes (index.html is "
              "always read per request); pair with a bind mount of the source directory",
     )
     args = ap.parse_args()
+    show_xpub = args.show_xpub or os.environ.get("ROSE_GUI_SHOW_XPUB", "") in ("1", "true", "yes")
+    Handler.allowed_methods = ALLOWED_METHODS | XPUB_METHODS if show_xpub else ALLOWED_METHODS
 
     sys.stdout.reconfigure(line_buffering=True)  # banner shows when piped to a service log
 

@@ -427,6 +427,7 @@ mod tests {
             cookiefile: Some(cookie.clone()),
             work_queue: 16,
             allowed_methods: vec![],
+            expose_xpub: false,
             allow_duplicate_shielded_recipients: false,
         };
         let auth = Authenticator::from_config(&rpc).unwrap();
@@ -461,6 +462,7 @@ mod tests {
             cookiefile: Some(dir.path().join(".cookie")),
             work_queue: 16,
             allowed_methods: vec![],
+            expose_xpub: false,
             allow_duplicate_shielded_recipients: false,
         };
         // An empty bare password (an unpopulated password_file reads as exactly this).

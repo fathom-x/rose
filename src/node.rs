@@ -1113,6 +1113,7 @@ pub(crate) mod testutil {
             cookiefile: None,
             work_queue: 16,
             allowed_methods,
+            expose_xpub: false,
             allow_duplicate_shielded_recipients: false,
         };
         AppConfig {

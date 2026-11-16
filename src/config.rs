@@ -1130,6 +1130,14 @@ pub struct RpcConfig {
     /// these methods, with anything else rejected as method-not-found (`-32601`). Names are
     /// validated at startup against [`crate::rpc::ALL_METHODS`], so a typo fails fast.
     pub allowed_methods: Vec<String>,
+    /// Serve the methods that hand out the account xpub ([`crate::rpc::XPUB_METHODS`]:
+    /// `listdescriptors`). Off by default: with it off they answer method-not-found
+    /// (`-32601`), exactly like a safelisted-out method. The xpub is a privacy key that
+    /// cannot be rotated: it watches every past and future address of the account, change
+    /// included, without the daemon, until the seed is swept, so a client that once read it
+    /// keeps that view after its RPC access is withdrawn. The operator's route to it is
+    /// `rose export-xpub`, beside `keys.toml`.
+    pub expose_xpub: bool,
     /// Accept a repeated *shielded* recipient in one `z_sendmany` call (default false).
     ///
     /// zcashd rejects any duplicate recipient address, and rose matches that by default: this
@@ -2003,6 +2011,7 @@ struct RpcFile {
     cookiefile: Option<PathBuf>,
     work_queue: Option<usize>,
     allowed_methods: Option<Vec<String>>,
+    expose_xpub: Option<bool>,
     allow_duplicate_shielded_recipients: Option<bool>,
 }
 
@@ -3197,6 +3206,7 @@ impl AppConfig {
             cookiefile: None,
             work_queue: None,
             allowed_methods: None,
+            expose_xpub: None,
             allow_duplicate_shielded_recipients: None,
         });
         // RPC password precedence: `--rpcpassword` / `ROSE_RPC_PASSWORD` (clap) > `[rpc]
@@ -3218,6 +3228,21 @@ impl AppConfig {
                     "[rpc] allowed_methods contains unknown method {m:?}; \
                      it is not an RPC method this build implements (see the example config \
                      for the full list)"
+                );
+            }
+        }
+        // A safelisted xpub method stays gated unless `expose_xpub` opens it too: refuse the
+        // contradiction at startup rather than serve a list that silently does not hold.
+        let expose_xpub = rpc_file.expose_xpub.unwrap_or(false);
+        if !expose_xpub {
+            if let Some(m) = allowed_methods
+                .iter()
+                .find(|m| crate::rpc::XPUB_METHODS.contains(&m.as_str()))
+            {
+                anyhow::bail!(
+                    "[rpc] allowed_methods lists {m:?}, which reveals the account xpub and is \
+                     served only with [rpc] expose_xpub = true; set that too, or drop {m:?} \
+                     from the list (`rose export-xpub` reads the xpub beside keys.toml)"
                 );
             }
         }
@@ -3253,6 +3278,7 @@ impl AppConfig {
                 .or_else(|| Some(datadir.join(".cookie"))),
             work_queue: rpc_file.work_queue.unwrap_or(100).max(1),
             allowed_methods,
+            expose_xpub,
             allow_duplicate_shielded_recipients: rpc_file
                 .allow_duplicate_shielded_recipients
                 .unwrap_or(false),
@@ -5071,6 +5097,37 @@ mod tests {
         let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
         let err = AppConfig::resolve(&cli).unwrap_err().to_string();
         assert!(err.contains("getblance"), "got: {err}");
+    }
+
+    /// The xpub methods are closed by default, open with `expose_xpub`, and a safelist that
+    /// names one without the key is a startup error rather than a list that does not hold.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn expose_xpub_defaults_off_and_guards_the_safelist() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("rose.toml");
+        let resolve = |body: &str| {
+            std::fs::write(&conf, body).unwrap();
+            let cli = Cli::parse_from(["rose", "--conf", conf.to_str().unwrap()]);
+            AppConfig::resolve(&cli)
+        };
+
+        assert!(!resolve("network = \"test\"\n").unwrap().rpc.expose_xpub);
+        assert!(
+            resolve("[rpc]\nexpose_xpub = true\n")
+                .unwrap()
+                .rpc
+                .expose_xpub
+        );
+        let listed = "[rpc]\nallowed_methods = [\"getbalance\", \"listdescriptors\"]\n";
+        let err = resolve(listed).unwrap_err().to_string();
+        assert!(
+            err.contains("listdescriptors") && err.contains("expose_xpub"),
+            "got: {err}"
+        );
+        let cfg = resolve(&format!("{listed}expose_xpub = true\n")).unwrap();
+        assert!(cfg.rpc.expose_xpub);
     }
 
     #[test]

@@ -303,7 +303,8 @@
   </div>
   <div id="pane-addrs" class="pane" hidden>
     <!-- The account xpub, from listdescriptors: the receiving descriptor's key with its
-         origin. Public material only; rose refuses the private form. -->
+         origin. Public material only; rose refuses the private form. Shown only where the
+         operator opted in on both sides ([rpc] expose_xpub, the proxy's --show-xpub). -->
     <div id="xpub-block">
       <div>
         <label style="margin-top:0">account xpub</label>
@@ -498,7 +499,9 @@ function renderAddresses(received, descriptors, unspent) {
   } else {
     $("xpub").style.color = "var(--dim)";
     $("xpub-origin").innerHTML = "";
-    $("xpub").textContent = "unavailable (listdescriptors failed)";
+    // Off by default on both sides: rose serves listdescriptors only with [rpc] expose_xpub,
+    // and this page's proxy forwards it only with --show-xpub (the xpub cannot be rotated).
+    $("xpub").textContent = "not shown (rose needs [rpc] expose_xpub = true and this page --show-xpub; rose export-xpub reads it beside keys.toml)";
   }
   const balance = new Map();   // address -> unspent satoshis
   for (const u of unspent || []) balance.set(u.address, (balance.get(u.address) || 0) + toSats(u.amount));

@@ -303,6 +303,13 @@ password = "change-me"
 # batch. Neither consensus nor the wallet forbids that shape; the refusal is dialect parity.
 # Repeated *transparent* recipients stay refused either way.
 # allow_duplicate_shielded_recipients = false
+#
+# Serve `listdescriptors` (Bitcoin wallets), which returns the account xpub. Off by default:
+# it then answers -32601, like a method off the safelist, and naming it in `allowed_methods`
+# without this key is a startup error. The xpub cannot be rotated: it derives every past and
+# future address of the account, change included, so a client that reads it once keeps that
+# view after its RPC access is withdrawn. `rose export-xpub` reads it beside keys.toml instead.
+# expose_xpub = false
 
 [keys]
 # age identity file used to decrypt the wallet seed for unattended sending.

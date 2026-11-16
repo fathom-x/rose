@@ -31,6 +31,10 @@
 use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
 use serde_json::json;
 
+/// The daemon-wide table the restores below run with: they read the keychain's `range`
+/// from `listdescriptors`, which `[rpc] expose_xpub` (default off) gates.
+const EXPOSE_XPUB: &str = "[rpc]\nexpose_xpub = true\n";
+
 /// How many receiving addresses the original hands out; the last one is paid.
 const ISSUED: usize = 30;
 
@@ -119,11 +123,13 @@ async fn btc_restore_over_kyoto_discovers_used_addresses_past_the_recovery_set()
     //    paid an index whose reveal put an unwatched one in the window, with the set the
     //    index now gives, and repeats - each pass a lookahead further - until one reveals
     //    nothing new.
-    let mut rose = RoseBtc::prepare(
+    let mut rose = RoseBtc::prepare_full(
         dir.path().join("restore-kyoto"),
         BtcBackend::Kyoto,
         &node,
         &["btc"],
+        "",
+        EXPOSE_XPUB,
     );
     rose.init_ok(
         "btc",
@@ -280,12 +286,13 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
     //    regtest_btc_restore covers), so the restored wallet accepts spending without a
     //    mempool view - the original's sends are all mined, so nothing is pending.
     {
-        let mut rose = RoseBtc::prepare_with(
+        let mut rose = RoseBtc::prepare_full(
             dir.path().join("restore-wide"),
             restore_backend,
             &node,
             &["btc"],
             "lookahead = 40\nallow_sends_without_mempool_view = true",
+            EXPOSE_XPUB,
         );
         rose.init_ok(
             "btc",

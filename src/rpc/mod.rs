@@ -22,6 +22,13 @@ use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 
+/// The methods whose answer carries the account xpub, served only with `[rpc] expose_xpub =
+/// true` (default off; `dispatch` answers `-32601` otherwise, like the safelist). Every
+/// other method carries at most a derived key with its origin, as in Bitcoin Core. A new
+/// method that returns an extended public key, a descriptor over one, or a viewing key from
+/// which the account's addresses follow belongs on this list.
+pub const XPUB_METHODS: &[&str] = &["listdescriptors"];
+
 /// Every RPC method name rose implements, used to validate the `[rpc] allowed_methods`
 /// safelist at startup. Keep this in lockstep with the `dispatch` table; the
 /// `all_methods_matches_dispatch_tables` test enforces it.
@@ -382,6 +389,11 @@ pub(crate) async fn dispatch(
     // An empty safelist (the default) imposes no restriction.
     let safelist = &state.config.rpc.allowed_methods;
     if !safelist.is_empty() && !safelist.iter().any(|m| m == &req.method) {
+        return Err(RpcError::method_not_found(&req.method));
+    }
+    // The xpub gate (`[rpc] expose_xpub`, default off): a method that hands out the account
+    // xpub reads as method-not-found too, before the arity check, for the same reason.
+    if !state.config.rpc.expose_xpub && XPUB_METHODS.contains(&req.method.as_str()) {
         return Err(RpcError::method_not_found(&req.method));
     }
     // Reject over-arity positional calls before dispatch (Bitcoin Core's help error, -1). Runs

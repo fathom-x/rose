@@ -8,5 +8,8 @@
 # which rose never uses.
 # RUSTSEC-2026-0459: SQLite WAL page-size disclosure, which needs a crafted database + `-wal`
 # pair; rose opens only files it creates in its own datadir.
+# RUSTSEC-2023-0071: `rsa` 0.9 timing, only in `rose-petal` via `pgp`, holder-local private-key
+# operations with no remote timing oracle; no `pgp` release on `rsa` 0.10 yet.
+# RUSTSEC-2021-0127: `serde_cbor` unmaintained, a `rose-petal` dev-dependency only.
 # The rationale is in deny.toml, which CI enforces; keep the two lists identical.
-ignore = ["RUSTSEC-2026-0374", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459"]
+ignore = ["RUSTSEC-2026-0374", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459", "RUSTSEC-2023-0071", "RUSTSEC-2021-0127"]

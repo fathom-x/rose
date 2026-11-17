@@ -33,10 +33,23 @@ yanked = "deny"
 # enclave, where nothing outside can write. The fix (libsqlite3-sys 0.39, rusqlite 0.41) cannot
 # resolve yet: `links = "sqlite3"` allows one copy, and every zakura-client-sqlite release
 # requires rusqlite ^0.37. Drop the exception with that bump.
+# RUSTSEC-2023-0071: `rsa` 0.9 (the Marvin attack) leaks private-key bits through the timing of
+# many RSA decryptions or PKCS#1 v1.5 signatures an attacker can trigger and measure. It reaches
+# the tree only through `rose-petal` -> `pgp` (`default-features = false` does not drop it), so
+# it ships in the shard holder's binary alone: `rosed`, `rose` and the images do not link `pgp`.
+# `rose-petal` makes private-key operations only on the holder's own machine, once per shard
+# send, with the holder's keyring, so there is no oracle a remote party can query repeatedly,
+# and only an RSA holder key would be exposed. `rsa` 0.10 is fixed, but `pgp` 0.21.1, its newest
+# release, still requires `rsa ^0.9.10`; drop the exception when `pgp` moves, then cut a new
+# holder-tools release.
+# RUSTSEC-2021-0127: `serde_cbor` is unmaintained (informational). It is a dev-dependency of
+# `rose-petal` only (its test fixtures' hashing), and no shipped binary links it.
 ignore = [
     { id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained: compile-time i18n config parser behind age, no upgrade exists yet" },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing leaks: reached only via age's P-256 recipients, which rose never uses; no age release on a fixed version yet" },
     { id = "RUSTSEC-2026-0459", reason = "SQLite WAL page-size disclosure: needs a crafted db + -wal pair, and rose opens only files it creates in its own datadir; fix blocked on zakura-client-sqlite" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing attack: only in rose-petal via pgp, holder-local private-key operations with no remote timing oracle; no pgp release on rsa 0.10 yet" },
+    { id = "RUSTSEC-2021-0127", reason = "serde_cbor unmaintained: a rose-petal dev-dependency only, never shipped" },
 ]
 
 [licenses]

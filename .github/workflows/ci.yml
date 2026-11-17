@@ -159,7 +159,9 @@ jobs:
   # Dependency policy: RustSec advisories (vulnerabilities AND unmaintained crates),
   # license allowlist, wildcard-version ban, and registry/git source pinning. Exceptions
   # (with rationale) live in deny.toml; .cargo/audit.toml mirrors the advisory exceptions
-  # for local `cargo audit` runs.
+  # for local `cargo audit` runs. `--workspace` because the root manifest is a package as well
+  # as the workspace: without it cargo-deny checks `rosed`'s graph alone, never rose-cli's or
+  # rose-petal's.
   deny:
     runs-on: ubuntu-latest
     steps:
@@ -171,7 +173,7 @@ jobs:
           tool: cargo-deny
 
       - name: Check advisories, licenses, bans, sources
-        run: cargo deny check
+        run: cargo deny --workspace check
 
   # Verify THIRD-PARTY-LICENSES.txt still covers the current dependency tree. rose ships
   # statically linked, so that bundle of every dependency's license text travels with the

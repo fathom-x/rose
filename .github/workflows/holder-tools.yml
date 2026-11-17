@@ -53,7 +53,9 @@ jobs:
           if-no-files-found: error
 
   darwin-arm64:
-    runs-on: macos-14
+    # macos-14 was retired by GitHub ("The configuration 'macos-14-arm64-us-xl' is not
+    # supported", 2026-11-17): the job was cancelled before any runner took it.
+    runs-on: macos-15
     timeout-minutes: 45
     continue-on-error: true
     steps:

@@ -19,6 +19,10 @@ peers on the Bitcoin network.
   the runtime image, `rosed --restore-if-empty` restores the wallet into the enclave's empty
   storage per boot, and a send gate visible over RPC (`getwalletinfo.send_gate`) says when a
   restored wallet may not spend yet, and why.
+- Custody controls for a spending wallet: per-credential RPC scopes (`[rpc] whitelist`,
+  Bitcoin Core's `-rpcwhitelist`) with every spend logged under its user, and a spending
+  policy (`[wallets.<name>.spend_policy]`: recipient allowlist, per-send and 144-block caps)
+  checked on the built transaction before it is signed.
 - Mainnet, testnet4, testnet3 and regtest.
 
 ## Three crates

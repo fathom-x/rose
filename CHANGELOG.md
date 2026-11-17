@@ -5,6 +5,85 @@ All notable changes to rose (`zecd` before 0.10.0) are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.12.0] - 2026-11-17
+
+Custody controls for a Bitcoin wallet before it holds real funds: **per-credential RPC scopes**
+(`[rpc] whitelist`, Bitcoin Core's `-rpcwhitelist`), with every spend logged under the user
+who made it, and a **spending policy** (recipient allowlist, per-send and 144-block caps)
+enforced on the built transaction before it is signed. **Read before upgrading:**
+`listdescriptors` is no longer served by default (see Changed).
+
+### Added
+
+- **Per-credential RPC scopes.** `[rpc] whitelist = ["<user>:<method>,..."]` and
+  `[rpc] whitelist_default` (`--rpcwhitelist`, `--rpcwhitelistdefault`), Bitcoin Core's
+  `-rpcwhitelist` grammar and rules: entries for one user intersect, and once any entry
+  exists an unnamed credential is refused every method unless the default is turned off. An
+  off-scope call answers `-32601` like a safelisted-out method, `allowed_methods` stays the
+  server-wide ceiling, names are validated at startup, and `config check` warns about a scope
+  naming no credential, a credential refused everything and a scoped method the safelist
+  removes. Every call of a spending method, `walletpassphrase` or `abandontransaction` is
+  logged on `rose::audit` with the RPC user, the peer and the outcome, and the `rpc` span
+  carries the `user`. A whitelist entry is also the only way to `listdescriptors` now; see
+  Changed.
+- **A spending policy for Bitcoin wallets.** `[wallets.<name>.spend_policy]` with
+  `allow_recipients`, `max_per_transaction_sat` and `max_per_day_sat` (over the last 144
+  blocks plus unconfirmed sends), checked on every built send and `bumpfee` before it is
+  signed; outputs to the wallet's own addresses are exempt. A refusal is `-4` naming the
+  rule and what is left. The window is read from the wallet's history, so a restart does
+  not reset it. While a policy is set, `sendrawtransaction` refuses a new spend of the
+  wallet's coins. `getwalletinfo.spend_policy` reports the rules and the remaining
+  allowance, and `config show` renders the section. Config file only; refused on a Zcash
+  wallet for now.
+- **The monitor page warns before addresses pass the recovery horizon.** While
+  `getwalletinfo.recovery.restorable` is false, `scripts/rose-gui` shows a red banner naming
+  the `initial_scan` a restore needs; the Receive card counts down the last five addresses
+  before the horizon and says so when a new address lands past it, and the Addresses tab marks
+  the indexes past it.
+
+### Changed
+
+- **Breaking: `listdescriptors` is no longer served by default.** It is the one method
+  that returns the account xpub, which cannot be rotated, so it is now served only to a
+  credential whose `[rpc] whitelist` entry names it: never through `whitelist_default`, never
+  to a credential with no entry, and never to an embedder's `Node::call`. Without such an
+  entry it answers `-32601`, where 0.11.0 served it to any credential. A configuration whose
+  `allowed_methods` names `listdescriptors` while no whitelist entry grants it is now a startup
+  error. To keep serving it, name it in the entry of the credential that reads it (an entry
+  scopes its credential to exactly what it names, so a watch-only coordinator's lists every
+  method it uses, for example `"coordinator:listdescriptors,getwalletinfo,getblockcount"`);
+  `rose export-xpub` stays the operator's offline route. The monitor page (`scripts/rose-gui`)
+  forwards it only with `--show-xpub` (`ROSE_GUI_SHOW_XPUB=1`), behind such a credential.
+- The `holder-tools-<sha7>` darwin-arm64 build runs on `macos-15`, since GitHub retired the
+  `macos-14` image; the toolchain stays pinned at 1.97.1.
+
+### Fixed
+
+- **A payment to an address past the recovery horizon no longer marks a Bitcoin wallet
+  restorable.** The horizon followed the highest paid external index alone, so a
+  payment to an address issued past the window led the horizon on and set
+  `getwalletinfo.recovery.restorable` back to true, although a restore from the seed never
+  finds that payment. The horizon now follows paid indexes upward only while each one sits
+  inside the window the ones below it open, and stops at the first that does not: the wallet
+  stays unrestorable until `initial_scan` is raised past it.
+
+### Security
+
+- **RUSTSEC-2026-0459** (bundled SQLite before 3.54.0, a WAL page-size read that can return
+  stale memory) is accepted in `deny.toml` with its rationale: it needs a crafted
+  database and `-wal` pair, and rose opens only database files it created in its own datadir.
+  The fix cannot resolve until the Zakura wallet layer moves past rusqlite 0.37.
+- **The dependency check now covers every workspace crate.** `cargo deny` checked only
+  the root `rosed` package, so `rose-cli` and `rose-petal` were never checked; it now runs with
+  `--workspace`. That surfaces **RUSTSEC-2023-0071** (`rsa` 0.9, the Marvin timing attack) in
+  `rose-petal` through `pgp`, accepted with its rationale: `rose-petal` makes private-key
+  operations only on the holder's own machine, once per shard send, with no oracle a remote
+  party can time, and only an RSA holder key would be exposed. No `pgp` release takes the fixed
+  `rsa` 0.10 yet. `serde_cbor` (RUSTSEC-2021-0127, unmaintained) is a `rose-petal`
+  test-only dependency and is accepted too. `rosed` and the images link neither.
+- The regtest harness takes **tokio 1.54.1** (RUSTSEC-2026-0386), as the workspace did in
+  0.11.0.
+
 ## [0.11.0] - 2026-11-03
 
 Three crates now release together: `rosed`, `rose-cli` and the new **`rose-petal`**, the shard

@@ -250,8 +250,11 @@ with the flags and the config.
   pass it through from `deploy/.env`. The config file the proxy read is on the header's
   tooltip.
 - `ROSE_GUI_SHOW_XPUB` - `1` forwards `listdescriptors`, so the Addresses tab shows the account
-  xpub (also `--show-xpub`). Off by default, and rose serves the method only with `[rpc]
-  expose_xpub = true`: the xpub watches every address of the account and cannot be rotated.
+  xpub (also `--show-xpub`). Off by default, and rose serves the method only to a credential
+  whose `[rpc] whitelist` entry names it: the xpub watches every address of the account and
+  cannot be rotated. A whitelist entry scopes its credential to exactly the methods it names,
+  so the proxy's entry lists `listdescriptors` and every method the page uses
+  (`ALLOWED_METHODS` in `serve.py`).
 
 ### Command-line Arguments
 
@@ -271,7 +274,7 @@ Full options:
 - `--port PORT` - Server port (default: `8080`)
 - `--wallet NAME` - Route RPC via `/wallet/<name>` (default: default wallet)
 - `--machine NAME` - the machine name the page header shows (env: `ROSE_GUI_MACHINE`; default: the hostname)
-- `--show-xpub` - forward `listdescriptors` for the Addresses tab's xpub (env: `ROSE_GUI_SHOW_XPUB=1`; needs `[rpc] expose_xpub = true` in rose)
+- `--show-xpub` - forward `listdescriptors` for the Addresses tab's xpub (env: `ROSE_GUI_SHOW_XPUB=1`; needs an `[rpc] whitelist` entry in rose granting the proxy's credential `listdescriptors`)
 - `--rpc-user NAME` - rose RPC username, overriding `[rpc] user` (env: `ROSE_RPC_USER`)
 - `--rpc-url URL` - whole rose JSON-RPC base URL, overriding the config's `[rpc]` bind/port (env: `ROSE_RPC_URL`)
 - `--rpc-host HOST` / `--rpc-port PORT` / `--rpc-scheme SCHEME` - compose the base URL from parts

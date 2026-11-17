@@ -159,7 +159,7 @@ async fn handle(
     let peer = peer.map(|a| a.to_string());
     let peer = peer.as_deref().unwrap_or("unknown");
     let forwarded_for = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    if !state.auth.check(auth_header) {
+    let Some(user) = state.auth.authenticate(auth_header) else {
         // Bitcoin Core inserts a small delay on auth failure to deter brute-forcing.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         warn!(
@@ -173,31 +173,37 @@ async fn handle(
             "RPC authentication failed"
         );
         return unauthorized();
-    }
+    };
     // Success is the overwhelmingly common case - one line per authenticated request - so it
     // sits at DEBUG (still under the audit target for a sink that wants it); failures warn.
     tracing::debug!(
         target: "rose::audit",
-        user = auth::basic_auth_username(auth_header)
-            .as_deref()
-            .unwrap_or("<none>"),
+        user = user.as_str(),
         wallet = wallet_label,
         peer,
         forwarded_for,
         "RPC authentication succeeded"
     );
+    let caller = Caller {
+        user: &user,
+        peer,
+        forwarded_for,
+    };
 
     match jsonrpc::parse_body(&body) {
         Err(e) => json_response(status_for(&e), &jsonrpc::error(Value::Null, &e)),
         Ok(Body::Single(v)) => {
-            let (resp, status) = process_single(&state.app, wallet.as_deref(), v).await;
+            let (resp, status) = process_single(&state.app, &caller, wallet.as_deref(), v).await;
             json_response(status, &resp)
         }
         Ok(Body::Batch(items)) => {
-            // Batches always return HTTP 200; per-item errors live in the array.
+            // Batches always return HTTP 200; per-item errors live in the array. The scope is
+            // checked per item, so one off-scope call in a batch answers -32601 in its own
+            // slot (Core refuses the whole batch with a 403; a per-item -32601 discloses no
+            // more than a single call would).
             let mut out = Vec::with_capacity(items.len());
             for v in items {
-                let (resp, _) = process_single(&state.app, wallet.as_deref(), v).await;
+                let (resp, _) = process_single(&state.app, &caller, wallet.as_deref(), v).await;
                 out.push(resp);
             }
             json_response(StatusCode::OK, &Value::Array(out))
@@ -218,16 +224,66 @@ fn status_for(err: &crate::error::RpcError) -> StatusCode {
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// The authenticated credential behind a request, for its scope and for attribution.
+#[cfg(feature = "server")]
+struct Caller<'a> {
+    /// The RPC user name the request authenticated as (`__cookie__` for the cookie).
+    user: &'a str,
+    /// The socket peer, for the audit line.
+    peer: &'a str,
+    /// The client-supplied `X-Forwarded-For`, logged as-is and never trusted.
+    forwarded_for: Option<&'a str>,
+}
+
+/// The identifier a successful audited call produced, for its audit line: a bare string
+/// result (a txid, an opid) or the `txid`/`opid` field of an object result.
+#[cfg(feature = "server")]
+fn audited_result_id(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(s) => Some(s),
+        Value::Object(o) => o
+            .get("txid")
+            .or_else(|| o.get("opid"))
+            .and_then(Value::as_str),
+        _ => None,
+    }
+}
+
 /// Validate and dispatch one request, returning `(envelope, http_status)`. Registers the
 /// command as active (for `getrpcinfo`) and emits one structured log line per call.
+///
+/// The caller's `[rpc] whitelist` scope is checked here, before dispatch: an off-scope method
+/// answers `-32601` like one the `allowed_methods` safelist removed (which dispatch checks, so
+/// the safelist stays the ceiling over every scope), and the refusal is an audit event. An
+/// [`rpc::AUDITED_METHODS`] call gets one `rose::audit` line naming the credential and the
+/// outcome.
 #[cfg(feature = "server")]
-async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Value, StatusCode) {
+async fn process_single(
+    state: &AppState,
+    caller: &Caller<'_>,
+    wallet: Option<&str>,
+    v: Value,
+) -> (Value, StatusCode) {
     match RpcRequest::from_value(v) {
         Err((id, err)) => {
             tracing::debug!(code = err.code, message = %err.message, "rpc request rejected");
             (jsonrpc::error(id, &err), status_for(&err))
         }
         Ok(req) => {
+            let wallet_label = wallet.unwrap_or("default");
+            if !state.config.rpc.whitelist.permits(caller.user, &req.method) {
+                warn!(
+                    target: "rose::audit",
+                    user = caller.user,
+                    method = %req.method,
+                    wallet = wallet_label,
+                    peer = caller.peer,
+                    forwarded_for = caller.forwarded_for,
+                    "RPC method refused: outside this credential's [rpc] whitelist"
+                );
+                let err = crate::error::RpcError::method_not_found(&req.method);
+                return (jsonrpc::error(req.id, &err), status_for(&err));
+            }
             let _active = state.active.begin(&req.method);
             let start = std::time::Instant::now();
             // Dispatch under a span so every event emitted while handling this call - down to
@@ -235,12 +291,41 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
             // and a JSON log consumer can join them to the `rpc ok`/`rpc error` event below.
             // The client-supplied request `id` is deliberately not a span field: it is
             // untrusted display data.
-            let span = tracing::info_span!("rpc", method = %req.method, wallet = wallet.unwrap_or("default"));
+            let span = tracing::info_span!("rpc", method = %req.method, wallet = wallet_label, user = caller.user);
             let result = {
                 use tracing::Instrument as _;
-                rpc::dispatch(state, wallet, &req).instrument(span).await
+                // The xpub methods reach `dispatch` only with an entry naming them for this
+                // credential (`permits` above requires it); say so to the gate there.
+                let xpub_granted = state.config.rpc.whitelist.grants(caller.user, &req.method);
+                rpc::dispatch_scoped(state, wallet, &req, xpub_granted)
+                    .instrument(span)
+                    .await
             };
             let elapsed_ms = start.elapsed().as_millis() as u64;
+            if rpc::AUDITED_METHODS.contains(&req.method.as_str()) {
+                match &result {
+                    Ok(value) => tracing::info!(
+                        target: "rose::audit",
+                        user = caller.user,
+                        method = %req.method,
+                        wallet = wallet_label,
+                        peer = caller.peer,
+                        forwarded_for = caller.forwarded_for,
+                        result = audited_result_id(value),
+                        "RPC call succeeded"
+                    ),
+                    Err(err) => tracing::info!(
+                        target: "rose::audit",
+                        user = caller.user,
+                        method = %req.method,
+                        wallet = wallet_label,
+                        peer = caller.peer,
+                        forwarded_for = caller.forwarded_for,
+                        code = err.code,
+                        "RPC call failed"
+                    ),
+                }
+            }
             match result {
                 Ok(value) => {
                     // A successful call is one line per request, so DEBUG - except a slow one.
@@ -325,7 +410,7 @@ mod tests {
             cookiefile: None,
             work_queue: 16,
             allowed_methods: vec![],
-            expose_xpub: false,
+            whitelist: Default::default(),
             allow_duplicate_shielded_recipients: false,
         };
         test_state_with_rpc(rpc)
@@ -491,7 +576,7 @@ mod tests {
                 ),
                 work_queue: 16,
                 allowed_methods: vec![],
-                expose_xpub: false,
+                whitelist: Default::default(),
                 allow_duplicate_shielded_recipients: false,
             };
 
@@ -1171,6 +1256,124 @@ mod tests {
             call_with_safelist(vec![], r#"{"method":"getnetworkinfo","id":1}"#).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(code, None);
+    }
+
+    /// `[rpc] whitelist` scopes each credential: a scoped user reaches its methods only, an
+    /// off-scope call (single or in a batch) answers -32601 / HTTP 404 like a safelisted-out
+    /// method, an unnamed user is refused by default and unrestricted with
+    /// `whitelist_default = false`, and the `allowed_methods` ceiling still binds a scope.
+    #[tokio::test]
+    async fn whitelist_scopes_each_credential() {
+        use crate::error::codes::RPC_METHOD_NOT_FOUND;
+        let (monitor, _) = crate::server::auth::generate_rpcauth("monitor", Some("m"));
+        let state_with = |entries: &[&str], default: Option<bool>, safelist: &[&str]| {
+            let rpc = RpcConfig {
+                bind: "127.0.0.1".parse().unwrap(),
+                port: 1,
+                user: Some("u".into()),
+                password: Some("p".into()),
+                auth: vec![monitor.clone()],
+                cookiefile: None,
+                work_queue: 16,
+                allowed_methods: safelist.iter().map(|m| m.to_string()).collect(),
+                whitelist: crate::config::RpcWhitelist::resolve(
+                    &entries.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+                    default,
+                )
+                .unwrap(),
+                allow_duplicate_shielded_recipients: false,
+            };
+            test_state_with_rpc(rpc)
+        };
+        async fn call(state: HttpState, who: (&str, &str), body: &str) -> (StatusCode, Value) {
+            let r = router(state).oneshot(req(body, Some(who))).await.unwrap();
+            let status = r.status();
+            if status == StatusCode::UNAUTHORIZED {
+                return (status, Value::Null);
+            }
+            (status, body_json(r).await)
+        }
+        let uptime = r#"{"method":"uptime","id":1}"#;
+        let netinfo = r#"{"method":"getnetworkinfo","id":1}"#;
+        let not_found = Some(RPC_METHOD_NOT_FOUND as i64);
+
+        let scoped = state_with(&["monitor:uptime"], None, &[]);
+        let (status, body) = call(scoped.clone(), ("monitor", "m"), uptime).await;
+        assert_eq!(
+            (status, body["error"]["code"].as_i64()),
+            (StatusCode::OK, None)
+        );
+        let (status, body) = call(scoped.clone(), ("monitor", "m"), netinfo).await;
+        assert_eq!(
+            (status, body["error"]["code"].as_i64()),
+            (StatusCode::NOT_FOUND, not_found)
+        );
+        // The unnamed user is refused everything by default, exactly the same way.
+        let (status, body) = call(scoped.clone(), ("u", "p"), uptime).await;
+        assert_eq!(
+            (status, body["error"]["code"].as_i64()),
+            (StatusCode::NOT_FOUND, not_found)
+        );
+        // A wrong password is still a 401, never a scope answer.
+        let (status, _) = call(scoped.clone(), ("monitor", "x"), uptime).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // In a batch, the off-scope item fails in its own slot and the rest are served.
+        let (status, body) = call(
+            scoped,
+            ("monitor", "m"),
+            r#"[{"method":"uptime","id":1},{"method":"getnetworkinfo","id":2}]"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["error"], Value::Null);
+        assert_eq!(body[1]["error"]["code"].as_i64(), not_found);
+
+        // whitelist_default = false: the unnamed user is unrestricted, the named one is not.
+        let open = state_with(&["monitor:uptime"], Some(false), &[]);
+        let (status, _) = call(open.clone(), ("u", "p"), netinfo).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(open, ("monitor", "m"), netinfo).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The xpub methods: refused to an unscoped credential and through an open default,
+        // reached only by the user whose entry names them.
+        let descriptors = r#"{"method":"listdescriptors","id":1}"#;
+        let (status, _) = call(test_state(), ("u", "p"), descriptors).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let xpub = state_with(&["monitor:uptime,listdescriptors"], Some(false), &[]);
+        let (status, _) = call(xpub.clone(), ("u", "p"), descriptors).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, body) = call(xpub, ("monitor", "m"), descriptors).await;
+        // Past the gate; this state holds no wallet, so the answer is that, not -32601.
+        #[cfg(feature = "bitcoin")]
+        assert_ne!(body["error"]["code"].as_i64(), not_found, "{body}");
+        #[cfg(not(feature = "bitcoin"))]
+        let _ = body;
+
+        // The safelist is the ceiling: a scope cannot reach past it.
+        let ceilinged = state_with(&["monitor:uptime,getnetworkinfo"], None, &["uptime"]);
+        let (status, _) = call(ceilinged.clone(), ("monitor", "m"), uptime).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(ceilinged, ("monitor", "m"), netinfo).await;
+        assert_eq!(
+            (status, body["error"]["code"].as_i64()),
+            (StatusCode::NOT_FOUND, not_found)
+        );
+    }
+
+    #[test]
+    fn audited_result_id_names_the_txid_or_opid() {
+        assert_eq!(audited_result_id(&serde_json::json!("ab12")), Some("ab12"));
+        assert_eq!(
+            audited_result_id(&serde_json::json!({"txid": "cd34", "fee": 1})),
+            Some("cd34")
+        );
+        assert_eq!(
+            audited_result_id(&serde_json::json!({"opid": "opid-1"})),
+            Some("opid-1")
+        );
+        assert_eq!(audited_result_id(&Value::Null), None);
     }
 
     /// One-shot a single RPC call and return the error code from the envelope (None = success).

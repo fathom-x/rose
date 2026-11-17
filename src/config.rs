@@ -3,7 +3,7 @@
 //! CLI flags use Bitcoin-Core-style names (`-rpcuser`, `-rpcport`, `-datadir`, `-testnet`)
 //! where it helps operators, but the canonical source is the TOML config.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 #[cfg(feature = "zcash")]
 use std::num::NonZeroU32;
@@ -1173,14 +1173,11 @@ pub struct RpcConfig {
     /// these methods, with anything else rejected as method-not-found (`-32601`). Names are
     /// validated at startup against [`crate::rpc::ALL_METHODS`], so a typo fails fast.
     pub allowed_methods: Vec<String>,
-    /// Serve the methods that hand out the account xpub ([`crate::rpc::XPUB_METHODS`]:
-    /// `listdescriptors`). Off by default: with it off they answer method-not-found
-    /// (`-32601`), exactly like a safelisted-out method. The xpub is a privacy key that
-    /// cannot be rotated: it watches every past and future address of the account, change
-    /// included, without the daemon, until the seed is swept, so a client that once read it
-    /// keeps that view after its RPC access is withdrawn. The operator's route to it is
-    /// `rose export-xpub`, beside `keys.toml`.
-    pub expose_xpub: bool,
+    /// Per-credential method scopes (`[rpc] whitelist`/`whitelist_default`, Bitcoin Core's
+    /// `-rpcwhitelist`/`-rpcwhitelistdefault`). Enforced by the HTTP server after
+    /// authentication, under the `allowed_methods` ceiling; the embedded facade carries no
+    /// credential, is bounded by the safelist alone, and never reaches the xpub methods.
+    pub whitelist: RpcWhitelist,
     /// Accept a repeated *shielded* recipient in one `z_sendmany` call (default false).
     ///
     /// zcashd rejects any duplicate recipient address, and rose matches that by default: this
@@ -1195,6 +1192,114 @@ pub struct RpcConfig {
     /// Embedded callers need no knob: [`crate::node::Node::send`] takes a
     /// `zip321::TransactionRequest`, which expresses repeated recipients natively.
     pub allow_duplicate_shielded_recipients: bool,
+}
+
+/// Which methods each RPC credential may call: Bitcoin Core's `-rpcwhitelist` model.
+///
+/// An entry is `<user>:<method>,<method>,...` (commas or spaces between names; `<user>:` alone
+/// grants nothing). Several entries for one user intersect, as in Core, so adding a line can
+/// only narrow a credential. A user with no entry is refused every method when
+/// [`RpcWhitelist::default_deny`] is set, which is Core's `-rpcwhitelistdefault`: it defaults
+/// to on as soon as any entry exists, so naming one credential's scope locks every unnamed
+/// credential (the cookie included) out until it is named too or the default is turned off.
+/// An off-scope call answers `-32601`, exactly like a method the `allowed_methods` safelist
+/// removed, so a scoped credential learns nothing about what it cannot reach.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RpcWhitelist {
+    /// Each scoped user's methods: the intersection of every entry naming the user.
+    pub users: BTreeMap<String, BTreeSet<String>>,
+    /// Whether a user with no entry is refused every method.
+    pub default_deny: bool,
+}
+
+impl RpcWhitelist {
+    /// Resolve the `[rpc] whitelist` entries and `whitelist_default`. Every method name is
+    /// validated against [`crate::rpc::ALL_METHODS`], so a typo fails at startup instead of
+    /// silently narrowing a credential. `whitelist_default = true` with no entry at all is
+    /// refused: it would refuse every credential every method (Core accepts it; a daemon that
+    /// serves no one is never what an operator meant).
+    pub fn resolve(entries: &[String], default: Option<bool>) -> anyhow::Result<RpcWhitelist> {
+        let mut users: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for entry in entries {
+            let (user, methods) = entry.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[rpc] whitelist entry {entry:?} is not <user>:<method>,<method>,..."
+                )
+            })?;
+            if user.is_empty() {
+                anyhow::bail!("[rpc] whitelist entry {entry:?} names no user");
+            }
+            let mut set = BTreeSet::new();
+            for m in methods.split([',', ' ']).filter(|m| !m.is_empty()) {
+                if !crate::rpc::is_known_method(m) {
+                    anyhow::bail!(
+                        "[rpc] whitelist entry for user {user:?} names unknown method {m:?}; \
+                         it is not an RPC method this build implements"
+                    );
+                }
+                set.insert(m.to_string());
+            }
+            match users.get_mut(user) {
+                Some(existing) => existing.retain(|m| set.contains(m)),
+                None => {
+                    users.insert(user.to_string(), set);
+                }
+            }
+        }
+        if default == Some(true) && users.is_empty() {
+            anyhow::bail!(
+                "[rpc] whitelist_default = true with no [rpc] whitelist entry would refuse every \
+                 credential every method; name each credential's methods in [rpc] whitelist"
+            );
+        }
+        let default_deny = default.unwrap_or(!users.is_empty());
+        Ok(RpcWhitelist {
+            users,
+            default_deny,
+        })
+    }
+
+    /// Whether `user` (an authenticated credential's name) may call `method`. A method that
+    /// reveals the account xpub ([`crate::rpc::XPUB_METHODS`]) needs an entry naming it for
+    /// this user ([`RpcWhitelist::grants`]): an unscoped credential never reaches it.
+    pub fn permits(&self, user: &str, method: &str) -> bool {
+        if crate::rpc::XPUB_METHODS.contains(&method) {
+            return self.grants(user, method);
+        }
+        match self.users.get(user) {
+            Some(methods) => methods.contains(method),
+            None => !self.default_deny,
+        }
+    }
+
+    /// Whether an entry for `user` names `method` explicitly (the default never counts).
+    pub fn grants(&self, user: &str, method: &str) -> bool {
+        self.users.get(user).is_some_and(|m| m.contains(method))
+    }
+
+    /// Whether any entry names `method` explicitly.
+    pub fn grants_anyone(&self, method: &str) -> bool {
+        self.users.values().any(|m| m.contains(method))
+    }
+
+    /// The entries in their canonical form (one per user, methods sorted), which resolve back
+    /// to this whitelist: what `config show` renders.
+    pub fn entries(&self) -> Vec<String> {
+        self.users
+            .iter()
+            .map(|(user, methods)| {
+                format!(
+                    "{user}:{}",
+                    methods
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2065,6 +2170,13 @@ struct RpcFile {
     cookiefile: Option<PathBuf>,
     work_queue: Option<usize>,
     allowed_methods: Option<Vec<String>>,
+    /// Per-credential method scopes, `<user>:<method>,...` (Core's `-rpcwhitelist`).
+    whitelist: Option<Vec<String>>,
+    /// Whether a credential with no whitelist entry is refused every method (Core's
+    /// `-rpcwhitelistdefault`); unset means "yes once any entry exists".
+    whitelist_default: Option<bool>,
+    /// Retired before any release: an entry in `whitelist` grants the xpub methods.
+    /// Kept only so a config carrying it is refused with the replacement spelled out.
     expose_xpub: Option<bool>,
     allow_duplicate_shielded_recipients: Option<bool>,
 }
@@ -2183,6 +2295,10 @@ pub struct ConfigOverrides {
     pub rpc_password: Option<Password>,
     /// rpcauth credentials (`<user>:<salt>$<hmac-sha256 hex>`).
     pub rpc_auth: Vec<String>,
+    /// Per-credential method scopes (`<user>:<method>,...`), added to `[rpc] whitelist`.
+    pub rpc_whitelist: Vec<String>,
+    /// Overrides `[rpc] whitelist_default`.
+    pub rpc_whitelist_default: Option<bool>,
     /// Chain upstream token (`zebra`, `zebra://host:port`, `zecrocks`, `https://...`, ...).
     pub server: Option<String>,
     /// SOCKS5 proxy carrying every outbound connection (`socks5://host:port`).
@@ -2207,6 +2323,8 @@ impl From<&Cli> for ConfigOverrides {
             rpc_user: cli.rpc_user.clone(),
             rpc_password: cli.rpc_password.clone(),
             rpc_auth: cli.rpc_auth.clone(),
+            rpc_whitelist: cli.rpc_whitelist.clone(),
+            rpc_whitelist_default: cli.rpc_whitelist_default,
             server: cli.server.clone(),
             proxy: cli.proxy.clone(),
             age_identity: cli.age_identity.clone(),
@@ -2277,6 +2395,16 @@ pub struct Cli {
     /// rpcauth credential (`<user>:<salt>$<hmac-sha256 hex>`); may be repeated.
     #[arg(long = "rpcauth", global = true, value_name = "USER:SALT$HASH")]
     pub rpc_auth: Vec<String>,
+
+    /// Limit an RPC user to the listed methods (`<user>:<method>,<method>`), as bitcoind's
+    /// `-rpcwhitelist`; may be repeated, and entries for one user intersect.
+    #[arg(long = "rpcwhitelist", global = true, value_name = "USER:METHODS")]
+    pub rpc_whitelist: Vec<String>,
+
+    /// Whether a user with no `--rpcwhitelist` entry is refused every method (bitcoind's
+    /// `-rpcwhitelistdefault`; default: yes once any entry exists).
+    #[arg(long = "rpcwhitelistdefault", global = true, value_name = "BOOL")]
+    pub rpc_whitelist_default: Option<bool>,
 
     /// Chain upstream: `zebra` (local zebrad, the default) or `zebra://host:port`.
     #[arg(long, global = true, value_name = "SERVER")]
@@ -3271,6 +3399,8 @@ impl AppConfig {
             cookiefile: None,
             work_queue: None,
             allowed_methods: None,
+            whitelist: None,
+            whitelist_default: None,
             expose_xpub: None,
             allow_duplicate_shielded_recipients: None,
         });
@@ -3296,20 +3426,39 @@ impl AppConfig {
                 );
             }
         }
-        // A safelisted xpub method stays gated unless `expose_xpub` opens it too: refuse the
-        // contradiction at startup rather than serve a list that silently does not hold.
-        let expose_xpub = rpc_file.expose_xpub.unwrap_or(false);
-        if !expose_xpub {
-            if let Some(m) = allowed_methods
-                .iter()
-                .find(|m| crate::rpc::XPUB_METHODS.contains(&m.as_str()))
-            {
-                anyhow::bail!(
-                    "[rpc] allowed_methods lists {m:?}, which reveals the account xpub and is \
-                     served only with [rpc] expose_xpub = true; set that too, or drop {m:?} \
-                     from the list (`rose export-xpub` reads the xpub beside keys.toml)"
-                );
-            }
+        // Per-credential scopes: entries accumulate across CLI and file like rpcauth lines
+        // (and intersect per user, as Core's repeated -rpcwhitelist does); the CLI default
+        // wins over the file's.
+        let whitelist_entries: Vec<String> = cli
+            .rpc_whitelist
+            .iter()
+            .cloned()
+            .chain(rpc_file.whitelist.unwrap_or_default())
+            .collect();
+        let whitelist = RpcWhitelist::resolve(
+            &whitelist_entries,
+            cli.rpc_whitelist_default.or(rpc_file.whitelist_default),
+        )?;
+        if rpc_file.expose_xpub.is_some() {
+            anyhow::bail!(
+                "[rpc] expose_xpub is gone: the methods that reveal the account xpub \
+                 (listdescriptors) are served only to a credential an [rpc] whitelist entry \
+                 names them for, e.g. whitelist = [\"<user>:listdescriptors,...\"]; drop the key"
+            );
+        }
+        // A safelisted xpub method is served only to a credential whose whitelist entry names
+        // it: refuse a list that names one no entry grants, rather than serve a list that
+        // silently does not hold.
+        if let Some(m) = allowed_methods
+            .iter()
+            .find(|m| crate::rpc::XPUB_METHODS.contains(&m.as_str()) && !whitelist.grants_anyone(m))
+        {
+            anyhow::bail!(
+                "[rpc] allowed_methods lists {m:?}, which reveals the account xpub and is served \
+                 only to a credential an [rpc] whitelist entry grants it (\"<user>:{m},...\"); \
+                 add that entry, or drop {m:?} from the list (`rose export-xpub` reads the xpub \
+                 beside keys.toml)"
+            );
         }
         let bind: IpAddr = cli
             .rpc_bind
@@ -3343,7 +3492,7 @@ impl AppConfig {
                 .or_else(|| Some(datadir.join(".cookie"))),
             work_queue: rpc_file.work_queue.unwrap_or(100).max(1),
             allowed_methods,
-            expose_xpub,
+            whitelist,
             allow_duplicate_shielded_recipients: rpc_file
                 .allow_duplicate_shielded_recipients
                 .unwrap_or(false),
@@ -5267,11 +5416,97 @@ mod tests {
         assert!(err.contains("getblance"), "got: {err}");
     }
 
-    /// The xpub methods are closed by default, open with `expose_xpub`, and a safelist that
-    /// names one without the key is a startup error rather than a list that does not hold.
+    /// `[rpc] whitelist` follows Core's `-rpcwhitelist`: entries per user intersect, an
+    /// unnamed user is refused once any entry exists unless `whitelist_default = false`, names
+    /// are validated, and the CLI's entries join the file's.
     #[cfg(feature = "cli")]
     #[test]
-    fn expose_xpub_defaults_off_and_guards_the_safelist() {
+    fn rpc_whitelist_follows_core_semantics() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("rose.toml");
+        let resolve = |text: &str, extra: &[&str]| {
+            std::fs::write(&conf, text).unwrap();
+            let mut args = vec!["rose", "--conf", conf.to_str().unwrap()];
+            args.extend_from_slice(extra);
+            AppConfig::resolve(&Cli::parse_from(args))
+        };
+
+        // No entries: unrestricted, nothing scoped.
+        let w = resolve("network = \"test\"\n", &[]).unwrap().rpc.whitelist;
+        assert_eq!(w, RpcWhitelist::default());
+        assert!(w.permits("anyone", "sendtoaddress"));
+
+        // One entry: that user gets its methods only, and every other user nothing.
+        let w = resolve(
+            "[rpc]\nwhitelist = [\"monitor:getwalletinfo, getblockcount\"]\n",
+            &[],
+        )
+        .unwrap()
+        .rpc
+        .whitelist;
+        assert!(w.default_deny);
+        assert!(w.permits("monitor", "getwalletinfo"));
+        assert!(w.permits("monitor", "getblockcount"));
+        assert!(!w.permits("monitor", "sendtoaddress"));
+        assert!(!w.permits("__cookie__", "getblockcount"));
+        assert_eq!(w.entries(), vec!["monitor:getblockcount,getwalletinfo"]);
+
+        // whitelist_default = false leaves unnamed users unrestricted.
+        let w = resolve(
+            "[rpc]\nwhitelist = [\"monitor:getblockcount\"]\nwhitelist_default = false\n",
+            &[],
+        )
+        .unwrap()
+        .rpc
+        .whitelist;
+        assert!(!w.default_deny);
+        assert!(w.permits("spender", "sendtoaddress"));
+        assert!(!w.permits("monitor", "sendtoaddress"));
+
+        // Repeated entries intersect, and the CLI's join the file's; `user:` grants nothing.
+        let w = resolve(
+            "[rpc]\nwhitelist = [\"a:getblockcount,getwalletinfo\", \"b:\"]\n",
+            &["--rpcwhitelist", "a:getwalletinfo,getbalance"],
+        )
+        .unwrap()
+        .rpc
+        .whitelist;
+        assert_eq!(w.entries(), vec!["a:getwalletinfo", "b:"]);
+        assert!(!w.permits("b", "getblockcount"));
+
+        // The CLI default wins over the file's.
+        let w = resolve(
+            "[rpc]\nwhitelist = [\"a:ping\"]\nwhitelist_default = true\n",
+            &["--rpcwhitelistdefault", "false"],
+        )
+        .unwrap()
+        .rpc
+        .whitelist;
+        assert!(!w.default_deny);
+
+        // Refusals: an unknown method, a malformed entry, no user, and a default that would
+        // refuse everyone.
+        for (text, needle) in [
+            ("[rpc]\nwhitelist = [\"a:getblance\"]\n", "getblance"),
+            ("[rpc]\nwhitelist = [\"getblockcount\"]\n", "<user>:"),
+            ("[rpc]\nwhitelist = [\":getblockcount\"]\n", "names no user"),
+            (
+                "[rpc]\nwhitelist_default = true\n",
+                "refuse every credential",
+            ),
+        ] {
+            let err = format!("{:#}", resolve(text, &[]).unwrap_err());
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+    }
+
+    /// The xpub methods reach only a credential an entry names them for: never an unscoped
+    /// one, never through the default; a safelist naming one that no entry grants is a startup
+    /// error, and the retired `expose_xpub` key is refused with the replacement spelled out.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn xpub_methods_need_an_explicit_whitelist_entry() {
         use clap::Parser as _;
         let dir = tempfile::tempdir().unwrap();
         let conf = dir.path().join("rose.toml");
@@ -5281,21 +5516,39 @@ mod tests {
             AppConfig::resolve(&cli)
         };
 
-        assert!(!resolve("network = \"test\"\n").unwrap().rpc.expose_xpub);
-        assert!(
-            resolve("[rpc]\nexpose_xpub = true\n")
-                .unwrap()
-                .rpc
-                .expose_xpub
-        );
+        // No whitelist: every credential is unscoped, and none reaches listdescriptors.
+        let open = resolve("network = \"test\"\n").unwrap().rpc.whitelist;
+        assert!(open.permits("anyone", "getbalance"));
+        assert!(!open.permits("anyone", "listdescriptors"));
+        // An entry naming it grants that user alone, even with the default open.
+        let w = resolve(
+            "[rpc]\nwhitelist = [\"watch:listdescriptors,getbalance\", \"ops:getbalance\"]\n\
+             whitelist_default = false\n",
+        )
+        .unwrap()
+        .rpc
+        .whitelist;
+        assert!(w.permits("watch", "listdescriptors"));
+        assert!(!w.permits("ops", "listdescriptors"));
+        assert!(!w.permits("unnamed", "listdescriptors"));
+        assert!(w.permits("unnamed", "getbalance"));
+        assert!(w.grants_anyone("listdescriptors"));
+
         let listed = "[rpc]\nallowed_methods = [\"getbalance\", \"listdescriptors\"]\n";
         let err = resolve(listed).unwrap_err().to_string();
         assert!(
-            err.contains("listdescriptors") && err.contains("expose_xpub"),
+            err.contains("listdescriptors") && err.contains("whitelist entry"),
             "got: {err}"
         );
-        let cfg = resolve(&format!("{listed}expose_xpub = true\n")).unwrap();
-        assert!(cfg.rpc.expose_xpub);
+        resolve(&format!(
+            "{listed}whitelist = [\"watch:listdescriptors,getbalance\"]\n"
+        ))
+        .unwrap();
+
+        let err = resolve("[rpc]\nexpose_xpub = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expose_xpub is gone"), "got: {err}");
     }
 
     #[test]

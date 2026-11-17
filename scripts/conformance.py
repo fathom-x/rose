@@ -12,6 +12,7 @@ expected Bitcoin Core codes.
 Usage:  python3 scripts/conformance.py [--coin zcash|bitcoin] [--url http://127.0.0.1:18232/]
                                        [--user u] [--password p]
                                        [--passphrase <wallet passphrase>]
+                                       [--xpub-user u --xpub-password p]
 
 `--coin` selects the engine the wallet under test runs on (default `zcash`). The checks are
 organised as sections, each tagged with the coins it applies to - a readable copy of
@@ -165,6 +166,8 @@ class Ctx:
         self.ck = ck
         self.args = args
         self.coin = args.coin
+        # A client for a credential the whitelist grants the xpub methods (`--xpub-user`).
+        self.xpub_rpc = None
 
 
 @section("getblockchaininfo fields/types", *BOTH)
@@ -1108,10 +1111,11 @@ def s_labels_removed(ctx):
 
 
 def xpub_gated(rpc):
-    """True when the daemon runs with `[rpc] expose_xpub` off (the default): listdescriptors,
-    the one method that returns the account xpub, then answers -32601 on a Bitcoin wallet,
-    exactly like a method off the safelist. Only meaningful on a Bitcoin wallet (a Zcash wallet
-    answers -32601 either way)."""
+    """True when this credential is not granted the xpub: listdescriptors, the one method that
+    returns the account xpub, answers -32601 on a Bitcoin wallet, exactly like a method off
+    the safelist, to every credential whose `[rpc] whitelist` entry does not name it (the
+    default for every credential). Only meaningful on a Bitcoin wallet (a Zcash wallet answers
+    -32601 either way)."""
     try:
         rpc.call("listdescriptors")
         return False
@@ -1125,9 +1129,9 @@ def xpub_gated(rpc):
 def s_listdescriptors(ctx):
     rpc, ck = ctx.rpc, ctx.ck
     if xpub_gated(rpc):
-        # The default: the xpub cannot be rotated, so it is not RPC surface unless the operator
-        # opts in. The gate runs before parameter parsing and the arity check, so every form of
-        # the call reads as a method that does not exist.
+        # The default: the xpub cannot be rotated, so it is not RPC surface unless a whitelist
+        # entry names it for a credential. The gate runs before parameter parsing and the arity
+        # check, so every form of the call reads as a method that does not exist.
         for label, params in (("private", [True]), ("non-boolean", ["yes"]),
                               ("extra arg", [False, "extra"])):
             try:
@@ -1135,8 +1139,13 @@ def s_listdescriptors(ctx):
                 ck(f"gated listdescriptors {label} raises", False)
             except JSONRPCException as e:
                 ck(f"gated listdescriptors {label} -> -32601", e.code == -32601, e.code)
-        print("  (listdescriptors gated off: [rpc] expose_xpub is false; shape checks skipped)")
-        return
+        if ctx.xpub_rpc is None:
+            print("  (listdescriptors gated for this credential and no --xpub-user; "
+                  "shape checks skipped)")
+            return
+        # The credential a whitelist entry grants it is served.
+        rpc = ctx.xpub_rpc
+        ck("listdescriptors served to the --xpub-user credential", not xpub_gated(rpc))
     # Core's shape over the wallet's two public BIP 84 descriptors: the receiving chain
     # (/0/*) first, change (/1/*) second, the origin-qualified account xpub inside both, and
     # the keychain's next index. Public material only.
@@ -2224,9 +2233,9 @@ def s_errors_bitcoin(ctx):
         ck("validateaddress extra arg raises", False)
     except JSONRPCException as e:
         ck("validateaddress extra arg -> code -1", e.code == -1, e.code)
-    # Over-arity is -1 where the method is served, and -32601 where `[rpc] expose_xpub` gates it
-    # off (the gate runs first, so a hidden method gives no arity hint). A Zcash wallet cannot
-    # tell the two apart by probing, so it accepts either.
+    # Over-arity is -1 where the method is served, and -32601 where the xpub gate hides it from
+    # this credential (the gate runs first, so a hidden method gives no arity hint). A Zcash
+    # wallet cannot tell the two apart by probing, so it accepts either.
     if ctx.coin == BITCOIN:
         want = {-32601} if xpub_gated(rpc) else {-1}
     else:
@@ -2337,6 +2346,10 @@ def main() -> int:
     ap.add_argument("--password", default="p")
     ap.add_argument("--passphrase", default="",
                     help="wallet passphrase (enables the encrypted-wallet state-machine checks)")
+    ap.add_argument("--xpub-user", default=None,
+                    help="a credential an [rpc] whitelist entry grants listdescriptors "
+                         "(enables its shape checks when --user is not granted it)")
+    ap.add_argument("--xpub-password", default="")
     args = ap.parse_args()
     rpc = AuthServiceProxy(args.url, args.user, args.password)
 
@@ -2362,6 +2375,8 @@ def main() -> int:
             return 2
 
     ctx = Ctx(rpc, ck, args)
+    if args.xpub_user:
+        ctx.xpub_rpc = AuthServiceProxy(args.url, args.xpub_user, args.xpub_password)
     for title, coins, run in SECTIONS:
         if args.coin in coins:
             print(f"== {title} ==")

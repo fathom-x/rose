@@ -307,7 +307,16 @@ pub fn render(config: &AppConfig) -> String {
         "allowed_methods",
         list_val(&config.rpc.allowed_methods),
     );
-    kv(&mut s, "expose_xpub", config.rpc.expose_xpub);
+    kv(
+        &mut s,
+        "whitelist",
+        list_val(&config.rpc.whitelist.entries()),
+    );
+    kv(
+        &mut s,
+        "whitelist_default",
+        config.rpc.whitelist.default_deny,
+    );
     kv(
         &mut s,
         "allow_duplicate_shielded_recipients",
@@ -752,7 +761,8 @@ mod tests {
                  transparent = true\ntransparent_gap_limit = 30\n\
                  [spend]\nprivacy_policy = \"FullPrivacy\"\ntrusted_confirmations = 5\n\
                  untrusted_confirmations = 11\n\
-                 [health]\nreadiness = \"connected\"\n",
+                 [health]\nreadiness = \"connected\"\n\
+                 [rpc]\nwhitelist = [\"monitor:getwalletinfo getblockcount\", \"monitor:getblockcount\"]\n",
                 dir.path()
             ),
             dir.path(),
@@ -777,6 +787,10 @@ mod tests {
             "{first}"
         );
         assert!(first.contains("readiness = \"connected\""), "{first}");
+        assert!(
+            first.contains("whitelist = [\"monitor:getblockcount\"]\nwhitelist_default = true"),
+            "{first}"
+        );
     }
 
     /// The spending policy renders as the wallet's sub-table, every set key at its value,

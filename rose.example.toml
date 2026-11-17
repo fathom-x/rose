@@ -314,6 +314,28 @@ password = "change-me"
 #   "encryptwallet",           # ⚠ re-wraps the seed at rest; can lock the owner out
 # ]
 #
+# Per-credential scopes (Bitcoin Core's -rpcwhitelist): `<user>:<method>,<method>,...`, one
+# entry per credential, so a monitoring login cannot spend. Entries naming one user intersect.
+# Once any entry exists, a credential with no entry (including __cookie__, the cookie the `rose`
+# command line uses by default) is refused every method, unless `whitelist_default = false`.
+# An off-scope call answers -32601, like a method `allowed_methods` removed; `allowed_methods`
+# stays the ceiling over every scope. Every spend is logged on rose::audit with its user.
+#
+# `listdescriptors` (Bitcoin wallets), which returns the account xpub, is served only to a
+# credential whose entry names it: never to an unscoped credential, never through
+# `whitelist_default = false`. It otherwise answers -32601, like a method off the safelist,
+# and naming it in `allowed_methods` with no entry granting it is a startup error. The xpub
+# cannot be rotated: it derives every past and future address of the account, change
+# included, so a client that reads it once keeps that view after its RPC access is
+# withdrawn. `rose export-xpub` reads it beside keys.toml instead. An entry scopes its
+# credential to exactly what it names, so a watch-only coordinator's entry lists every method
+# it uses, e.g. "coordinator:listdescriptors,getwalletinfo,getblockcount".
+# whitelist = [
+#   "monitor:getwalletinfo,getblockcount,getbalance,listtransactions",
+#   "spender:sendtoaddress,getbalance,getwalletinfo",
+# ]
+# whitelist_default = true
+#
 # Accept a repeated *shielded* recipient address within one `z_sendmany` call. Off by default,
 # matching zcashd, which refuses any duplicate recipient. Turn it on only if you run a protocol
 # that deliberately pays one shielded address from several outputs in a single transaction -
@@ -321,13 +343,6 @@ password = "change-me"
 # batch. Neither consensus nor the wallet forbids that shape; the refusal is dialect parity.
 # Repeated *transparent* recipients stay refused either way.
 # allow_duplicate_shielded_recipients = false
-#
-# Serve `listdescriptors` (Bitcoin wallets), which returns the account xpub. Off by default:
-# it then answers -32601, like a method off the safelist, and naming it in `allowed_methods`
-# without this key is a startup error. The xpub cannot be rotated: it derives every past and
-# future address of the account, change included, so a client that reads it once keeps that
-# view after its RPC access is withdrawn. `rose export-xpub` reads it beside keys.toml instead.
-# expose_xpub = false
 
 [keys]
 # age identity file used to decrypt the wallet seed for unattended sending.

@@ -29,6 +29,19 @@ use crate::{pick_port, rose_bin, rosed_bin};
 /// builds its filter index in the background.
 pub const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// A `[rpc]` table adding a second credential, `xpub` (password [`XPUB_PASSWORD`]), whose
+/// whitelist entry grants `listdescriptors` and nothing else. The xpub methods answer
+/// `-32601` to every credential no entry names them for, so a suite reading the descriptors
+/// calls through this one ([`RoseBtc::call_xpub`]); `whitelist_default = false` leaves the
+/// harness's own `zec` credential unrestricted otherwise.
+pub const XPUB_READER: &str = "[rpc]\n\
+     auth = [\"xpub:e25f0d8b8e9b1beaa734093ed38dcbd7$7219b198f1e73dd3da166630dc6adc67849d1fb10652bfbe35b05c01f997a169\"]\n\
+     whitelist = [\"xpub:listdescriptors\"]\n\
+     whitelist_default = false\n";
+
+/// The password of [`XPUB_READER`]'s `xpub` credential.
+pub const XPUB_PASSWORD: &str = "xpub-reader";
+
 /// Locate a bitcoind: `$BITCOIND_BIN`, else PATH. `None` means skip.
 pub fn bitcoind_bin() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("BITCOIND_BIN") {
@@ -838,6 +851,18 @@ impl RoseBtc {
             .await
     }
 
+    /// Call the default wallet as [`XPUB_READER`]'s `xpub` credential (the daemon must run
+    /// with that table).
+    pub async fn call_xpub(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
+        self.call_wallet_as(
+            ("xpub", XPUB_PASSWORD),
+            &self.default_wallet.clone(),
+            method,
+            params,
+        )
+        .await
+    }
+
     /// Call `/wallet/<wallet>`.
     pub async fn call_wallet(
         &self,
@@ -845,10 +870,22 @@ impl RoseBtc {
         method: &str,
         params: Value,
     ) -> Result<Value, (i64, String)> {
+        self.call_wallet_as(("zec", "secret"), wallet, method, params)
+            .await
+    }
+
+    /// Call `/wallet/<wallet>` with the credential `(user, password)`.
+    pub async fn call_wallet_as(
+        &self,
+        (user, password): (&str, &str),
+        wallet: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, (i64, String)> {
         let resp = self
             .client
             .post(format!("{}wallet/{wallet}", self.base_url))
-            .basic_auth("zec", Some("secret"))
+            .basic_auth(user, Some(password))
             .json(&json!({"jsonrpc": "1.0", "id": "t", "method": method, "params": params}))
             .send()
             .await

@@ -188,8 +188,10 @@ ALLOWED_METHODS = frozenset({
 
 # The xpub's method, forwarded only with --show-xpub (ROSE_GUI_SHOW_XPUB=1). The xpub watches
 # every address of the account forever and cannot be rotated, so a page anyone with the
-# password can open should not hand it out by default; rose itself serves the method only
-# with [rpc] expose_xpub = true, and `rose export-xpub` is the operator's route without it.
+# password can open should not hand it out by default. rose itself serves the method only to
+# a credential whose [rpc] whitelist entry names it, so this proxy's credential then needs an
+# entry naming listdescriptors and every method above it uses; `rose export-xpub` is the
+# operator's route without one.
 XPUB_METHODS = frozenset({"listdescriptors"})
 
 
@@ -606,8 +608,9 @@ def main():
         "--show-xpub",
         action="store_true",
         help="forward listdescriptors, so the Addresses tab shows the account xpub (rose serves "
-             "it only with [rpc] expose_xpub = true). Off by default: the xpub cannot be "
-             "rotated. Env: ROSE_GUI_SHOW_XPUB=1",
+             "it only to a credential an [rpc] whitelist entry names it for, so this proxy's "
+             "credential needs one). Off by default: the xpub cannot be rotated. "
+             "Env: ROSE_GUI_SHOW_XPUB=1",
     )
     ap.add_argument(
         "--reload",

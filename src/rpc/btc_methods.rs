@@ -1618,9 +1618,9 @@ mod tests {
         assert_eq!(call("listunspent", vec![]).await.unwrap(), json!([]));
         assert_eq!(call("listtransactions", vec![]).await.unwrap(), json!([]));
 
-        // The account xpub is not RPC surface by default (`[rpc] expose_xpub` off):
-        // listdescriptors reads as method-not-found in every form, ahead of the arity check
-        // and its own parameter parsing, so the gated server hints at nothing.
+        // The account xpub is not RPC surface without a credential whose whitelist entry
+        // names it: listdescriptors reads as method-not-found in every form, ahead of the
+        // arity check and its own parameter parsing, so the gated server hints at nothing.
         for params in [
             vec![],
             vec![json!(true)],
@@ -1629,18 +1629,12 @@ mod tests {
             let err = call("listdescriptors", params).await.unwrap_err();
             assert_eq!(err.code, crate::error::codes::RPC_METHOD_NOT_FOUND);
         }
-        // With the key on it serves Core's shape, the xpub inside, and the arity check
-        // and the private-form refusal come back.
-        let mut open_config = (*state.config).clone();
-        open_config.rpc.expose_xpub = true;
-        let open = AppState {
-            config: Arc::new(open_config),
-            ..state.clone()
-        };
+        // Granted, it serves Core's shape, the xpub inside, and the arity check and the
+        // private-form refusal come back.
         let open_call = |method: &str, params: Vec<Value>| {
             let req = RpcRequest::positional(method.to_string(), params);
-            let state = &open;
-            async move { crate::rpc::dispatch(state, None, &req).await }
+            let state = &state;
+            async move { crate::rpc::dispatch_scoped(state, None, &req, true).await }
         };
         let descriptors = open_call("listdescriptors", vec![]).await.unwrap();
         let descs = descriptors["descriptors"].as_array().unwrap();

@@ -28,12 +28,8 @@
 //! Skips cleanly without a bitcoind (`BITCOIND_BIN` or PATH) or a rose built without the
 //! `bitcoin` feature - the same two probes as `regtest_btc.rs`.
 
-use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc};
+use rose_regtest_harness::btc::{provisioned, BitcoinD, BtcBackend, RoseBtc, XPUB_READER};
 use serde_json::json;
-
-/// The daemon-wide table the restores below run with: they read the keychain's `range`
-/// from `listdescriptors`, which `[rpc] expose_xpub` (default off) gates.
-const EXPOSE_XPUB: &str = "[rpc]\nexpose_xpub = true\n";
 
 /// How many receiving addresses the original hands out; the last one is paid.
 const ISSUED: usize = 30;
@@ -129,7 +125,7 @@ async fn btc_restore_over_kyoto_discovers_used_addresses_past_the_recovery_set()
         &node,
         &["btc"],
         "",
-        EXPOSE_XPUB,
+        XPUB_READER,
     );
     rose.init_ok(
         "btc",
@@ -152,7 +148,7 @@ async fn btc_restore_over_kyoto_discovers_used_addresses_past_the_recovery_set()
     assert_eq!(ai["ismine"], json!(true), "index {}: {ai}", USED - 1);
     assert_eq!(ai["address_index"], json!(USED - 1), "{ai}");
     let descriptors = rose
-        .call("listdescriptors", json!([]))
+        .call_xpub("listdescriptors", json!([]))
         .await
         .expect("listdescriptors");
     assert_eq!(
@@ -292,7 +288,7 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
             &node,
             &["btc"],
             "lookahead = 40\nallow_sends_without_mempool_view = true",
-            EXPOSE_XPUB,
+            XPUB_READER,
         );
         rose.init_ok(
             "btc",
@@ -316,7 +312,7 @@ async fn lookahead_flow(restore_backend: BtcBackend) {
             assert_eq!(ai["address_index"], json!(index), "{ai}");
         }
         let descriptors = rose
-            .call("listdescriptors", json!([]))
+            .call_xpub("listdescriptors", json!([]))
             .await
             .expect("listdescriptors");
         let external = &descriptors["descriptors"][0];

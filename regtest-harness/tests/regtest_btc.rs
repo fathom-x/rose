@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use rose_regtest_harness::btc::{XPUB_PASSWORD, XPUB_READER};
 use rose_regtest_harness::{pick_port, rose_bin, rosed_bin};
 use serde_json::{json, Value};
 
@@ -190,8 +191,9 @@ impl RoseBtc {
         let conf = datadir.join("rose.toml");
         // A tight sync interval so the 0-conf mempool pass lands quickly; the health
         // server is disabled to avoid a port pick for a surface this test does not assert.
-        // The xpub is exposed so listdescriptors (here and in conformance.py) checks the
-        // served shape; regtest_btc_encrypted runs conformance on the gated default.
+        // The `xpub` credential is granted listdescriptors, so the suite and conformance.py
+        // check both the served shape (as it) and the gate (as `zec`); regtest_btc_encrypted
+        // runs conformance on the gated default alone.
         std::fs::write(
             &conf,
             format!(
@@ -206,8 +208,7 @@ impl RoseBtc {
                  interval_secs = 1\n\
                  [health]\n\
                  enabled = false\n\
-                 [rpc]\n\
-                 expose_xpub = true\n"
+                 {XPUB_READER}"
             ),
         )
         .unwrap();
@@ -261,10 +262,24 @@ impl RoseBtc {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
+        self.call_as(("zec", "secret"), method, params).await
+    }
+
+    /// Call as the `xpub` credential `XPUB_READER` adds, the one granted `listdescriptors`.
+    async fn call_xpub(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
+        self.call_as(("xpub", XPUB_PASSWORD), method, params).await
+    }
+
+    async fn call_as(
+        &self,
+        (user, password): (&str, &str),
+        method: &str,
+        params: Value,
+    ) -> Result<Value, (i64, String)> {
         let resp = self
             .client
             .post(&self.url)
-            .basic_auth("zec", Some("secret"))
+            .basic_auth(user, Some(password))
             .json(&json!({"jsonrpc": "1.0", "id": "t", "method": method, "params": params}))
             .send()
             .await
@@ -424,10 +439,17 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
     assert_eq!(only_funded.as_array().map(Vec::len), Some(1));
     assert_eq!(only_funded[0]["address"], json!(address));
 
-    // `listdescriptors` is Core's shape over the two public descriptors, the xpub inside;
-    // the private form is refused (the database holds no private material).
+    // `listdescriptors` is Core's shape over the two public descriptors, the xpub inside,
+    // served only to the credential a whitelist entry grants it; the private form is refused
+    // (the database holds no private material).
+    let gated = rose.call("listdescriptors", json!([])).await;
+    assert_eq!(
+        gated.map_err(|(code, _)| code),
+        Err(-32601),
+        "an unscoped credential must not read the xpub"
+    );
     let descriptors = rose
-        .call("listdescriptors", json!([]))
+        .call_xpub("listdescriptors", json!([]))
         .await
         .expect("listdescriptors");
     let descs = descriptors["descriptors"].as_array().expect("descriptors");
@@ -444,7 +466,7 @@ async fn btc_wallet_receives_and_sends_against_regtest_bitcoind() {
         descs[0]["next_index"].as_u64().unwrap() >= 1,
         "{descriptors}"
     );
-    let private = rose.call("listdescriptors", json!([true])).await;
+    let private = rose.call_xpub("listdescriptors", json!([true])).await;
     assert!(private.is_err(), "private descriptors must be refused");
 
     // The wallet builds, signs (seed-derived signers), and broadcasts a send; the node's
@@ -935,6 +957,10 @@ fn run_conformance(rpc_port: u16) {
             "zec",
             "--password",
             "secret",
+            "--xpub-user",
+            "xpub",
+            "--xpub-password",
+            XPUB_PASSWORD,
         ])
         .output();
     match out {

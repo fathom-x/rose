@@ -372,6 +372,15 @@ fn log_auth_mode(rpc: &config::RpcConfig, password_on_cli: bool) {
     } else if let Some(cookie) = &rpc.cookiefile {
         info!(target: "rose::audit", "RPC auth: cookie file {}", cookie.display());
     }
+    if !rpc.whitelist.users.is_empty() || rpc.whitelist.default_deny {
+        info!(
+            target: "rose::audit",
+            scoped = %rpc.whitelist.entries().join(" "),
+            unlisted = if rpc.whitelist.default_deny { "refused" } else { "unrestricted" },
+            "RPC whitelist: {} credential(s) scoped",
+            rpc.whitelist.users.len()
+        );
+    }
     if password_on_cli {
         warn!(
             target: "rose::audit",

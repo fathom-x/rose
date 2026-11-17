@@ -227,22 +227,24 @@ impl Authenticator {
 
     /// Verify an `Authorization` header value (e.g. `Basic dXNlcjpwYXNz`).
     pub fn check(&self, header: Option<&str>) -> bool {
-        let Some(header) = header else { return false };
-        let Some(b64) = header
+        self.authenticate(header).is_some()
+    }
+
+    /// Verify an `Authorization` header value and name the credential it proved: the user
+    /// name, which is what `[rpc] whitelist` scopes and the audit log attributes a call to.
+    /// `None` when the header does not authenticate. A match requires the header's user name
+    /// to equal a configured one, so the name returned is the header's own, and returning it
+    /// reveals nothing the comparison below does not already keep constant-time.
+    pub fn authenticate(&self, header: Option<&str>) -> Option<String> {
+        let header = header?;
+        let b64 = header
             .strip_prefix("Basic ")
-            .or_else(|| header.strip_prefix("basic "))
-        else {
-            return false;
-        };
-        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
-            return false;
-        };
-        let Ok(creds) = std::str::from_utf8(&decoded) else {
-            return false;
-        };
-        let Some((user, password)) = creds.split_once(':') else {
-            return false;
-        };
+            .or_else(|| header.strip_prefix("basic "))?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .ok()?;
+        let creds = std::str::from_utf8(&decoded).ok()?;
+        let (user, password) = creds.split_once(':')?;
 
         // Check every configured credential without short-circuiting: always run the password
         // HMAC (via `check_ct`) and combine with bitwise `Choice` ops, so response timing does
@@ -254,7 +256,7 @@ impl Authenticator {
             let pass_ok = hash.check_ct(password);
             found |= user_ok & pass_ok;
         }
-        found.into()
+        bool::from(found).then(|| user.to_string())
     }
 }
 
@@ -427,7 +429,7 @@ mod tests {
             cookiefile: Some(cookie.clone()),
             work_queue: 16,
             allowed_methods: vec![],
-            expose_xpub: false,
+            whitelist: Default::default(),
             allow_duplicate_shielded_recipients: false,
         };
         let auth = Authenticator::from_config(&rpc).unwrap();
@@ -462,7 +464,7 @@ mod tests {
             cookiefile: Some(dir.path().join(".cookie")),
             work_queue: 16,
             allowed_methods: vec![],
-            expose_xpub: false,
+            whitelist: Default::default(),
             allow_duplicate_shielded_recipients: false,
         };
         // An empty bare password (an unpopulated password_file reads as exactly this).

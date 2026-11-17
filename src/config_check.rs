@@ -664,6 +664,78 @@ fn check_rpc(config: &AppConfig, findings: &mut Vec<Finding>) {
             config.rpc.bind
         )));
     }
+    check_rpc_whitelist(config, findings);
+}
+
+/// `[rpc] whitelist`: the names were validated by the resolve; what is left is a scope that
+/// cannot do what it reads as doing. An entry for a user no credential carries (a typo leaves
+/// the real user under the default), a configured credential the default refuses everything
+/// (Core's behaviour, and the cookie the `rose` command line uses by default is one), and a
+/// scoped method the server-wide `allowed_methods` ceiling removes anyway.
+fn check_rpc_whitelist(config: &AppConfig, findings: &mut Vec<Finding>) {
+    let rpc = &config.rpc;
+    let whitelist = &rpc.whitelist;
+    if whitelist.users.is_empty() && !whitelist.default_deny {
+        return;
+    }
+    let mut credentials: Vec<String> = rpc
+        .auth
+        .iter()
+        .filter_map(|entry| entry.split_once(':').map(|(user, _)| user.to_string()))
+        .collect();
+    match (&rpc.user, &rpc.password) {
+        (Some(user), Some(_)) => credentials.push(user.clone()),
+        _ if rpc.cookiefile.is_some() => credentials.push("__cookie__".to_string()),
+        _ => {}
+    }
+    for user in whitelist.users.keys() {
+        if !credentials.iter().any(|c| c == user) {
+            findings.push(Finding::warning(format!(
+                "[rpc] whitelist names user {user:?}, which no configured credential \
+                 carries ([rpc] user, [rpc] auth, or __cookie__ for the cookie)"
+            )));
+        }
+    }
+    if whitelist.default_deny {
+        let mut refused: Vec<&str> = credentials
+            .iter()
+            .filter(|c| !whitelist.users.contains_key(c.as_str()))
+            .map(String::as_str)
+            .collect();
+        refused.sort_unstable();
+        refused.dedup();
+        if !refused.is_empty() {
+            findings.push(Finding::warning(format!(
+                "[rpc] whitelist names no scope for {}, so {} refused every method \
+                 (whitelist_default is on, as it is by default once any entry exists); give \
+                 {} an entry, or set [rpc] whitelist_default = false to leave unnamed \
+                 credentials unrestricted",
+                refused.join(", "),
+                if refused.len() == 1 {
+                    "it is"
+                } else {
+                    "they are"
+                },
+                if refused.len() == 1 { "it" } else { "each" },
+            )));
+        }
+    }
+    if !rpc.allowed_methods.is_empty() {
+        for (user, methods) in &whitelist.users {
+            let ceilinged: Vec<&str> = methods
+                .iter()
+                .filter(|m| !rpc.allowed_methods.contains(m))
+                .map(String::as_str)
+                .collect();
+            if !ceilinged.is_empty() {
+                findings.push(Finding::warning(format!(
+                    "[rpc] whitelist grants {user:?} {}, which [rpc] allowed_methods does not \
+                     serve to anyone",
+                    ceilinged.join(", ")
+                )));
+            }
+        }
+    }
 }
 
 /// The data-directory layout: whether any wallet still keeps librustzcash's files at its root
@@ -1463,6 +1535,39 @@ mod tests {
             "{:?}",
             inspect(&config)
         );
+    }
+
+    /// `[rpc] whitelist` warns about a scope naming no credential, a credential the default
+    /// refuses everything (the cookie, here), and a scoped method the safelist removes; a
+    /// whitelist that names every credential within the ceiling is silent.
+    #[test]
+    fn whitelist_scopes_that_cannot_do_what_they_say_are_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("network = \"test\"\ndatadir = {:?}\n[rpc]\n", dir.path());
+        let config = resolve(
+            &format!(
+                "{base}allowed_methods = [\"getblockcount\"]\n\
+                 whitelist = [\"monitr:getblockcount,getwalletinfo\"]\n"
+            ),
+            dir.path(),
+        );
+        let found = warnings(&inspect(&config)).join("\n");
+        assert!(
+            found.contains("\"monitr\", which no configured credential"),
+            "{found}"
+        );
+        assert!(found.contains("no scope for __cookie__"), "{found}");
+        assert!(
+            found.contains("getwalletinfo, which [rpc] allowed_methods"),
+            "{found}"
+        );
+
+        let config = resolve(
+            &format!("{base}user = \"u\"\npassword = \"p\"\nwhitelist = [\"u:getblockcount\"]\n"),
+            dir.path(),
+        );
+        let found = warnings(&inspect(&config)).join("\n");
+        assert!(!found.contains("whitelist"), "{found}");
     }
 
     /// What `check` prints as the effective settings is exactly what `config show` prints -

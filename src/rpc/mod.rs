@@ -22,11 +22,12 @@ use crate::error::RpcError;
 use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 
-/// The methods whose answer carries the account xpub, served only with `[rpc] expose_xpub =
-/// true` (default off; `dispatch` answers `-32601` otherwise, like the safelist). Every
-/// other method carries at most a derived key with its origin, as in Bitcoin Core. A new
-/// method that returns an extended public key, a descriptor over one, or a viewing key from
-/// which the account's addresses follow belongs on this list.
+/// The methods whose answer carries the account xpub, served only to a credential whose
+/// `[rpc] whitelist` entry names them (never through the whitelist's default, never to an
+/// unscoped credential, never through `Node::call`); every other caller gets `-32601`, like
+/// the safelist. Every other method carries at most a derived key with its origin, as in
+/// Bitcoin Core. A new method that returns an extended public key, a descriptor over one, or
+/// a viewing key from which the account's addresses follow belongs on this list.
 pub const XPUB_METHODS: &[&str] = &["listdescriptors"];
 
 /// Every RPC method name rose implements, used to validate the `[rpc] allowed_methods`
@@ -110,6 +111,23 @@ pub const ALL_METHODS: &[&str] = &[
 pub fn is_known_method(name: &str) -> bool {
     ALL_METHODS.contains(&name)
 }
+
+/// The methods whose every call the HTTP server records on `rose::audit` with the credential
+/// that made it: the ones that move funds or broadcast (the spends), the one that puts the
+/// seed in memory, and the one that releases a send's inputs for a double-spend. Spend
+/// authority is the question an audit trail has to answer, so these name the RPC user, the
+/// peer and the outcome; every other call stays at the per-request DEBUG line.
+pub const AUDITED_METHODS: &[&str] = &[
+    "sendtoaddress",
+    "sendmany",
+    "sendrawtransaction",
+    "bumpfee",
+    "abandontransaction",
+    "walletpassphrase",
+    "z_sendmany",
+    "z_shieldcoinbase",
+    "z_mergetoaddress",
+];
 
 /// The maximum number of *positional* parameters each method accepts. Bitcoin Core rejects a
 /// call carrying more positional arguments than the method declares (it raises the help text,
@@ -377,11 +395,24 @@ fn check_arity(req: &RpcRequest) -> Result<(), RpcError> {
 }
 
 /// Route a parsed request to rose's method table. `wallet` is the wallet name from a
-/// `/wallet/<name>` path (or `None` for the default wallet).
+/// `/wallet/<name>` path (or `None` for the default wallet). No credential is in hand, so
+/// the [`XPUB_METHODS`] answer `-32601`: this is `Node::call`'s route.
 pub(crate) async fn dispatch(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    dispatch_scoped(state, wallet, req, false).await
+}
+
+/// [`dispatch`] for an authenticated caller: `xpub_granted` is whether the caller's
+/// `[rpc] whitelist` entry names the method (`RpcWhitelist::grants`), the only thing that
+/// opens an [`XPUB_METHODS`] method.
+pub(crate) async fn dispatch_scoped(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+    xpub_granted: bool,
 ) -> Result<Value, RpcError> {
     // RPC method safelist: when `[rpc] allowed_methods` is non-empty, ONLY those methods are
     // served. A blocked method is rejected exactly like one that does not exist (-32601 →
@@ -391,9 +422,10 @@ pub(crate) async fn dispatch(
     if !safelist.is_empty() && !safelist.iter().any(|m| m == &req.method) {
         return Err(RpcError::method_not_found(&req.method));
     }
-    // The xpub gate (`[rpc] expose_xpub`, default off): a method that hands out the account
-    // xpub reads as method-not-found too, before the arity check, for the same reason.
-    if !state.config.rpc.expose_xpub && XPUB_METHODS.contains(&req.method.as_str()) {
+    // The xpub gate: a method that hands out the account xpub reads as method-not-found too,
+    // before the arity check, for the same reason, unless a whitelist entry names it for the
+    // caller.
+    if !xpub_granted && XPUB_METHODS.contains(&req.method.as_str()) {
         return Err(RpcError::method_not_found(&req.method));
     }
     // Reject over-arity positional calls before dispatch (Bitcoin Core's help error, -1). Runs
@@ -818,5 +850,14 @@ mod tests {
             arity.len(),
             "MAX_POSITIONAL_ARGS contains duplicate method names"
         );
+    }
+
+    /// Every audited method is one rose implements, so a rename cannot quietly drop a spend
+    /// from the audit trail.
+    #[test]
+    fn audited_methods_are_known() {
+        for m in super::AUDITED_METHODS {
+            assert!(super::is_known_method(m), "{m} is not in ALL_METHODS");
+        }
     }
 }

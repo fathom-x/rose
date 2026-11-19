@@ -27,7 +27,7 @@ on:
       - deploy/rose.toml
       - deploy/rose.btc-mainnet-view.toml
   push:
-    branches: [main, master]
+    branches: [main, master, dev, "[0-9]*.[0-9]*.x"]
     paths:
       - Dockerfile
       - Dockerfile.arm64

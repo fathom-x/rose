@@ -62,9 +62,10 @@ on:
     # one - enables ROSE_REGTEST_STRESS; the weekly cron above leaves the stress test skipping.
     - cron: "33 7 1 * *"
   push:
-    # Mainline only: feature branches (incl. feature/**) are covered by the pull_request trigger
-    # below, so listing them here too would run every job twice on a PR push.
-    branches: [main, master]
+    # main (releases), dev (integration) and the N.N.x release branches. topic/** work
+    # branches do not run the tier on push (it is the expensive one): dispatch it on one, or
+    # let it run when the branch lands on dev.
+    branches: [main, master, dev, "[0-9]*.[0-9]*.x"]
     paths:
       - "regtest-harness/**"
       - "src/**"

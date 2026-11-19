@@ -9,7 +9,7 @@ name: Style
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, dev, "[0-9]*.[0-9]*.x", "topic/**"]
   pull_request:
 
 concurrency:
